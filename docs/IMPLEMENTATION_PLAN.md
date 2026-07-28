@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 3 |
+| Plan revision | 4 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `dc9e490` (`docs: validate workflow before implementation`) |
+| Previous plan commit | `1bc1c60` (`docs: correct spike reading contract and MVP recovery gate`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
-| Current release stage | Walking-skeleton validation |
-| Current implementation status | Foundation complete; production workflow implementation not started |
-| Next executable work package | `SPIKE-001` |
+| Current release stage | Walking-skeleton validation, awaiting acceptance |
+| Current implementation status | Foundation complete; `SPIKE-001` executed with all seven hypotheses passing; production workflow implementation not started |
+| Next executable work package | `WP-100`, blocked until the acceptance owner approves `docs/spikes/SPIKE-001-REPORT.md` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1263,9 +1263,14 @@ Evidence:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `IN_PROGRESS`, executed and reported; blocked only on acceptance-owner approval |
 | Owner | Claude, coordinator role |
 | Started | 2026-07-28 |
+| Executed | 2026-07-28, 29 minutes elapsed against a 16-hour budget |
+| Hypothesis results | `H-01` through `H-07` all `PASS`; see `docs/spikes/SPIKE-001-REPORT.md` |
+| Prototype head | `1bb3fc81195c43c27fc01488e3efa7a2bc3ae377`, archived at `refs/archive/spikes/SPIKE-001` |
+| Prototype size | 219 non-generated executable lines against a 300-line budget |
+| Remaining criterion | Acceptance owner approves the report, then `WP-100` becomes `READY` |
 | Dependencies | `WP-000` |
 | Target release | Walking-skeleton validation |
 | Branch | `spike/SPIKE-001-walking-skeleton` |
@@ -1647,6 +1652,8 @@ Deliverables:
 
 - generated factual handoff section;
 - required actor-authored declaration;
+- actor-declared `delivered_sha`, compared against the branch head at handoff
+  creation (`SPIKE-001` finding F-1, D-022, R-017);
 - handoff digest;
 - branch freeze expectation;
 - invalidation event;
@@ -1658,7 +1665,12 @@ Acceptance:
 - a dirty worktree fails;
 - stale receipts fail;
 - a head change automatically invalidates handoff eligibility;
-- handoff can be reproduced from control and Git objects.
+- a branch rewritten between delivery and handoff creation fails with a
+  distinct policy error naming both SHAs, and does not produce a handoff;
+- handoff can be reproduced from control and Git objects;
+- the handoff record names its canonicalization algorithm and carries or
+  references the card, so every digest is independently recomputable
+  (`SPIKE-001` finding F-2, R-018).
 
 ### WP-300 — Named gate registry
 
@@ -1723,7 +1735,13 @@ Deliverables:
 
 - review schema;
 - reviewer/feature-actor separation check;
-- findings and residual-risk structure;
+- findings and residual-risk structure, with a per-finding `disposition` of
+  resolved, accepted as residual risk, or unresolvable within the card's write
+  scope (`SPIKE-001` finding F-4, D-025);
+- re-review records that supersede a prior review and disposition each of its
+  findings;
+- required gate-adequacy assessment stating whether the named gates can
+  actually observe each acceptance behavior (`SPIKE-001` finding F-5, D-024);
 - review gate binding;
 - review invalidation;
 - `review begin`, `record`, `inspect`.
@@ -1734,7 +1752,10 @@ Acceptance:
 - approval references exact candidate/card/dependencies;
 - a candidate change invalidates approval;
 - changes requested return the card to active work;
-- findings remain visible after subsequent approval.
+- findings remain visible after subsequent approval;
+- a re-review that leaves a prior finding undispositioned fails;
+- an approval whose gate-adequacy assessment reports an unobservable
+  acceptance behavior records that fact rather than discarding it.
 
 ### WP-400 — Bare authority initialization
 
@@ -1773,6 +1794,10 @@ Deliverables:
 
 - integration schema;
 - selected-card validation;
+- a discoverable ready-to-integrate view listing approved cards awaiting
+  integration, so no actor has to hold that state out of band
+  (`SPIKE-001` finding F-3);
+- an explicit statement of whether cards land individually or as a batch;
 - topological ordering;
 - atomic-group handling;
 - integration lease;
@@ -1781,6 +1806,8 @@ Deliverables:
 Acceptance:
 
 - only approved exact candidates are selected;
+- an actor resuming from a cold context can determine which cards are awaiting
+  integration from harness state alone;
 - missing dependencies fail;
 - ordering is deterministic;
 - one integration lease exists per cycle/project;
@@ -2227,18 +2254,22 @@ Status: `DONE`.
 
 ### 19.2 Walking-skeleton gate
 
-Status: `READY`.
+Status: `IN_PROGRESS`. Five of seven criteria met; the gate is held by
+acceptance-owner approval.
 
-All must be true:
+| Criterion | Status |
+| --- | --- |
+| `SPIKE-001` is `DONE` | ⬜ blocked on the report acceptance below |
+| `H-01` through `H-07` are `PASS` | ✅ all seven, evidence in the spike report |
+| `docs/spikes/SPIKE-001-REPORT.md` is accepted | ⬜ **outstanding**, acceptance owner |
+| Prototype head preserved under `refs/archive/spikes/SPIKE-001` | ✅ `1bb3fc8` |
+| No prototype implementation present on `main` | ✅ verified with `git ls-tree` |
+| Sections 9–15 and the dependency sequence reflect observed evidence | ✅ plan revision 4 |
+| `WP-100` is explicitly changed to `READY` | ⬜ blocked on report acceptance |
 
-- `SPIKE-001` is `DONE`;
-- `H-01` through `H-07` are `PASS`;
-- `docs/spikes/SPIKE-001-REPORT.md` is accepted;
-- the prototype head is preserved under
-  `refs/archive/spikes/SPIKE-001`;
-- no prototype implementation is present on `main`;
-- Sections 9–15 and the dependency sequence reflect observed evidence;
-- `WP-100` is explicitly changed to `READY`.
+The coordinator cannot satisfy the two outstanding criteria. Section 2 makes
+`DONE` binary and Section 17 lists acceptance-owner approval as an acceptance
+criterion for the spike.
 
 ### 19.3 Single-repository MVP gate
 
@@ -2296,7 +2327,7 @@ All must be true:
 | Area | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | Repository foundation | `DONE` | Commit `4729d18` | Preserve |
-| Walking-skeleton validation | `IN_PROGRESS` | Plan revision 3, `SPIKE-001` packets | Execute the seven hypotheses and report |
+| Walking-skeleton validation | `IN_PROGRESS` | `SPIKE-001` report, seven passing hypotheses, archive ref `1bb3fc8` | Acceptance owner approves the report |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
 | Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
@@ -2322,14 +2353,14 @@ All must be true:
 
 | Field | Current value |
 | --- | --- |
-| Active work package | `SPIKE-001` |
-| Active implementation branch | `spike/SPIKE-001-walking-skeleton` |
-| Active implementation worktree | Disposable toy repositories outside this repository |
-| Active owner | Claude, coordinator role |
-| Active blocker | None |
-| Next work package | `WP-100`, blocked until the `SPIKE-001` report is accepted |
-| Next branch name | `spike/SPIKE-001-walking-skeleton` |
-| Next acceptance evidence | `docs/spikes/SPIKE-001-REPORT.md`, seven passing hypotheses, accepted plan revision, and archived prototype ref |
+| Active work package | `SPIKE-001`, executed and reported |
+| Active implementation branch | `spike/SPIKE-001-walking-skeleton`, archived at `refs/archive/spikes/SPIKE-001` |
+| Active implementation worktree | Removed; toy repositories were disposable and outside this repository |
+| Active owner | Alvaro Alvarez, as acceptance owner |
+| Active blocker | Acceptance-owner approval of `docs/spikes/SPIKE-001-REPORT.md`. No production work package may begin until this clears. |
+| Next work package | `WP-100`, plus the required corrections F-1 through F-4 recorded in the spike report |
+| Next branch name | To be assigned when `WP-100` becomes `READY` |
+| Next acceptance evidence | Acceptance-owner sign-off on the spike report, then `WP-100` deliverables |
 
 ### 20.3 Current demonstrated behavior
 
@@ -2405,6 +2436,9 @@ commands before commit even though Rust behavior is unchanged.
 | R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | Complete `SPIKE-001` before `WP-100`; keep Sections 9–15 provisional | Production code begins before accepted spike evidence | Actively controlled |
 | R-015 | Full-plan reading consumes feature-agent context | Reduced implementation focus and higher error rate | Role-specific reading contract and explicit per-item reading list | Feature agent is instructed to load the complete plan without a coordination role | Mitigated by plan revision 2 |
 | R-016 | Review reuses implementation context | Nominally independent review repeats the implementer's assumptions | Fresh session, review packet only, different session ID, no branch edits | Reviewer inherits or forks implementation conversation | Mitigated procedurally; not a security boundary |
+| R-017 | Candidate branch is rewritten between actor delivery and handoff creation | A structurally valid handoff describes code the feature actor never delivered, and review evaluates the wrong objects | Record the actor-declared `delivered_sha` and compare it at handoff creation; reject on mismatch | Any handoff whose candidate SHA differs from the declared delivered SHA | Open; observed in `SPIKE-001` finding F-1 and confirmed by reflog |
+| R-018 | Evidence records cannot be independently verified by their holder | An auditor can check records against each other but cannot recompute any digest, so internal consistency is mistaken for correctness | Records name their canonicalization algorithm and carry or reference the card; commit digest vectors before activation | Any record whose digest cannot be recomputed from the record plus Git objects | Open; observed in `SPIKE-001` finding F-2 |
+| R-019 | Independent reviewers reach different verdicts on identical code | Approval depends on which reviewer is assigned rather than on the code | Comparability guidance in Section 15.3; required gate-adequacy output | Same construct flagged in one card and not another | Open; observed in `SPIKE-001` finding F-6 |
 
 ## 22. Decision register
 
@@ -2431,6 +2465,10 @@ commands before commit even though Rust behavior is unchanged.
 | D-019 | Exempt spike roles from the standing agent reading contract when the tracker names a packet as sole required reading | Accepted | The general contract in `AGENTS.md` forced the implementer to read Sections 1–7 and the spike entry itself, which would have revealed the seeded omission and invalidated `H-01` and `H-02` |
 | D-020 | Assign MVP ownership of mandatory scenarios 34 and 35 to `WP-450` and `WP-230`, and scope `WP-500` to injected failure | Accepted | The Single-repository MVP gate required all 40 scenarios while scenario 35 was claimed only by `WP-500`, a hardened-release package, making the gate unsatisfiable as written |
 | D-021 | Define the spike packet contract inside the `SPIKE-001` entry rather than Sections 9–15 | Accepted | `H-01` and `H-02` test packet sufficiency, so the contract must exist before the spike, but hardening a general packet schema before evidence is exactly the failure R-014 describes |
+| D-022 | Bind the actor-declared delivered SHA to the handoff candidate SHA | Accepted, unimplemented | `SPIKE-001` demonstrated that a branch rewritten between delivery and handoff produces an internally consistent handoff describing code the actor never delivered. Closes a gap between two things the plan already treats as authoritative; requires no new trust model. |
+| D-023 | Measure implementation-packet sufficiency as zero blocking clarifications with recorded assumptions, not zero clarification messages | Accepted | Both `SPIKE-001` implementers completed without blocking, chose documented defaults, and recorded genuine packet ambiguities. That behavior is desirable and the original metric penalized it. |
+| D-024 | Make gate adequacy a required, recorded review output | Accepted, unimplemented | Both `SPIKE-001` reviewers mutation-tested the gates unprompted and proved in three of three cases that a green receipt was not evidence for the acceptance behavior it appeared to support |
+| D-025 | Add per-finding disposition and re-review to the review contract | Accepted, unimplemented | Every `SPIKE-001` review round needed to mark findings resolved, accepted as residual risk, or unresolvable within the card's write scope. Section 15.1 describes only a first review. |
 
 ## 23. Decisions required later
 
