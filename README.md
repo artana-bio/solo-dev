@@ -45,6 +45,9 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-See [Architecture](./docs/ARCHITECTURE.md) for the initial design and delivery
-sequence.
+See:
 
+- [Implementation Plan and Status Ledger](./docs/IMPLEMENTATION_PLAN.md) for
+  authoritative requirements, work packages, acceptance gates, and current
+  status.
+- [Architecture](./docs/ARCHITECTURE.md) for the shorter design summary.

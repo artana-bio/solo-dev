@@ -1,6 +1,8 @@
 # Change Harness Agent Instructions
 
-Read `README.md` and `docs/ARCHITECTURE.md` before changing implementation.
+Read `README.md`, `docs/IMPLEMENTATION_PLAN.md`, and `docs/ARCHITECTURE.md`
+before changing implementation. `docs/IMPLEMENTATION_PLAN.md` is authoritative
+for work-package scope, dependencies, acceptance gates, and status.
 
 ## Engineering rules
 
@@ -21,4 +23,5 @@ Read `README.md` and `docs/ARCHITECTURE.md` before changing implementation.
   state persistence, and command-line presentation.
 - Do not add speculative infrastructure. Implement the smallest complete
   end-to-end workflow slice and harden it with evidence.
-
+- Update the implementation plan and status ledger whenever work starts,
+  completes, blocks, changes scope, or produces acceptance evidence.

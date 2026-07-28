@@ -1,5 +1,9 @@
 # Change Harness Architecture
 
+This document is the concise architecture summary. The authoritative work
+packages, requirements, acceptance gates, and current status are maintained in
+[Implementation Plan and Status Ledger](./IMPLEMENTATION_PLAN.md).
+
 ## Recommendation
 
 Build one thin, complete workflow before adding distributed coordination,
@@ -107,4 +111,3 @@ This boundary is not implemented in the foundation release.
 - Automatic semantic conflict resolution
 - General container orchestration
 - Claims of atomic commits across independent repositories
-

@@ -1,0 +1,2195 @@
+# Change Harness Implementation Plan and Status Ledger
+
+## 1. Document control
+
+| Field | Value |
+| --- | --- |
+| Document status | Authoritative implementation plan |
+| Plan revision | 1 |
+| Plan date | 2026-07-28 |
+| Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
+| Repository | `/Users/alvaro/Documents/Code/change-harness` |
+| Active branch | `main` |
+| Current release stage | Foundation |
+| Current implementation status | Foundation complete; workflow implementation not started |
+| Next executable work package | `WP-100` |
+| Final acceptance owner | Alvaro Alvarez |
+
+This file is the authoritative delivery plan and current status ledger for
+Change Harness. `docs/ARCHITECTURE.md` summarizes the design but does not
+supersede requirements, acceptance gates, dependencies, or status recorded
+here.
+
+Every implementation change MUST update this file when it:
+
+- starts or completes a work package;
+- changes a dependency, requirement, CLI contract, schema, or invariant;
+- discovers or resolves a risk;
+- records acceptance evidence;
+- changes a release gate;
+- defers, splits, replaces, or abandons planned work.
+
+Status changes MUST be supported by repository evidence. An agent statement,
+chat message, green hook, or uncommitted local result is not sufficient.
+
+## 2. Status vocabulary
+
+Only these status values may be used:
+
+| Status | Exact meaning |
+| --- | --- |
+| `DONE` | All acceptance criteria passed, evidence is recorded, and the implementation is committed. |
+| `IN_PROGRESS` | Work has started on one identified branch or worktree. Only one owner is active. |
+| `READY` | Requirements and dependencies are complete enough to begin without another product decision. |
+| `BLOCKED` | Work cannot proceed until the recorded blocking condition is resolved. |
+| `NOT_STARTED` | Work is planned but a dependency or sequencing decision prevents it from starting. |
+| `DEFERRED` | Work is intentionally outside the current release target. |
+| `ABANDONED` | Work was started or planned and explicitly rejected; retained only for auditability. |
+
+`DONE` is binary. Partial implementation remains `IN_PROGRESS`. Passing a
+subset of tests does not make a work package `DONE`.
+
+## 3. Executive objective
+
+Change Harness will be a project-neutral command-line tool that coordinates
+bounded changes made by humans and coding agents in local Git repositories. It
+will replace the mechanical functions of a hosted pull-request platform for
+local development:
+
+- work allocation;
+- exact baseline selection;
+- worktree creation;
+- ownership enforcement;
+- candidate handoff;
+- independent review binding;
+- reproducible gates and receipts;
+- deterministic integration;
+- explicit acceptance;
+- safe promotion;
+- recovery, archival, and cleanup.
+
+Change Harness will not replace semantic engineering judgment. Humans or
+independent reviewers remain responsible for requirement correctness,
+architecture, test adequacy, residual risk, and final acceptance.
+
+## 4. Release definitions
+
+### 4.1 Foundation
+
+The repository exists, builds, and exposes a read-only diagnostic command.
+Foundation does not manage development work.
+
+### 4.2 Single-repository MVP
+
+The MVP is complete only when one repository can execute this full lifecycle
+without manual Git mutation:
+
+```text
+initialize project
+  → create and activate cycle
+  → create immutable card
+  → allocate isolated worktree
+  → implement and checkpoint
+  → verify candidate scope
+  → run named gates
+  → create exact-SHA handoff
+  → record independent review
+  → prepare clean integration
+  → test exact landing commit
+  → record acceptance
+  → promote to canonical bare authority
+  → synchronize clean main worktree
+  → archive evidence
+  → close and safely remove worktree
+```
+
+### 4.3 Hardened single-repository release
+
+The hardened release adds interruption recovery, concurrency locks, backup
+verification, generated-artifact governance, failure injection, and a complete
+audit report.
+
+### 4.4 Multi-repository release
+
+The multi-repository release coordinates exact candidate SHAs across
+independent repositories with a workspace manifest. It does not claim that Git
+can perform one atomic commit across repositories.
+
+### 4.5 Optional isolation release
+
+Runtime-resource brokers, sandboxed gate execution, stronger actor identity,
+and plugin distribution are separate extensions. They are not prerequisites
+for the single-repository MVP.
+
+## 5. Scope and non-goals
+
+### 5.1 In scope
+
+- Local Git repositories and linked worktrees
+- A separate local bare Git repository as canonical ref authority
+- A separate versioned control repository
+- Deterministic, non-interactive CLI commands
+- Human-readable and JSON output
+- Project-neutral configuration
+- Immutable work cards after activation
+- Exact commit IDs and content digests
+- Named gates defined by trusted project policy
+- Independent semantic review records
+- Acceptance records
+- Single-repository integration and promotion
+- Cross-repository manifests after the single-repository workflow is proven
+- macOS arm64 as the first validated host
+
+### 5.2 Explicit non-goals for MVP
+
+- Replacing human product judgment
+- Preventing malicious behavior by the same operating-system account
+- Hosted collaboration or a web interface
+- General job scheduling
+- General container orchestration
+- Arbitrary shell commands embedded in cards
+- Automatic semantic merge-conflict resolution
+- Automatic production deployment
+- GitHub, GitLab, Jira, or Linear integration
+- Windows support
+- Atomic commits across independent repositories
+- A public plugin ecosystem
+
+## 6. Definitions
+
+| Term | Definition |
+| --- | --- |
+| Authority repository | Bare Git repository whose protected branch ref is the canonical accepted state. |
+| Candidate repository | Ordinary Git clone or repository in which feature and integration objects are created. |
+| Control repository | Separate Git repository containing authoritative configuration, cards, events, reviews, receipts, and integration records. |
+| Project | One configured candidate repository and its authority/control boundaries. |
+| Cycle | A bounded integration period with one frozen baseline and declared cards. |
+| Card | Immutable activated definition of one independently reviewable outcome. |
+| Card revision | Replacement immutable card created when an activated requirement changes. |
+| Lease | Exclusive record assigning one card to one actor and worktree. |
+| Candidate | Exact feature commit produced for one card. |
+| Handoff | Generated record binding a card revision, baseline, candidate SHA, diff facts, and evidence. |
+| Reviewer | Actor other than the feature actor who evaluates semantic correctness. |
+| Receipt | Structured result of one named gate run against one exact commit. |
+| Integration | Deterministic combination of approved candidates from one cycle. |
+| Landing commit | Exact commit tested and accepted for promotion to the protected branch. |
+| Acceptance | Explicit decision approving one landing commit and its declared residual risk. |
+| Promotion | Expected-old-SHA update of the authority repository's protected branch. |
+| Archive ref | Durable ref preserving candidate or integration reachability after ordinary branches are removed. |
+| Project profile | Project-specific repository paths, named gates, generated-artifact rules, and optional adapters. |
+
+## 7. Non-negotiable invariants
+
+The implementation MUST preserve all invariants below.
+
+### 7.1 Authority invariants
+
+1. Candidate worktrees never contain authoritative cards or acceptance state.
+2. A generated `.agent/` file is a cache and never overrides the control
+   repository.
+3. Acceptance always names an exact landing commit SHA.
+4. Reviews always name an exact card digest, baseline SHA, and candidate SHA.
+5. Gate receipts always name an exact gate-definition digest and evaluated SHA.
+6. Hooks are advisory and never count as integration evidence.
+7. No branch name is accepted as proof of code identity.
+
+### 7.2 Git safety invariants
+
+1. The CLI never constructs shell command strings from project configuration.
+2. Git is invoked with explicit executable and argument arrays.
+3. The CLI never performs `git reset --hard`, force checkout, force worktree
+   removal, or unconditional force push as a normal workflow action.
+4. Promotion never directly changes a branch ref that is checked out in a
+   working tree.
+5. Promotion is rejected unless the authority branch equals the recorded
+   expected baseline SHA.
+6. Worktree removal is rejected until candidate commits are landed, archived,
+   or explicitly abandoned.
+7. Dirty main worktrees block synchronization and promotion preparation.
+8. Every mutating operation records enough state to resume or safely diagnose
+   an interruption.
+
+### 7.3 Workflow invariants
+
+1. One card has at most one active implementation lease.
+2. Active cards may not overlap write scopes or exclusive resources.
+3. Cards are immutable after activation.
+4. A card change creates a new revision and invalidates previous handoffs,
+   reviews, and receipts.
+5. A candidate SHA change invalidates its handoff and review.
+6. A relevant dependency SHA change invalidates dependent evidence.
+7. A feature actor cannot approve its own candidate under the declared actor
+   identity model.
+8. The integrator reruns required gates from a clean disposable worktree.
+9. Semantic conflict resolution requires a new reviewed candidate or explicit
+   integration-fix card.
+10. Final acceptance cannot be inferred from green tests.
+
+### 7.4 Evidence invariants
+
+1. Passing and failed gate attempts are recorded.
+2. Logs may live outside Git, but their location and SHA-256 digest are
+   recorded.
+3. A receipt for an earlier SHA is stale and cannot be reused.
+4. Gate success requires exit code zero and completion before the configured
+   timeout.
+5. A retry policy is declared by the gate; undeclared reruns do not convert a
+   flaky result into deterministic evidence.
+6. The integration worktree MUST be clean before and after final verification.
+
+## 8. Target repository architecture
+
+The intended source layout is:
+
+```text
+change-harness/
+  Cargo.toml
+  rust-toolchain.toml
+  AGENTS.md
+  README.md
+  docs/
+    ARCHITECTURE.md
+    IMPLEMENTATION_PLAN.md
+  schemas/
+    project.schema.json
+    cycle.schema.json
+    card.schema.json
+    event.schema.json
+    gate.schema.json
+    receipt.schema.json
+    handoff.schema.json
+    review.schema.json
+    acceptance.schema.json
+    integration.schema.json
+    workspace-manifest.schema.json
+  src/
+    cli/
+      mod.rs
+      output.rs
+      exit.rs
+    commands/
+      doctor.rs
+      project.rs
+      cycle.rs
+      card.rs
+      work.rs
+      gate.rs
+      handoff.rs
+      review.rs
+      integration.rs
+      acceptance.rs
+      archive.rs
+    config/
+      mod.rs
+      load.rs
+      validate.rs
+    control/
+      mod.rs
+      repository.rs
+      transaction.rs
+      event_store.rs
+      lock.rs
+    domain/
+      ids.rs
+      digest.rs
+      project.rs
+      cycle.rs
+      card.rs
+      event.rs
+      gate.rs
+      review.rs
+      integration.rs
+    git/
+      mod.rs
+      command.rs
+      inspect.rs
+      diff.rs
+      worktree.rs
+      merge.rs
+      authority.rs
+      archive.rs
+    policy/
+      mod.rs
+      ownership.rs
+      resources.rs
+      transitions.rs
+      evidence.rs
+    runner/
+      mod.rs
+      gate.rs
+      receipt.rs
+      logs.rs
+    lib.rs
+    main.rs
+  tests/
+    cli/
+    fixtures/
+    support/
+    candidate_lifecycle.rs
+    review_lifecycle.rs
+    integration_lifecycle.rs
+    recovery.rs
+    safety.rs
+```
+
+This is a target decomposition, not permission to create empty modules. A module
+is added only when its owning work package implements behavior and tests.
+
+## 9. Configuration contract
+
+### 9.1 Bootstrap inputs
+
+Project initialization MUST require explicit paths. No destructive or
+authority-related path may be inferred from the current directory.
+
+```bash
+change-harness project init \
+  --project-id example \
+  --repository /absolute/path/to/repository \
+  --control /absolute/path/to/example-control \
+  --authority /absolute/path/to/example-authority.git \
+  --protected-branch main
+```
+
+Initialization MUST fail when:
+
+- `project-id` is invalid or already bound to different paths;
+- the candidate repository is not a Git repository;
+- the protected branch does not exist;
+- the authority path exists and is not an empty directory or compatible bare
+  repository;
+- the control path exists and is not an empty directory or compatible control
+  repository;
+- any resolved paths alias each other;
+- the authority or control path is nested inside a candidate worktree;
+- the candidate repository has unresolved Git operations;
+- the protected branch cannot be resolved to one exact commit.
+
+`project init` MUST support `--dry-run`. The dry run performs all read-only
+validation and prints the planned filesystem and Git mutations.
+
+### 9.2 Authoritative project file
+
+The control repository stores `project/project.json`:
+
+```json
+{
+  "schema": "harness.project/v1",
+  "project_id": "example",
+  "repository": "/absolute/path/to/repository",
+  "control_repository": "/absolute/path/to/example-control",
+  "authority_repository": "/absolute/path/to/example-authority.git",
+  "authority_remote": "harness-authority",
+  "protected_branch": "main",
+  "worktree_root": "/absolute/path/to/example-worktrees",
+  "default_output": "text",
+  "host_policy": {
+    "supported_os": ["macos"],
+    "minimum_git_version": "2.50.0"
+  }
+}
+```
+
+Rules:
+
+- Authoritative state uses JSON.
+- Deserialization rejects unknown fields.
+- All stored paths are absolute, normalized, and validated before use.
+- Symlink resolution is recorded. A later change in resolved target blocks
+  mutations until the project is revalidated.
+- The control repository commits every authoritative transition.
+- Control commits use the fixed repository-local identity
+  `Change Harness <change-harness@local.invalid>`. Workflow actor identity is
+  recorded in the authoritative event and is not inferred from Git author
+  configuration.
+- Project configuration changes create a revision event and invalidate active
+  operations affected by the change.
+
+### 9.3 Worktree link
+
+Each allocated worktree receives an ignored `.agent/project.json`:
+
+```json
+{
+  "schema": "harness.worktree-link/v1",
+  "project_id": "example",
+  "card_id": "F-123",
+  "card_revision": 1,
+  "control_repository": "/absolute/path/to/example-control",
+  "lease_id": "L-000123"
+}
+```
+
+This file is a locator only. The CLI MUST compare it with the authoritative
+control record before acting. Allocation adds `.agent/` to the candidate
+repository's common `.git/info/exclude` when no equivalent rule exists. The CLI
+does not modify the candidate's committed `.gitignore` for this purpose.
+
+## 10. Authoritative data contracts
+
+### 10.1 Canonical serialization and digests
+
+- Human-authored draft cards MAY use YAML.
+- Activated cards and all authoritative records MUST be stored as JSON.
+- Unknown fields MUST be rejected.
+- Activated records MUST be canonicalized using one documented canonical JSON
+  algorithm before hashing.
+- Digests use SHA-256 and the prefix `sha256:`.
+- The original draft MAY be retained, but only the canonical activated JSON
+  and its digest are authoritative.
+- Digest test vectors MUST be committed before activation is implemented.
+
+### 10.2 Cycle record
+
+Required fields:
+
+```text
+schema
+cycle_id
+objective
+status
+baseline_sha
+harness_version
+project_revision
+release_invariants[]
+card_ids[]
+atomic_groups[]
+created_by
+created_at
+activated_at
+```
+
+Rules:
+
+- A cycle baseline is frozen on activation.
+- Independent cards use the cycle baseline.
+- Dependent cards use exact accepted dependency SHAs declared in the card.
+- A protected-branch change does not silently change an active cycle.
+- The coordinator must explicitly continue, revise, or abandon an affected
+  cycle.
+
+### 10.3 Card record
+
+Required fields:
+
+```text
+schema
+card_id
+revision
+cycle_id
+title
+goal
+non_goals[]
+risk
+change_kind
+base_sha
+write_scope.include[]
+write_scope.exclude[]
+contract_reads[]
+contract_changes[]
+depends_on[]
+exclusive_resources[]
+named_gates.feature[]
+named_gates.review[]
+named_gates.integration[]
+acceptance.behaviors[]
+acceptance.regressions[]
+generated_artifacts[]
+review_policy
+rollback_strategy
+created_by
+created_at
+```
+
+Rules:
+
+- Card IDs match `F-[0-9]{3,}`.
+- Revisions begin at `1` and increase by exactly one.
+- Include and exclude patterns use repository-relative `/` separators.
+- Absolute paths, parent traversal, empty patterns, and `.git/**` are rejected.
+- Write scope is deny-by-default.
+- Contract domains and exclusive resources are checked independently from path
+  overlap.
+- Cards reference named gates; they never define executable commands.
+- Activation requires an existing cycle, exact base SHA, satisfiable
+  dependencies, non-overlapping ownership, and a non-empty acceptance section.
+
+### 10.4 Event record
+
+Required fields:
+
+```text
+schema
+event_id
+project_id
+cycle_id
+card_id
+card_revision
+card_digest
+event_type
+actor_id
+occurred_at
+previous_state
+next_state
+head_sha
+metadata
+```
+
+The control repository's Git history is the primary integrity chain. A
+secondary `previous_event_digest` field will not be introduced until a
+non-Git event transport exists.
+
+### 10.5 Gate definition
+
+Required fields:
+
+```text
+schema
+gate_id
+revision
+argv[]
+working_directory
+timeout_seconds
+environment.allow[]
+environment.set{}
+network_policy
+retry_policy
+artifacts[]
+```
+
+Rules:
+
+- `argv` is a non-empty string array.
+- No command is parsed by a shell.
+- Working directories must resolve inside the disposable evaluation worktree.
+- Secret environment variables are deny-by-default.
+- MVP network policy is declarative and reported; hard enforcement is deferred
+  until a sandbox executor exists.
+- A gate revision changes its digest and invalidates older receipts.
+
+### 10.6 Receipt
+
+Required fields:
+
+```text
+schema
+receipt_id
+project_id
+cycle_id
+card_id
+card_digest
+evaluated_sha
+gate_id
+gate_digest
+harness_version
+environment_fingerprint
+started_at
+finished_at
+duration_ms
+exit_code
+termination
+stdout_digest
+stderr_digest
+artifact_digests{}
+log_location
+attempt
+```
+
+`termination` is one of `completed`, `timeout`, `signal`, or `runner_error`.
+
+### 10.7 Handoff
+
+Machine-computed fields:
+
+- card identity and digest;
+- cycle and baseline;
+- candidate branch and SHA;
+- dependency SHAs;
+- commit list;
+- changed paths including renames, deletions, type changes, and modes;
+- diff statistics;
+- current receipts;
+- clean-worktree result.
+
+Actor-authored fields:
+
+- behavior delivered;
+- implementation decisions;
+- assumptions;
+- known limitations;
+- residual risks;
+- rollback notes.
+
+Handoff creation fails if the worktree is dirty, the candidate is outside
+scope, required gates are stale or missing, or the branch no longer matches its
+lease.
+
+### 10.8 Review
+
+Required fields:
+
+```text
+schema
+review_id
+card_id
+card_revision
+card_digest
+baseline_sha
+candidate_sha
+reviewer_actor_id
+feature_actor_id
+decision
+findings[]
+review_receipts[]
+residual_risks[]
+reviewed_at
+```
+
+Decision is one of `approved`, `changes_requested`, or `blocked`.
+
+### 10.9 Acceptance
+
+Required fields:
+
+```text
+schema
+acceptance_id
+integration_id
+landing_sha
+integration_record_digest
+receipt_ids[]
+acceptance_owner
+decision
+residual_risks[]
+rollback_reference
+accepted_at
+```
+
+Only `decision: accepted` authorizes promotion. The MVP compares declared actor
+IDs for separation but does not claim cryptographic identity proof.
+
+## 11. State machines
+
+### 11.1 Cycle states
+
+```text
+draft → active → integrating → accepted → landed → closed
+  └──────────────→ abandoned
+active → blocked → active
+integrating → blocked → integrating
+```
+
+No other transition is valid.
+
+### 11.2 Card states
+
+```text
+draft
+  → ready
+  → leased
+  → active
+  → handed_off
+  → review_pending
+  → approved
+  → integrating
+  → accepted
+  → landed
+  → closed
+```
+
+Alternative transitions:
+
+```text
+active → blocked → active
+review_pending → changes_requested → active
+handed_off → active
+approved → active
+any non-landed state → abandoned
+landed → closed
+```
+
+Rules:
+
+- `handed_off → active` invalidates the handoff and review.
+- `approved → active` requires a new handoff and review.
+- `landed` cannot transition to `abandoned`.
+- `closed` is terminal.
+
+### 11.3 Integration states
+
+```text
+draft → prepared → verified → reviewed → accepted → promoted → archived
+draft|prepared|verified|reviewed → blocked
+blocked → prepared
+any pre-promoted state → abandoned
+```
+
+### 11.4 Command authorization by state
+
+| Command | Required state | Resulting state |
+| --- | --- | --- |
+| `card activate` | Card `draft`; cycle `active` | Card `ready` |
+| `work start` | Card `ready` | Card `active` through `leased` |
+| `work checkpoint` | Card `active` or `blocked` | State unchanged |
+| `handoff create` | Card `active` | Card `handed_off` |
+| `review begin` | Card `handed_off` | Card `review_pending` |
+| `review record --approve` | Card `review_pending` | Card `approved` |
+| `review record --changes-requested` | Card `review_pending` | Card `changes_requested` |
+| `integration prepare` | All selected cards `approved` | Cards `integrating`; integration `prepared` |
+| `integration verify` | Integration `prepared` | Integration `verified` |
+| `integration review` | Integration `verified` | Integration `reviewed` |
+| `acceptance record` | Integration `reviewed` | Integration and cards `accepted` |
+| `integration promote` | Integration `accepted` | Integration `promoted`; cards `landed` |
+| `archive close` | Integration `promoted` | Integration `archived`; cards `closed` |
+
+## 12. CLI contract
+
+### 12.1 Global behavior
+
+Every command MUST:
+
+- be non-interactive by default;
+- support `--output text|json`;
+- print results to stdout;
+- print diagnostics to stderr;
+- return a documented exit code;
+- include a stable machine-readable error code in JSON mode;
+- resolve project state before mutation;
+- acquire the required lock before mutation;
+- reject unknown configuration fields;
+- avoid printing secrets;
+- preserve incomplete state for recovery after failure.
+
+`--output` is the canonical global output option. The foundation command's
+existing `doctor --format text|json` option remains an accepted alias through
+the Single-repository MVP and emits a deprecation warning after `--output` is
+available. It may be removed only in a documented breaking release.
+
+Mutating commands MUST support `--dry-run` unless the command only appends an
+actor-authored review or acceptance record. Dry runs perform no filesystem,
+Git-ref, control-state, or process mutations.
+
+### 12.2 Exit codes
+
+| Exit code | Category | Meaning |
+| --- | --- | --- |
+| `0` | Success | Command completed and postconditions passed. |
+| `2` | Usage | Invalid CLI arguments or unsupported option combination. |
+| `3` | Configuration | Missing, invalid, or incompatible project/control configuration. |
+| `4` | Precondition | Repository, worktree, branch, state, or cleanliness precondition failed. |
+| `5` | Policy | Ownership, dependency, identity-separation, or state-transition violation. |
+| `6` | Conflict | Textual/semantic merge conflict or stale expected SHA. |
+| `7` | Gate | Named gate failed, timed out, or produced invalid evidence. |
+| `8` | External tool | Git or another required executable failed unexpectedly. |
+| `9` | Recovery required | A mutation partially completed and requires `recover`. |
+| `10` | Internal | Harness invariant violation or unclassified defect. |
+
+### 12.3 Required command surface
+
+```text
+change-harness doctor
+
+change-harness project init
+change-harness project validate
+change-harness project status
+change-harness project recover
+
+change-harness cycle create
+change-harness cycle activate
+change-harness cycle status
+change-harness cycle abandon
+
+change-harness card create
+change-harness card validate
+change-harness card activate
+change-harness card revise
+change-harness card status
+
+change-harness work start
+change-harness work status
+change-harness work checkpoint
+change-harness work resume
+change-harness work block
+
+change-harness gate run
+change-harness gate status
+
+change-harness handoff create
+change-harness handoff inspect
+change-harness handoff revoke
+
+change-harness review begin
+change-harness review record
+change-harness review inspect
+
+change-harness integration prepare
+change-harness integration verify
+change-harness integration inspect
+change-harness integration review
+change-harness integration promote
+
+change-harness acceptance record
+change-harness acceptance inspect
+
+change-harness archive create
+change-harness archive verify
+change-harness archive close
+```
+
+Commands are introduced only by their owning work package. Help output MUST
+mark unimplemented commands absent rather than presenting placeholders.
+
+### 12.4 Stable command output envelope
+
+JSON output uses:
+
+```json
+{
+  "schema": "harness.command-result/v1",
+  "command": "work.start",
+  "status": "success",
+  "project_id": "example",
+  "operation_id": "OP-000123",
+  "data": {},
+  "warnings": []
+}
+```
+
+JSON errors use:
+
+```json
+{
+  "schema": "harness.command-error/v1",
+  "command": "work.start",
+  "status": "error",
+  "error": {
+    "code": "CH-POLICY-OWNERSHIP-OVERLAP",
+    "message": "Card F-124 overlaps active card F-123",
+    "details": {
+      "paths": ["src/shared/**"]
+    },
+    "recovery": "Revise card ownership or serialize the cards."
+  }
+}
+```
+
+## 13. Git operation specifications
+
+### 13.1 Read-only inspection
+
+The Git module MUST provide typed operations for:
+
+- Git version;
+- repository root and common directory;
+- bare/non-bare state;
+- worktree inventory in porcelain format;
+- exact ref resolution;
+- object existence and type;
+- ancestry;
+- merge base;
+- changed paths and modes;
+- clean/dirty state including untracked files;
+- in-progress merge, rebase, cherry-pick, revert, or bisect state;
+- remote URL and ref state;
+- commit/tree construction inputs.
+
+Parsing MUST use stable porcelain or machine-readable formats with NUL
+delimiters where Git supports them.
+
+### 13.2 Worktree creation
+
+`work start` MUST:
+
+1. acquire the project mutation lock;
+2. load the authoritative card and cycle;
+3. validate the card state and lease availability;
+4. verify the exact base object exists and is a commit;
+5. re-run path, contract, dependency, and exclusive-resource overlap checks;
+6. confirm the target branch and worktree path do not exist;
+7. record an `allocating` operation journal;
+8. create the branch from the exact base SHA;
+9. create the linked worktree;
+10. lock the worktree against pruning;
+11. write the ignored `.agent/project.json`;
+12. validate branch, `HEAD`, worktree registration, and cleanliness;
+13. append lease and activation events;
+14. commit control-state changes;
+15. mark the operation complete.
+
+On failure, recovery MUST distinguish:
+
+- nothing created;
+- branch created, no worktree;
+- worktree registered, directory incomplete;
+- worktree complete, control event missing;
+- control event committed, response interrupted.
+
+### 13.3 Candidate verification
+
+Verification MUST compare Git objects, not the feature worktree's cached card.
+It MUST detect:
+
+- added, modified, deleted, and renamed paths;
+- file-mode changes;
+- symlink additions or target changes;
+- submodule entries;
+- `.gitmodules` changes;
+- case-only path changes;
+- paths outside include scope;
+- paths matching exclude scope;
+- protected harness or control paths;
+- undeclared dependency manifests;
+- undeclared generated artifacts;
+- commit-message policy violations;
+- base ancestry mismatch;
+- candidate SHA mismatch;
+- dirty or untracked worktree state.
+
+### 13.4 Merge preflight
+
+The implementation MAY use `git merge-tree --write-tree` only after the
+minimum supported Git version and output/exit behavior are covered by tests.
+Fallback behavior MUST be explicit. Unsupported Git versions fail project
+validation; the CLI does not silently switch algorithms.
+
+### 13.5 Landing commit
+
+The landing commit MUST:
+
+- have the expected authority baseline as first parent;
+- have the verified integration head as second parent;
+- contain the exact verified integration tree;
+- use a deterministic subject containing the integration ID;
+- include cycle, card, integration-record, and receipt identifiers in trailers;
+- be created before final verification;
+- remain unreachable from the protected authority branch until accepted.
+
+### 13.6 Promotion
+
+Promotion MUST:
+
+1. acquire the project and integration locks;
+2. reload the acceptance, integration, receipt, and landing objects;
+3. verify every digest and SHA;
+4. verify the authority protected branch equals `expected_main_sha`;
+5. verify the landing commit first parent equals `expected_main_sha`;
+6. verify the landing tree equals the verified integration tree;
+7. verify required archive refs can be created;
+8. verify the registered local main worktree is clean and at
+   `expected_main_sha`;
+9. push the landing SHA to the authority branch with an exact expected-old
+   condition;
+10. confirm the authority now resolves to the landing SHA;
+11. fast-forward the clean local main worktree so its index and files remain
+    consistent;
+12. record promotion evidence in the control repository;
+13. create archive refs;
+14. mark the integration and cards landed.
+
+If authority promotion succeeds but local synchronization fails, the operation
+returns exit code `9`, records `authority_promoted_local_sync_pending`, and
+requires `project recover`. It MUST NOT roll the authority backward
+automatically.
+
+## 14. Named-gate execution
+
+### 14.1 Runner rules
+
+- The runner invokes the configured executable directly.
+- Environment variables are allowlisted.
+- The candidate process does not inherit production credentials.
+- stdout and stderr are streamed to bounded log files.
+- The runner computes hashes after closing logs.
+- Timeouts terminate the process group, not only the immediate child.
+- The receipt records whether termination was clean, timed out, signaled, or
+  failed in the runner.
+- The integration runner uses a clean disposable worktree.
+- Gate execution can run untrusted candidate build scripts; therefore the
+  integration environment MUST contain no secrets even before sandboxing is
+  implemented.
+
+### 14.2 Retry rules
+
+- Default maximum attempts: `1`.
+- A retry requires a gate-defined policy.
+- Every attempt receives a separate receipt.
+- The final result includes the complete attempt list.
+- A gate that passes only after an undeclared retry remains failed for
+  acceptance.
+
+### 14.3 Log retention
+
+MVP defaults:
+
+- receipt metadata: retained indefinitely in the control repository;
+- passing logs: retained for 30 days or until the containing integration is
+  archived and backed up, whichever is later;
+- failing logs: retained for 90 days;
+- final landing-gate logs: retained for one year;
+- credentials and known secrets: never intentionally logged.
+
+Retention settings are configurable, but shortening them requires an explicit
+project-policy revision.
+
+## 15. Review and acceptance specifications
+
+### 15.1 Independent review
+
+The reviewer MUST receive:
+
+- authoritative cycle and card;
+- exact baseline and candidate SHAs;
+- complete diff;
+- contract-domain changes;
+- feature receipts;
+- implementation decisions;
+- assumptions and limitations.
+
+The reviewer MUST evaluate:
+
+1. requirement fidelity;
+2. architecture and responsibility boundaries;
+3. public API/schema/persistence compatibility;
+4. error, timeout, concurrency, and partial-state paths;
+5. negative and boundary cases;
+6. whether tests could pass while behavior remains wrong;
+7. unnecessary dependencies or complexity;
+8. security, privacy, logging, and audit implications;
+9. deterministic generated changes;
+10. maintainability by another human or agent.
+
+### 15.2 Review invalidation
+
+Approval becomes invalid when any of these changes:
+
+- candidate SHA;
+- card revision or digest;
+- cycle invariant;
+- required dependency SHA;
+- required gate definition;
+- reviewer-required receipt;
+- declared contract change.
+
+### 15.3 Risk policy
+
+| Risk | Minimum review |
+| --- | --- |
+| Low | One independent agent or human reviewer |
+| Medium | One independent reviewer plus acceptance owner |
+| High | Human reviewer plus independent technical review |
+| Critical | Explicit human acceptance, rollback exercise, and second human approval before public or destructive use |
+
+Until multiple human approvers are available, critical changes remain blocked
+from public or destructive use. Local prototypes may proceed only when they
+cannot affect production data or authority.
+
+## 16. Test strategy
+
+### 16.1 Test layers
+
+| Layer | Purpose |
+| --- | --- |
+| Unit | Pure parsing, validation, state transitions, path matching, canonicalization, and policy decisions |
+| Component | Git command construction, output parsing, control transactions, and receipt generation |
+| Integration | Complete commands against temporary real Git repositories |
+| Lifecycle | Full card-to-promotion flows against temporary authority/control/candidate repositories |
+| Failure injection | Interrupted or partially completed mutations and recovery |
+| Compatibility | Supported Git and macOS versions |
+| Security regression | Traversal, symlink, argument-injection, secret-output, and candidate-code execution boundaries |
+
+### 16.2 Mandatory temporary-repository scenarios
+
+Before Single-repository MVP acceptance, tests MUST cover:
+
+1. new project initialization;
+2. incompatible existing authority path;
+3. incompatible existing control path;
+4. dirty candidate main;
+5. active Git merge/rebase state;
+6. exact baseline worktree creation;
+7. duplicate branch;
+8. duplicate worktree path;
+9. overlapping write scope;
+10. overlapping contract domain;
+11. duplicate exclusive resource;
+12. invalid dependency DAG;
+13. out-of-scope modification;
+14. excluded-path modification;
+15. rename across ownership boundary;
+16. deletion outside scope;
+17. executable-bit change;
+18. symlink addition;
+19. `.gitmodules` change;
+20. stale handoff;
+21. stale review;
+22. self-review declaration;
+23. feature gate failure;
+24. feature gate timeout;
+25. retry-policy violation;
+26. clean disposable integration;
+27. textual merge conflict;
+28. semantic-fix card requirement;
+29. combined gate failure;
+30. landing-tree mismatch;
+31. authority `main` moved before promotion;
+32. dirty local main before promotion;
+33. promotion succeeds and local synchronization succeeds;
+34. promotion succeeds and local synchronization is interrupted;
+35. recovery after each journaled mutation boundary;
+36. archive reachability;
+37. cleanup rejection for unarchived commits;
+38. successful cleanup after archival;
+39. JSON success envelope;
+40. JSON error envelope and stable exit code.
+
+### 16.3 Quality gate
+
+Every work package that changes Rust code MUST pass:
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The package owner adds focused commands when appropriate. No ignored, skipped,
+or quarantined test counts as acceptance unless the plan explicitly records
+why it is outside the package gate.
+
+## 17. Work package plan
+
+### WP-000 — Repository foundation
+
+| Field | Value |
+| --- | --- |
+| Status | `DONE` |
+| Commit | `4729d18` |
+| Dependencies | None |
+| Owner | Codex |
+
+Delivered:
+
+- independent Git repository on `main`;
+- pinned Rust `1.95.0`;
+- modular CLI foundation;
+- read-only `doctor`;
+- README, architecture, and agent instructions;
+- three CLI integration tests;
+- strict formatting and lint gate.
+
+Evidence:
+
+- `cargo fmt --check` passed;
+- `cargo test` passed with three integration tests;
+- `cargo clippy --all-targets --all-features -- -D warnings` passed;
+- working tree was clean after the foundation commit.
+
+### WP-100 — Core contracts and stable command output
+
+| Field | Value |
+| --- | --- |
+| Status | `READY` |
+| Dependencies | `WP-000` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- domain ID types for project, cycle, card, lease, receipt, review, integration,
+  acceptance, event, and operation;
+- validated ID parsers and display formats;
+- UTC clock abstraction for deterministic tests;
+- SHA-256 digest type;
+- stable JSON success/error envelopes;
+- exit-code mapping;
+- global `--output text|json`;
+- machine-readable error-code registry.
+
+Acceptance:
+
+- invalid IDs are rejected with stable error codes;
+- JSON output round-trips through committed test fixtures;
+- no command prints JSON diagnostics to stdout outside the result envelope;
+- existing `doctor` behavior remains compatible;
+- unit tests cover every exit-code category.
+
+### WP-110 — Project configuration and validation
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-100` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- `harness.project/v1` schema;
+- strict JSON loader;
+- absolute path normalization;
+- symlink-target recording;
+- candidate/control/authority alias detection;
+- protected-branch validation;
+- minimum Git-version validation;
+- `project validate` and extended `doctor`.
+
+Acceptance:
+
+- unknown configuration fields fail;
+- missing or aliased paths fail without mutation;
+- unsupported Git versions fail explicitly;
+- text and JSON diagnostics identify the exact invalid field;
+- temporary-repository tests cover valid and invalid configurations.
+
+### WP-120 — Control repository and transaction journal
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-110` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- control repository initialization;
+- single-writer process lock;
+- append-only event commits;
+- operation journal;
+- atomic temporary-file write and rename;
+- expected-control-HEAD compare-and-swap;
+- `project init`, `project status`, and `project recover`;
+- recovery report for interrupted initialization.
+
+Acceptance:
+
+- concurrent mutation attempts result in one winner and one policy failure;
+- a killed command at every journal boundary can be resumed or diagnosed;
+- control history contains no partial authoritative record;
+- initialization is idempotent for identical configuration;
+- incompatible re-initialization fails without alteration.
+
+### WP-130 — Git inspection layer
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-100` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- typed command runner;
+- Git-version parser;
+- repository/worktree inventory;
+- ref/object/ancestry inspection;
+- clean-state and in-progress-operation detection;
+- NUL-safe diff parser;
+- rename, deletion, mode, symlink, and submodule detection.
+
+Acceptance:
+
+- no shell command construction;
+- paths containing spaces and Unicode work;
+- malicious path names do not become arguments;
+- every parser has real Git fixture coverage;
+- inspection commands perform no repository mutation.
+
+### WP-200 — Cycle model
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-120`, `WP-130` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- cycle schema and domain model;
+- release invariants;
+- frozen baseline;
+- atomic-group and card membership validation;
+- cycle state machine;
+- `cycle create`, `activate`, `status`, `abandon`.
+
+Acceptance:
+
+- activation records one exact authority baseline;
+- active cycles cannot silently change baseline;
+- invalid transitions fail;
+- abandoned cycles cannot accept new cards;
+- status is derived from authoritative events.
+
+### WP-210 — Card schema, canonicalization, and digest
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-200` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- draft YAML input;
+- strict activated JSON schema;
+- canonical serialization;
+- committed digest vectors;
+- card revision rules;
+- immutable activated record;
+- `card create`, `validate`, `activate`, `revise`, `status`.
+
+Acceptance:
+
+- equivalent drafts produce the same activated digest;
+- material field changes produce different digests;
+- unknown fields fail;
+- activation rejects missing goals, acceptance, or gates;
+- revisions invalidate prior dependent records.
+
+### WP-220 — Ownership, contracts, resources, and dependencies
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-210` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- include/exclude path policy;
+- case-normalized overlap checks appropriate to the host filesystem;
+- contract-domain ownership;
+- exclusive-resource reservations;
+- dependency DAG validation;
+- active-card global allocation validator.
+
+Acceptance:
+
+- overlapping cards cannot both activate;
+- excludes override includes;
+- contract overlap fails even when paths differ;
+- dependency cycles fail with an explanatory path;
+- inactive/closed allocations do not block new cards.
+
+### WP-230 — Safe worktree allocation and resume link
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-120`, `WP-130`, `WP-220` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- lease record;
+- journaled branch/worktree creation;
+- locked worktree;
+- ignored `.agent/project.json`;
+- idempotent `.agent/` common-exclude installation;
+- initial progress record;
+- `work start`, `status`, `checkpoint`, `resume`, `block`;
+- recovery for every allocation boundary.
+
+Acceptance:
+
+- branch begins at the exact card base;
+- duplicate lease, branch, or worktree fails;
+- partial allocation is recoverable;
+- resume rejects a locator/control mismatch;
+- no force deletion occurs.
+
+### WP-240 — Authoritative candidate verification
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-220`, `WP-230` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- exact base-to-head diff verification;
+- full path/mode/symlink/submodule checks;
+- commit-message policy;
+- dependency and generated-artifact declaration checks;
+- clean-worktree requirement;
+- structured policy report.
+
+Acceptance:
+
+- all mandatory scenarios 13 through 19 pass;
+- cached worktree card changes cannot alter verification;
+- verification produces identical results from another clean clone;
+- out-of-scope candidates cannot hand off.
+
+### WP-250 — Exact-SHA handoff
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-240`, `WP-310` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- generated factual handoff section;
+- required actor-authored declaration;
+- handoff digest;
+- branch freeze expectation;
+- invalidation event;
+- `handoff create`, `inspect`, `revoke`.
+
+Acceptance:
+
+- missing narrative or evidence fields fail;
+- a dirty worktree fails;
+- stale receipts fail;
+- a head change automatically invalidates handoff eligibility;
+- handoff can be reproduced from control and Git objects.
+
+### WP-300 — Named gate registry
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-110`, `WP-210` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- gate schema;
+- strict registry loader;
+- argv-only command contract;
+- environment allowlist;
+- timeout and retry policies;
+- gate digest.
+
+Acceptance:
+
+- cards cannot introduce commands;
+- unknown gates fail card activation;
+- shell strings are not accepted;
+- gate revisions invalidate prior receipts;
+- invalid working directories are rejected.
+
+### WP-310 — Gate runner and receipts
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-300` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- process-group execution;
+- timeout termination;
+- bounded stdout/stderr logs;
+- environment fingerprint;
+- SHA-256 log/artifact digests;
+- retry accounting;
+- `gate run`, `gate status`.
+
+Acceptance:
+
+- success, failure, timeout, signal, and runner error are distinct;
+- every attempt is recorded;
+- no unallowlisted environment variable reaches the child;
+- logs do not print through JSON stdout;
+- stale receipts are rejected.
+
+### WP-320 — Independent review
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-250`, `WP-310` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- review schema;
+- reviewer/feature-actor separation check;
+- findings and residual-risk structure;
+- review gate binding;
+- review invalidation;
+- `review begin`, `record`, `inspect`.
+
+Acceptance:
+
+- self-review declaration fails;
+- approval references exact candidate/card/dependencies;
+- a candidate change invalidates approval;
+- changes requested return the card to active work;
+- findings remain visible after subsequent approval.
+
+### WP-400 — Bare authority initialization
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-120`, `WP-130` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- compatible bare-repository detection;
+- non-destructive initialization;
+- explicit authority remote;
+- initial protected-branch transfer;
+- expected-ref inspection;
+- authority health check.
+
+Acceptance:
+
+- existing unrelated directories fail;
+- initialization never overwrites a remote;
+- protected branch matches the configured baseline;
+- candidate repo retains existing remotes;
+- rerun with identical state is idempotent.
+
+### WP-410 — Integration plan and dependency order
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-320`, `WP-400` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- integration schema;
+- selected-card validation;
+- topological ordering;
+- atomic-group handling;
+- integration lease;
+- `integration prepare`, `inspect`.
+
+Acceptance:
+
+- only approved exact candidates are selected;
+- missing dependencies fail;
+- ordering is deterministic;
+- one integration lease exists per cycle/project;
+- prepared state records expected authority baseline.
+
+### WP-420 — Merge preflight and disposable integration
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-410` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- disposable integration worktree;
+- non-destructive merge preflight;
+- deterministic candidate merging;
+- conflict classification;
+- integration-fix-card route;
+- intermediate smoke/contract gates.
+
+Acceptance:
+
+- feature untracked state cannot enter integration;
+- textual conflicts block without partial landing;
+- semantic conflict resolution cannot be silently committed;
+- integration order matches the DAG;
+- worktree is clean after each accepted group.
+
+### WP-430 — Landing commit construction
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-420` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- exact tree validation;
+- two-parent landing commit;
+- commit trailers;
+- landing object inspection.
+
+Acceptance:
+
+- landing first parent equals expected authority baseline;
+- landing second parent equals integration head;
+- landing tree equals the verified integration tree.
+- the landing commit is created without changing the protected authority ref;
+- projects declaring shared generated artifacts fail with a stable
+  `unsupported-until-WP-540` policy error.
+
+`WP-540` extends this path with integration-owned artifact generation. It is
+not a prerequisite for MVP projects that declare no shared generated
+artifacts.
+
+### WP-440 — Combined verification and integration review
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-420`, `WP-310` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- clean-worktree rerun of required feature/review/integration gates;
+- cycle-invariant report;
+- combined interaction checklist;
+- integration review record;
+- exact landing-receipt binding;
+- `integration verify`, `integration review`.
+
+Acceptance:
+
+- every final receipt evaluates the exact landing SHA;
+- stale feature evidence cannot replace integration reruns;
+- combined gate failure blocks acceptance;
+- dirty post-gate worktree fails;
+- integration review records residual risk.
+
+### WP-450 — Acceptance and promotion
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-400`, `WP-430`, `WP-440` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- acceptance schema and command;
+- exact-SHA/digest validation;
+- authority expected-old promotion;
+- clean main-worktree synchronization;
+- partial-success journal and recovery;
+- `acceptance record`, `inspect`, `integration promote`.
+
+Acceptance:
+
+- moved authority branch fails before update;
+- dirty local main fails before authority update;
+- exact accepted landing succeeds;
+- authority success/local-sync interruption returns recovery-required state;
+- no command rewinds authority automatically.
+
+### WP-460 — Archive, close, and cleanup
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-450` |
+| Target release | Single-repository MVP |
+
+Deliverables:
+
+- archive refs for cards and integrations;
+- reachability verification;
+- handoff/review/receipt archive index;
+- safe worktree removal;
+- safe ordinary branch deletion;
+- `archive create`, `verify`, `close`.
+
+Acceptance:
+
+- unarchived unique commits block cleanup;
+- dirty worktrees block cleanup;
+- landed/archived commits remain reachable;
+- closed state is terminal;
+- repeated close is idempotent.
+
+### WP-500 — Recovery and failure injection
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-460` |
+| Target release | Hardened single-repository release |
+
+Deliverables:
+
+- injectable interruption points;
+- recovery tests for every mutation journal;
+- consistent operation-status inspection;
+- operator recovery instructions;
+- unresolved-operation blocking.
+
+Acceptance:
+
+- mandatory scenarios 34 and 35 pass;
+- no interruption silently reports success;
+- recovery never deletes ambiguous work;
+- completed operations are idempotently recognized.
+
+### WP-510 — Concurrency and lease hardening
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-500` |
+| Target release | Hardened single-repository release |
+
+Deliverables:
+
+- cross-process lock implementation;
+- stale-lock diagnosis;
+- explicit lease reclaim;
+- control-HEAD compare-and-swap;
+- concurrent integration rejection.
+
+Acceptance:
+
+- parallel mutation tests have one winner;
+- lease reclaim preserves candidate commits;
+- PID reuse does not silently steal a lease;
+- manual decision is required for ambiguous ownership.
+
+### WP-520 — Backup and integrity verification
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-460` |
+| Target release | Hardened single-repository release |
+
+Deliverables:
+
+- backup policy configuration;
+- Git bundle or mirror creation;
+- independent-destination validation;
+- `git bundle verify`/`git fsck` integration;
+- receipt/control backup;
+- restore drill documentation.
+
+Acceptance:
+
+- same-disk sibling directories do not satisfy independent-backup policy;
+- corrupted backup verification fails;
+- archive refs exist in the backup;
+- one restore drill reconstructs authority and control state.
+
+### WP-530 — Audit report and redaction
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-460` |
+| Target release | Hardened single-repository release |
+
+Deliverables:
+
+- cycle audit report;
+- chronological event reconstruction;
+- SHA/digest cross-check;
+- log redaction tests;
+- residual-risk and rollback summary.
+
+Acceptance:
+
+- report can be reproduced from authority/control state;
+- secrets are excluded;
+- missing or mismatched evidence is explicit;
+- report identifies the exact protected-branch transition.
+
+### WP-540 — Generated-artifact governance
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `WP-310`, `WP-420` |
+| Target release | Hardened single-repository release |
+
+Deliverables:
+
+- transient, per-card, shared, and serialized classifications;
+- generator gate references;
+- deterministic regeneration checks;
+- integration ownership;
+- snapshot/lockfile policy.
+
+Acceptance:
+
+- each generated path has exactly one class;
+- transient outputs cannot be committed;
+- per-card outputs require in-scope sources;
+- shared outputs are generated once in integration;
+- serialized identifiers are allocated before work.
+
+### WP-600 — Workspace manifest
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | Hardened single-repository release accepted |
+| Target release | Multi-repository release |
+
+Deliverables:
+
+- multiple project references;
+- exact baseline/landing SHAs per repository;
+- cross-repository gate list;
+- manifest digest;
+- combined review/acceptance record.
+
+Acceptance:
+
+- every repository SHA exists and is verified;
+- no branch-name-only references;
+- manifest changes invalidate acceptance;
+- single-repository behavior remains unchanged.
+
+### WP-610 — Cross-repository prepare and landing
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | `WP-600` |
+| Target release | Multi-repository release |
+
+Deliverables:
+
+- prepare candidate landing objects in every repository;
+- exact-SHA workspace checkout;
+- cross-repository gates;
+- ordered expected-old promotions;
+- partial-landing transaction record;
+- completion/compensation procedures.
+
+Acceptance:
+
+- the tool never claims Git-level atomicity;
+- partial promotion is detected and blocks release;
+- documented completion or compensation is required;
+- final manifest names actual landed SHAs.
+
+### WP-700 — Runtime-resource adapters
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | Hardened single-repository release accepted |
+| Target release | Optional isolation release |
+
+Potential adapters:
+
+- port ranges;
+- temporary directories;
+- database names;
+- Docker Compose project names;
+- cache namespaces;
+- language virtual environments.
+
+Adapters MUST remain project-profile extensions. They cannot enter the generic
+engine until two real projects demonstrate the same requirement.
+
+### WP-710 — Constrained gate executor
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | `WP-310`, explicit threat-model approval |
+| Target release | Optional isolation release |
+
+Potential capabilities:
+
+- network denial;
+- filesystem write scopes;
+- secret isolation;
+- process limits;
+- container or OS-user execution.
+
+Configuration declarations alone MUST NOT be described as enforced isolation.
+
+## 18. Dependency and execution order
+
+The required order is:
+
+```text
+WP-000
+  ↓
+WP-100
+  ├─→ WP-110 → WP-120 ───────────────┐
+  └─→ WP-130 ────────────────────────┤
+                                      ↓
+                         WP-200 → WP-210 → WP-220
+                                      │        │
+                             WP-300   │        ↓
+                                ↓     │      WP-230
+                              WP-310  │        ↓
+                                │     └────→ WP-240
+                                └──────────→ WP-250
+                                               ↓
+                                            WP-320
+                                               ↓
+WP-120 + WP-130 → WP-400              WP-410
+        │                                 ↓
+        └────────────────────────────→ WP-420
+                                          ├─→ WP-440
+                                          └─→ WP-430
+                                                │
+WP-400 ─────────────────────────────────────────┤
+WP-440 ─────────────────────────────────────────┤
+                                                ↓
+                                             WP-450
+                                                ↓
+                                             WP-460
+```
+
+Permitted parallel work:
+
+- `WP-110` and `WP-130` may run after `WP-100`.
+- `WP-300` may begin after the card model fields are stable in `WP-210`.
+- `WP-400` may run after `WP-120` and `WP-130`.
+
+No other parallel implementation is authorized until the dependency graph is
+updated here.
+
+## 19. Release acceptance gates
+
+### 19.1 Foundation gate
+
+Status: `DONE`.
+
+- Repository initialized on `main`
+- Pinned Rust toolchain
+- Read-only doctor command
+- Three CLI tests
+- Format, test, and strict Clippy pass
+- Architecture and agent instructions committed
+
+### 19.2 Single-repository MVP gate
+
+Status: `NOT_STARTED`.
+
+All must be true:
+
+- `WP-100`, `WP-110`, `WP-120`, `WP-130`, `WP-200`, `WP-210`,
+  `WP-220`, `WP-230`, `WP-240`, `WP-250`, `WP-300`, `WP-310`,
+  `WP-320`, `WP-400`, `WP-410`, `WP-420`, `WP-430`, `WP-440`,
+  `WP-450`, and `WP-460` are `DONE`;
+- all 40 mandatory scenarios pass;
+- no unclassified failure path mutates authority;
+- exact-SHA review and acceptance invalidation is demonstrated;
+- one temporary project completes the full lifecycle twice;
+- second lifecycle proves stale-main rejection;
+- recovery-required promotion state is demonstrated and recovered;
+- audit evidence identifies the exact authority transition;
+- no critical or high open defect remains;
+- README documents installation and operator workflow;
+- acceptance owner signs the release record.
+
+### 19.3 Hardened single-repository gate
+
+Status: `NOT_STARTED`.
+
+All must be true:
+
+- `WP-500`, `WP-510`, `WP-520`, `WP-530`, and `WP-540` are `DONE`;
+- every mutation boundary has failure-injection coverage;
+- backup and restore drill passes;
+- generated-artifact governance is demonstrated;
+- concurrency tests pass repeatedly;
+- one ARTANA profile trial completes without changing the generic engine;
+- no critical/high risk remains unmitigated.
+
+### 19.4 Multi-repository gate
+
+Status: `DEFERRED`.
+
+All must be true:
+
+- hardened single-repository release accepted;
+- `WP-600` and `WP-610` are `DONE`;
+- exact-SHA manifest demonstrated with at least two repositories;
+- partial landing is detected and recovered;
+- cross-repository test evidence is retained;
+- documentation explicitly avoids atomicity claims.
+
+## 20. Current status tracker
+
+### 20.1 Summary
+
+| Area | Status | Evidence | Next action |
+| --- | --- | --- | --- |
+| Repository foundation | `DONE` | Commit `4729d18` | Preserve |
+| Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
+| CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
+| Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Refactor in `WP-130` |
+| Stable command envelope | `NOT_STARTED` | None | `WP-100` |
+| Project configuration | `NOT_STARTED` | None | `WP-110` |
+| Control repository | `NOT_STARTED` | None | `WP-120` |
+| Full Git inspection | `NOT_STARTED` | None | `WP-130` |
+| Cycles and cards | `NOT_STARTED` | None | `WP-200` onward |
+| Worktree allocation | `NOT_STARTED` | None | `WP-230` |
+| Candidate verification | `NOT_STARTED` | None | `WP-240` |
+| Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
+| Handoff and review | `NOT_STARTED` | None | `WP-250`, `WP-320` |
+| Bare authority | `NOT_STARTED` | None | `WP-400` |
+| Integration | `NOT_STARTED` | None | `WP-410` onward |
+| Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
+| Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
+| Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
+| Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
+| Multi-repository | `DEFERRED` | Architecture only | After hardened release |
+| Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
+
+### 20.2 Active work
+
+| Field | Current value |
+| --- | --- |
+| Active work package | None |
+| Active implementation branch | None |
+| Active implementation worktree | None |
+| Active owner | None |
+| Active blocker | None |
+| Next work package | `WP-100` |
+| Next branch name | `feature/WP-100-core-contracts` |
+| Next acceptance command | `cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings` |
+
+### 20.3 Current demonstrated behavior
+
+The current binary supports:
+
+```bash
+change-harness doctor --workspace <path> --format text
+change-harness doctor --workspace <path> --format json
+change-harness --help
+change-harness --version
+```
+
+The current `doctor`:
+
+- rejects a missing workspace;
+- reports the installed Git version;
+- reports the containing Git repository when one exists;
+- performs no mutation.
+
+The current binary does not:
+
+- create configuration;
+- create a control or authority repository;
+- create cycles, cards, leases, branches, or worktrees;
+- run project gates;
+- create handoffs, reviews, integrations, or acceptances;
+- update any Git ref;
+- clean up any worktree.
+
+### 20.4 Current test inventory
+
+| Test | Status | Purpose |
+| --- | --- | --- |
+| `help_identifies_the_cli` | Passing | Confirms CLI identity and doctor visibility |
+| `doctor_reports_the_repository_as_json` | Passing | Confirms repository detection and JSON report |
+| `doctor_rejects_a_missing_workspace` | Passing | Confirms missing-path failure |
+
+Last verified commands before this plan:
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+All passed. Documentation changes made after that evidence require the same
+commands before commit even though Rust behavior is unchanged.
+
+## 21. Risk register
+
+| ID | Risk | Impact | Mitigation | Trigger/stop condition | Status |
+| --- | --- | --- | --- | --- | --- |
+| R-001 | Same OS account can bypass hooks and modify local state | False security claims | Treat hooks as advisory; exact-SHA verifier; document threat model | Any claim of malicious-actor prevention | Open, accepted for MVP |
+| R-002 | Direct ref update desynchronizes checked-out main | Corrupted/confusing worktree state | Canonical bare authority; coherent local fast-forward | Any design using direct `update-ref` on checked-out branch | Mitigated by design; unimplemented |
+| R-003 | Control repository is corrupted or rewritten | Loss of workflow authority | Git history, locks, backups, expected-HEAD transactions | Digest/history mismatch | Open |
+| R-004 | Candidate tests/build scripts execute untrusted code | Credential or host compromise | No secrets in runner; constrained executor later | Gate requires production credentials | Open; production use blocked |
+| R-005 | Path matcher mishandles rename, case, symlink, or Unicode | Scope escape | NUL-safe Git parsing and adversarial tests | Any unsupported path condition | Open |
+| R-006 | CLI interruption leaves partial branch/worktree/ref mutation | Stale or ambiguous state | Operation journal and recovery | Incomplete operation detected | Open |
+| R-007 | Cross-repository landing partially succeeds | Inconsistent workspace | Exact manifest and explicit completion/compensation | Any partial promotion | Deferred with feature |
+| R-008 | Gate retries hide flakiness | False acceptance | Attempt receipts and declared retry policy | Undeclared rerun | Open |
+| R-009 | Tool becomes ARTANA-specific | Reuse failure and coupling | Generic schemas/engine; ARTANA profile only | ARTANA name/command in core domain | Actively controlled |
+| R-010 | Implementation expands into infrastructure platform before MVP | Schedule failure | Single vertical slice and deferred capabilities | Work outside active package/dependencies | Actively controlled |
+| R-011 | Same-disk backup is mistaken for independent backup | Permanent loss | Independent destination validation and restore drill | Backup path shares device | Open |
+| R-012 | Actor string is treated as proven identity | Invalid separation claim | Declare identity limits; stronger boundary optional | Security-sensitive approval needs proof | Open, accepted for local MVP |
+
+## 22. Decision register
+
+| ID | Decision | Status | Rationale |
+| --- | --- | --- | --- |
+| D-001 | Maintain Change Harness in an independent repository | Accepted | Prevents ARTANA development from blocking or being blocked by harness work |
+| D-002 | Keep the engine project- and language-neutral | Accepted | Git workflow mechanics are not language-specific |
+| D-003 | Implement the CLI in Rust 1.95 | Accepted | Pinned local toolchain, typed models, safe process invocation, single binary |
+| D-004 | Separate control authority from candidate worktrees | Accepted | Candidate actors cannot define their own acceptance policy |
+| D-005 | Use a local bare repository as canonical protected-ref authority | Accepted | Avoids direct ref changes that desynchronize working trees |
+| D-006 | Treat hooks as advisory only | Accepted | Hooks are bypassable and cannot serve as acceptance evidence |
+| D-007 | Bind cards, receipts, reviews, and acceptance to exact digests/SHAs | Accepted | Branch names and narrative claims are mutable |
+| D-008 | Cards reference named gates and cannot introduce commands | Accepted | Prevents cards from expanding executable authority |
+| D-009 | Deliver one single-repository vertical slice before multi-repository work | Accepted | Proves value before infrastructure expansion |
+| D-010 | Authoritative records use strict JSON; draft cards may use YAML | Accepted | Stable machine representation with human-friendly authoring |
+| D-011 | Git history is the event integrity chain for MVP | Accepted | Avoids redundant custom hash chaining |
+| D-012 | macOS arm64 is the first supported host | Accepted | Matches current development environment |
+| D-013 | Same-user local operation is not a hard security boundary | Accepted | Honest threat model |
+| D-014 | Licensing remains undecided while `publish = false` | Accepted temporarily | No public distribution has been authorized |
+
+## 23. Decisions required later
+
+These are intentionally time-bounded and do not block `WP-100`.
+
+| ID | Decision needed | Deadline | Blocking effect |
+| --- | --- | --- | --- |
+| Q-001 | Open-source or proprietary license | Before any public remote, package publication, or external distribution | Blocks public distribution only |
+| Q-002 | Minimum supported macOS version | Before hardened release | Blocks compatibility claim |
+| Q-003 | Linux support level | Before multi-project external trial | Blocks Linux support claim |
+| Q-004 | Cryptographic or OS-backed actor identity | Before security-sensitive multi-user use | Blocks hard authorization claim |
+| Q-005 | Sandboxed gate executor technology | Before gates may access sensitive repositories or credentials | Blocks sensitive/production gate use |
+| Q-006 | Long-term artifact storage backend | Before one-year landing-log retention is operational | Blocks hardened retention acceptance |
+
+## 24. Definition of done for every work package
+
+A work package is `DONE` only when:
+
+1. its listed deliverables exist;
+2. all listed acceptance criteria pass;
+3. relevant negative and regression tests exist;
+4. `cargo fmt --check` passes;
+5. `cargo test` passes;
+6. strict Clippy passes;
+7. public CLI/schema/documentation changes are documented;
+8. no unrelated cleanup is mixed into the package;
+9. the branch head is committed;
+10. the status and evidence fields in this document are updated;
+11. discovered risks and decisions are recorded;
+12. the final diff is reviewed against package scope.
+
+## 25. Plan maintenance procedure
+
+When starting a work package:
+
+1. verify dependencies are `DONE`;
+2. change package status from `READY` or `NOT_STARTED` to `IN_PROGRESS`;
+3. record owner, branch, worktree, and start date;
+4. add or confirm exact acceptance commands;
+5. commit the tracker update before implementation diverges materially.
+
+When completing a work package:
+
+1. run all acceptance commands from a clean worktree;
+2. record exact command results and relevant artifact paths;
+3. record the final implementation commit;
+4. update risks and decisions;
+5. change status to `DONE`;
+6. mark newly unblocked packages `READY`;
+7. commit the status update.
+
+When blocked:
+
+1. change status to `BLOCKED`;
+2. record the exact condition, evidence, and decision needed;
+3. preserve the branch and worktree;
+4. do not start dependent packages;
+5. resume only after recording the resolution.
+
+When the plan changes:
+
+1. increment the plan revision;
+2. record the reason in the decision register;
+3. update dependencies, acceptance, status, and release gates together;
+4. do not silently reinterpret an existing work package.
