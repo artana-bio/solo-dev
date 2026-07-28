@@ -1397,7 +1397,10 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `READY` |
+| Status | `IN_PROGRESS` |
+| Owner | Claude |
+| Started | 2026-07-28 |
+| Branch | `claude/project-status-review-543d65` |
 | Dependencies | `SPIKE-001`, `DONE` and accepted 2026-07-28 |
 | Target release | Single-repository MVP |
 
@@ -2353,10 +2356,10 @@ All must be true:
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None |
-| Active implementation branch | None |
+| Active work package | `WP-100` |
+| Active implementation branch | `claude/project-status-review-543d65` |
 | Active implementation worktree | None |
-| Active owner | None |
+| Active owner | Claude |
 | Active blocker | None |
 | Next work package | `WP-100`, `READY` |
 | Next branch name | `wp/WP-100-core-contracts` |
