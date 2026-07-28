@@ -4,9 +4,9 @@
 
 | Field | Value |
 | --- | --- |
-| Outcome | All seven hypotheses `PASS`. Not yet `DONE`: acceptance-owner approval is outstanding. |
+| Outcome | `DONE`. All seven hypotheses `PASS`. Accepted 2026-07-28 by Alvaro Alvarez. |
 | Recommendation | Preserve the design. Two required corrections, several simplifications. |
-| Production implementation | `WP-100` stays `NOT_STARTED` until the acceptance owner approves this report |
+| Production implementation | Unblocked. `WP-100` is `READY`. |
 
 The planned workflow survived contact with real agents. Fresh-context review
 found a deliberately seeded acceptance omission that a green gate could not
@@ -374,14 +374,19 @@ accepted as proof of code identity, was directly vindicated by F-1.
 | No prototype implementation on `main` | ✅ verified |
 | Archive ref resolves to recorded prototype head | ✅ `1bb3fc8` |
 | Sections 9–15 updated from observed evidence | ✅ plan revision 4 |
-| Acceptance owner approves the report | ⬜ **outstanding**, Alvaro Alvarez |
-| `WP-100` changed to `READY` | ⬜ blocked on the line above |
+| Acceptance owner approves the report | ✅ 2026-07-28, Alvaro Alvarez |
+| `WP-100` changed to `READY` | ✅ plan revision 5 |
 
-Two criteria remain. The spike is not `DONE` and `WP-100` is not `READY`.
-Section 2 makes `DONE` binary, and Section 17 lists acceptance-owner approval
-as an acceptance criterion, so the coordinator cannot close this out. Section
-6.1 keeps production implementation blocked until the report is accepted.
+All criteria met. `SPIKE-001` is `DONE` and production implementation may
+begin at `WP-100`.
 
-To accept: confirm the hypothesis evidence in Section 3 and the required
-corrections in Section 5, then set `SPIKE-001` to `DONE` and `WP-100` to
-`READY` per the Section 25 completion procedure.
+Acceptance evidence, run from a clean worktree on 2026-07-28:
+
+```text
+git status --porcelain                                    (empty)
+cargo fmt --check                                         PASS
+cargo test                                                3 passed, 0 failed
+cargo clippy --all-targets --all-features -- -D warnings  PASS
+git rev-parse refs/archive/spikes/SPIKE-001               1bb3fc81195c43c2...
+git ls-tree -r --name-only main | grep -c prototype       0
+```

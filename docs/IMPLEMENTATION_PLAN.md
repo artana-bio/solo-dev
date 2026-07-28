@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 4 |
+| Plan revision | 5 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `1bc1c60` (`docs: correct spike reading contract and MVP recovery gate`) |
+| Previous plan commit | `f910e74` (`docs: record SPIKE-001 results and plan revision 4`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
-| Current release stage | Walking-skeleton validation, awaiting acceptance |
-| Current implementation status | Foundation complete; `SPIKE-001` executed with all seven hypotheses passing; production workflow implementation not started |
-| Next executable work package | `WP-100`, blocked until the acceptance owner approves `docs/spikes/SPIKE-001-REPORT.md` |
+| Current release stage | Single-repository MVP |
+| Current implementation status | Foundation complete; `SPIKE-001` accepted with all seven hypotheses passing; production workflow implementation may begin at `WP-100` |
+| Next executable work package | `WP-100` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1263,14 +1263,14 @@ Evidence:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS`, executed and reported; blocked only on acceptance-owner approval |
+| Status | `DONE` |
 | Owner | Claude, coordinator role |
 | Started | 2026-07-28 |
 | Executed | 2026-07-28, 29 minutes elapsed against a 16-hour budget |
+| Accepted | 2026-07-28 by Alvaro Alvarez, acceptance owner |
 | Hypothesis results | `H-01` through `H-07` all `PASS`; see `docs/spikes/SPIKE-001-REPORT.md` |
 | Prototype head | `1bb3fc81195c43c27fc01488e3efa7a2bc3ae377`, archived at `refs/archive/spikes/SPIKE-001` |
 | Prototype size | 219 non-generated executable lines against a 300-line budget |
-| Remaining criterion | Acceptance owner approves the report, then `WP-100` becomes `READY` |
 | Dependencies | `WP-000` |
 | Target release | Walking-skeleton validation |
 | Branch | `spike/SPIKE-001-walking-skeleton` |
@@ -1397,8 +1397,8 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
-| Dependencies | `SPIKE-001` |
+| Status | `READY` |
+| Dependencies | `SPIKE-001`, `DONE` and accepted 2026-07-28 |
 | Target release | Single-repository MVP |
 
 Deliverables:
@@ -2254,22 +2254,22 @@ Status: `DONE`.
 
 ### 19.2 Walking-skeleton gate
 
-Status: `IN_PROGRESS`. Five of seven criteria met; the gate is held by
-acceptance-owner approval.
+Status: `DONE`. Accepted 2026-07-28 by Alvaro Alvarez.
 
 | Criterion | Status |
 | --- | --- |
-| `SPIKE-001` is `DONE` | ⬜ blocked on the report acceptance below |
+| `SPIKE-001` is `DONE` | ✅ |
 | `H-01` through `H-07` are `PASS` | ✅ all seven, evidence in the spike report |
-| `docs/spikes/SPIKE-001-REPORT.md` is accepted | ⬜ **outstanding**, acceptance owner |
+| `docs/spikes/SPIKE-001-REPORT.md` is accepted | ✅ 2026-07-28, Alvaro Alvarez |
 | Prototype head preserved under `refs/archive/spikes/SPIKE-001` | ✅ `1bb3fc8` |
 | No prototype implementation present on `main` | ✅ verified with `git ls-tree` |
 | Sections 9–15 and the dependency sequence reflect observed evidence | ✅ plan revision 4 |
-| `WP-100` is explicitly changed to `READY` | ⬜ blocked on report acceptance |
+| `WP-100` is explicitly changed to `READY` | ✅ plan revision 5 |
 
-The coordinator cannot satisfy the two outstanding criteria. Section 2 makes
-`DONE` binary and Section 17 lists acceptance-owner approval as an acceptance
-criterion for the spike.
+Acceptance evidence: `cargo fmt --check`, `cargo test` with three passing
+integration tests, and strict Clippy all passed from a clean worktree; the
+archive ref resolved to the recorded prototype head; `main` contained no
+prototype path.
 
 ### 19.3 Single-repository MVP gate
 
@@ -2327,11 +2327,11 @@ All must be true:
 | Area | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | Repository foundation | `DONE` | Commit `4729d18` | Preserve |
-| Walking-skeleton validation | `IN_PROGRESS` | `SPIKE-001` report, seven passing hypotheses, archive ref `1bb3fc8` | Acceptance owner approves the report |
+| Walking-skeleton validation | `DONE` | `SPIKE-001` report accepted 2026-07-28, seven passing hypotheses, archive ref `1bb3fc8` | Preserve |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
 | Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
-| Stable command envelope | `NOT_STARTED` | None | Blocked until `SPIKE-001` passes |
+| Stable command envelope | `READY` | `SPIKE-001` accepted | `WP-100` |
 | Project configuration | `NOT_STARTED` | None | `WP-110` |
 | Control repository | `NOT_STARTED` | None | `WP-120` |
 | Full Git inspection | `NOT_STARTED` | None | `WP-130` |
@@ -2353,14 +2353,18 @@ All must be true:
 
 | Field | Current value |
 | --- | --- |
-| Active work package | `SPIKE-001`, executed and reported |
-| Active implementation branch | `spike/SPIKE-001-walking-skeleton`, archived at `refs/archive/spikes/SPIKE-001` |
-| Active implementation worktree | Removed; toy repositories were disposable and outside this repository |
-| Active owner | Alvaro Alvarez, as acceptance owner |
-| Active blocker | Acceptance-owner approval of `docs/spikes/SPIKE-001-REPORT.md`. No production work package may begin until this clears. |
-| Next work package | `WP-100`, plus the required corrections F-1 through F-4 recorded in the spike report |
-| Next branch name | To be assigned when `WP-100` becomes `READY` |
-| Next acceptance evidence | Acceptance-owner sign-off on the spike report, then `WP-100` deliverables |
+| Active work package | None |
+| Active implementation branch | None |
+| Active implementation worktree | None |
+| Active owner | None |
+| Active blocker | None |
+| Next work package | `WP-100`, `READY` |
+| Next branch name | `wp/WP-100-core-contracts` |
+| Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
+
+The spike-derived corrections are assigned to their owning packages and are not
+`WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
+F-5 to `WP-320`.
 
 ### 20.3 Current demonstrated behavior
 
@@ -2469,6 +2473,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-023 | Measure implementation-packet sufficiency as zero blocking clarifications with recorded assumptions, not zero clarification messages | Accepted | Both `SPIKE-001` implementers completed without blocking, chose documented defaults, and recorded genuine packet ambiguities. That behavior is desirable and the original metric penalized it. |
 | D-024 | Make gate adequacy a required, recorded review output | Accepted, unimplemented | Both `SPIKE-001` reviewers mutation-tested the gates unprompted and proved in three of three cases that a green receipt was not evidence for the acceptance behavior it appeared to support |
 | D-025 | Add per-finding disposition and re-review to the review contract | Accepted, unimplemented | Every `SPIKE-001` review round needed to mark findings resolved, accepted as residual risk, or unresolvable within the card's write scope. Section 15.1 describes only a first review. |
+| D-026 | Accept the `SPIKE-001` report and begin production implementation at `WP-100` | Accepted 2026-07-28 by Alvaro Alvarez | All seven hypotheses passed, the acceptance commands passed from a clean worktree, the archived prototype head matched the recorded SHA, and no prototype code reached `main`. Sections 9–15 were corrected from observed evidence before acceptance rather than after. |
 
 ## 23. Decisions required later
 
