@@ -9,10 +9,17 @@ will not own the workflow engine.
 
 ## Status
 
-Foundation complete; workflow implementation has not started. The next
-milestone is the timeboxed `SPIKE-001` walking skeleton, which will test the
-complete card-to-authority workflow on a disposable toy repository before the
-production schemas are stabilized.
+Foundation complete; workflow implementation has not started.
+
+The timeboxed `SPIKE-001` walking skeleton has been executed. It ran the
+complete card-to-authority workflow on a disposable toy repository using fresh
+agent contexts, and all seven hypotheses passed. Its findings are recorded in
+[the spike report](./docs/spikes/SPIKE-001-REPORT.md) and folded into plan
+revision 4.
+
+Production implementation remains blocked until the acceptance owner approves
+that report. No prototype code was merged; the prototype is preserved only
+under `refs/archive/spikes/SPIKE-001`.
 
 The current CLI provides a read-only `doctor` command that validates the host
 Git installation and reports whether a path belongs to a Git repository. It
