@@ -53,6 +53,12 @@ pub enum ErrorCode {
     ConfigControlIncompatible,
     /// Another process holds the project mutation lock.
     PolicyLockHeld,
+    /// A state transition outside the documented state machine was requested.
+    PolicyInvalidTransition,
+    /// A cycle record is internally inconsistent.
+    PolicyInvalidCycle,
+    /// The named record does not exist.
+    PreconditionNotFound,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -69,7 +75,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -89,6 +95,9 @@ impl ErrorCode {
         Self::ConfigInvalidValue,
         Self::ConfigControlIncompatible,
         Self::PolicyLockHeld,
+        Self::PolicyInvalidTransition,
+        Self::PolicyInvalidCycle,
+        Self::PreconditionNotFound,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -120,7 +129,10 @@ impl ErrorCode {
             | Self::ConfigUnsupportedHost
             | Self::ConfigInvalidValue
             | Self::ConfigControlIncompatible => ExitCategory::Configuration,
-            Self::PolicyLockHeld => ExitCategory::Policy,
+            Self::PolicyLockHeld | Self::PolicyInvalidTransition | Self::PolicyInvalidCycle => {
+                ExitCategory::Policy
+            }
+            Self::PreconditionNotFound => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
             Self::ConflictControlHeadMoved => ExitCategory::Conflict,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
@@ -151,6 +163,9 @@ impl ErrorCode {
             Self::ConfigInvalidValue => "INVALID-VALUE",
             Self::ConfigControlIncompatible => "CONTROL-INCOMPATIBLE",
             Self::PolicyLockHeld => "LOCK-HELD",
+            Self::PolicyInvalidTransition => "INVALID-TRANSITION",
+            Self::PolicyInvalidCycle => "INVALID-CYCLE",
+            Self::PreconditionNotFound => "NOT-FOUND",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -203,6 +218,13 @@ impl ErrorCode {
                 "Point at the matching control repository, or initialize a new project elsewhere."
             }
             Self::PolicyLockHeld => "Wait for the other command to finish, then retry.",
+            Self::PolicyInvalidTransition => {
+                "Move through the documented states in order, or abandon the subject."
+            }
+            Self::PolicyInvalidCycle => {
+                "Correct the cycle record so its membership and baseline are coherent."
+            }
+            Self::PreconditionNotFound => "Create the named record, or correct the identifier.",
             Self::RecoveryIncomplete => {
                 "Run `project recover` to resume or diagnose the interrupted operation."
             }

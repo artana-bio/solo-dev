@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 8 |
+| Plan revision | 9 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `c36b06a` (`feat(WP-110): project configuration and validation`) |
+| Previous plan commit | `7bfbfa6` (`feat(WP-120): control repository, locking, and the transaction journal`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, `WP-120`, and `WP-130` complete; 186 tests passing |
-| Next executable work package | `WP-200` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, `WP-120`, `WP-130`, and `WP-200` complete; 225 tests passing |
+| Next executable work package | `WP-210` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1601,9 +1601,29 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-120`, `WP-130` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 14 workspace tests plus 17 unit tests;
+- activation resolves one exact commit from the *authority*, proven by a test
+  that advances the candidate first so the two heads differ;
+- a frozen baseline never moves: advancing the authority and re-activating is
+  refused, and the recorded baseline is unchanged afterwards;
+- every Section 11.1 transition is asserted legal and undocumented ones fail in
+  the policy category naming the permitted alternatives;
+- an abandoned cycle refuses every onward transition;
+- status is folded from the event log, and a tampered cached status is reported
+  as drift with history winning rather than being silently trusted;
+- events and cycle records are versioned while the journal is not.
+
+Note: `WP-120` listed append-only event commits as a deliverable and shipped
+without them. The event store was added here, before the cycle model that needs
+it, rather than leaving the gap recorded as complete.
 
 Deliverables:
 
@@ -2421,7 +2441,8 @@ All must be true:
 | Project configuration | `DONE` | `WP-110`, 28 tests | Preserve |
 | Control repository | `DONE` | `WP-120`, 30 tests | Preserve |
 | Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
-| Cycles and cards | `READY` | `WP-120` and `WP-130` complete | `WP-200` |
+| Cycles | `DONE` | `WP-200`, 31 tests | Preserve |
+| Cards | `READY` | `WP-200` complete | `WP-210` |
 | Worktree allocation | `NOT_STARTED` | None | `WP-230` |
 | Candidate verification | `NOT_STARTED` | None | `WP-240` |
 | Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
@@ -2444,8 +2465,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-200` |
-| Next branch name | `wp/WP-200-cycle-model` |
+| Next work package | `WP-210` |
+| Next branch name | `wp/WP-210-card-schema` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not

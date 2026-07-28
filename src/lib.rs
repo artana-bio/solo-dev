@@ -37,7 +37,7 @@ pub struct Execution {
 pub fn failure_format(cli: &Cli) -> OutputFormat {
     let legacy = match &cli.command {
         Command::Doctor(args) => args.format,
-        Command::Project { .. } => None,
+        Command::Project { .. } | Command::Cycle { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -48,6 +48,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
     match &cli.command {
         Command::Doctor(_) => "doctor",
         Command::Project { .. } => "project",
+        Command::Cycle { .. } => "cycle",
     }
 }
 
@@ -85,6 +86,15 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         Command::Project { command } => {
             let resolved = resolve_output(cli.output, None)?;
             let outcome = commands::project::execute(&command, &domain::clock::SystemClock)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
+        Command::Cycle { command } => {
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome = commands::cycle::execute(&command, &domain::clock::SystemClock)?;
             Ok(Execution {
                 stdout: outcome.render(resolved.format)?,
                 warnings: outcome.warnings().to_vec(),

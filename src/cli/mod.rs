@@ -6,7 +6,7 @@ pub mod output;
 use clap::{Parser, Subcommand};
 
 use crate::{
-    commands::{doctor::DoctorArgs, project::ProjectCommand},
+    commands::{cycle::CycleCommand, doctor::DoctorArgs, project::ProjectCommand},
     error::HarnessError,
 };
 
@@ -42,6 +42,12 @@ pub enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+
+    /// Declare and manage bounded integration periods.
+    Cycle {
+        #[command(subcommand)]
+        command: CycleCommand,
     },
 }
 

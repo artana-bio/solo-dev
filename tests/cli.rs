@@ -32,7 +32,7 @@ fn help_does_not_advertise_unimplemented_commands() {
     let stdout = String::from_utf8(run(&["--help"]).stdout).expect("help should be UTF-8");
     // Section 12.3 lists these, but they must stay absent until their owning
     // work packages implement them.
-    for absent in ["cycle", "card", "work", "gate", "handoff", "review"] {
+    for absent in ["card", "work", "gate", "handoff", "review", "integration"] {
         assert!(
             !stdout.contains(&format!("  {absent}")),
             "help advertises unimplemented `{absent}`"
