@@ -1,18 +1,14 @@
 //! Cycle lifecycle commands.
 
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-};
+use std::{fmt::Write as _, path::PathBuf};
 
 use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::transaction::with_transaction,
     control::{
         event_store::{EventDraft, EventStore},
-        journal::{Journal, OperationState},
-        lock::ProjectLock,
         repository::ControlRepository,
     },
     domain::{
@@ -161,48 +157,6 @@ fn derived_status(
         .filter_map(|event| event.next_state.as_deref())
         .collect();
     Ok(status_from_events(transitions))
-}
-
-/// Runs a mutating cycle command inside the lock and the journal.
-fn with_transaction<F>(
-    control_path: &Path,
-    command_name: &str,
-    clock: &dyn Clock,
-    body: F,
-) -> Result<CommandOutcome, HarnessError>
-where
-    F: FnOnce(
-        &ControlRepository,
-        &EventStore<'_>,
-        Option<&str>,
-    ) -> Result<CommandOutcome, HarnessError>,
-{
-    let control = ControlRepository::open(control_path)?;
-    let _lock = ProjectLock::acquire(control.root(), command_name, clock)?;
-    let journal = Journal::new(&control);
-    journal.require_settled()?;
-
-    let expected_head = control.head()?;
-    let mut operation = journal.begin(command_name, expected_head.clone(), clock)?;
-    let events = EventStore::new(&control);
-
-    match body(&control, &events, expected_head.as_deref()) {
-        Ok(outcome) => {
-            journal.finish(&mut operation, OperationState::Completed, None, clock)?;
-            Ok(outcome.with_operation(operation.operation_id.clone()))
-        }
-        Err(error) => {
-            // A failure before any write leaves nothing partial; the journal
-            // records that distinction so recovery knows whether to look.
-            let state = if control.is_clean()? {
-                OperationState::FailedClean
-            } else {
-                OperationState::FailedPartial
-            };
-            journal.finish(&mut operation, state, Some(error.to_string()), clock)?;
-            Err(error)
-        }
-    }
 }
 
 fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

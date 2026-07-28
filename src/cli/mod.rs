@@ -6,7 +6,9 @@ pub mod output;
 use clap::{Parser, Subcommand};
 
 use crate::{
-    commands::{cycle::CycleCommand, doctor::DoctorArgs, project::ProjectCommand},
+    commands::{
+        card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, project::ProjectCommand,
+    },
     error::HarnessError,
 };
 
@@ -48,6 +50,12 @@ pub enum Command {
     Cycle {
         #[command(subcommand)]
         command: CycleCommand,
+    },
+
+    /// Author, activate, and revise work cards.
+    Card {
+        #[command(subcommand)]
+        command: CardCommand,
     },
 }
 

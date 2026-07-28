@@ -133,6 +133,62 @@ impl Workspace {
         serde_json::from_slice(&output.stdout).expect("stdout should be the JSON envelope")
     }
 
+    /// Runs a `card` subcommand in JSON mode without asserting success.
+    pub fn card_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "card".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+        ];
+        // `card validate` takes no control repository.
+        if args[0] != "validate" {
+            full.push("--control".to_owned());
+            full.push(self.control.display().to_string());
+        }
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs a `card` subcommand, asserting success.
+    pub fn card(&self, args: &[&str]) -> Output {
+        let output = self.card_raw(args);
+        assert!(
+            output.status.success(),
+            "card {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a `card` subcommand and parses its JSON envelope.
+    pub fn card_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.card(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Every authoritative event recorded in the control repository.
+    pub fn events(&self) -> Vec<serde_json::Value> {
+        let directory = self.control.join("events");
+        if !directory.exists() {
+            return Vec::new();
+        }
+        let mut names: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+            .collect()
+    }
+
     /// The candidate repository's current commit.
     pub fn candidate_head(&self) -> String {
         capture(&self.repository, &["rev-parse", "HEAD"])

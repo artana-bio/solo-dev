@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 9 |
+| Plan revision | 10 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `7bfbfa6` (`feat(WP-120): control repository, locking, and the transaction journal`) |
+| Previous plan commit | `9041fd6` (`feat(WP-200): cycle model with event-derived status`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, `WP-120`, `WP-130`, and `WP-200` complete; 225 tests passing |
-| Next executable work package | `WP-210` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, `WP-120`, `WP-130`, `WP-200`, and `WP-210` complete; 258 tests passing |
+| Next executable work package | `WP-220` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1646,9 +1646,33 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-200` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 14 workspace tests plus 22 unit tests;
+- a committed digest vector pins the canonical form, so an accidental change to
+  canonicalization fails there rather than silently invalidating stored reviews;
+- reordered YAML and JSON drafts produce identical activated digests under a
+  fixed clock, and six separate material changes each move the digest;
+- activation rejects a missing goal, acceptance behavior, feature gate, write
+  scope, review policy, or rollback strategy, and rejects a `base_sha` that is
+  not a full object ID;
+- unsafe write-scope patterns are rejected: absolute, upward-traversing,
+  `.git`-naming, and backslash-separated;
+- an activated revision is never rewritten, and `card status` recomputes the
+  digest rather than trusting it, so an edited record is detected;
+- a revision supersedes rather than replaces: both revision records survive and
+  the event records the invalidated revision and digest.
+
+Note on the digest: `created_at` and `base_sha` participate, so the digest
+identifies an exact record instance rather than a class of equivalent cards.
+Two identical drafts activated at different times digest differently, which is
+correct for binding evidence to one exact card.
 
 Deliverables:
 
@@ -2442,7 +2466,8 @@ All must be true:
 | Control repository | `DONE` | `WP-120`, 30 tests | Preserve |
 | Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
 | Cycles | `DONE` | `WP-200`, 31 tests | Preserve |
-| Cards | `READY` | `WP-200` complete | `WP-210` |
+| Cards | `DONE` | `WP-210`, 36 tests | Preserve |
+| Ownership and overlap | `READY` | `WP-210` complete | `WP-220` |
 | Worktree allocation | `NOT_STARTED` | None | `WP-230` |
 | Candidate verification | `NOT_STARTED` | None | `WP-240` |
 | Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
@@ -2465,8 +2490,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-210` |
-| Next branch name | `wp/WP-210-card-schema` |
+| Next work package | `WP-220` |
+| Next branch name | `wp/WP-220-ownership` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2591,6 +2616,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-026 | Accept the `SPIKE-001` report and begin production implementation at `WP-100` | Accepted 2026-07-28 by Alvaro Alvarez | All seven hypotheses passed, the acceptance commands passed from a clean worktree, the archived prototype head matched the recorded SHA, and no prototype code reached `main`. Sections 9–15 were corrected from observed evidence before acceptance rather than after. |
 | D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
 | D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
+| D-030 | Accept card drafts in YAML or JSON via `serde_yaml_ng` | Accepted | D-010 permits YAML drafts. `serde_yaml` is archived, so a maintained fork is used. JSON is accepted for free because it is a YAML subset, which suits machine authors without a second code path. |
+| D-031 | Include `created_at` and `base_sha` in the card digest | Accepted | The digest identifies one exact record instance, not a class of equivalent cards. Two identical drafts activated at different times digest differently, which is the correct behavior when the digest is what reviews and receipts bind to. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

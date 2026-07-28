@@ -57,6 +57,8 @@ pub enum ErrorCode {
     PolicyInvalidTransition,
     /// A cycle record is internally inconsistent.
     PolicyInvalidCycle,
+    /// A card record is internally inconsistent or violates a card rule.
+    PolicyInvalidCard,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A previous mutation did not complete and must be recovered first.
@@ -75,7 +77,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -97,6 +99,7 @@ impl ErrorCode {
         Self::PolicyLockHeld,
         Self::PolicyInvalidTransition,
         Self::PolicyInvalidCycle,
+        Self::PolicyInvalidCard,
         Self::PreconditionNotFound,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
@@ -129,9 +132,10 @@ impl ErrorCode {
             | Self::ConfigUnsupportedHost
             | Self::ConfigInvalidValue
             | Self::ConfigControlIncompatible => ExitCategory::Configuration,
-            Self::PolicyLockHeld | Self::PolicyInvalidTransition | Self::PolicyInvalidCycle => {
-                ExitCategory::Policy
-            }
+            Self::PolicyLockHeld
+            | Self::PolicyInvalidTransition
+            | Self::PolicyInvalidCycle
+            | Self::PolicyInvalidCard => ExitCategory::Policy,
             Self::PreconditionNotFound => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
             Self::ConflictControlHeadMoved => ExitCategory::Conflict,
@@ -165,6 +169,7 @@ impl ErrorCode {
             Self::PolicyLockHeld => "LOCK-HELD",
             Self::PolicyInvalidTransition => "INVALID-TRANSITION",
             Self::PolicyInvalidCycle => "INVALID-CYCLE",
+            Self::PolicyInvalidCard => "INVALID-CARD",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
@@ -223,6 +228,9 @@ impl ErrorCode {
             }
             Self::PolicyInvalidCycle => {
                 "Correct the cycle record so its membership and baseline are coherent."
+            }
+            Self::PolicyInvalidCard => {
+                "Correct the card so it satisfies the activation rules in Section 10.3."
             }
             Self::PreconditionNotFound => "Create the named record, or correct the identifier.",
             Self::RecoveryIncomplete => {
