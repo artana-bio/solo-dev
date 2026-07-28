@@ -59,6 +59,32 @@ pub struct ValidationReport {
 /// Schema identifier for the validation report.
 pub const VALIDATION_SCHEMA: &str = "harness.project-validation/v1";
 
+/// Which paths are allowed to be absent.
+///
+/// `project init` creates the control repository and the worktree root, so
+/// requiring them to exist would make initialization impossible. Every other
+/// command validates an established project, where absence is a real fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    /// Validating before initialization: control and worktree root may be absent.
+    Initializing,
+    /// Validating an established project: every configured path must exist.
+    Established,
+}
+
+impl Mode {
+    /// True when the named field is allowed to point at a path that does not
+    /// exist yet.
+    const fn allows_absent(self, field: &str) -> bool {
+        match self {
+            Self::Initializing => {
+                matches!(field.as_bytes(), b"control_repository" | b"worktree_root")
+            }
+            Self::Established => matches!(field.as_bytes(), b"worktree_root"),
+        }
+    }
+}
+
 /// Validates a project configuration without mutating anything.
 ///
 /// Checks run in a deliberate order: cheap structural checks first, then
@@ -69,8 +95,20 @@ pub const VALIDATION_SCHEMA: &str = "harness.project-validation/v1";
 ///
 /// Returns a configuration error naming the exact offending field.
 pub fn validate(config: &ProjectConfig) -> Result<ValidationReport, HarnessError> {
+    validate_in_mode(config, Mode::Established)
+}
+
+/// Validates a project configuration under an explicit mode.
+///
+/// # Errors
+///
+/// Returns a configuration error naming the exact offending field.
+pub fn validate_in_mode(
+    config: &ProjectConfig,
+    mode: Mode,
+) -> Result<ValidationReport, HarnessError> {
     validate_scalars(config)?;
-    let paths = resolve_paths(config)?;
+    let paths = resolve_paths(config, mode)?;
     check_aliases(&paths)?;
     check_nesting(&paths)?;
     let (git_version, minimum) = check_git_version(config)?;
@@ -130,7 +168,7 @@ fn validate_scalars(config: &ProjectConfig) -> Result<(), HarnessError> {
 }
 
 /// Requires every path to be absolute and existing, and records its resolution.
-fn resolve_paths(config: &ProjectConfig) -> Result<Vec<ResolvedPath>, HarnessError> {
+fn resolve_paths(config: &ProjectConfig, mode: Mode) -> Result<Vec<ResolvedPath>, HarnessError> {
     let mut resolved = Vec::new();
     for (field, path) in config.labeled_paths() {
         if !path.is_absolute() {
@@ -141,11 +179,8 @@ fn resolve_paths(config: &ProjectConfig) -> Result<Vec<ResolvedPath>, HarnessErr
             )
             .into_error());
         }
-        // The worktree root is created on demand, so its absence is not an
-        // error; every other role must already exist to be validated.
-        let must_exist = field != "worktree_root";
         if !path.exists() {
-            if must_exist {
+            if !mode.allows_absent(field) {
                 return Err(FieldError::new(
                     field,
                     format!("path does not exist: {}", path.display()),

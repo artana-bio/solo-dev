@@ -4,6 +4,7 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod domain;
 pub mod error;
 pub mod git;
@@ -83,7 +84,7 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         }
         Command::Project { command } => {
             let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::project::execute(&command)?;
+            let outcome = commands::project::execute(&command, &domain::clock::SystemClock)?;
             Ok(Execution {
                 stdout: outcome.render(resolved.format)?,
                 warnings: outcome.warnings().to_vec(),

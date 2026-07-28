@@ -49,6 +49,16 @@ pub enum ErrorCode {
     ConfigUnsupportedHost,
     /// A configured value was structurally valid but not usable.
     ConfigInvalidValue,
+    /// An existing control repository does not match the supplied configuration.
+    ConfigControlIncompatible,
+    /// Another process holds the project mutation lock.
+    PolicyLockHeld,
+    /// A previous mutation did not complete and must be recovered first.
+    RecoveryIncomplete,
+    /// Control state is internally inconsistent.
+    InternalControlCorrupt,
+    /// The control repository moved under a command that expected a fixed head.
+    ConflictControlHeadMoved,
     /// Git could not be executed.
     ExternalGitUnavailable,
     /// A Git command failed.
@@ -59,7 +69,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 25] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -77,6 +87,11 @@ impl ErrorCode {
         Self::ConfigGitVersion,
         Self::ConfigUnsupportedHost,
         Self::ConfigInvalidValue,
+        Self::ConfigControlIncompatible,
+        Self::PolicyLockHeld,
+        Self::RecoveryIncomplete,
+        Self::InternalControlCorrupt,
+        Self::ConflictControlHeadMoved,
         Self::ExternalGitUnavailable,
         Self::ExternalGitCommand,
         Self::InternalEncoding,
@@ -103,9 +118,13 @@ impl ErrorCode {
             | Self::ConfigProtectedBranch
             | Self::ConfigGitVersion
             | Self::ConfigUnsupportedHost
-            | Self::ConfigInvalidValue => ExitCategory::Configuration,
+            | Self::ConfigInvalidValue
+            | Self::ConfigControlIncompatible => ExitCategory::Configuration,
+            Self::PolicyLockHeld => ExitCategory::Policy,
+            Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
+            Self::ConflictControlHeadMoved => ExitCategory::Conflict,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
-            Self::InternalEncoding => ExitCategory::Internal,
+            Self::InternalControlCorrupt | Self::InternalEncoding => ExitCategory::Internal,
         }
     }
 
@@ -130,6 +149,11 @@ impl ErrorCode {
             Self::ConfigGitVersion => "GIT-VERSION",
             Self::ConfigUnsupportedHost => "UNSUPPORTED-HOST",
             Self::ConfigInvalidValue => "INVALID-VALUE",
+            Self::ConfigControlIncompatible => "CONTROL-INCOMPATIBLE",
+            Self::PolicyLockHeld => "LOCK-HELD",
+            Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
+            Self::InternalControlCorrupt => "CONTROL-CORRUPT",
+            Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
             Self::ExternalGitUnavailable => "GIT-UNAVAILABLE",
             Self::ExternalGitCommand => "GIT-COMMAND",
             Self::InternalEncoding => "ENCODING",
@@ -175,6 +199,19 @@ impl ErrorCode {
                 "Run on a supported host, or add this host to the support list deliberately."
             }
             Self::ConfigInvalidValue => "Correct the reported field to a value the schema accepts.",
+            Self::ConfigControlIncompatible => {
+                "Point at the matching control repository, or initialize a new project elsewhere."
+            }
+            Self::PolicyLockHeld => "Wait for the other command to finish, then retry.",
+            Self::RecoveryIncomplete => {
+                "Run `project recover` to resume or diagnose the interrupted operation."
+            }
+            Self::InternalControlCorrupt => {
+                "Inspect the control repository history; this indicates a harness defect or external edit."
+            }
+            Self::ConflictControlHeadMoved => {
+                "Reload the project and retry; another writer advanced control state."
+            }
             Self::ExternalGitUnavailable => "Install Git and ensure it is on PATH.",
             Self::ExternalGitCommand => "Inspect the reported Git diagnostic and retry.",
             Self::InternalEncoding => {
@@ -248,6 +285,25 @@ pub enum HarnessError {
         source: io::Error,
     },
 
+    /// A control-state operation failed for a reason with a stable code.
+    #[error("control state: {reason}")]
+    Control {
+        /// What went wrong.
+        reason: String,
+        /// The stable code for this class of failure.
+        code: ErrorCode,
+    },
+
+    /// A control-state file could not be read or written.
+    #[error("cannot access control state at {path}: {source}")]
+    ControlIo {
+        /// The path that could not be accessed.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
     /// Git could not be executed.
     #[error("failed to execute Git: {0}")]
     GitUnavailable(#[source] io::Error),
@@ -297,7 +353,8 @@ impl HarnessError {
             Self::InvalidDigest { .. } => ErrorCode::UsageInvalidDigest,
             Self::InvalidTimestamp { .. } => ErrorCode::UsageInvalidTimestamp,
             Self::ConflictingOptions(_) => ErrorCode::UsageConflictingOptions,
-            Self::Config { code, .. } => *code,
+            Self::Config { code, .. } | Self::Control { code, .. } => *code,
+            Self::ControlIo { .. } => ErrorCode::InternalControlCorrupt,
             Self::WorkspaceNotFound(_) => ErrorCode::PreconditionWorkspaceMissing,
             Self::WorkspaceAccess { .. } => ErrorCode::PreconditionWorkspaceAccess,
             Self::GitUnavailable(_) => ErrorCode::ExternalGitUnavailable,
@@ -324,6 +381,8 @@ impl HarnessError {
             Self::Config { field, reason, .. } => {
                 serde_json::json!({ "field": field, "reason": reason })
             }
+            Self::Control { reason, .. } => serde_json::json!({ "reason": reason }),
+            Self::ControlIo { path, .. } => serde_json::json!({ "path": path }),
             Self::WorkspaceNotFound(path) | Self::WorkspaceAccess { path, .. } => {
                 serde_json::json!({ "path": path })
             }
