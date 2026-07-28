@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::output::{CommandOutcome, OutputFormat},
     error::HarnessError,
-    git::GitClient,
+    git::{GitClient, inspect::RepositoryClass},
 };
 
 /// Schema identifier for the doctor payload.
@@ -27,6 +27,9 @@ pub struct DoctorArgs {
 }
 
 /// The diagnostic payload.
+///
+/// The first four fields are frozen by `WP-100` compatibility. `WP-130` adds
+/// the remainder; adding keys is compatible, renaming or removing one is not.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DoctorReport {
     /// Always [`DOCTOR_SCHEMA`].
@@ -37,6 +40,34 @@ pub struct DoctorReport {
     pub git_version: String,
     /// The repository containing the workspace, when one was detected.
     pub repository_root: Option<PathBuf>,
+    /// The lowest Git version the harness supports.
+    pub minimum_git_version: String,
+    /// True when the installed Git satisfies the minimum.
+    pub meets_minimum_git_version: bool,
+    /// True when the installed Git supports the worktree subcommands.
+    pub supports_worktrees: bool,
+    /// What the inspected path turned out to be.
+    pub repository: RepositoryClass,
+    /// A short summary of the inspected path's role.
+    pub workspace_role: String,
+}
+
+/// Describes the inspected path in one word, for the human rendering.
+fn workspace_role(repository: &RepositoryClass) -> &'static str {
+    match repository {
+        RepositoryClass::Repository { bare: true, .. } => "bare repository",
+        RepositoryClass::Repository {
+            detached_head: true,
+            ..
+        } => "detached worktree",
+        RepositoryClass::Repository {
+            linked_worktree: true,
+            ..
+        } => "linked worktree",
+        RepositoryClass::Repository { .. } => "main worktree",
+        RepositoryClass::NotRepository => "not a repository",
+        RepositoryClass::GitError { .. } => "Git refused inspection",
+    }
 }
 
 impl DoctorReport {
@@ -63,6 +94,11 @@ impl DoctorReport {
             workspace,
             git_version: git.version,
             repository_root: git.repository_root,
+            minimum_git_version: git.minimum_version.to_string(),
+            meets_minimum_git_version: git.meets_minimum_version,
+            supports_worktrees: git.supports_worktrees,
+            workspace_role: workspace_role(&git.repository).to_owned(),
+            repository: git.repository,
         })
     }
 
@@ -73,10 +109,21 @@ impl DoctorReport {
             || "not detected".to_owned(),
             |path| path.display().to_string(),
         );
+        let version_note = if self.meets_minimum_git_version {
+            format!("meets minimum {}", self.minimum_git_version)
+        } else {
+            format!("BELOW minimum {}", self.minimum_git_version)
+        };
+        let diagnostic = match &self.repository {
+            RepositoryClass::GitError { diagnostic } => format!("\ngit error: {diagnostic}"),
+            RepositoryClass::Repository { .. } | RepositoryClass::NotRepository => String::new(),
+        };
         format!(
-            "Change Harness doctor\nworkspace: {}\ngit: {}\nrepository: {repository}",
+            "Change Harness doctor\nworkspace: {}\ngit: {} ({version_note})\nworktree support: {}\nrole: {}\nrepository: {repository}{diagnostic}",
             self.workspace.display(),
-            self.git_version
+            self.git_version,
+            if self.supports_worktrees { "yes" } else { "no" },
+            self.workspace_role,
         )
     }
 
@@ -114,11 +161,24 @@ mod tests {
     use super::*;
 
     fn sample() -> DoctorReport {
+        let repository = RepositoryClass::Repository {
+            top_level: Some(PathBuf::from("/repo")),
+            git_dir: PathBuf::from("/repo/.git"),
+            common_dir: PathBuf::from("/repo/.git"),
+            bare: false,
+            linked_worktree: false,
+            detached_head: false,
+        };
         DoctorReport {
             schema: DOCTOR_SCHEMA.to_owned(),
             workspace: PathBuf::from("/repo"),
             git_version: "git version 2.50.1".to_owned(),
             repository_root: Some(PathBuf::from("/repo")),
+            minimum_git_version: "2.50.0".to_owned(),
+            meets_minimum_git_version: true,
+            supports_worktrees: true,
+            workspace_role: workspace_role(&repository).to_owned(),
+            repository,
         }
     }
 
@@ -160,9 +220,60 @@ mod tests {
     fn missing_repository_renders_as_not_detected() {
         let report = DoctorReport {
             repository_root: None,
+            repository: RepositoryClass::NotRepository,
+            workspace_role: workspace_role(&RepositoryClass::NotRepository).to_owned(),
             ..sample()
         };
         assert!(report.to_text().contains("repository: not detected"));
+        assert!(report.to_text().contains("role: not a repository"));
+    }
+
+    #[test]
+    fn a_git_refusal_is_surfaced_and_never_reads_as_absence() {
+        let repository = RepositoryClass::GitError {
+            diagnostic: "detected dubious ownership".to_owned(),
+        };
+        let report = DoctorReport {
+            repository_root: None,
+            workspace_role: workspace_role(&repository).to_owned(),
+            repository,
+            ..sample()
+        };
+        let text = report.to_text();
+        assert!(text.contains("role: Git refused inspection"));
+        assert!(text.contains("git error: detected dubious ownership"));
+    }
+
+    #[test]
+    fn workspace_role_distinguishes_every_repository_shape() {
+        let base = |bare, linked, detached| RepositoryClass::Repository {
+            top_level: Some(PathBuf::from("/repo")),
+            git_dir: PathBuf::from("/repo/.git"),
+            common_dir: PathBuf::from("/repo/.git"),
+            bare,
+            linked_worktree: linked,
+            detached_head: detached,
+        };
+        assert_eq!(workspace_role(&base(false, false, false)), "main worktree");
+        assert_eq!(workspace_role(&base(false, true, false)), "linked worktree");
+        assert_eq!(
+            workspace_role(&base(false, false, true)),
+            "detached worktree"
+        );
+        assert_eq!(workspace_role(&base(true, false, false)), "bare repository");
+    }
+
+    #[test]
+    fn text_reports_minimum_version_compliance_and_worktree_support() {
+        let text = sample().to_text();
+        assert!(text.contains("meets minimum 2.50.0"));
+        assert!(text.contains("worktree support: yes"));
+
+        let below = DoctorReport {
+            meets_minimum_git_version: false,
+            ..sample()
+        };
+        assert!(below.to_text().contains("BELOW minimum 2.50.0"));
     }
 
     #[test]

@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 5 |
+| Plan revision | 6 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `f910e74` (`docs: record SPIKE-001 results and plan revision 4`) |
+| Previous plan commit | `0cd2e64` (`feat(WP-100): core contracts and stable command output`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Foundation complete; `SPIKE-001` accepted with all seven hypotheses passing; production workflow implementation may begin at `WP-100` |
-| Next executable work package | `WP-110` and `WP-130` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, and `WP-130` complete; 115 tests passing |
+| Next executable work package | `WP-110` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1504,9 +1504,31 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-100` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 21 temporary-repository tests cover main, linked, detached, and bare
+  classification; worktree inventory including lock state; clean and dirty
+  state counting untracked files; in-progress merge detection; ancestry and
+  merge base; and rename, deletion, symlink, executable-bit, and gitlink
+  detection;
+- R-013 has a named regression test: a malformed gitfile is classified
+  `git_error` with its diagnostic preserved, never `not_repository`;
+- paths containing spaces, newlines, and Unicode are parsed correctly, which is
+  why the parser reads `--raw -z` rather than a line-oriented format;
+- a shell-metacharacter argument is proven inert rather than interpreted;
+- one test snapshots `HEAD`, all refs, status, and the reflog around every
+  read-only entry point and asserts nothing moved.
+
+Implementation note: `rev-parse --git-path` resolves relative to the *process*
+working directory, not the repository, so in-progress-operation detection must
+pass `--path-format=absolute`. Without it the existence check silently tests
+the wrong filesystem location and every repository looks settled.
 
 Deliverables:
 
@@ -2355,11 +2377,11 @@ All must be true:
 | Walking-skeleton validation | `DONE` | `SPIKE-001` report accepted 2026-07-28, seven passing hypotheses, archive ref `1bb3fc8` | Preserve |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
-| Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
+| Read-only Git probe | `DONE` | `src/git/`, 21 fixture tests | Preserve |
 | Stable command envelope | `DONE` | `WP-100`, 59 passing tests | Extend as commands are added |
-| Project configuration | `NOT_STARTED` | None | `WP-110` |
+| Project configuration | `READY` | `WP-100` and `WP-130` complete | `WP-110` |
 | Control repository | `NOT_STARTED` | None | `WP-120` |
-| Full Git inspection | `NOT_STARTED` | None | `WP-130` |
+| Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
 | Cycles and cards | `NOT_STARTED` | None | `WP-200` onward |
 | Worktree allocation | `NOT_STARTED` | None | `WP-230` |
 | Candidate verification | `NOT_STARTED` | None | `WP-240` |
@@ -2383,7 +2405,7 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-110` and `WP-130`, both `READY` and parallelizable |
+| Next work package | `WP-110` |
 | Next branch name | `wp/WP-110-project-config` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
@@ -2469,7 +2491,7 @@ commands before commit even though Rust behavior is unchanged.
 | R-010 | Implementation expands into infrastructure platform before MVP | Schedule failure | Timeboxed walking skeleton, single vertical slice, and deferred capabilities | Work outside active package/dependencies or spike budget | Actively controlled |
 | R-011 | Same-disk backup is mistaken for independent backup | Permanent loss | Independent destination validation and restore drill | Backup path shares device | Open |
 | R-012 | Actor string is treated as proven identity | Invalid separation claim | Declare identity limits; stronger boundary optional | Security-sensitive approval needs proof | Open, accepted for local MVP |
-| R-013 | Repository probe discards `rev-parse` failure diagnostics | Git refusal is misreported as non-repository | Preserve exit/stderr and classify repository versus Git error in `WP-130` | Any nonzero repository probe result | Open; foundation limitation |
+| R-013 | Repository probe discards `rev-parse` failure diagnostics | Git refusal is misreported as non-repository | Preserve exit/stderr and classify repository versus Git error in `WP-130` | Any nonzero repository probe result | Closed 2026-07-28 by `WP-130`, with a named regression test |
 | R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | Complete `SPIKE-001` before `WP-100`; keep Sections 9–15 provisional | Production code begins before accepted spike evidence | Actively controlled |
 | R-015 | Full-plan reading consumes feature-agent context | Reduced implementation focus and higher error rate | Role-specific reading contract and explicit per-item reading list | Feature agent is instructed to load the complete plan without a coordination role | Mitigated by plan revision 2 |
 | R-016 | Review reuses implementation context | Nominally independent review repeats the implementer's assumptions | Fresh session, review packet only, different session ID, no branch edits | Reviewer inherits or forks implementation conversation | Mitigated procedurally; not a security boundary |

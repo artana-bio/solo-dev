@@ -104,6 +104,39 @@ fn output_option_emits_the_stable_result_envelope() {
 }
 
 #[test]
+fn doctor_reports_version_compliance_worktree_support_and_role() {
+    let output = run(&[
+        "doctor",
+        "--workspace",
+        env!("CARGO_MANIFEST_DIR"),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let data = &stdout_json(&output)["data"];
+    assert!(data["meets_minimum_git_version"].as_bool().unwrap());
+    assert_eq!(data["minimum_git_version"], "2.50.0");
+    assert!(data["supports_worktrees"].as_bool().unwrap());
+    assert_eq!(data["repository"]["kind"], "repository");
+    let role = data["workspace_role"].as_str().unwrap();
+    assert!(
+        role == "main worktree" || role == "linked worktree",
+        "unexpected role: {role}"
+    );
+}
+
+#[test]
+fn doctor_text_reports_the_extended_diagnostics() {
+    let stdout =
+        String::from_utf8(run(&["doctor", "--workspace", env!("CARGO_MANIFEST_DIR")]).stdout)
+            .expect("stdout should be UTF-8");
+    assert!(stdout.contains("meets minimum 2.50.0"));
+    assert!(stdout.contains("worktree support: yes"));
+    assert!(stdout.contains("role: "));
+}
+
+#[test]
 fn output_text_matches_the_default_rendering() {
     let explicit = run(&[
         "doctor",
