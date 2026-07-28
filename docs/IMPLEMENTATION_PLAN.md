@@ -5,12 +5,12 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 2 |
+| Plan revision | 3 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `9383e8c` (`docs: define implementation plan and status ledger`) |
+| Previous plan commit | `dc9e490` (`docs: validate workflow before implementation`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `main` |
+| Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Walking-skeleton validation |
 | Current implementation status | Foundation complete; production workflow implementation not started |
 | Next executable work package | `SPIKE-001` |
@@ -1197,12 +1197,25 @@ Before Single-repository MVP acceptance, tests MUST cover:
 32. dirty local main before promotion;
 33. promotion succeeds and local synchronization succeeds;
 34. promotion succeeds and local synchronization is interrupted;
-35. recovery after each journaled mutation boundary;
+35. recovery after each mutation boundary journaled by an MVP work package,
+    meaning worktree allocation and promotion;
 36. archive reachability;
 37. cleanup rejection for unarchived commits;
 38. successful cleanup after archival;
 39. JSON success envelope;
 40. JSON error envelope and stable exit code.
+
+Scenario ownership for the two recovery scenarios is explicit because both were
+previously claimed by a post-MVP work package:
+
+| Scenario | MVP owner | Hardened extension |
+| --- | --- | --- |
+| 34 | `WP-450` partial-success journal and recovery | `WP-500` injected interruption at the promotion boundary |
+| 35 | `WP-230` allocation recovery and `WP-450` promotion recovery | `WP-500` systematic failure injection at every journaled boundary |
+
+`WP-500` broadens coverage to boundaries introduced after the MVP and to
+injected rather than naturally occurring interruptions. It is not a
+prerequisite for the Single-repository MVP gate.
 
 ### 16.3 Quality gate
 
@@ -1250,10 +1263,13 @@ Evidence:
 
 | Field | Value |
 | --- | --- |
-| Status | `READY` |
+| Status | `IN_PROGRESS` |
+| Owner | Claude, coordinator role |
+| Started | 2026-07-28 |
 | Dependencies | `WP-000` |
 | Target release | Walking-skeleton validation |
 | Branch | `spike/SPIKE-001-walking-skeleton` |
+| Branch base | Plan revision 3, which carries the `AGENTS.md` spike exception the spike depends on |
 | Maximum duration | 16 active engineering hours or two consecutive working days, whichever occurs first |
 | Maximum prototype size | 300 non-generated executable lines; fixtures, logs, and the report are excluded |
 | Coordinator required reading | Complete implementation plan and `docs/ARCHITECTURE.md` |
@@ -1268,7 +1284,8 @@ stabilized.
 
 Required setup:
 
-1. create the spike branch from the current `main`;
+1. create the spike branch from plan revision 3, which is the first commit
+   carrying the `AGENTS.md` spike exception the packets depend on;
 2. create a disposable toy candidate repository outside this repository;
 3. create a disposable bare authority repository;
 4. seed two independent toy changes;
@@ -1277,6 +1294,46 @@ Required setup:
 6. prepare one bounded implementation packet without including the full plan;
 7. prepare one independent review packet;
 8. record every manual or prototype command used.
+
+Required packet contents:
+
+`H-01` and `H-02` test packet sufficiency, so the packets are the experiment
+and not merely its paperwork. Both are stored under `docs/spikes/` and quoted
+verbatim in the report. Packet fields are derived from the provisional handoff
+contract in Section 10.7 and the reviewer input list in Section 15.1; the spike
+tests whether those lists are sufficient, excessive, or wrong.
+
+The implementation packet MUST contain:
+
+- the toy repository path, exact base SHA, and target branch name;
+- card identity, title, goal, and non-goals;
+- write scope includes and excludes;
+- acceptance behaviors and regressions;
+- named gates and the exact argv used to run them in the toy repository;
+- commit and reporting instructions;
+- the exact fields the implementer must return, meaning candidate SHA,
+  implementation decisions, assumptions, known limitations, and residual risks;
+- an explicit statement that the packet is the complete assigned context and
+  that missing information must be reported rather than assumed.
+
+The implementation packet MUST NOT contain the implementation plan, the
+hypothesis table, review criteria, or any indication that an omission was
+seeded.
+
+The review packet MUST contain:
+
+- the same toy card and cycle identity given to the implementer;
+- exact baseline and candidate SHAs;
+- the complete diff;
+- contract-domain changes;
+- feature gate receipts;
+- the implementer's decisions, assumptions, and limitations;
+- the ten evaluation criteria in Section 15.1;
+- the decision vocabulary `approved`, `changes_requested`, or `blocked`, and
+  the requirement that findings be specific and located.
+
+The review packet MUST NOT contain the implementer's conversation, the
+hypothesis table, or the location, nature, or existence of the seeded omission.
 
 Required hypotheses:
 
@@ -1542,6 +1599,8 @@ Deliverables:
 - idempotent `.agent/` common-exclude installation;
 - initial progress record;
 - `work start`, `status`, `checkpoint`, `resume`, `block`;
+- `--dry-run` for every mutating command in this package, as required by
+  Section 12.1;
 - recovery for every allocation boundary.
 
 Acceptance:
@@ -1873,7 +1932,9 @@ Deliverables:
 
 Acceptance:
 
-- mandatory scenarios 34 and 35 pass;
+- injected failure covers every journaled mutation boundary, extending
+  scenarios 34 and 35 beyond the naturally occurring interruptions already
+  demonstrated for the MVP gate;
 - no interruption silently reports success;
 - recovery never deletes ambiguous work;
 - completed operations are idempotently recognized.
@@ -2235,7 +2296,7 @@ All must be true:
 | Area | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | Repository foundation | `DONE` | Commit `4729d18` | Preserve |
-| Walking-skeleton validation | `READY` | `SPIKE-001` specification | Execute before production implementation |
+| Walking-skeleton validation | `IN_PROGRESS` | Plan revision 3, `SPIKE-001` packets | Execute the seven hypotheses and report |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
 | Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
@@ -2261,12 +2322,12 @@ All must be true:
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None |
-| Active implementation branch | None |
-| Active implementation worktree | None |
-| Active owner | None |
+| Active work package | `SPIKE-001` |
+| Active implementation branch | `spike/SPIKE-001-walking-skeleton` |
+| Active implementation worktree | Disposable toy repositories outside this repository |
+| Active owner | Claude, coordinator role |
 | Active blocker | None |
-| Next work package | `SPIKE-001` |
+| Next work package | `WP-100`, blocked until the `SPIKE-001` report is accepted |
 | Next branch name | `spike/SPIKE-001-walking-skeleton` |
 | Next acceptance evidence | `docs/spikes/SPIKE-001-REPORT.md`, seven passing hypotheses, accepted plan revision, and archived prototype ref |
 
@@ -2367,6 +2428,9 @@ commands before commit even though Rust behavior is unchanged.
 | D-016 | Dogfood in three thresholds: allocation, review, then complete lifecycle | Accepted | Earlier full self-hosting is impossible because required commands do not yet exist |
 | D-017 | Fresh reviewer context is the MVP operational definition of independent agent review | Accepted | Prevents inherited implementation conversation while honestly avoiding a hard identity claim |
 | D-018 | Keep Section 7 invariants committed while treating Sections 9–15 contracts as provisional until the spike | Accepted | Preserves safety boundaries while allowing evidence-driven schema correction |
+| D-019 | Exempt spike roles from the standing agent reading contract when the tracker names a packet as sole required reading | Accepted | The general contract in `AGENTS.md` forced the implementer to read Sections 1–7 and the spike entry itself, which would have revealed the seeded omission and invalidated `H-01` and `H-02` |
+| D-020 | Assign MVP ownership of mandatory scenarios 34 and 35 to `WP-450` and `WP-230`, and scope `WP-500` to injected failure | Accepted | The Single-repository MVP gate required all 40 scenarios while scenario 35 was claimed only by `WP-500`, a hardened-release package, making the gate unsatisfiable as written |
+| D-021 | Define the spike packet contract inside the `SPIKE-001` entry rather than Sections 9–15 | Accepted | `H-01` and `H-02` test packet sufficiency, so the contract must exist before the spike, but hardening a general packet schema before evidence is exactly the failure R-014 describes |
 
 ## 23. Decisions required later
 

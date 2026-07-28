@@ -19,6 +19,18 @@ Every implementation agent reads:
 An implementation item without an explicit `Required reading` entry MUST NOT
 start. The coordinator updates the tracker first.
 
+### Spike exception
+
+A spike may test whether a bounded context is sufficient to complete work.
+When a spike tracker entry names a packet as the sole required reading for a
+role, that packet is the complete reading list for that role. The agent MUST
+NOT read `README.md`, this file, any implementation-plan section, or the
+spike's own tracker entry.
+
+The coordinator delivers the packet directly and owns its sufficiency. An
+agent that reads the surrounding plan contaminates the hypothesis under test,
+and that spike result MUST be discarded rather than reported.
+
 Coordinators, integrators, acceptance owners, and agents changing the plan or
 cross-package architecture MUST read the complete implementation plan and
 `docs/ARCHITECTURE.md`.
