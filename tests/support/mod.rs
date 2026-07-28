@@ -189,6 +189,88 @@ impl Workspace {
             .collect()
     }
 
+    /// Runs a `work` subcommand in JSON mode without asserting success.
+    pub fn work_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "work".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs a `work` subcommand, asserting success.
+    pub fn work(&self, args: &[&str]) -> Output {
+        let output = self.work_raw(args);
+        assert!(
+            output.status.success(),
+            "work {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a `work` subcommand and parses its JSON envelope.
+    pub fn work_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.work(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Creates and activates a card claiming the given paths.
+    pub fn activate_card(&self, card_id: &str, include: &[&str]) {
+        self.activate_card_with_base(card_id, include, &self.authority_head());
+    }
+
+    /// Creates and activates a card declaring an explicit base commit.
+    pub fn activate_card_with_base(&self, card_id: &str, include: &[&str], base: &str) {
+        let includes = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{includes}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Resolves a revision in the candidate repository.
+    pub fn candidate_rev(&self, revision: &str) -> String {
+        capture(&self.repository, &["rev-parse", revision])
+    }
+
+    /// True when a branch exists in the candidate repository.
+    pub fn candidate_branch_exists(&self, branch: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.repository)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .expect("git should run")
+            .status
+            .success()
+    }
+
+    /// The candidate repository's worktree inventory, as porcelain lines.
+    pub fn candidate_worktrees(&self) -> Vec<String> {
+        capture(&self.repository, &["worktree", "list", "--porcelain"])
+            .split("\n\n")
+            .map(|block| block.replace('\n', " "))
+            .collect()
+    }
+
     /// The candidate repository's current commit.
     pub fn candidate_head(&self) -> String {
         capture(&self.repository, &["rev-parse", "HEAD"])

@@ -5,3 +5,4 @@ pub mod clock;
 pub mod cycle;
 pub mod digest;
 pub mod ids;
+pub mod lease;

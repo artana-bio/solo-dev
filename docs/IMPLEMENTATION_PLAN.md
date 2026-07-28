@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 11 |
+| Plan revision | 12 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `b38eb0f` (`feat(WP-210): card schema, canonicalization, and digest`) |
+| Previous plan commit | `c2456a7` (`feat(WP-220): ownership, contracts, resources, and dependencies`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`, `WP-210`, and `WP-220` complete; 301 tests passing |
-| Next executable work package | `WP-230` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-230` complete; 336 tests passing. Threshold A is now live. |
+| Next executable work package | `WP-240` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1745,9 +1745,31 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-120`, `WP-130`, `WP-220` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 19 workspace tests plus 16 unit tests;
+- the branch begins at exactly the card's declared base, asserted against the
+  authority head rather than the candidate's;
+- duplicate lease, duplicate branch, and duplicate worktree path each fail with
+  their own code, and the lease check runs first because it is the actionable
+  diagnosis;
+- a card whose base is absent is refused with nothing created, proven by
+  asserting the branch and worktree do not exist afterwards;
+- resume rejects a locator that disagrees with control on card or lease, and
+  names the disagreeing field;
+- nothing forces: `branch -d` not `-D`, `worktree remove` without `--force`,
+  and a test leaves uncommitted work in an allocated worktree and asserts it
+  survives a refused re-allocation;
+- the `.agent/` rule lands in `info/exclude`, never in the committed
+  `.gitignore`, and installing it twice is a no-op;
+- allocation postconditions are verified rather than assumed: registration,
+  checked-out head, and cleanliness are each confirmed before success.
 
 Deliverables:
 
@@ -2354,7 +2376,7 @@ has not implemented.
 
 #### Threshold A — Worktree allocation
 
-Trigger: `WP-230` becomes `DONE`.
+Trigger: `WP-230` becomes `DONE`. **Reached 2026-07-28.**
 
 Requirement:
 
@@ -2492,9 +2514,10 @@ All must be true:
 | Cycles | `DONE` | `WP-200`, 31 tests | Preserve |
 | Cards | `DONE` | `WP-210`, 36 tests | Preserve |
 | Ownership and overlap | `DONE` | `WP-220`, 44 tests | Preserve |
-| Worktree allocation | `READY` | `WP-220` complete | `WP-230` |
+| Worktree allocation | `DONE` | `WP-230`, 35 tests | Preserve |
+| Candidate verification | `READY` | `WP-230` complete | `WP-240` |
 
-| Candidate verification | `NOT_STARTED` | None | `WP-240` |
+
 | Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
 | Handoff and review | `NOT_STARTED` | None | `WP-250`, `WP-320` |
 | Bare authority | `NOT_STARTED` | None | `WP-400` |
@@ -2515,8 +2538,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-230` |
-| Next branch name | `wp/WP-230-worktree-allocation` |
+| Next work package | `WP-240` |
+| Next branch name | `wp/WP-240-candidate-verification` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not

@@ -1,12 +1,16 @@
 //! Git access.
 //!
 //! Split by responsibility: [`command`] owns process invocation, [`inspect`]
-//! answers read-only questions, and [`diff`] parses change sets. No module here
-//! mutates a repository; mutation arrives with its owning work package.
+//! answers read-only questions, [`diff`] parses change sets, and [`worktree`]
+//! performs the bounded branch and worktree mutations `WP-230` needs.
+//!
+//! Everything outside [`worktree`] is read-only. Mutation is confined to one
+//! module so the safety rules in invariant 7.2 have a single place to hold.
 
 pub mod command;
 pub mod diff;
 pub mod inspect;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 

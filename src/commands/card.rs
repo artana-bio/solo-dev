@@ -183,6 +183,55 @@ fn stored_draft(control: &ControlRepository, card_id: &CardId) -> Result<CardDra
     CardDraft::parse(&control.read(&relative)?)
 }
 
+/// Reads a card's activated revision and current state together.
+///
+/// Shared with the `work` commands so both read allocation state through one
+/// path rather than each re-deriving it.
+///
+/// # Errors
+///
+/// Returns a precondition error when the card is not activated.
+pub fn load_card(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<(CardRecord, CardStateRecord), HarnessError> {
+    let state = state_of(control, card_id)?.ok_or_else(|| HarnessError::Control {
+        reason: format!("card {card_id} is not activated"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
+    let record: CardRecord = serde_json::from_str(
+        &control.read(&CardRecord::relative_path(card_id, state.current_revision))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("card {card_id} revision record is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    Ok((record, state))
+}
+
+/// Moves a card to a new state, keeping its revision and digest.
+///
+/// # Errors
+///
+/// Returns an error when the state file cannot be written.
+pub fn store_card_state(
+    control: &ControlRepository,
+    record: &CardRecord,
+    current: &CardStateRecord,
+    next: CardState,
+) -> Result<(), HarnessError> {
+    control.write_atomic(
+        &CardStateRecord::relative_path(&record.card_id),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&CardStateRecord {
+                state: next,
+                ..current.clone()
+            })?
+        ),
+    )
+}
+
 /// Reads a card's state file.
 fn state_of(
     control: &ControlRepository,

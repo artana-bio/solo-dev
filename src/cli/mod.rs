@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, project::ProjectCommand,
+        work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -56,6 +57,12 @@ pub enum Command {
     Card {
         #[command(subcommand)]
         command: CardCommand,
+    },
+
+    /// Allocate and track work on a card.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
     },
 }
 
