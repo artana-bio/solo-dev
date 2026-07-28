@@ -13,7 +13,7 @@
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
 | Current implementation status | Foundation complete; `SPIKE-001` accepted with all seven hypotheses passing; production workflow implementation may begin at `WP-100` |
-| Next executable work package | `WP-100` |
+| Next executable work package | `WP-110` and `WP-130` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -805,9 +805,16 @@ Every command MUST:
 - preserve incomplete state for recovery after failure.
 
 `--output` is the canonical global output option. The foundation command's
-existing `doctor --format text|json` option remains an accepted alias through
-the Single-repository MVP and emits a deprecation warning after `--output` is
+existing `doctor --format text|json` option remains accepted through the
+Single-repository MVP and emits a deprecation warning once `--output` is
 available. It may be removed only in a documented breaking release.
+
+`--format json` keeps the pre-envelope payload rather than emitting the
+Section 12.4 envelope. `WP-100` acceptance requires existing `doctor` behavior
+to remain compatible, and moving the payload under `data` would break every
+existing caller. The option is therefore a compatibility shim, not a strict
+alias. Supplying both `--output` and `--format` is a usage error rather than a
+silent precedence rule. See D-027.
 
 Mutating commands MUST support `--dry-run` unless the command only appends an
 actor-authored review or acceptance record. Dry runs perform no filesystem,
@@ -1397,12 +1404,27 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Owner | Claude |
 | Started | 2026-07-28 |
+| Completed | 2026-07-28 |
 | Branch | `claude/project-status-review-543d65` |
 | Dependencies | `SPIKE-001`, `DONE` and accepted 2026-07-28 |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- `cargo fmt --check`, `cargo test` with 47 unit and 12 integration tests, and
+  strict Clippy all passed from a clean worktree;
+- committed digest vectors cover the SHA-256 empty-string and `abc` cases, and
+  prove canonical JSON makes field order immaterial while a material change
+  moves the digest;
+- every exit-code category is asserted against its documented number, and every
+  registered error code is asserted to carry its category prefix, a unique
+  rendering, and recovery guidance;
+- both envelopes round-trip through committed fixtures;
+- `doctor --format json` still emits its original top-level payload, so the
+  three foundation tests pass unchanged.
 
 Deliverables:
 
@@ -2334,7 +2356,7 @@ All must be true:
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
 | Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
-| Stable command envelope | `READY` | `SPIKE-001` accepted | `WP-100` |
+| Stable command envelope | `DONE` | `WP-100`, 59 passing tests | Extend as commands are added |
 | Project configuration | `NOT_STARTED` | None | `WP-110` |
 | Control repository | `NOT_STARTED` | None | `WP-120` |
 | Full Git inspection | `NOT_STARTED` | None | `WP-130` |
@@ -2356,13 +2378,13 @@ All must be true:
 
 | Field | Current value |
 | --- | --- |
-| Active work package | `WP-100` |
-| Active implementation branch | `claude/project-status-review-543d65` |
+| Active work package | None |
+| Active implementation branch | None |
 | Active implementation worktree | None |
-| Active owner | Claude |
+| Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-100`, `READY` |
-| Next branch name | `wp/WP-100-core-contracts` |
+| Next work package | `WP-110` and `WP-130`, both `READY` and parallelizable |
+| Next branch name | `wp/WP-110-project-config` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2406,13 +2428,21 @@ The current binary does not:
 
 ### 20.4 Current test inventory
 
-| Test | Status | Purpose |
-| --- | --- | --- |
-| `help_identifies_the_cli` | Passing | Confirms CLI identity and doctor visibility |
-| `doctor_reports_the_repository_as_json` | Passing | Confirms repository detection and JSON report |
-| `doctor_rejects_a_missing_workspace` | Passing | Confirms missing-path failure |
+59 tests pass: 47 unit and 12 CLI integration.
 
-Last verified commands before this plan:
+| Area | Tests | Covers |
+| --- | --- | --- |
+| `domain::ids` | 6 | Documented shapes, wrong prefix, short and non-numeric suffixes, length bound, project slug rejection, JSON round-trip |
+| `domain::digest` | 8 | Committed SHA-256 vectors, canonical key ordering, field-order immateriality, material-change sensitivity, parse rejection, round-trip |
+| `domain::clock` | 6 | Epoch and known-instant rendering, fixed-clock determinism, RFC 3339 round-trip, malformed-input rejection |
+| `cli::exit` | 4 | Every category's documented number, uniqueness, reserved exit 1, name shape |
+| `cli::output` | 8 | Every envelope key present, null rather than omitted, warnings placement, text purity, both envelopes round-trip |
+| `cli` | 4 | Output-option resolution and the both-options usage error |
+| `error` | 6 | Category prefixes, code uniqueness, recovery guidance, no success-category code, per-variant code mapping |
+| `commands::doctor` | 5 | Frozen legacy payload, envelope placement under `data`, identical text in both paths, round-trip |
+| `tests/cli.rs` | 12 | Help surface, unimplemented commands absent, legacy payload and its warning, envelope output, both-options rejection, exit codes 2 and 4, JSON error envelope |
+
+Last verified commands:
 
 ```bash
 cargo fmt --check
@@ -2477,6 +2507,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-024 | Make gate adequacy a required, recorded review output | Accepted, unimplemented | Both `SPIKE-001` reviewers mutation-tested the gates unprompted and proved in three of three cases that a green receipt was not evidence for the acceptance behavior it appeared to support |
 | D-025 | Add per-finding disposition and re-review to the review contract | Accepted, unimplemented | Every `SPIKE-001` review round needed to mark findings resolved, accepted as residual risk, or unresolvable within the card's write scope. Section 15.1 describes only a first review. |
 | D-026 | Accept the `SPIKE-001` report and begin production implementation at `WP-100` | Accepted 2026-07-28 by Alvaro Alvarez | All seven hypotheses passed, the acceptance commands passed from a clean worktree, the archived prototype head matched the recorded SHA, and no prototype code reached `main`. Sections 9–15 were corrected from observed evidence before acceptance rather than after. |
+| D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
+| D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
 
 ## 23. Decisions required later
 
