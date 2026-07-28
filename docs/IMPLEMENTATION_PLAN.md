@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 10 |
+| Plan revision | 11 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `9041fd6` (`feat(WP-200): cycle model with event-derived status`) |
+| Previous plan commit | `b38eb0f` (`feat(WP-210): card schema, canonicalization, and digest`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, `WP-120`, `WP-130`, `WP-200`, and `WP-210` complete; 258 tests passing |
-| Next executable work package | `WP-220` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`, `WP-210`, and `WP-220` complete; 301 tests passing |
+| Next executable work package | `WP-230` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1696,9 +1696,33 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-210` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 13 workspace tests plus 31 unit tests;
+- overlapping cards cannot both activate, and the refusal names both patterns
+  and the conflicting card;
+- excludes override includes, demonstrated by two cards sharing a directory
+  because one excludes the subtree the other owns;
+- contract overlap is refused with disjoint paths, and the test asserts the
+  path check finds nothing first, so only the contract check can catch it;
+- a dependency cycle is refused with the route through it, not a bare
+  "cycle exists";
+- released claims do not block: closed, abandoned, landed, and draft cards all
+  free their region, while eight in-flight states still hold it;
+- a revision that widens scope into a conflict is refused, so allocation is
+  re-checked rather than assumed to hold from activation.
+
+Note: the path matcher is implemented in-tree rather than taken from a crate.
+What a pattern means decides what a card may change, so the semantics are
+specified and tested here rather than inherited. Pattern intersection
+deliberately over-approximates: refusing two cards that might overlap costs one
+conversation, admitting two that do costs a silent lost write.
 
 Deliverables:
 
@@ -2467,8 +2491,9 @@ All must be true:
 | Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
 | Cycles | `DONE` | `WP-200`, 31 tests | Preserve |
 | Cards | `DONE` | `WP-210`, 36 tests | Preserve |
-| Ownership and overlap | `READY` | `WP-210` complete | `WP-220` |
-| Worktree allocation | `NOT_STARTED` | None | `WP-230` |
+| Ownership and overlap | `DONE` | `WP-220`, 44 tests | Preserve |
+| Worktree allocation | `READY` | `WP-220` complete | `WP-230` |
+
 | Candidate verification | `NOT_STARTED` | None | `WP-240` |
 | Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
 | Handoff and review | `NOT_STARTED` | None | `WP-250`, `WP-320` |
@@ -2490,8 +2515,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-220` |
-| Next branch name | `wp/WP-220-ownership` |
+| Next work package | `WP-230` |
+| Next branch name | `wp/WP-230-worktree-allocation` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not

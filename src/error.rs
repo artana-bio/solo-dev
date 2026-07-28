@@ -59,6 +59,16 @@ pub enum ErrorCode {
     PolicyInvalidCycle,
     /// A card record is internally inconsistent or violates a card rule.
     PolicyInvalidCard,
+    /// Two active cards claim overlapping write scopes.
+    PolicyOwnershipOverlap,
+    /// Two active cards change the same contract domain.
+    PolicyContractOverlap,
+    /// Two active cards reserve the same exclusive resource.
+    PolicyResourceConflict,
+    /// A declared dependency does not exist.
+    PolicyDependencyUnsatisfied,
+    /// Declared dependencies form a cycle.
+    PolicyDependencyCycle,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A previous mutation did not complete and must be recovered first.
@@ -77,7 +87,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 34] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -100,6 +110,11 @@ impl ErrorCode {
         Self::PolicyInvalidTransition,
         Self::PolicyInvalidCycle,
         Self::PolicyInvalidCard,
+        Self::PolicyOwnershipOverlap,
+        Self::PolicyContractOverlap,
+        Self::PolicyResourceConflict,
+        Self::PolicyDependencyUnsatisfied,
+        Self::PolicyDependencyCycle,
         Self::PreconditionNotFound,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
@@ -135,7 +150,12 @@ impl ErrorCode {
             Self::PolicyLockHeld
             | Self::PolicyInvalidTransition
             | Self::PolicyInvalidCycle
-            | Self::PolicyInvalidCard => ExitCategory::Policy,
+            | Self::PolicyInvalidCard
+            | Self::PolicyOwnershipOverlap
+            | Self::PolicyContractOverlap
+            | Self::PolicyResourceConflict
+            | Self::PolicyDependencyUnsatisfied
+            | Self::PolicyDependencyCycle => ExitCategory::Policy,
             Self::PreconditionNotFound => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
             Self::ConflictControlHeadMoved => ExitCategory::Conflict,
@@ -170,6 +190,11 @@ impl ErrorCode {
             Self::PolicyInvalidTransition => "INVALID-TRANSITION",
             Self::PolicyInvalidCycle => "INVALID-CYCLE",
             Self::PolicyInvalidCard => "INVALID-CARD",
+            Self::PolicyOwnershipOverlap => "OWNERSHIP-OVERLAP",
+            Self::PolicyContractOverlap => "CONTRACT-OVERLAP",
+            Self::PolicyResourceConflict => "RESOURCE-CONFLICT",
+            Self::PolicyDependencyUnsatisfied => "DEPENDENCY-UNSATISFIED",
+            Self::PolicyDependencyCycle => "DEPENDENCY-CYCLE",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
@@ -231,6 +256,21 @@ impl ErrorCode {
             }
             Self::PolicyInvalidCard => {
                 "Correct the card so it satisfies the activation rules in Section 10.3."
+            }
+            Self::PolicyOwnershipOverlap => {
+                "Narrow one card's write scope, or serialize the two cards."
+            }
+            Self::PolicyContractOverlap => {
+                "Serialize the cards, or split the contract change into one owning card."
+            }
+            Self::PolicyResourceConflict => {
+                "Assign a distinct resource, or wait for the holding card to close."
+            }
+            Self::PolicyDependencyUnsatisfied => {
+                "Declare the dependency in this cycle, or remove the reference."
+            }
+            Self::PolicyDependencyCycle => {
+                "Break the reported cycle by removing one dependency edge."
             }
             Self::PreconditionNotFound => "Create the named record, or correct the identifier.",
             Self::RecoveryIncomplete => {

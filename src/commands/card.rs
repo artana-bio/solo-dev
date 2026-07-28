@@ -17,6 +17,7 @@ use crate::{
         ids::CardId,
     },
     error::{ErrorCode, HarnessError},
+    policy::allocation::{Claim, check_admissible, check_dependencies},
 };
 
 /// Schema identifier for a card's mutable state file.
@@ -230,6 +231,50 @@ fn cycle_accepting_cards(
     Ok(cycle)
 }
 
+/// Collects the claims of every card already declared in a cycle.
+///
+/// Only activated cards appear: a draft has claimed nothing yet, and a card
+/// whose state has released its claims is filtered by the allocator itself.
+fn existing_claims(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    skip: &CardId,
+) -> Result<Vec<Claim>, HarnessError> {
+    let mut claims = Vec::new();
+    for card_id in &cycle.card_ids {
+        if card_id == skip {
+            continue;
+        }
+        let Some(state) = state_of(control, card_id)? else {
+            continue;
+        };
+        let record: CardRecord = serde_json::from_str(
+            &control.read(&CardRecord::relative_path(card_id, state.current_revision))?,
+        )
+        .map_err(|source| HarnessError::Control {
+            reason: format!("card {card_id} revision record is malformed: {source}"),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+        claims.push(Claim::from_record(&record, state.state));
+    }
+    Ok(claims)
+}
+
+/// Refuses a card that would contend with anything already active.
+fn check_allocation(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    record: &CardRecord,
+) -> Result<(), HarnessError> {
+    let existing = existing_claims(control, cycle, &record.card_id)?;
+    let candidate = Claim::from_record(record, CardState::Ready);
+    check_admissible(&candidate, &existing)?;
+
+    let mut all = existing;
+    all.push(candidate);
+    check_dependencies(&all)
+}
+
 fn run_validate(args: &DraftArgs) -> Result<CommandOutcome, HarnessError> {
     let draft = read_draft(&args.draft)?;
     draft.validate()?;
@@ -357,6 +402,9 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             let config = control.project()?;
 
             let record = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
+            // Ownership, contract, resource, and dependency checks run before
+            // anything is written, so a refused card leaves no trace.
+            check_allocation(control, &cycle, &record)?;
             let digest = record.digest()?;
             write_revision(control, &record, &digest, CardState::Ready)?;
 
@@ -486,6 +534,15 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 
             let config = control.project()?;
             let record = previous.revise(&draft, &args.common.actor, clock.now())?;
+            // A revision may widen the write scope, so allocation is re-checked
+            // rather than assumed to still hold from activation.
+            let cycle: CycleRecord =
+                serde_json::from_str(&control.read(&CycleRecord::relative_path(&record.cycle_id))?)
+                    .map_err(|source| HarnessError::Control {
+                        reason: format!("cycle {} is malformed: {source}", record.cycle_id),
+                        code: ErrorCode::InternalControlCorrupt,
+                    })?;
+            check_allocation(control, &cycle, &record)?;
             let digest = record.digest()?;
             // A revision returns the card to `ready`: its definition changed, so
             // any work, handoff, or review bound to the old digest no longer

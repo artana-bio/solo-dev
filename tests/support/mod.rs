@@ -246,6 +246,20 @@ impl Workspace {
         self.authority_head()
     }
 
+    /// Rewrites a stored card's state, simulating a transition made by a
+    /// command that does not exist yet.
+    pub fn tamper_card_state(&self, card_id: &str, state: &str) {
+        let path = self.control.join(format!("cards/{card_id}/state.json"));
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["state"] = serde_json::json!(state);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+        )
+        .unwrap();
+    }
+
     /// Rewrites a stored cycle's cached status, simulating an external edit.
     pub fn tamper_cycle_status(&self, cycle_id: &str, status: &str) {
         let path = self.control.join(format!("cycles/{cycle_id}.json"));
