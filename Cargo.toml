@@ -1,0 +1,24 @@
+[package]
+name = "change-harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A local, project-neutral change-control harness for humans and coding agents"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
