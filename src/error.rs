@@ -27,6 +27,28 @@ pub enum ErrorCode {
     PreconditionWorkspaceMissing,
     /// The requested workspace path could not be read.
     PreconditionWorkspaceAccess,
+    /// A configuration file could not be read or parsed.
+    ConfigMalformed,
+    /// A configuration document carried a field the schema does not define.
+    ConfigUnknownField,
+    /// A configured path was not absolute.
+    ConfigPathNotAbsolute,
+    /// A configured path did not exist.
+    ConfigPathMissing,
+    /// Two configured paths resolved to the same location.
+    ConfigPathAlias,
+    /// A control or authority path was nested inside a candidate worktree.
+    ConfigPathNested,
+    /// The configured candidate path is not a Git repository.
+    ConfigNotRepository,
+    /// The configured protected branch does not resolve to one commit.
+    ConfigProtectedBranch,
+    /// The installed Git is older than the configured minimum.
+    ConfigGitVersion,
+    /// The host operating system is not in the configured support list.
+    ConfigUnsupportedHost,
+    /// A configured value was structurally valid but not usable.
+    ConfigInvalidValue,
     /// Git could not be executed.
     ExternalGitUnavailable,
     /// A Git command failed.
@@ -37,13 +59,24 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 20] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
         Self::UsageConflictingOptions,
         Self::PreconditionWorkspaceMissing,
         Self::PreconditionWorkspaceAccess,
+        Self::ConfigMalformed,
+        Self::ConfigUnknownField,
+        Self::ConfigPathNotAbsolute,
+        Self::ConfigPathMissing,
+        Self::ConfigPathAlias,
+        Self::ConfigPathNested,
+        Self::ConfigNotRepository,
+        Self::ConfigProtectedBranch,
+        Self::ConfigGitVersion,
+        Self::ConfigUnsupportedHost,
+        Self::ConfigInvalidValue,
         Self::ExternalGitUnavailable,
         Self::ExternalGitCommand,
         Self::InternalEncoding,
@@ -60,6 +93,17 @@ impl ErrorCode {
             Self::PreconditionWorkspaceMissing | Self::PreconditionWorkspaceAccess => {
                 ExitCategory::Precondition
             }
+            Self::ConfigMalformed
+            | Self::ConfigUnknownField
+            | Self::ConfigPathNotAbsolute
+            | Self::ConfigPathMissing
+            | Self::ConfigPathAlias
+            | Self::ConfigPathNested
+            | Self::ConfigNotRepository
+            | Self::ConfigProtectedBranch
+            | Self::ConfigGitVersion
+            | Self::ConfigUnsupportedHost
+            | Self::ConfigInvalidValue => ExitCategory::Configuration,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
             Self::InternalEncoding => ExitCategory::Internal,
         }
@@ -75,6 +119,17 @@ impl ErrorCode {
             Self::UsageConflictingOptions => "CONFLICTING-OPTIONS",
             Self::PreconditionWorkspaceMissing => "WORKSPACE-MISSING",
             Self::PreconditionWorkspaceAccess => "WORKSPACE-ACCESS",
+            Self::ConfigMalformed => "MALFORMED",
+            Self::ConfigUnknownField => "UNKNOWN-FIELD",
+            Self::ConfigPathNotAbsolute => "PATH-NOT-ABSOLUTE",
+            Self::ConfigPathMissing => "PATH-MISSING",
+            Self::ConfigPathAlias => "PATH-ALIAS",
+            Self::ConfigPathNested => "PATH-NESTED",
+            Self::ConfigNotRepository => "NOT-REPOSITORY",
+            Self::ConfigProtectedBranch => "PROTECTED-BRANCH",
+            Self::ConfigGitVersion => "GIT-VERSION",
+            Self::ConfigUnsupportedHost => "UNSUPPORTED-HOST",
+            Self::ConfigInvalidValue => "INVALID-VALUE",
             Self::ExternalGitUnavailable => "GIT-UNAVAILABLE",
             Self::ExternalGitCommand => "GIT-COMMAND",
             Self::InternalEncoding => "ENCODING",
@@ -99,6 +154,27 @@ impl ErrorCode {
             Self::UsageConflictingOptions => "Remove one of the conflicting options.",
             Self::PreconditionWorkspaceMissing => "Create the path or pass an existing one.",
             Self::PreconditionWorkspaceAccess => "Check filesystem permissions on the path.",
+            Self::ConfigMalformed => "Correct the JSON syntax of the project file.",
+            Self::ConfigUnknownField => {
+                "Remove the field; the schema rejects fields it does not define."
+            }
+            Self::ConfigPathNotAbsolute => "Replace the value with an absolute, normalized path.",
+            Self::ConfigPathMissing => "Create the path or correct the configured value.",
+            Self::ConfigPathAlias => {
+                "Give each role a distinct location; they must not resolve to the same path."
+            }
+            Self::ConfigPathNested => {
+                "Move the control or authority repository outside every candidate worktree."
+            }
+            Self::ConfigNotRepository => {
+                "Point the repository field at an existing Git repository."
+            }
+            Self::ConfigProtectedBranch => "Create the protected branch or correct its name.",
+            Self::ConfigGitVersion => "Upgrade Git to at least the configured minimum version.",
+            Self::ConfigUnsupportedHost => {
+                "Run on a supported host, or add this host to the support list deliberately."
+            }
+            Self::ConfigInvalidValue => "Correct the reported field to a value the schema accepts.",
             Self::ExternalGitUnavailable => "Install Git and ensure it is on PATH.",
             Self::ExternalGitCommand => "Inspect the reported Git diagnostic and retry.",
             Self::InternalEncoding => {
@@ -142,6 +218,21 @@ pub enum HarnessError {
     /// Two options were combined in an unsupported way.
     #[error("conflicting options: {0}")]
     ConflictingOptions(String),
+
+    /// A configuration field was missing, malformed, or unusable.
+    ///
+    /// The field name travels with the error so both text and JSON diagnostics
+    /// can name the exact offending value rather than reporting that
+    /// configuration is invalid.
+    #[error("configuration field `{field}`: {reason}")]
+    Config {
+        /// Dotted path to the offending field.
+        field: String,
+        /// Why the value was rejected.
+        reason: String,
+        /// The stable code for this class of configuration failure.
+        code: ErrorCode,
+    },
 
     /// The requested workspace path does not exist.
     #[error("workspace does not exist: {0}")]
@@ -206,6 +297,7 @@ impl HarnessError {
             Self::InvalidDigest { .. } => ErrorCode::UsageInvalidDigest,
             Self::InvalidTimestamp { .. } => ErrorCode::UsageInvalidTimestamp,
             Self::ConflictingOptions(_) => ErrorCode::UsageConflictingOptions,
+            Self::Config { code, .. } => *code,
             Self::WorkspaceNotFound(_) => ErrorCode::PreconditionWorkspaceMissing,
             Self::WorkspaceAccess { .. } => ErrorCode::PreconditionWorkspaceAccess,
             Self::GitUnavailable(_) => ErrorCode::ExternalGitUnavailable,
@@ -229,6 +321,9 @@ impl HarnessError {
             }
             Self::InvalidTimestamp { value, .. } => serde_json::json!({ "value": value }),
             Self::ConflictingOptions(detail) => serde_json::json!({ "detail": detail }),
+            Self::Config { field, reason, .. } => {
+                serde_json::json!({ "field": field, "reason": reason })
+            }
             Self::WorkspaceNotFound(path) | Self::WorkspaceAccess { path, .. } => {
                 serde_json::json!({ "path": path })
             }

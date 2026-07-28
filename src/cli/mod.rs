@@ -5,7 +5,10 @@ pub mod output;
 
 use clap::{Parser, Subcommand};
 
-use crate::{commands::doctor::DoctorArgs, error::HarnessError};
+use crate::{
+    commands::{doctor::DoctorArgs, project::ProjectCommand},
+    error::HarnessError,
+};
 
 use output::OutputFormat;
 
@@ -34,6 +37,12 @@ pub struct Cli {
 pub enum Command {
     /// Inspect the local Git environment without changing it.
     Doctor(DoctorArgs),
+
+    /// Inspect and validate project configuration.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
 }
 
 /// How the caller asked for output, and whether they used the deprecated

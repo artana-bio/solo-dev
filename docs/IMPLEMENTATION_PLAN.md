@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 6 |
+| Plan revision | 7 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `0cd2e64` (`feat(WP-100): core contracts and stable command output`) |
+| Previous plan commit | `4b7adc8` (`feat(WP-130): Git inspection layer`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, and `WP-130` complete; 115 tests passing |
-| Next executable work package | `WP-110` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`, `WP-110`, and `WP-130` complete; 147 tests passing |
+| Next executable work package | `WP-120` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1450,9 +1450,30 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-100` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 18 temporary-repository tests plus 10 unit tests cover valid and invalid
+  configurations;
+- unknown fields fail at both top level and nested, and each names itself;
+- relative, missing, aliased, and nested paths each fail with a distinct code
+  naming the exact field, and a test asserts validation creates nothing;
+- symlink aliasing is detected, which a string comparison would miss, and a
+  legitimate symlinked path is accepted with its resolution recorded;
+- an unsatisfiable minimum Git version fails as `CH-CONFIG-GIT-VERSION` while a
+  malformed one fails as `CH-CONFIG-INVALID-VALUE`, so an operator can tell a
+  policy failure from a typo;
+- the CLI returns exit 3 and a JSON envelope whose `details.field` names the
+  offending field.
+
+Implementation note: `worktree_root` is exempt from the existence check because
+it is created on demand at allocation. Every other configured role must already
+exist to be validated.
 
 Deliverables:
 
@@ -2379,8 +2400,8 @@ All must be true:
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
 | Read-only Git probe | `DONE` | `src/git/`, 21 fixture tests | Preserve |
 | Stable command envelope | `DONE` | `WP-100`, 59 passing tests | Extend as commands are added |
-| Project configuration | `READY` | `WP-100` and `WP-130` complete | `WP-110` |
-| Control repository | `NOT_STARTED` | None | `WP-120` |
+| Project configuration | `DONE` | `WP-110`, 28 tests | Preserve |
+| Control repository | `READY` | `WP-110` complete | `WP-120` |
 | Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
 | Cycles and cards | `NOT_STARTED` | None | `WP-200` onward |
 | Worktree allocation | `NOT_STARTED` | None | `WP-230` |
@@ -2405,8 +2426,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-110` |
-| Next branch name | `wp/WP-110-project-config` |
+| Next work package | `WP-120` |
+| Next branch name | `wp/WP-120-control-repository` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not

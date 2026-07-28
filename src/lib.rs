@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod domain;
 pub mod error;
 pub mod git;
@@ -35,6 +36,7 @@ pub struct Execution {
 pub fn failure_format(cli: &Cli) -> OutputFormat {
     let legacy = match &cli.command {
         Command::Doctor(args) => args.format,
+        Command::Project { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -44,6 +46,7 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
 pub fn command_path(cli: &Cli) -> &'static str {
     match &cli.command {
         Command::Doctor(_) => "doctor",
+        Command::Project { .. } => "project",
     }
 }
 
@@ -74,6 +77,15 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
 
             Ok(Execution {
                 stdout,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
+        Command::Project { command } => {
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome = commands::project::execute(&command)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
                 warnings: outcome.warnings().to_vec(),
                 format: resolved.format,
             })
