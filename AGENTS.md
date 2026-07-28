@@ -1,8 +1,31 @@
 # Change Harness Agent Instructions
 
-Read `README.md`, `docs/IMPLEMENTATION_PLAN.md`, and `docs/ARCHITECTURE.md`
-before changing implementation. `docs/IMPLEMENTATION_PLAN.md` is authoritative
-for work-package scope, dependencies, acceptance gates, and status.
+`docs/IMPLEMENTATION_PLAN.md` is authoritative for work-package scope,
+dependencies, acceptance gates, and status, but feature agents MUST NOT load
+the entire plan by default.
+
+## Role-specific reading contract
+
+Every implementation agent reads:
+
+1. `README.md`;
+2. this file;
+3. Sections 1–7 of `docs/IMPLEMENTATION_PLAN.md`;
+4. the active work-package or spike section;
+5. only the additional headings listed under `Required reading` in the active
+   tracker entry;
+6. Section 24, Definition of Done.
+
+An implementation item without an explicit `Required reading` entry MUST NOT
+start. The coordinator updates the tracker first.
+
+Coordinators, integrators, acceptance owners, and agents changing the plan or
+cross-package architecture MUST read the complete implementation plan and
+`docs/ARCHITECTURE.md`.
+
+Reviewers follow the independent-review context rule in Section 15.1. They
+receive the review packet and relevant repository state, but no inherited
+implementation conversation.
 
 ## Engineering rules
 

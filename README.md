@@ -9,10 +9,14 @@ will not own the workflow engine.
 
 ## Status
 
-Foundation only. The current CLI provides a read-only `doctor` command that
-validates the host Git installation and reports whether a path belongs to a Git
-repository. It does not yet create worktrees, integrate branches, or update
-protected refs.
+Foundation complete; workflow implementation has not started. The next
+milestone is the timeboxed `SPIKE-001` walking skeleton, which will test the
+complete card-to-authority workflow on a disposable toy repository before the
+production schemas are stabilized.
+
+The current CLI provides a read-only `doctor` command that validates the host
+Git installation and reports whether a path belongs to a Git repository. It
+does not yet create worktrees, integrate branches, or update protected refs.
 
 ## Product boundary
 

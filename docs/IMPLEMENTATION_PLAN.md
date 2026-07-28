@@ -5,14 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 1 |
+| Plan revision | 2 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
+| Previous plan commit | `9383e8c` (`docs: define implementation plan and status ledger`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `main` |
-| Current release stage | Foundation |
-| Current implementation status | Foundation complete; workflow implementation not started |
-| Next executable work package | `WP-100` |
+| Current release stage | Walking-skeleton validation |
+| Current implementation status | Foundation complete; production workflow implementation not started |
+| Next executable work package | `SPIKE-001` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -49,6 +50,10 @@ Only these status values may be used:
 `DONE` is binary. Partial implementation remains `IN_PROGRESS`. Passing a
 subset of tests does not make a work package `DONE`.
 
+A spike uses the same status vocabulary but has its own timebox and evidence
+gate. A successful spike validates or revises the plan; it does not count as
+production implementation.
+
 ## 3. Executive objective
 
 Change Harness will be a project-neutral command-line tool that coordinates
@@ -79,7 +84,27 @@ architecture, test adequacy, residual risk, and final acceptance.
 The repository exists, builds, and exposes a read-only diagnostic command.
 Foundation does not manage development work.
 
-### 4.2 Single-repository MVP
+### 4.2 Walking-skeleton validation
+
+Before production workflow code starts, one disposable lifecycle MUST test the
+highest-risk assumptions:
+
+```text
+bounded card
+  → fresh implementation context
+  → exact-baseline worktree
+  → exact-SHA handoff
+  → fresh-context review
+  → candidate combination
+  → exact landing commit
+  → expected-old-SHA bare-authority promotion
+  → deliberate stale-promotion rejection
+```
+
+The walking skeleton is evidence gathering, not an alternate implementation.
+Only its report and resulting plan changes enter `main`.
+
+### 4.3 Single-repository MVP
 
 The MVP is complete only when one repository can execute this full lifecycle
 without manual Git mutation:
@@ -103,19 +128,19 @@ initialize project
   → close and safely remove worktree
 ```
 
-### 4.3 Hardened single-repository release
+### 4.4 Hardened single-repository release
 
 The hardened release adds interruption recovery, concurrency locks, backup
 verification, generated-artifact governance, failure injection, and a complete
 audit report.
 
-### 4.4 Multi-repository release
+### 4.5 Multi-repository release
 
 The multi-repository release coordinates exact candidate SHAs across
 independent repositories with a workspace manifest. It does not claim that Git
 can perform one atomic commit across repositories.
 
-### 4.5 Optional isolation release
+### 4.6 Optional isolation release
 
 Runtime-resource brokers, sandboxed gate execution, stronger actor identity,
 and plugin distribution are separate extensions. They are not prerequisites
@@ -177,6 +202,25 @@ for the single-repository MVP.
 | Promotion | Expected-old-SHA update of the authority repository's protected branch. |
 | Archive ref | Durable ref preserving candidate or integration reachability after ordinary branches are removed. |
 | Project profile | Project-specific repository paths, named gates, generated-artifact rules, and optional adapters. |
+| Spike | Timeboxed experiment that tests named hypotheses without producing production implementation. |
+
+### 6.1 Specification maturity
+
+The following are committed constraints and are not provisional:
+
+- scope and non-goals in Section 5;
+- definitions in Section 6;
+- invariants in Section 7;
+- the separation of candidate, control, review, integration, and acceptance
+  authority;
+- the requirement for exact SHAs, expected-old promotion, and a bare
+  authority.
+
+Detailed schemas, command payloads, and workflow ergonomics in Sections 9–15
+are provisional until `SPIKE-001` is `DONE`. Production implementation MUST NOT
+begin at `WP-100` until the spike report either confirms those contracts or
+this plan is revised. A spike-driven schema correction is expected learning,
+not unauthorized scope expansion.
 
 ## 7. Non-negotiable invariants
 
@@ -1035,6 +1079,24 @@ project-policy revision.
 
 ### 15.1 Independent review
 
+For the initial one-human, multiple-agent-session operating model,
+`independent` has this exact procedural meaning:
+
+1. the reviewer runs in a fresh agent session or context;
+2. the reviewer session is not forked from and does not inherit the feature
+   agent's conversation, hidden reasoning, or working summary;
+3. the reviewer receives only the authoritative review packet, the exact
+   repository objects it references, and repository guidance required to
+   inspect those objects;
+4. the reviewer actor/session ID differs from the feature actor/session ID;
+5. the reviewer does not edit the candidate branch;
+6. requested changes return to the feature actor through a structured review
+   record;
+7. high- and critical-risk human-review requirements still apply.
+
+Fresh context is procedural independence, not a security boundary or
+cryptographic identity proof.
+
 The reviewer MUST receive:
 
 - authoritative cycle and card;
@@ -1184,12 +1246,97 @@ Evidence:
 - `cargo clippy --all-targets --all-features -- -D warnings` passed;
 - working tree was clean after the foundation commit.
 
-### WP-100 — Core contracts and stable command output
+### SPIKE-001 — Disposable end-to-end walking skeleton
 
 | Field | Value |
 | --- | --- |
 | Status | `READY` |
 | Dependencies | `WP-000` |
+| Target release | Walking-skeleton validation |
+| Branch | `spike/SPIKE-001-walking-skeleton` |
+| Maximum duration | 16 active engineering hours or two consecutive working days, whichever occurs first |
+| Maximum prototype size | 300 non-generated executable lines; fixtures, logs, and the report are excluded |
+| Coordinator required reading | Complete implementation plan and `docs/ARCHITECTURE.md` |
+| Implementer required reading | Spike implementation packet only |
+| Reviewer required reading | Spike review packet only |
+
+Purpose:
+
+Validate the agent-facing ceremony, evidence invalidation, integration shape,
+and bare-authority promotion before production schemas and command contracts are
+stabilized.
+
+Required setup:
+
+1. create the spike branch from the current `main`;
+2. create a disposable toy candidate repository outside this repository;
+3. create a disposable bare authority repository;
+4. seed two independent toy changes;
+5. seed one deliberate but non-obvious acceptance omission in the first
+   candidate;
+6. prepare one bounded implementation packet without including the full plan;
+7. prepare one independent review packet;
+8. record every manual or prototype command used.
+
+Required hypotheses:
+
+| ID | Hypothesis | Pass condition |
+| --- | --- | --- |
+| `H-01` | A bounded packet is sufficient for implementation | A fresh implementation context completes the assigned candidate with zero requirement-clarification messages. Tool/environment failures may be reported but do not count as requirement clarification. |
+| `H-02` | Fresh-context review adds semantic value | A fresh reviewer with no inherited implementation conversation identifies the seeded omission before being told its location or nature and records `changes_requested`. |
+| `H-03` | Evidence is bound to exact code | After the initial review, changing the candidate SHA causes the previous handoff and review to be rejected as stale. |
+| `H-04` | Corrected work can be independently approved | The corrected exact candidate receives a new handoff and an approval from a different session ID. |
+| `H-05` | Candidate combination is understandable | Two candidate changes are combined into one landing commit whose parents and tree can be independently explained and verified. |
+| `H-06` | Bare-authority promotion is safe | Promotion succeeds when the authority ref matches the expected baseline, then a deliberately stale expected baseline is rejected without changing the authority ref. |
+| `H-07` | Context recovery is practical | After a simulated context reset, both implementer and reviewer can identify the exact current state and next action from their packets and Git objects without consulting earlier chat. |
+
+Required report:
+
+`docs/spikes/SPIKE-001-REPORT.md` MUST contain:
+
+- start and finish timestamps and active hours;
+- prototype branch and head SHA;
+- toy baseline, candidate, landing, and authority SHAs;
+- exact actor/session identifiers;
+- exact packets given to implementer and reviewer;
+- commands executed and exit results;
+- each hypothesis marked `PASS` or `FAIL` with evidence;
+- every clarification or missing-field request;
+- observed command/artifact count;
+- confusing, redundant, missing, or unsafe ceremony;
+- schema and CLI fields that changed during the exercise;
+- recommendation to preserve, simplify, reorder, or reject the planned design;
+- exact plan sections and work packages requiring revision.
+
+Disposition rules:
+
+- Prototype code MUST NOT merge into `main`.
+- Only the report and approved documentation changes may merge into `main`.
+- The prototype head is retained as `refs/archive/spikes/SPIKE-001`.
+- `WP-100` remains blocked until the report is accepted.
+- If any of `H-02`, `H-03`, `H-05`, or `H-06` fails, the spike is `BLOCKED`
+  or `DONE` with a failed outcome, the plan is revised, and production
+  implementation does not begin.
+- Exceeding the time or line budget stops the spike. The response is
+  simplification, not extending the budget.
+
+Acceptance:
+
+- all seven hypotheses pass;
+- the report contains every required field;
+- no prototype implementation is present on `main`;
+- the archive ref resolves to the recorded prototype head;
+- Sections 9–15 and the work-package sequence are updated from observed
+  evidence;
+- the acceptance owner approves the report;
+- `WP-100` is changed to `READY`.
+
+### WP-100 — Core contracts and stable command output
+
+| Field | Value |
+| --- | --- |
+| Status | `NOT_STARTED` |
+| Dependencies | `SPIKE-001` |
 | Target release | Single-repository MVP |
 
 Deliverables:
@@ -1277,8 +1424,11 @@ Acceptance:
 Deliverables:
 
 - typed command runner;
+- typed command result retaining exit status, stdout, and stderr;
 - Git-version parser;
-- repository/worktree inventory;
+- repository classification as `repository`, `not_repository`, or `git_error`;
+- main, linked, detached, and bare worktree/repository inventory;
+- worktree-command capability check;
 - ref/object/ancestry inspection;
 - clean-state and in-progress-operation detection;
 - NUL-safe diff parser;
@@ -1289,6 +1439,13 @@ Acceptance:
 - no shell command construction;
 - paths containing spaces and Unicode work;
 - malicious path names do not become arguments;
+- a genuine non-repository is reported as `not_repository`;
+- `safe.directory`, permission, malformed-gitdir, and other Git refusals are
+  reported as `git_error` with a sanitized diagnostic, never as
+  `not_repository`;
+- extended `doctor` reports minimum-version compliance, worktree support, and
+  whether the inspected path is the main worktree, a linked worktree, detached,
+  or bare;
 - every parser has real Git fixture coverage;
 - inspection commands perform no repository mutation.
 
@@ -1907,6 +2064,8 @@ The required order is:
 ```text
 WP-000
   ↓
+SPIKE-001
+  ↓
 WP-100
   ├─→ WP-110 → WP-120 ───────────────┐
   └─→ WP-130 ────────────────────────┤
@@ -1937,12 +2096,60 @@ WP-440 ────────────────────────�
 
 Permitted parallel work:
 
+- No production work package may begin until `SPIKE-001` is `DONE` with all
+  required hypotheses passing.
 - `WP-110` and `WP-130` may run after `WP-100`.
 - `WP-300` may begin after the card model fields are stable in `WP-210`.
 - `WP-400` may run after `WP-120` and `WP-130`.
 
 No other parallel implementation is authorized until the dependency graph is
 updated here.
+
+### 18.1 Mandatory dogfooding thresholds
+
+Dogfooding is staged because the tool cannot safely manage lifecycle stages it
+has not implemented.
+
+#### Threshold A — Worktree allocation
+
+Trigger: `WP-230` becomes `DONE`.
+
+Requirement:
+
+- every subsequently started Change Harness work package uses `work start` to
+  create its implementation branch and worktree;
+- manual recovery is allowed only when the harness operation fails and the
+  failure is recorded as a regression;
+- card, review, integration, and landing remain manual until their thresholds.
+
+#### Threshold B — Cards, handoffs, and reviews
+
+Trigger: `WP-320` becomes `DONE`.
+
+Requirement:
+
+- every subsequently started Change Harness work package has an authoritative
+  harness card;
+- its implementation uses harness gate receipts and handoff;
+- review occurs in a fresh agent context and is recorded through the harness;
+- integration and promotion may remain manual but must preserve exact reviewed
+  SHAs.
+
+#### Threshold C — Complete self-hosting
+
+Trigger: `WP-460` becomes `DONE`.
+
+Requirement:
+
+- execute `SELFHOST-001`, a bounded documentation-only Change Harness card,
+  through card activation, worktree allocation, gate receipt, handoff,
+  fresh-context review, integration, acceptance, authority promotion, archive,
+  and cleanup;
+- no manual Git mutation may substitute for a harness command;
+- any failed or bypassed lifecycle stage blocks the Single-repository MVP
+  release gate;
+- after `SELFHOST-001` passes, all Change Harness feature work uses the complete
+  harness lifecycle.
 
 ## 19. Release acceptance gates
 
@@ -1957,7 +2164,22 @@ Status: `DONE`.
 - Format, test, and strict Clippy pass
 - Architecture and agent instructions committed
 
-### 19.2 Single-repository MVP gate
+### 19.2 Walking-skeleton gate
+
+Status: `READY`.
+
+All must be true:
+
+- `SPIKE-001` is `DONE`;
+- `H-01` through `H-07` are `PASS`;
+- `docs/spikes/SPIKE-001-REPORT.md` is accepted;
+- the prototype head is preserved under
+  `refs/archive/spikes/SPIKE-001`;
+- no prototype implementation is present on `main`;
+- Sections 9–15 and the dependency sequence reflect observed evidence;
+- `WP-100` is explicitly changed to `READY`.
+
+### 19.3 Single-repository MVP gate
 
 Status: `NOT_STARTED`.
 
@@ -1976,9 +2198,10 @@ All must be true:
 - audit evidence identifies the exact authority transition;
 - no critical or high open defect remains;
 - README documents installation and operator workflow;
+- `SELFHOST-001` completes every lifecycle stage without manual Git mutation;
 - acceptance owner signs the release record.
 
-### 19.3 Hardened single-repository gate
+### 19.4 Hardened single-repository gate
 
 Status: `NOT_STARTED`.
 
@@ -1992,7 +2215,7 @@ All must be true:
 - one ARTANA profile trial completes without changing the generic engine;
 - no critical/high risk remains unmitigated.
 
-### 19.4 Multi-repository gate
+### 19.5 Multi-repository gate
 
 Status: `DEFERRED`.
 
@@ -2012,10 +2235,11 @@ All must be true:
 | Area | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | Repository foundation | `DONE` | Commit `4729d18` | Preserve |
+| Walking-skeleton validation | `READY` | `SPIKE-001` specification | Execute before production implementation |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
 | CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
-| Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Refactor in `WP-130` |
-| Stable command envelope | `NOT_STARTED` | None | `WP-100` |
+| Read-only Git probe | `DONE` | `src/git.rs`, CLI test | Correct diagnostic classification in `WP-130` |
+| Stable command envelope | `NOT_STARTED` | None | Blocked until `SPIKE-001` passes |
 | Project configuration | `NOT_STARTED` | None | `WP-110` |
 | Control repository | `NOT_STARTED` | None | `WP-120` |
 | Full Git inspection | `NOT_STARTED` | None | `WP-130` |
@@ -2042,9 +2266,9 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-100` |
-| Next branch name | `feature/WP-100-core-contracts` |
-| Next acceptance command | `cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings` |
+| Next work package | `SPIKE-001` |
+| Next branch name | `spike/SPIKE-001-walking-skeleton` |
+| Next acceptance evidence | `docs/spikes/SPIKE-001-REPORT.md`, seven passing hypotheses, accepted plan revision, and archived prototype ref |
 
 ### 20.3 Current demonstrated behavior
 
@@ -2063,6 +2287,13 @@ The current `doctor`:
 - reports the installed Git version;
 - reports the containing Git repository when one exists;
 - performs no mutation.
+
+Known limitation:
+
+- any unsuccessful repository `rev-parse`, including Git refusals such as
+  `safe.directory`, is currently reported as no repository detected because
+  stderr is discarded. `WP-130` owns the typed diagnostic correction and
+  regression coverage.
 
 The current binary does not:
 
@@ -2106,9 +2337,13 @@ commands before commit even though Rust behavior is unchanged.
 | R-007 | Cross-repository landing partially succeeds | Inconsistent workspace | Exact manifest and explicit completion/compensation | Any partial promotion | Deferred with feature |
 | R-008 | Gate retries hide flakiness | False acceptance | Attempt receipts and declared retry policy | Undeclared rerun | Open |
 | R-009 | Tool becomes ARTANA-specific | Reuse failure and coupling | Generic schemas/engine; ARTANA profile only | ARTANA name/command in core domain | Actively controlled |
-| R-010 | Implementation expands into infrastructure platform before MVP | Schedule failure | Single vertical slice and deferred capabilities | Work outside active package/dependencies | Actively controlled |
+| R-010 | Implementation expands into infrastructure platform before MVP | Schedule failure | Timeboxed walking skeleton, single vertical slice, and deferred capabilities | Work outside active package/dependencies or spike budget | Actively controlled |
 | R-011 | Same-disk backup is mistaken for independent backup | Permanent loss | Independent destination validation and restore drill | Backup path shares device | Open |
 | R-012 | Actor string is treated as proven identity | Invalid separation claim | Declare identity limits; stronger boundary optional | Security-sensitive approval needs proof | Open, accepted for local MVP |
+| R-013 | Repository probe discards `rev-parse` failure diagnostics | Git refusal is misreported as non-repository | Preserve exit/stderr and classify repository versus Git error in `WP-130` | Any nonzero repository probe result | Open; foundation limitation |
+| R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | Complete `SPIKE-001` before `WP-100`; keep Sections 9–15 provisional | Production code begins before accepted spike evidence | Actively controlled |
+| R-015 | Full-plan reading consumes feature-agent context | Reduced implementation focus and higher error rate | Role-specific reading contract and explicit per-item reading list | Feature agent is instructed to load the complete plan without a coordination role | Mitigated by plan revision 2 |
+| R-016 | Review reuses implementation context | Nominally independent review repeats the implementer's assumptions | Fresh session, review packet only, different session ID, no branch edits | Reviewer inherits or forks implementation conversation | Mitigated procedurally; not a security boundary |
 
 ## 22. Decision register
 
@@ -2128,10 +2363,14 @@ commands before commit even though Rust behavior is unchanged.
 | D-012 | macOS arm64 is the first supported host | Accepted | Matches current development environment |
 | D-013 | Same-user local operation is not a hard security boundary | Accepted | Honest threat model |
 | D-014 | Licensing remains undecided while `publish = false` | Accepted temporarily | No public distribution has been authorized |
+| D-015 | Run a disposable walking skeleton before stabilizing production contracts | Accepted | Tests agent usability, evidence invalidation, and bare-authority landing before infrastructure hardens assumptions |
+| D-016 | Dogfood in three thresholds: allocation, review, then complete lifecycle | Accepted | Earlier full self-hosting is impossible because required commands do not yet exist |
+| D-017 | Fresh reviewer context is the MVP operational definition of independent agent review | Accepted | Prevents inherited implementation conversation while honestly avoiding a hard identity claim |
+| D-018 | Keep Section 7 invariants committed while treating Sections 9–15 contracts as provisional until the spike | Accepted | Preserves safety boundaries while allowing evidence-driven schema correction |
 
 ## 23. Decisions required later
 
-These are intentionally time-bounded and do not block `WP-100`.
+These are intentionally time-bounded and do not block `SPIKE-001`.
 
 | ID | Decision needed | Deadline | Blocking effect |
 | --- | --- | --- | --- |
@@ -2143,6 +2382,9 @@ These are intentionally time-bounded and do not block `WP-100`.
 | Q-006 | Long-term artifact storage backend | Before one-year landing-log retention is operational | Blocks hardened retention acceptance |
 
 ## 24. Definition of done for every work package
+
+Spikes use their explicitly listed hypothesis and disposition gates. They do
+not become production implementation by satisfying this section.
 
 A work package is `DONE` only when:
 
@@ -2161,15 +2403,16 @@ A work package is `DONE` only when:
 
 ## 25. Plan maintenance procedure
 
-When starting a work package:
+When starting a work package or spike:
 
 1. verify dependencies are `DONE`;
 2. change package status from `READY` or `NOT_STARTED` to `IN_PROGRESS`;
 3. record owner, branch, worktree, and start date;
-4. add or confirm exact acceptance commands;
-5. commit the tracker update before implementation diverges materially.
+4. record the exact `Required reading` headings for the assigned role;
+5. add or confirm exact acceptance commands;
+6. commit the tracker update before implementation diverges materially.
 
-When completing a work package:
+When completing a work package or spike:
 
 1. run all acceptance commands from a clean worktree;
 2. record exact command results and relevant artifact paths;

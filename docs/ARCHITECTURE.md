@@ -72,6 +72,20 @@ This boundary is not implemented in the foundation release.
 
 ## Initial delivery sequence
 
+### Spike 0: walking skeleton
+
+Before stabilizing production schemas, run one disposable, timeboxed lifecycle:
+
+- one bounded card given to a fresh implementation context;
+- one exact-baseline worktree;
+- one exact-SHA handoff;
+- one fresh-context independent review with a seeded omission;
+- two candidate changes combined into one landing commit;
+- one expected-old-SHA promotion to a disposable bare authority;
+- one deliberate stale-promotion rejection.
+
+Only findings and plan revisions enter `main`; prototype code does not.
+
 ### Slice 1: single-repository candidate
 
 - Versioned project configuration
@@ -102,6 +116,15 @@ This boundary is not implemented in the foundation release.
 - Cross-repository gates
 - Namespaced runtime resources
 - Optional constrained gate execution
+
+## Dogfooding thresholds
+
+- After worktree allocation is accepted, Change Harness creates its own new
+  implementation worktrees.
+- After handoff and review are accepted, Change Harness uses its own cards,
+  handoffs, and fresh-context reviews while landing remains manual.
+- After archive and cleanup are accepted, complete self-hosting is mandatory
+  for subsequent Change Harness feature work.
 
 ## Explicitly deferred
 
