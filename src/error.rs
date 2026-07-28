@@ -85,6 +85,8 @@ pub enum ErrorCode {
     PolicyLeaseHeld,
     /// A worktree locator disagrees with authoritative control state.
     PolicyLocatorMismatch,
+    /// A candidate changed paths outside its card's declared scope.
+    PolicyCandidateOutOfScope,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -101,7 +103,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 42] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -137,6 +139,7 @@ impl ErrorCode {
         Self::PreconditionUnmergedWork,
         Self::PolicyLeaseHeld,
         Self::PolicyLocatorMismatch,
+        Self::PolicyCandidateOutOfScope,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -178,7 +181,8 @@ impl ErrorCode {
             | Self::PolicyDependencyUnsatisfied
             | Self::PolicyDependencyCycle
             | Self::PolicyLeaseHeld
-            | Self::PolicyLocatorMismatch => ExitCategory::Policy,
+            | Self::PolicyLocatorMismatch
+            | Self::PolicyCandidateOutOfScope => ExitCategory::Policy,
             Self::PreconditionNotFound
             | Self::PreconditionBaseMissing
             | Self::PreconditionBranchExists
@@ -231,6 +235,7 @@ impl ErrorCode {
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
             Self::PolicyLeaseHeld => "LEASE-HELD",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
+            Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -326,6 +331,9 @@ impl ErrorCode {
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {
                 "The worktree link disagrees with control state; re-allocate rather than trusting it."
+            }
+            Self::PolicyCandidateOutOfScope => {
+                "Revert the out-of-scope changes, or revise the card to declare them."
             }
             Self::RecoveryIncomplete => {
                 "Run `project recover` to resume or diagnose the interrupted operation."

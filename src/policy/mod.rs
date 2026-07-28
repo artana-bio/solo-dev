@@ -6,3 +6,4 @@
 
 pub mod allocation;
 pub mod paths;
+pub mod verification;

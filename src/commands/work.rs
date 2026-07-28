@@ -26,7 +26,8 @@ use crate::{
         },
     },
     error::{ErrorCode, HarnessError},
-    git::{command::GitScope, inspect, worktree},
+    git::{command::GitScope, diff::diff_commits, inspect, worktree},
+    policy::verification::{CandidateFacts, verify},
 };
 
 /// Subcommands under `work`.
@@ -40,6 +41,8 @@ pub enum WorkCommand {
     Checkpoint(CheckpointArgs),
     /// Verify a worktree still matches authoritative control state.
     Resume(CardArgs),
+    /// Verify the candidate stays inside its card.
+    Verify(CardArgs),
     /// Mark work halted pending a decision.
     Block(BlockArgs),
 }
@@ -121,6 +124,7 @@ pub fn execute(command: &WorkCommand, clock: &dyn Clock) -> Result<CommandOutcom
         WorkCommand::Status(args) => run_status(args),
         WorkCommand::Checkpoint(args) => run_checkpoint(args, clock),
         WorkCommand::Resume(args) => run_resume(args),
+        WorkCommand::Verify(args) => run_verify(args),
         WorkCommand::Block(args) => run_block(args, clock),
     }
 }
@@ -676,6 +680,98 @@ fn run_resume(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// Collects the facts verification needs, from Git objects only.
+///
+/// Nothing here reads the worktree's copy of the card. Section 13.3 requires
+/// verification to compare Git objects, because an actor can edit anything
+/// inside their own worktree, including a cached card.
+fn collect_facts(record: &CardRecord, lease: &LeaseRecord) -> Result<CandidateFacts, HarnessError> {
+    let scope = GitScope::work_tree(&lease.worktree_path);
+    let candidate_sha = inspect::resolve_commit(&scope, "HEAD")?;
+    let declared_base = inspect::resolve_commit(&scope, &record.base_sha)?;
+    let actual_base = inspect::merge_base(&scope, &declared_base, &candidate_sha)?;
+    let diff = diff_commits(&scope, &declared_base, &candidate_sha)?;
+
+    let subjects = inspect::raw(
+        &scope,
+        [
+            "log",
+            "--format=%s",
+            &format!("{declared_base}..{candidate_sha}"),
+        ],
+    )?;
+    let commit_subjects: Vec<String> = subjects
+        .trimmed_stdout()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let state = inspect::worktree_state(&scope)?;
+    Ok(CandidateFacts {
+        declared_base,
+        actual_base,
+        candidate_sha,
+        diff,
+        commit_subjects,
+        worktree_clean: state.clean,
+        dirty_paths: state.dirty_paths,
+    })
+}
+
+fn run_verify(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (record, state, lease) = allocation(&control, &card_id)?;
+
+    let facts = collect_facts(&record, &lease)?;
+    let report = verify(&record, state.current_digest.as_str(), &facts);
+
+    let mut text = format!(
+        "Card {card_id} candidate {}\nbase: {}\nchanged paths: {}\nverdict: {}",
+        report.candidate_sha,
+        report.base_sha,
+        report.changed_paths.len(),
+        if report.passed { "PASS" } else { "FAIL" }
+    );
+    for finding in &report.findings {
+        let _ = write!(
+            text,
+            "\n  [{}] {} {}",
+            match finding.severity {
+                crate::policy::verification::Severity::Blocking => "blocking",
+                crate::policy::verification::Severity::Advisory => "advisory",
+            },
+            finding.kind,
+            finding.detail
+        );
+    }
+
+    let outcome = CommandOutcome::new("work.verify", text, serde_json::to_value(&report)?)
+        .with_project(config.project_id.clone());
+
+    if report.passed {
+        Ok(outcome)
+    } else {
+        // A failed verification is a policy refusal, not a report. Returning
+        // success with `passed: false` would let a caller pipe it onward and
+        // treat an out-of-scope candidate as ready.
+        Err(HarnessError::Control {
+            reason: format!(
+                "candidate {} is outside card {card_id}: {}",
+                report.candidate_sha,
+                report
+                    .blocking()
+                    .iter()
+                    .map(|finding| finding.detail.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            code: ErrorCode::PolicyCandidateOutOfScope,
+        })
+    }
 }
 
 fn run_block(args: &BlockArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

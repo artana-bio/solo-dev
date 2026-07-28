@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 12 |
+| Plan revision | 13 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `c2456a7` (`feat(WP-220): ownership, contracts, resources, and dependencies`) |
+| Previous plan commit | `a04869f` (`feat(WP-230): safe worktree allocation and resume link`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-230` complete; 336 tests passing. Threshold A is now live. |
-| Next executable work package | `WP-240` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240` complete; 368 tests passing. Threshold A is live. |
+| Next executable work package | `WP-300` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1796,9 +1796,32 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-220`, `WP-230` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 13 workspace tests plus 19 unit tests;
+- mandatory scenarios 13 through 19 each have a named unit test and, where
+  observable end to end, a workspace test;
+- a card cached inside the worktree cannot widen the real scope: one test plants
+  a permissive card in `.agent/` and asserts the out-of-scope change is still
+  refused;
+- verification is a pure function of committed objects, so repeated runs are
+  byte-identical, which is what makes identical results from another clean clone
+  achievable;
+- a rename is checked on both sides, so moving a file from outside the scope
+  into it is refused on the source;
+- an excluded path is reported distinctly from an out-of-scope path, because the
+  operator fix differs.
+
+Note: verification diffs the declared base against the candidate, not commit to
+commit. A file added and then chmod'd within the candidate is therefore a single
+addition at mode 100755, not a mode change. A first test asserted otherwise and
+was wrong about the model rather than finding a defect.
 
 Deliverables:
 
@@ -2515,10 +2538,11 @@ All must be true:
 | Cards | `DONE` | `WP-210`, 36 tests | Preserve |
 | Ownership and overlap | `DONE` | `WP-220`, 44 tests | Preserve |
 | Worktree allocation | `DONE` | `WP-230`, 35 tests | Preserve |
-| Candidate verification | `READY` | `WP-230` complete | `WP-240` |
+| Candidate verification | `DONE` | `WP-240`, 32 tests | Preserve |
+| Gates and receipts | `READY` | `WP-210` complete | `WP-300`, `WP-310` |
 
 
-| Gates and receipts | `NOT_STARTED` | None | `WP-300`, `WP-310` |
+
 | Handoff and review | `NOT_STARTED` | None | `WP-250`, `WP-320` |
 | Bare authority | `NOT_STARTED` | None | `WP-400` |
 | Integration | `NOT_STARTED` | None | `WP-410` onward |
@@ -2538,8 +2562,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-240` |
-| Next branch name | `wp/WP-240-candidate-verification` |
+| Next work package | `WP-300` |
+| Next branch name | `wp/WP-300-gate-registry` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2665,6 +2689,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
 | D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
 | D-030 | Accept card drafts in YAML or JSON via `serde_yaml_ng` | Accepted | D-010 permits YAML drafts. `serde_yaml` is archived, so a maintained fork is used. JSON is accepted for free because it is a YAML subset, which suits machine authors without a second code path. |
+| D-032 | Add `work verify` to the Section 12.3 command surface | Accepted | `WP-240` produces a structured verification report, and without a command it would only be observable through `handoff create` in `WP-250`. A separate read-only command lets an actor check scope before attempting handoff. |
+| D-033 | Treat a failed verification as a policy refusal rather than a successful report | Accepted | Returning exit 0 with `passed: false` would let a caller pipe the result onward and treat an out-of-scope candidate as ready. The verdict is the command's outcome, not its payload. |
 | D-031 | Include `created_at` and `base_sha` in the card digest | Accepted | The digest identifies one exact record instance, not a class of equivalent cards. Two identical drafts activated at different times digest differently, which is the correct behavior when the digest is what reviews and receipts bind to. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
