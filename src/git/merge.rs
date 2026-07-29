@@ -41,6 +41,13 @@ pub enum ConflictKind {
     DirectoryFile,
     /// The sides disagree about a path's object type.
     DistinctTypes,
+    /// Both sides changed a file Git cannot merge textually.
+    ///
+    /// Structural, not textual, and the distinction is not cosmetic: Git writes
+    /// "our" side verbatim into the conflicted tree with no conflict markers, so
+    /// telling an actor to resolve it by editing markers sends them looking for
+    /// something that is not there.
+    Binary,
     /// Anything Git reports that this list does not name.
     Other,
 }
@@ -68,8 +75,14 @@ impl ConflictKind {
             "CONFLICT (modify/delete)" => Self::ModifyDelete,
             "CONFLICT (rename/rename)" => Self::RenameRename,
             "CONFLICT (rename/delete)" => Self::RenameDelete,
-            "CONFLICT (directory/file)" | "CONFLICT (file/directory)" => Self::DirectoryFile,
-            "CONFLICT (distinct types)" => Self::DistinctTypes,
+            "CONFLICT (file/directory)" => Self::DirectoryFile,
+            // `distinct modes`, not `distinct types`. The phrase "distinct
+            // types" appears only inside Git's human message, so the old arm
+            // was unreachable and every file-versus-symlink change was reported
+            // as `other`. Likewise `CONFLICT (directory/file)` is a token no
+            // supported Git emits, in either merge direction.
+            "CONFLICT (distinct modes)" => Self::DistinctTypes,
+            "CONFLICT (binary)" => Self::Binary,
             _ => Self::Other,
         }
     }
@@ -86,6 +99,7 @@ impl ConflictKind {
             | Self::RenameDelete
             | Self::DirectoryFile
             | Self::DistinctTypes
+            | Self::Binary
             | Self::Other => ConflictClass::Structural,
         }
     }
@@ -100,6 +114,7 @@ impl ConflictKind {
             Self::RenameDelete => "rename_delete",
             Self::DirectoryFile => "directory_file",
             Self::DistinctTypes => "distinct_types",
+            Self::Binary => "binary",
             Self::Other => "other",
         }
     }
@@ -234,6 +249,26 @@ fn parse_preview(stdout: &str) -> Result<MergePreview, HarnessError> {
             detail: detail.trim().to_owned(),
         });
     }
+
+    // Git reports a binary conflict twice for the same path: `CONFLICT (binary)`
+    // and then `CONFLICT (contents)`. The second is a lie about what is in the
+    // tree — Git wrote one side verbatim, with no conflict markers — so keeping
+    // it both doubles the count and tells an actor to resolve markers that do
+    // not exist. The `binary` record is the one kept, because its detail names
+    // both sides, which is what someone choosing a side needs.
+    //
+    // Matched on the exact path vector rather than membership: every binary form
+    // observed (real binary content, binary add/add, and a text file marked
+    // binary in .gitattributes) carries the same single-path vector in both
+    // records, so equality is as loose as the evidence supports.
+    let binary: std::collections::HashSet<Vec<String>> = conflicts
+        .iter()
+        .filter(|conflict| conflict.kind == ConflictKind::Binary)
+        .map(|conflict| conflict.paths.clone())
+        .collect();
+    conflicts.retain(|conflict| {
+        conflict.kind != ConflictKind::Content || !binary.contains(&conflict.paths)
+    });
 
     Ok(MergePreview { tree, conflicts })
 }
@@ -417,11 +452,116 @@ mod tests {
         );
     }
 
+    /// Adds a committed binary file to `main` before any branching.
+    fn with_binary(fixture: &Fixture) {
+        git(&fixture.path, &["checkout", "-q", "main"]);
+        fs::write(fixture.path.join("b.bin"), b"\x00\x01\x02base\x00").unwrap();
+        git(&fixture.path, &["add", "-A"]);
+        git(&fixture.path, &["commit", "-q", "-m", "bin base"]);
+    }
+
+    #[test]
+    fn a_binary_conflict_is_reported_once_and_is_not_textual() {
+        // Git reports a binary conflict three times — `CONFLICT (binary)`,
+        // `Auto-merging`, `CONFLICT (contents)` — and the parser kept two of
+        // them, so one path became two conflicts and one of those was labelled
+        // textual. There are no conflict markers in the tree to edit: Git wrote
+        // "our" side verbatim.
+        let fixture = Fixture::new();
+        with_binary(&fixture);
+        fixture.branch("ba", |path| {
+            fs::write(path.join("b.bin"), b"\x00\x01AAAA\x00").unwrap();
+        });
+        fixture.branch("bb", |path| {
+            fs::write(path.join("b.bin"), b"\x00\x01BBBB\x00").unwrap();
+        });
+
+        let preview = merge_tree(&fixture.path, "ba", "bb").expect("a preview");
+        assert_eq!(preview.conflicts.len(), 1, "unexpected: {preview:?}");
+        assert_eq!(preview.conflicts[0].kind, ConflictKind::Binary);
+        assert_eq!(preview.of_class(ConflictClass::Textual).count(), 0);
+        assert_eq!(preview.of_class(ConflictClass::Structural).count(), 1);
+    }
+
+    #[test]
+    fn a_text_conflict_beside_a_binary_one_survives() {
+        // The guard against collapsing too much. Deduplicating by path
+        // membership rather than by the exact path vector, or dropping every
+        // `content` record once any binary conflict exists, would silently eat a
+        // real textual conflict — and textual conflict reporting is what this
+        // command is for.
+        let fixture = Fixture::new();
+        with_binary(&fixture);
+        fixture.branch("ma", |path| {
+            fs::write(path.join("b.bin"), b"\x00\x01AAAA\x00").unwrap();
+            fs::write(path.join("f.txt"), "line1\nMINE\nline3\n").unwrap();
+        });
+        fixture.branch("mb", |path| {
+            fs::write(path.join("b.bin"), b"\x00\x01BBBB\x00").unwrap();
+            fs::write(path.join("f.txt"), "line1\nTHEIRS\nline3\n").unwrap();
+        });
+
+        let preview = merge_tree(&fixture.path, "ma", "mb").expect("a preview");
+        assert_eq!(preview.conflicts.len(), 2, "unexpected: {preview:?}");
+        assert_eq!(preview.of_class(ConflictClass::Textual).count(), 1);
+        assert_eq!(
+            preview
+                .of_class(ConflictClass::Textual)
+                .next()
+                .expect("a textual conflict")
+                .paths,
+            ["f.txt"]
+        );
+        assert_eq!(preview.of_class(ConflictClass::Structural).count(), 1);
+    }
+
+    #[test]
+    fn a_type_change_is_named_not_lumped_into_other() {
+        // Git's token is `CONFLICT (distinct modes)`; the table looked for
+        // `distinct types`, which appears only in the human message. So the
+        // `DistinctTypes` variant was unreachable and every type change was
+        // reported as `other`.
+        let fixture = Fixture::new();
+        fixture.branch("ta", |path| {
+            fs::write(path.join("t"), "a regular file\n").unwrap();
+        });
+        fixture.branch("tb", |path| {
+            std::os::unix::fs::symlink("f.txt", path.join("t")).unwrap();
+        });
+
+        let preview = merge_tree(&fixture.path, "ta", "tb").expect("a preview");
+        assert_eq!(preview.conflicts.len(), 1, "unexpected: {preview:?}");
+        assert_eq!(preview.conflicts[0].kind, ConflictKind::DistinctTypes);
+        assert_eq!(preview.conflicts[0].kind.class(), ConflictClass::Structural);
+    }
+
+    #[test]
+    fn a_file_against_a_directory_is_named() {
+        let fixture = Fixture::new();
+        fixture.branch("fa", |path| {
+            fs::write(path.join("thing"), "a file\n").unwrap();
+        });
+        fixture.branch("fb", |path| {
+            fs::create_dir_all(path.join("thing")).unwrap();
+            fs::write(path.join("thing/inner.txt"), "inside\n").unwrap();
+        });
+
+        let preview = merge_tree(&fixture.path, "fa", "fb").expect("a preview");
+        assert_eq!(preview.conflicts.len(), 1, "unexpected: {preview:?}");
+        assert_eq!(preview.conflicts[0].kind, ConflictKind::DirectoryFile);
+    }
+
     #[test]
     fn an_unknown_conflict_token_is_kept_and_treated_as_structural() {
         // Guards the parser's default. A conflict this code cannot name must
         // not vanish, and must not be reported as the milder textual case.
-        let kind = ConflictKind::parse("CONFLICT (submodule)");
+        //
+        // The token must be one Git cannot emit. This used `CONFLICT
+        // (submodule)`, which is a real Git 2.50 token, so the test was pinning
+        // the table's gap open rather than guarding its default — and it would
+        // have silently become a submodule-classification test the moment
+        // anyone extended the table.
+        let kind = ConflictKind::parse("CONFLICT (wormhole)");
         assert_eq!(kind, ConflictKind::Other);
         assert_eq!(kind.class(), ConflictClass::Structural);
     }
