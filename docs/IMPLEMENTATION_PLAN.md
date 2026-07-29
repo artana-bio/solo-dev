@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 35 |
+| Plan revision | 36 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 699 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 718 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2683,9 +2683,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-310`, `WP-420` |
 | Target release | Hardened single-repository release |
+| Evidence | `src/domain/artifact.rs`, validation in `src/domain/card.rs`, enforcement in `src/policy/verification.rs`, `tests/artifacts.rs` (10 acceptance tests) |
 
 Deliverables:
 
@@ -2702,6 +2703,32 @@ Acceptance:
 - per-card outputs require in-scope sources;
 - shared outputs are generated once in integration;
 - serialized identifiers are allocated before work.
+
+Delivered notes:
+
+- The class is required rather than defaulted. A path with no class is the
+  failure this package exists to prevent, and guessing one would reintroduce
+  it quietly (D-059).
+- `generated_artifacts` changed from `Vec<String>` to a typed declaration,
+  which is a change to the Section 10.3 card contract. Every stored card in
+  this project declared an empty list, so nothing needed migrating.
+- Each class implies an owner, and the scope rules follow from that. A
+  per-card artifact generated from sources the card does not own would go
+  stale the moment somebody else changed them, with nothing to notice. A
+  shared artifact inside a card's write scope is one path with two owners,
+  which is the exact collision the classes prevent.
+- A transient artifact naming a generator is refused. Not pedantry: a
+  generator implies someone believes the file is regenerated and checked, and
+  nothing checks a file that is never committed.
+- **Not delivered: integration-owned generation.** A shared artifact is
+  classified and no card may commit it, but nothing produces it during
+  integration yet. The `WP-430` landing guard therefore still refuses a
+  shared declaration — narrowed from refusing *all* generated artifacts, which
+  was the conservative reading available before classes existed. Deterministic
+  regeneration checking is likewise not built. Both are named here rather than
+  implied by the package being `DONE`.
+
+| D-059 | Require a class on every generated declaration rather than defaulting one | Accepted | A default would have to be either transient — silently forbidding a file somebody committed on purpose — or per-card, silently granting a card ownership of something integration should produce. Both restore the ambiguity the classification exists to remove, and neither failure is visible at the point it is made. Requiring the class costs one line per declaration and makes the ownership decision explicit where it belongs, in the card under review. |
 
 ### WP-600 — Workspace manifest
 

@@ -284,16 +284,38 @@ fn check_path(
         ));
     }
 
-    if card
+    // Whether a generated path may be committed is a matter of class, not of
+    // taste. Transient output belongs to nobody and shared output belongs to
+    // integration, so a card committing either is claiming something it does
+    // not own — which is the whole reason the classes exist.
+    if let Some(artifact) = card
         .generated_artifacts
         .iter()
-        .any(|pattern| super::paths::matches(pattern, path, case))
+        .find(|artifact| super::paths::matches(&artifact.path, path, case))
     {
-        findings.push(Finding::advisory(
-            "generated-artifact",
-            Some(path.to_owned()),
-            format!("`{path}` is a declared generated artifact"),
-        ));
+        if artifact.class.card_may_commit() {
+            findings.push(Finding::advisory(
+                "generated-artifact",
+                Some(path.to_owned()),
+                format!(
+                    "`{path}` is a declared `{}` artifact",
+                    artifact.class.name()
+                ),
+            ));
+        } else {
+            findings.push(Finding::blocking(
+                "generated-artifact-not-owned",
+                Some(path.to_owned()),
+                match artifact.class {
+                    crate::domain::artifact::ArtifactClass::Transient => format!(
+                        "`{path}` is declared transient and must never be committed"
+                    ),
+                    _ => format!(
+                        "`{path}` is declared shared; integration generates it, so no card may commit it"
+                    ),
+                },
+            ));
+        }
     }
 
     findings
@@ -364,12 +386,17 @@ fn check_entry_kind(change: &ChangedPath) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::artifact::{ArtifactClass, GeneratedArtifact};
     use crate::domain::{
         card::{Acceptance, CardDraft, CardRecord, NamedGates, Risk, WriteScope},
         clock::{Clock as _, FixedClock},
     };
 
-    fn card_with(include: &[&str], exclude: &[&str], generated: &[&str]) -> CardRecord {
+    fn card_with(
+        include: &[&str],
+        exclude: &[&str],
+        generated: &[GeneratedArtifact],
+    ) -> CardRecord {
         let draft = CardDraft {
             card_id: "F-001".parse().unwrap(),
             cycle_id: "C-001".parse().unwrap(),
@@ -396,12 +423,28 @@ mod tests {
                 behaviors: vec!["works".to_owned()],
                 regressions: vec![],
             },
-            generated_artifacts: generated.iter().map(|s| (*s).to_owned()).collect(),
+            generated_artifacts: generated.to_vec(),
             review_policy: "independent".to_owned(),
             rollback_strategy: "revert".to_owned(),
         };
         let stamp = FixedClock::at_unix_seconds(1_785_196_800).unwrap().now();
         CardRecord::activate(&draft, 1, "alvaro", stamp).unwrap()
+    }
+
+    /// A declaration of the given class, with whatever that class requires.
+    fn artifact(path: &str, class: ArtifactClass) -> GeneratedArtifact {
+        GeneratedArtifact {
+            path: path.to_owned(),
+            class,
+            generator: matches!(class, ArtifactClass::PerCard | ArtifactClass::Shared)
+                .then(|| "gate.generate".to_owned()),
+            sources: if class == ArtifactClass::PerCard {
+                vec!["src/**".to_owned()]
+            } else {
+                Vec::new()
+            },
+            identifier: (class == ArtifactClass::Serialized).then(|| "0007".to_owned()),
+        }
     }
 
     fn facts(raw_diff: &str) -> CandidateFacts {
@@ -626,15 +669,60 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_generated_artifact_is_advisory_only() {
-        let card = card_with(&["src/**"], &[], &["src/generated.rs"]);
+    fn committing_an_artifact_the_card_owns_is_advisory() {
+        let card = card_with(
+            &["src/**"],
+            &[],
+            &[artifact("src/generated.rs", ArtifactClass::PerCard)],
+        );
         let report = verify(
             &card,
             "sha256:x",
             &facts(":100644 100644 a b M\0src/generated.rs\0"),
         );
-        assert!(report.passed);
+        assert!(report.passed, "a card may commit what it generates");
         assert!(kinds(&report).contains(&"generated-artifact"));
+    }
+
+    #[test]
+    fn committing_a_transient_artifact_blocks() {
+        let card = card_with(
+            &["src/**"],
+            &[],
+            &[artifact("src/generated.rs", ArtifactClass::Transient)],
+        );
+        let report = verify(
+            &card,
+            "sha256:x",
+            &facts(":100644 100644 a b M\0src/generated.rs\0"),
+        );
+        assert!(!report.passed, "transient output belongs to nobody");
+        assert!(kinds(&report).contains(&"generated-artifact-not-owned"));
+    }
+
+    #[test]
+    fn committing_a_shared_artifact_blocks() {
+        let card = card_with(
+            &["src/**"],
+            &[],
+            &[artifact("src/generated.rs", ArtifactClass::Shared)],
+        );
+        let report = verify(
+            &card,
+            "sha256:x",
+            &facts(":100644 100644 a b M\0src/generated.rs\0"),
+        );
+        assert!(!report.passed, "integration owns a shared artifact");
+        let detail = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "generated-artifact-not-owned")
+            .expect("a blocking finding");
+        assert!(
+            detail.detail.contains("integration generates it"),
+            "the reason must say who owns it: {}",
+            detail.detail
+        );
     }
 
     #[test]
