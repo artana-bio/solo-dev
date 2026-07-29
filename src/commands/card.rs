@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::output::CommandOutcome,
-    commands::transaction::with_transaction,
+    commands::{gate::require_registered, transaction::with_transaction},
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         card::{CARD_DIR, CardDraft, CardRecord, CardState},
@@ -451,8 +451,29 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             let config = control.project()?;
 
             let record = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
+            // A card may only name gates the registry defines (D-008). Checked
+            // at activation so an undefined check fails now rather than at the
+            // point its evidence was supposed to exist.
+            require_registered(
+                control,
+                record
+                    .named_gates
+                    .feature
+                    .iter()
+                    .chain(&record.named_gates.review)
+                    .chain(&record.named_gates.integration),
+            )?;
             // Ownership, contract, resource, and dependency checks run before
             // anything is written, so a refused card leaves no trace.
+            require_registered(
+                control,
+                record
+                    .named_gates
+                    .feature
+                    .iter()
+                    .chain(&record.named_gates.review)
+                    .chain(&record.named_gates.integration),
+            )?;
             check_allocation(control, &cycle, &record)?;
             let digest = record.digest()?;
             write_revision(control, &record, &digest, CardState::Ready)?;

@@ -4,5 +4,6 @@ pub mod card;
 pub mod clock;
 pub mod cycle;
 pub mod digest;
+pub mod gate;
 pub mod ids;
 pub mod lease;

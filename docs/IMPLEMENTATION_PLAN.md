@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 13 |
+| Plan revision | 14 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `a04869f` (`feat(WP-230): safe worktree allocation and resume link`) |
+| Previous plan commit | `f2066bd` (`feat(WP-240): authoritative candidate verification`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240` complete; 368 tests passing. Threshold A is live. |
-| Next executable work package | `WP-300` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240`, `WP-300` complete; 399 tests passing. Threshold A is live. |
+| Next executable work package | `WP-310` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1875,9 +1875,27 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-110`, `WP-210` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 14 workspace tests plus 17 unit tests;
+- a card cannot introduce a command: the schema has no field that carries one,
+  and naming an unregistered gate fails activation with the gate named;
+- shell strings are refused at registration, including a single argv entry
+  containing spaces, pipes, semicolons, and command substitution;
+- an argument may still contain spaces, because nothing splits it; only the
+  executable is checked for shell syntax;
+- working directories outside the evaluation worktree are refused;
+- credential variables are denied even when explicitly allowlisted;
+- a gate revision moves its digest and records the superseded digest in the
+  event, which is what makes an older receipt detectably stale;
+- revisions must advance by exactly one, so a receipt traces to a definition
+  rather than to whichever version happened to be on disk.
 
 Deliverables:
 
@@ -2539,7 +2557,8 @@ All must be true:
 | Ownership and overlap | `DONE` | `WP-220`, 44 tests | Preserve |
 | Worktree allocation | `DONE` | `WP-230`, 35 tests | Preserve |
 | Candidate verification | `DONE` | `WP-240`, 32 tests | Preserve |
-| Gates and receipts | `READY` | `WP-210` complete | `WP-300`, `WP-310` |
+| Gate registry | `DONE` | `WP-300`, 31 tests | Preserve |
+| Gate runner and receipts | `READY` | `WP-300` complete | `WP-310` |
 
 
 
@@ -2562,8 +2581,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-300` |
-| Next branch name | `wp/WP-300-gate-registry` |
+| Next work package | `WP-310` |
+| Next branch name | `wp/WP-310-gate-runner` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2689,6 +2708,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
 | D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
 | D-030 | Accept card drafts in YAML or JSON via `serde_yaml_ng` | Accepted | D-010 permits YAML drafts. `serde_yaml` is archived, so a maintained fork is used. JSON is accepted for free because it is a YAML subset, which suits machine authors without a second code path. |
+| D-034 | Add `gate validate`, `register`, `list`, and `show` to the Section 12.3 command surface | Accepted | Section 12.3 lists only `gate run` and `gate status`, but gates must be registered before a card can name one, and D-008 makes registration a deliberate trusted act rather than a side effect of authoring a card. |
 | D-032 | Add `work verify` to the Section 12.3 command surface | Accepted | `WP-240` produces a structured verification report, and without a command it would only be observable through `handoff create` in `WP-250`. A separate read-only command lets an actor check scope before attempting handoff. |
 | D-033 | Treat a failed verification as a policy refusal rather than a successful report | Accepted | Returning exit 0 with `passed: false` would let a caller pipe the result onward and treat an out-of-scope candidate as ready. The verdict is the command's outcome, not its payload. |
 | D-031 | Include `created_at` and `base_sha` in the card digest | Accepted | The digest identifies one exact record instance, not a class of equivalent cards. Two identical drafts activated at different times digest differently, which is the correct behavior when the digest is what reviews and receipts bind to. |

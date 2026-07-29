@@ -49,6 +49,10 @@ pub enum ErrorCode {
     ConfigUnsupportedHost,
     /// A configured value was structurally valid but not usable.
     ConfigInvalidValue,
+    /// A gate definition violates a registry rule.
+    ConfigInvalidGate,
+    /// A card names a gate the registry does not define.
+    ConfigUnknownGate,
     /// An existing control repository does not match the supplied configuration.
     ConfigControlIncompatible,
     /// Another process holds the project mutation lock.
@@ -103,7 +107,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 44] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -121,6 +125,8 @@ impl ErrorCode {
         Self::ConfigGitVersion,
         Self::ConfigUnsupportedHost,
         Self::ConfigInvalidValue,
+        Self::ConfigInvalidGate,
+        Self::ConfigUnknownGate,
         Self::ConfigControlIncompatible,
         Self::PolicyLockHeld,
         Self::PolicyInvalidTransition,
@@ -170,6 +176,8 @@ impl ErrorCode {
             | Self::ConfigGitVersion
             | Self::ConfigUnsupportedHost
             | Self::ConfigInvalidValue
+            | Self::ConfigInvalidGate
+            | Self::ConfigUnknownGate
             | Self::ConfigControlIncompatible => ExitCategory::Configuration,
             Self::PolicyLockHeld
             | Self::PolicyInvalidTransition
@@ -217,6 +225,8 @@ impl ErrorCode {
             Self::ConfigGitVersion => "GIT-VERSION",
             Self::ConfigUnsupportedHost => "UNSUPPORTED-HOST",
             Self::ConfigInvalidValue => "INVALID-VALUE",
+            Self::ConfigInvalidGate => "INVALID-GATE",
+            Self::ConfigUnknownGate => "UNKNOWN-GATE",
             Self::ConfigControlIncompatible => "CONTROL-INCOMPATIBLE",
             Self::PolicyLockHeld => "LOCK-HELD",
             Self::PolicyInvalidTransition => "INVALID-TRANSITION",
@@ -252,8 +262,23 @@ impl ErrorCode {
     }
 
     /// Operator guidance for recovering from this failure.
+    ///
+    /// Split by category rather than kept as one match: the registry grows with
+    /// every work package, and a single arm list would keep outgrowing any
+    /// reasonable function length.
     #[must_use]
     pub const fn recovery(self) -> &'static str {
+        match self.category() {
+            ExitCategory::Usage => self.usage_recovery(),
+            ExitCategory::Configuration => self.config_recovery(),
+            ExitCategory::Policy => self.policy_recovery(),
+            ExitCategory::Precondition => self.precondition_recovery(),
+            _ => self.other_recovery(),
+        }
+    }
+
+    /// Guidance for usage failures.
+    const fn usage_recovery(self) -> &'static str {
         match self {
             Self::UsageInvalidId => {
                 "Supply an identifier matching its documented prefix and shape."
@@ -261,9 +286,14 @@ impl ErrorCode {
             Self::UsageInvalidDigest => "Supply a digest of the form sha256:<64 lowercase hex>.",
             Self::UsageInvalidTimestamp => "Supply an RFC 3339 UTC timestamp.",
             Self::UsageConflictingOptions => "Remove one of the conflicting options.",
-            Self::PreconditionWorkspaceMissing => "Create the path or pass an existing one.",
-            Self::PreconditionWorkspaceAccess => "Check filesystem permissions on the path.",
-            Self::ConfigMalformed => "Correct the JSON syntax of the project file.",
+            _ => "Correct the command invocation.",
+        }
+    }
+
+    /// Guidance for configuration failures.
+    const fn config_recovery(self) -> &'static str {
+        match self {
+            Self::ConfigMalformed => "Correct the JSON or YAML syntax of the document.",
             Self::ConfigUnknownField => {
                 "Remove the field; the schema rejects fields it does not define."
             }
@@ -283,10 +313,22 @@ impl ErrorCode {
             Self::ConfigUnsupportedHost => {
                 "Run on a supported host, or add this host to the support list deliberately."
             }
-            Self::ConfigInvalidValue => "Correct the reported field to a value the schema accepts.",
+            Self::ConfigInvalidGate => {
+                "Correct the gate definition; argv is an array and commands are never shell strings."
+            }
+            Self::ConfigUnknownGate => {
+                "Register the gate before naming it in a card, or correct the gate name."
+            }
             Self::ConfigControlIncompatible => {
                 "Point at the matching control repository, or initialize a new project elsewhere."
             }
+            _ => "Correct the reported field to a value the schema accepts.",
+        }
+    }
+
+    /// Guidance for policy failures.
+    const fn policy_recovery(self) -> &'static str {
+        match self {
             Self::PolicyLockHeld => "Wait for the other command to finish, then retry.",
             Self::PolicyInvalidTransition => {
                 "Move through the documented states in order, or abandon the subject."
@@ -312,6 +354,22 @@ impl ErrorCode {
             Self::PolicyDependencyCycle => {
                 "Break the reported cycle by removing one dependency edge."
             }
+            Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
+            Self::PolicyLocatorMismatch => {
+                "The worktree link disagrees with control state; re-allocate rather than trusting it."
+            }
+            Self::PolicyCandidateOutOfScope => {
+                "Revert the out-of-scope changes, or revise the card to declare them."
+            }
+            _ => "Resolve the reported policy violation.",
+        }
+    }
+
+    /// Guidance for precondition failures.
+    const fn precondition_recovery(self) -> &'static str {
+        match self {
+            Self::PreconditionWorkspaceMissing => "Create the path or pass an existing one.",
+            Self::PreconditionWorkspaceAccess => "Check filesystem permissions on the path.",
             Self::PreconditionNotFound => "Create the named record, or correct the identifier.",
             Self::PreconditionBaseMissing => {
                 "Fetch the base commit into this repository, or revise the card's base."
@@ -328,27 +386,25 @@ impl ErrorCode {
             Self::PreconditionUnmergedWork => {
                 "Land or archive the branch's commits before deleting it."
             }
-            Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
-            Self::PolicyLocatorMismatch => {
-                "The worktree link disagrees with control state; re-allocate rather than trusting it."
-            }
-            Self::PolicyCandidateOutOfScope => {
-                "Revert the out-of-scope changes, or revise the card to declare them."
-            }
+            _ => "Satisfy the reported precondition, then retry.",
+        }
+    }
+
+    /// Guidance for the remaining categories.
+    const fn other_recovery(self) -> &'static str {
+        match self {
             Self::RecoveryIncomplete => {
                 "Run `project recover` to resume or diagnose the interrupted operation."
-            }
-            Self::InternalControlCorrupt => {
-                "Inspect the control repository history; this indicates a harness defect or external edit."
             }
             Self::ConflictControlHeadMoved => {
                 "Reload the project and retry; another writer advanced control state."
             }
             Self::ExternalGitUnavailable => "Install Git and ensure it is on PATH.",
             Self::ExternalGitCommand => "Inspect the reported Git diagnostic and retry.",
-            Self::InternalEncoding => {
-                "Report this as a defect; it indicates a harness invariant violation."
+            Self::InternalControlCorrupt => {
+                "Inspect the control repository history; this indicates a harness defect or external edit."
             }
+            _ => "Report this as a defect; it indicates a harness invariant violation.",
         }
     }
 }

@@ -33,14 +33,7 @@ fn help_does_not_advertise_unimplemented_commands() {
     // Section 12.3 lists these, but they must stay absent until their owning
     // work packages implement them. This list shrinks as packages land, which
     // is the point: help must never advertise a command that does nothing.
-    for absent in [
-        "gate",
-        "handoff",
-        "review",
-        "integration",
-        "acceptance",
-        "archive",
-    ] {
+    for absent in ["handoff", "review", "integration", "acceptance", "archive"] {
         assert!(
             !stdout.contains(&format!("  {absent}")),
             "help advertises unimplemented `{absent}`"

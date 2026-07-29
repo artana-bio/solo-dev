@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     commands::{
-        card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, project::ProjectCommand,
-        work::WorkCommand,
+        card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand,
+        project::ProjectCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -63,6 +63,12 @@ pub enum Command {
     Work {
         #[command(subcommand)]
         command: WorkCommand,
+    },
+
+    /// Register and inspect named validation gates.
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
     },
 }
 

@@ -41,7 +41,8 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         Command::Project { .. }
         | Command::Cycle { .. }
         | Command::Card { .. }
-        | Command::Work { .. } => None,
+        | Command::Work { .. }
+        | Command::Gate { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -55,6 +56,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Cycle { .. } => "cycle",
         Command::Card { .. } => "card",
         Command::Work { .. } => "work",
+        Command::Gate { .. } => "gate",
     }
 }
 
@@ -119,6 +121,15 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         Command::Work { command } => {
             let resolved = resolve_output(cli.output, None)?;
             let outcome = commands::work::execute(&command, &domain::clock::SystemClock)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
+        Command::Gate { command } => {
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome = commands::gate::execute(&command, &domain::clock::SystemClock)?;
             Ok(Execution {
                 stdout: outcome.render(resolved.format)?,
                 warnings: outcome.warnings().to_vec(),

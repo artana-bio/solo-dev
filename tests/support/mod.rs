@@ -90,7 +90,79 @@ impl Workspace {
             "project init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // Cards may only name registered gates, so the fixtures every test uses
+        // must exist before any card is activated.
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
         workspace
+    }
+
+    /// Registers a gate at revision 1 with the given argv.
+    pub fn register_gate(&self, gate_id: &str, argv: &[&str]) {
+        let list = argv
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+        );
+        let path = self.root.join(format!("{gate_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        let output = Self::run(&[
+            "gate".into(),
+            "register".into(),
+            "--control".into(),
+            self.control.display().to_string(),
+            "--definition".into(),
+            path.display().to_string(),
+        ]);
+        assert!(
+            output.status.success(),
+            "gate register {gate_id} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Runs a `gate` subcommand in JSON mode without asserting success.
+    pub fn gate_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "gate".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+        ];
+        if args[0] != "validate" {
+            full.push("--control".to_owned());
+            full.push(self.control.display().to_string());
+        }
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs a `gate` subcommand, asserting success.
+    pub fn gate(&self, args: &[&str]) -> Output {
+        let output = self.gate_raw(args);
+        assert!(
+            output.status.success(),
+            "gate {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a `gate` subcommand and parses its JSON envelope.
+    pub fn gate_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.gate(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Writes a gate definition file and returns its path.
+    pub fn gate_definition(&self, name: &str, body: &str) -> String {
+        let path = self.root.join(format!("{name}.yaml"));
+        fs::write(&path, body).unwrap();
+        path.display().to_string()
     }
 
     /// Runs the harness binary with the given arguments.
