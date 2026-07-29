@@ -93,9 +93,32 @@ prefix, so stripping three bytes turned `src/alpha.rs` into `/alpha.rs`.
 truncating it. Recording the disambiguation so the next reader does not
 re-audit `diff.rs`. Dependency SHAs are never bound to
 a review. Cycle status folds card events. Five cycle statuses and one card state
-are unreachable. Generated-artifact scope checks compare globs with `==`. Merge
-honours `commit.gpgsign` and repository hooks, contradicting "hooks are
-advisory".
+are unreachable. Merge honours `commit.gpgsign` and repository hooks,
+contradicting "hooks are advisory".
+
+✅ **FIXED:** generated-artifact scope checks compared globs with `==`. Both
+directions were wrong and in opposite ways: a shared artifact covered by a glob
+include was **accepted** — one path with two owners, the exact thing the class
+exists to prevent — while a per-card source the card plainly owns was
+**refused**. Excludes were ignored entirely. Sources now require containment
+(`Scope::allows`) and shared paths are refused on intersection; the asymmetry is
+deliberate and stated at the function.
+
+Three adjacent holes are **left open** and named at the check rather than
+implied closed: nothing compares one card's declared shared artifact against
+another *active* card's write scope; the per-card arm never checks the
+artifact's own `path`, only its `sources`; and `Transient`/`Serialized` are not
+checked at all. The first matters more after this fix than before, because
+carving the path out of the scope is now the normal way to declare a shared
+artifact.
+
+Two fixtures had to change. Neither asserted the broken comparison — they
+constructed cards the hole permitted, and needed a legal card to reach the
+verify-side rule. A third,
+`a_per_card_artifact_generated_from_owned_sources_is_accepted`, declared
+`sources: ["src/**"]` against `include: ["src/**"]`: it passed because the two
+strings were identical, so it certified `==` rather than ownership and could not
+tell the implementations apart.
 
 ## Why failure injection did not catch defect 11
 

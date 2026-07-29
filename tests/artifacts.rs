@@ -19,8 +19,22 @@ fn error_code(output: &std::process::Output) -> String {
 
 /// Writes a draft declaring the given generated-artifact YAML block.
 fn draft(workspace: &Workspace, card: &str, include: &str, artifacts: &str) -> String {
+    draft_excluding(workspace, card, include, "", artifacts)
+}
+
+/// The same, with an explicit exclude list.
+///
+/// Carving a shared artifact out of the scope is the only legal way to declare
+/// one now, so several fixtures need it.
+fn draft_excluding(
+    workspace: &Workspace,
+    card: &str,
+    include: &str,
+    exclude: &str,
+    artifacts: &str,
+) -> String {
     let body = format!(
-        "card_id: {card}\ncycle_id: C-001\ntitle: Implement {card}\ngoal: Deliver {card}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{include}]\n  exclude: []\ngenerated_artifacts:\n{artifacts}named_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        "card_id: {card}\ncycle_id: C-001\ntitle: Implement {card}\ngoal: Deliver {card}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{include}]\n  exclude: [{exclude}]\ngenerated_artifacts:\n{artifacts}named_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
         base = workspace.authority_head()
     );
     let path = workspace.root.join(format!("{card}.yaml"));
@@ -88,7 +102,11 @@ fn a_per_card_artifact_generated_from_owned_sources_is_accepted() {
         &workspace,
         "F-001",
         "\"src/**\"",
-        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/**\"]\n",
+        // A real source path, not the include pattern repeated. This test used
+        // `sources: ["src/**"]` against `include: ["src/**"]`, so it passed
+        // because the two strings were identical — it certified `==`, not
+        // ownership, and could not tell the two implementations apart.
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/schema.toml\"]\n",
     );
     workspace.card(&["validate", "--draft", &path]);
 }
@@ -188,10 +206,15 @@ fn committing_a_transient_path_fails_verification() {
 #[test]
 fn committing_a_shared_path_fails_verification() {
     let workspace = active_cycle();
-    let path = draft(
+    // The shared path is carved out of the scope. That is now the only legal
+    // way to declare one — a card whose include covers the artifact is refused
+    // at activation — and this test needs a legal card to reach the verify-side
+    // rule at all.
+    let path = draft_excluding(
         &workspace,
         "F-001",
         "\"src/**\"",
+        "\"src/shared.gen.rs\"",
         "  - path: src/shared.gen.rs\n    class: shared\n    generator: gate.all\n",
     );
     workspace.card(&["create", "--draft", &path]);
@@ -257,4 +280,125 @@ fn a_card_declaring_nothing_generated_is_unaffected() {
     support::git(&worktree, &["add", "-A"]);
     support::git(&worktree, &["commit", "-q", "-m", "feat: work"]);
     workspace.work(&["verify", "--card-id", "F-001"]);
+}
+
+#[test]
+fn a_shared_artifact_covered_by_a_glob_include_is_refused() {
+    // Tier 4. The check compared write-scope *patterns* to artifact *paths*
+    // with `==`, so it only ever fired when the include literally spelled the
+    // artifact. A glob include covering the same path sailed through: one path
+    // with two owners, which is the whole thing the shared class exists to
+    // prevent.
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "  - path: src/generated/api.rs\n    class: shared\n    generator: gate.all\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "a glob include covering a shared artifact must be refused: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-INVALID-ARTIFACT");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("two owners"),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn a_per_card_source_covered_by_a_glob_include_is_accepted() {
+    // The other direction of the same defect: `==` refused a source the card
+    // plainly owns, because the include was a glob rather than the literal
+    // path. This failed closed, which is the more annoying half — a correct
+    // card could not be written at all.
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/schema.toml\"]\n",
+    );
+    workspace.card(&["validate", "--draft", &path]);
+}
+
+#[test]
+fn a_shared_artifact_excluded_from_the_scope_is_accepted() {
+    // The guard that stops the shared arm refusing everything. Carving the
+    // integration-owned path out of the card's own scope is the only way to
+    // declare a shared artifact at all — and a card must declare it to get the
+    // protection at verify time. An arm that ignored excludes would make the
+    // whole Shared class undeclarable by any card whose scope globs the tree.
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"src/generated/api.rs\"",
+        "  - path: src/generated/api.rs\n    class: shared\n    generator: gate.all\n",
+    );
+    workspace.card(&["validate", "--draft", &path]);
+}
+
+#[test]
+fn a_shared_artifact_outside_the_scope_is_accepted() {
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "  - path: dist/bundle.js\n    class: shared\n    generator: gate.all\n",
+    );
+    workspace.card(&["validate", "--draft", &path]);
+}
+
+#[test]
+fn a_per_card_source_broader_than_the_scope_is_refused() {
+    // The guard that stops the sources arm going loose. Reaching for
+    // intersection here — because the shared arm uses it — would let a card
+    // owning `src/a/**` declare `src/**` as a source, which is exactly the
+    // staleness the rule exists to prevent.
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/a/**\"",
+        "  - path: src/a/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/**\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("go stale"),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn a_per_card_source_excluded_from_the_scope_is_refused() {
+    // Containment must honour excludes. `==` ignored them entirely.
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"src/schema.toml\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/schema.toml\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "an excluded source is not owned: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

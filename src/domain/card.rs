@@ -326,8 +326,51 @@ impl CardDraft {
     /// somebody else changed them, with nothing to notice. A shared artifact
     /// inside the card's scope is two owners for one path, which is the exact
     /// collision the classes exist to prevent.
+    /// Checks each declared artifact against what the card actually owns.
+    ///
+    /// Both arms used to compare write-scope *patterns* to artifact *paths*
+    /// with `==`, which is only ever right by accident. Section 2716's rule is
+    /// stated in ownership terms — "sources the card does not own", "inside a
+    /// card's write scope" — and ownership is a matching question.
+    ///
+    /// The two arms deliberately use different tests, and the asymmetry is the
+    /// point rather than an oversight:
+    ///
+    /// - A per-card **source** must be *contained* in the scope. `Scope::allows`
+    ///   applies deny-by-default and lets an exclude override an include.
+    ///   Intersection would be wrong here: a card owning `src/a/**` could then
+    ///   name `src/**` as a source, which is exactly the staleness the rule
+    ///   exists to prevent.
+    /// - A shared **path** is refused on *intersection*, because
+    ///   `artifact.path` may itself be a glob and any overlap means two owners.
+    ///   Over-approximating toward refusal is `patterns_intersect`'s documented
+    ///   policy.
+    ///
+    /// One further asymmetry inside the shared arm: an exclude is tested with
+    /// `matches` rather than intersection, so an exclude naming one file does
+    /// not carve out a glob artifact path that merely overlaps it. Conservative
+    /// on purpose — the card stays refused — but it is a behaviour that exists
+    /// nowhere else in this crate.
+    ///
+    /// Case sensitivity follows the host (`CaseSensitivity::host()`), as scope
+    /// matching does everywhere. This is the first place it governs *draft
+    /// validation*, which mints an immutable record, so the same draft can be
+    /// admissible on Linux and refused on macOS.
+    ///
+    /// Three adjacent holes this does **not** close, recorded so the next
+    /// reader does not assume otherwise:
+    /// - Nothing compares one card's declared shared artifact against another
+    ///   *active* card's write scope. `allocation` compares scope to scope only.
+    /// - The artifact's own `path` is never checked against the scope in the
+    ///   per-card arm, only its `sources`.
+    /// - `Transient` and `Serialized` are not checked at all.
     fn validate_generated_artifacts(&self) -> Result<(), HarnessError> {
+        use crate::policy::paths::{CaseSensitivity, Scope, matches, patterns_intersect};
+
         require_one_class_each(&self.generated_artifacts)?;
+
+        let case = CaseSensitivity::host();
+        let scope = Scope::new(&self.write_scope.include, &self.write_scope.exclude);
 
         for artifact in &self.generated_artifacts {
             let invalid = |reason: String| HarnessError::Control {
@@ -337,12 +380,7 @@ impl CardDraft {
             match artifact.class {
                 ArtifactClass::PerCard => {
                     for source in &artifact.sources {
-                        if !self
-                            .write_scope
-                            .include
-                            .iter()
-                            .any(|pattern| pattern == source)
-                        {
+                        if !scope.allows(source) {
                             return Err(invalid(format!(
                                 "per-card artifact `{}` is generated from `{source}`, which this card does not own; it would go stale the moment somebody else changed it",
                                 artifact.path
@@ -351,12 +389,18 @@ impl CardDraft {
                     }
                 }
                 ArtifactClass::Shared => {
-                    if self
+                    let carved_out = self
                         .write_scope
-                        .include
+                        .exclude
                         .iter()
-                        .any(|pattern| pattern == &artifact.path)
-                    {
+                        .any(|pattern| matches(pattern, &artifact.path, case));
+                    let claimed = !carved_out
+                        && self
+                            .write_scope
+                            .include
+                            .iter()
+                            .any(|pattern| patterns_intersect(pattern, &artifact.path, case));
+                    if claimed {
                         return Err(invalid(format!(
                             "shared artifact `{}` is also in this card's write scope; integration generates it, so claiming it here gives one path two owners",
                             artifact.path

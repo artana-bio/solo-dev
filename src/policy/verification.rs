@@ -702,9 +702,14 @@ mod tests {
 
     #[test]
     fn committing_a_shared_artifact_blocks() {
+        // The shared path is carved out of the scope, which is now the only
+        // legal way to declare one: a card whose include covers the artifact is
+        // refused at activation. This fixture needs a legal card to exercise
+        // the verify-side rule at all — it never asserted the comparison, it
+        // just used a shape the hole permitted.
         let card = card_with(
             &["src/**"],
-            &[],
+            &["src/generated.rs"],
             &[artifact("src/generated.rs", ArtifactClass::Shared)],
         );
         let report = verify(
