@@ -84,9 +84,18 @@ pub enum LockDiagnosis {
 /// `ps` is used rather than a platform crate because the crate forbids unsafe
 /// code and this is one shell-out on a path that already shells out to Git.
 /// A process that has exited yields `None`, which is the signal that matters.
+///
+/// `LC_ALL=C` is not cosmetic. `lstart` is rendered in the caller's locale —
+/// `Tue Jul 28` against `Di. 28 Juli` for the same instant — and this value is
+/// compared as a string across two separate invocations that may run under
+/// different environments, such as an interactive shell and a cron job. Without
+/// pinning, the same live process reads as a *different* one, the lock is
+/// declared stale, and recovery clears a lock whose holder is still writing:
+/// precisely the interleaving D-056 exists to prevent.
 #[must_use]
 pub fn process_start_time(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;

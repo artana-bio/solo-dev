@@ -311,3 +311,50 @@ fn a_reclaim_dry_run_changes_nothing() {
         "operator"
     );
 }
+
+#[test]
+fn a_lock_survives_being_diagnosed_under_a_different_locale() {
+    // `ps -o lstart=` renders in the caller's locale, and this value is
+    // compared as a string across separate invocations that may run under
+    // different environments. Without pinning it, the same live process reads
+    // as a different one, the lock is declared stale, and recovery clears a
+    // lock whose holder is still writing.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+
+    // Take a real lock by planting this live process with the start time the
+    // harness itself would record.
+    let recorded = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-o", "lstart=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps should run");
+    let recorded = String::from_utf8_lossy(&recorded.stdout).trim().to_owned();
+    plant_lock(&workspace, std::process::id(), Some(&recorded));
+
+    // Diagnose from a process whose locale differs from the default.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("LC_ALL", "de_DE.UTF-8")
+        .args([
+            "project",
+            "status",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("the CLI should start");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["lock"]["state"], "held",
+        "a live lock must stay held whatever locale reads it: {}",
+        envelope["data"]["lock"]
+    );
+}

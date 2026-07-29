@@ -12,7 +12,7 @@
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 672 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 673 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2560,6 +2560,15 @@ Delivered notes:
   leaves a lock and *no* unresolved entry, so gating the clear on the journal
   would have left the commonest stale lock permanent — which the first version
   of this package did, and the acceptance test caught.
+- The start time is read with `LC_ALL=C` pinned. `lstart` renders in the
+  caller's locale — `Tue Jul 28` against `Di. 28 Juli` for the same instant —
+  and it is compared as a string across invocations that may run under
+  different environments, such as an interactive shell and a cron job. Without
+  pinning, the same live process reads as a different one, the lock is declared
+  stale, and recovery clears a lock whose holder is still writing: exactly the
+  interleaving D-056 was written to prevent. Caught by writing it down as a
+  residual risk on the handoff declaration and then checking it instead of
+  accepting it; the handoff was revoked and the fix made under the same card.
 - `work reclaim` touches nothing in the candidate repository. The branch, the
   worktree, and every commit survive: a lease says who is responsible for a
   card, not what the work is worth, and an abandoned lease is a coordination
