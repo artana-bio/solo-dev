@@ -2569,6 +2569,11 @@ Delivered notes:
   interleaving D-056 was written to prevent. Caught by writing it down as a
   residual risk on the handoff declaration and then checking it instead of
   accepting it; the handoff was revoked and the fix made under the same card.
+- A test named for what it checked but did not check it:
+  `a_reclaim_is_recorded_with_the_head_it_preserved` asserted the actor and the
+  reason and never the head, so it passed whether or not the head was recorded.
+  Found by mutation-testing the review's own gate-adequacy claim instead of
+  writing it down — the claim was false, and the test was the reason.
 - `work reclaim` touches nothing in the candidate repository. The branch, the
   worktree, and every commit survive: a lease says who is responsible for a
   card, not what the work is worth, and an abandoned lease is a coordination

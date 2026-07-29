@@ -267,6 +267,15 @@ fn reclaiming_your_own_lease_is_refused() {
 #[test]
 fn a_reclaim_is_recorded_with_the_head_it_preserved() {
     let workspace = allocated();
+    // The card must have a commit, or "the head it preserved" is vacuously
+    // null and the assertion below proves nothing.
+    let worktree = workspace.worktrees.join("F-001");
+    fs::create_dir_all(worktree.join("src/F-001")).unwrap();
+    fs::write(worktree.join("src/F-001/a.rs"), "// work\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: work in progress"]);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+
     workspace.work(&[
         "reclaim",
         "--card-id",
@@ -287,6 +296,12 @@ fn a_reclaim_is_recorded_with_the_head_it_preserved() {
     assert_eq!(
         event["metadata"]["reason"],
         "the original actor's session ended"
+    );
+    // The point of the name. Without this the test passes whether or not the
+    // head is recorded, which is how it shipped the first time.
+    assert_eq!(
+        event["metadata"]["preserved_head"], head,
+        "the event must name the commit the reclaim preserved"
     );
 }
 
