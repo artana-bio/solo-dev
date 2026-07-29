@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 31 |
+| Plan revision | 32 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 657 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 672 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2522,9 +2522,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-500` |
 | Target release | Hardened single-repository release |
+| Evidence | `LockDiagnosis` in `src/control/lock.rs`, `work reclaim` in `src/commands/work.rs`, `tests/concurrency.rs` (11 acceptance tests) |
 
 Deliverables:
 
@@ -2540,6 +2541,32 @@ Acceptance:
 - lease reclaim preserves candidate commits;
 - PID reuse does not silently steal a lease;
 - manual decision is required for ambiguous ownership.
+
+Delivered notes:
+
+- A lock records the holder's process start time alongside its PID. The PID
+  alone is not enough: PIDs are recycled, so a lock left by a crashed process
+  can appear held by whatever unrelated program later inherited its number, and
+  the harness would then wait forever on something with no connection to it.
+  Two processes can share a PID but not a PID and a start instant.
+- The diagnosis has four outcomes, not two. `Ambiguous` is separate from
+  `Stale` on purpose (D-056): clearing a lock whose holder might still be
+  writing is how two processes interleave mutations, so an unprovable case
+  escalates to a person instead of being resolved by optimism. A lock written
+  before start times were recorded is ambiguous, not stale.
+- `clear_stale` takes the diagnosis rather than re-deriving it, so no caller
+  can skip the check by accident.
+- Clearing happens before the journal is consulted. A process killed outright
+  leaves a lock and *no* unresolved entry, so gating the clear on the journal
+  would have left the commonest stale lock permanent — which the first version
+  of this package did, and the acceptance test caught.
+- `work reclaim` touches nothing in the candidate repository. The branch, the
+  worktree, and every commit survive: a lease says who is responsible for a
+  card, not what the work is worth, and an abandoned lease is a coordination
+  problem rather than a reason to destroy code. The preserved head is recorded
+  in the event, so the claim is checkable from the log rather than trusted.
+
+| D-056 | Distinguish an ambiguous lock from a stale one | Accepted | The tempting design has two states, held and stale, with anything unprovable treated as stale so the harness never wedges. That trades a rare inconvenience for a rare correctness failure: clearing a lock whose holder is still writing lets two processes interleave mutations, which is the exact hazard the lock exists to prevent. An unprovable lock is therefore refused with its own code and left for a person, who can see the PID and decide. Wedging is recoverable; interleaved writes may not be. |
 
 ### WP-520 — Backup and integrity verification
 

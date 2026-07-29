@@ -45,6 +45,8 @@ pub enum WorkCommand {
     Verify(CardArgs),
     /// Mark work halted pending a decision.
     Block(BlockArgs),
+    /// Take over a card's lease from an actor who will not return.
+    Reclaim(ReclaimArgs),
 }
 
 /// Arguments shared by every work subcommand.
@@ -139,6 +141,7 @@ pub fn execute(command: &WorkCommand, clock: &dyn Clock) -> Result<CommandOutcom
         WorkCommand::Resume(args) => run_resume(args, clock),
         WorkCommand::Verify(args) => run_verify(args),
         WorkCommand::Block(args) => run_block(args, clock),
+        WorkCommand::Reclaim(args) => run_reclaim(args, clock),
     }
 }
 
@@ -982,6 +985,146 @@ fn run_block(args: &BlockArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     "card_id": card_id.to_string(),
                     "state": CardState::Blocked.name(),
                     "reason": args.reason,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Arguments accepted by `work reclaim`.
+#[derive(Debug, Args)]
+pub struct ReclaimArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card whose lease is being taken over.
+    #[arg(long)]
+    pub card_id: String,
+    /// Who is taking it over.
+    #[arg(long)]
+    pub actor_id: String,
+    /// Why the previous holder is not coming back.
+    #[arg(long)]
+    pub reason: String,
+    /// Report the takeover without performing it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Takes over a card's lease from an actor who will not return.
+///
+/// Nothing in the candidate repository is touched. The branch, the worktree,
+/// and every commit on it survive: a lease says who is responsible for a card,
+/// not what the work is worth, and an abandoned lease is a coordination
+/// problem rather than a reason to destroy code. Cleanup, if it is wanted, is
+/// `archive close` after the card has landed or been abandoned on its own
+/// terms.
+///
+/// # Errors
+///
+/// Returns a precondition error when no lease is held, or a policy error when
+/// the worktree no longer matches control state.
+fn run_reclaim(args: &ReclaimArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.common.control)?;
+        let (_record, _state, lease) = allocation(&control, &card_id)?;
+        return Ok(CommandOutcome::new(
+            "work.reclaim",
+            format!(
+                "Dry run: would move lease {} for card {card_id} from `{}` to `{}`\nthe branch, worktree, and every commit are left untouched\nnothing was changed",
+                lease.lease_id, lease.actor_id, args.actor_id
+            ),
+            serde_json::json!({
+                "dry_run": true,
+                "card_id": card_id.to_string(),
+                "lease_id": lease.lease_id.to_string(),
+                "from_actor": lease.actor_id,
+                "to_actor": args.actor_id,
+            }),
+        ));
+    }
+
+    with_transaction(
+        &args.common.control,
+        "work.reclaim",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let config = control.project()?;
+            let (record, state, mut lease) = allocation(control, &card_id)?;
+
+            if lease.actor_id == args.actor_id {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "{} already holds lease {} for card {card_id}; resume it rather than reclaiming it",
+                        args.actor_id, lease.lease_id
+                    ),
+                    code: ErrorCode::PolicyLeaseHeld,
+                });
+            }
+
+            // The candidate head is recorded before and after so the claim
+            // "reclaiming preserves candidate commits" is checkable from the
+            // event log rather than taken on trust.
+            let head =
+                inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD").ok();
+
+            let previous_actor = lease.actor_id.clone();
+            lease.actor_id.clone_from(&args.actor_id);
+            lease.progress.push(ProgressNote {
+                recorded_at: clock.now(),
+                note: format!(
+                    "lease reclaimed from {previous_actor} by {}: {}",
+                    args.actor_id, args.reason
+                ),
+                head_sha: head.clone(),
+            });
+            store_lease(control, &lease)?;
+            write_locator(
+                control,
+                &config,
+                &lease.worktree_path,
+                &card_id,
+                state.current_revision,
+                &lease.lease_id,
+            )?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("work.reclaimed", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .meta("lease_id", serde_json::json!(lease.lease_id.to_string()))
+                    .meta("from_actor", serde_json::json!(previous_actor))
+                    .meta("reason", serde_json::json!(args.reason))
+                    .meta("preserved_head", serde_json::json!(head)),
+                clock,
+            )?;
+            control.commit(expected, &format!("work: reclaim lease for {card_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "work.reclaim",
+                format!(
+                    "Reclaimed lease {} for card {card_id}\nfrom: {previous_actor}\nto: {}\nreason: {}\ncandidate head preserved at: {}",
+                    lease.lease_id,
+                    args.actor_id,
+                    args.reason,
+                    head.as_deref().unwrap_or("no commits yet")
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "lease_id": lease.lease_id.to_string(),
+                    "from_actor": previous_actor,
+                    "to_actor": args.actor_id,
+                    "reason": args.reason,
+                    "preserved_head": head,
+                    "worktree_path": lease.worktree_path,
                 }),
             )
             .with_project(config.project_id.clone()))
