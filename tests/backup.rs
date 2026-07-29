@@ -179,21 +179,120 @@ fn a_backup_contains_every_archive_ref_the_source_holds() {
     );
 
     let backups = envelope["data"]["backups"].as_array().unwrap();
-    assert_eq!(backups.len(), 2, "authority and control: {backups:?}");
-    let authority = backups
-        .iter()
-        .find(|entry| entry["subject"] == "authority")
-        .expect("an authority backup");
-    let refs: Vec<&str> = authority["refs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap())
-        .collect();
-    assert!(
-        refs.iter().any(|name| name.contains("refs/heads/main")),
-        "the protected branch must be in the backup: {refs:?}"
+    assert_eq!(
+        backups.len(),
+        3,
+        "authority, control, and archive: {backups:?}"
     );
+
+    let refs_of = |subject: &str| -> Vec<String> {
+        backups
+            .iter()
+            .find(|entry| entry["subject"] == subject)
+            .unwrap_or_else(|| panic!("a {subject} backup"))["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let authority = refs_of("authority");
+    assert!(
+        authority
+            .iter()
+            .any(|name| name.contains("refs/heads/main")),
+        "the protected branch must be in the backup: {authority:?}"
+    );
+
+    // Tier 2, defect 10, and this test is the reason it survived. Under its
+    // present name it asserted only the line above — the authority bundle
+    // holding `refs/heads/main` — and never looked at a single archive ref. The
+    // archive refs live in the candidate repository, which was in no backup at
+    // all, and they are the sole justification for `archive close` deleting
+    // card branches and worktrees.
+    let archive = refs_of("archive");
+    assert!(
+        archive
+            .iter()
+            .any(|name| name.starts_with("refs/archive/cards/")),
+        "every candidate's archive ref must be backed up: {archive:?}"
+    );
+    assert!(
+        archive
+            .iter()
+            .any(|name| name.starts_with("refs/archive/integrations/")),
+        "and the landing's: {archive:?}"
+    );
+}
+
+#[test]
+fn a_project_that_has_archived_nothing_still_backs_up_and_verifies() {
+    // The guard on the fix above. `git bundle create` refuses to write an empty
+    // bundle, so a project with no archive refs yet must not fail its backup —
+    // and `verify` must not then demand a bundle that was correctly never
+    // written.
+    let workspace = Workspace::initialized();
+    let destination = workspace.root.join("backups");
+    let created = backup_json(
+        &workspace,
+        &[
+            "create",
+            "--destination",
+            &destination.display().to_string(),
+            "--allow-same-device",
+        ],
+    );
+    assert_eq!(
+        created["data"]["backups"].as_array().unwrap().len(),
+        2,
+        "authority and control; there is nothing archived to bundle"
+    );
+    assert!(
+        !destination.join("archive.bundle").exists(),
+        "an empty archive bundle must not be written"
+    );
+
+    let verified = backup_json(
+        &workspace,
+        &[
+            "verify",
+            "--destination",
+            &destination.display().to_string(),
+        ],
+    );
+    assert_eq!(verified["data"]["backups"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_missing_archive_backup_is_a_failure_once_there_is_something_to_archive() {
+    // And the other half: absence is only acceptable while there is nothing to
+    // hold. Once archive refs exist, a missing archive bundle is a missing
+    // backup, not an empty one.
+    let workspace = with_archive();
+    let destination = workspace.root.join("backups");
+    backup_json(
+        &workspace,
+        &[
+            "create",
+            "--destination",
+            &destination.display().to_string(),
+            "--allow-same-device",
+        ],
+    );
+    assert!(destination.join("archive.bundle").exists());
+    fs::remove_file(destination.join("archive.bundle")).unwrap();
+
+    let output = backup_raw(
+        &workspace,
+        &[
+            "verify",
+            "--destination",
+            &destination.display().to_string(),
+        ],
+    );
+    assert!(!output.status.success(), "a deleted backup must be noticed");
+    assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
 }
 
 #[test]

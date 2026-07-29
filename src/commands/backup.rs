@@ -13,7 +13,9 @@ use crate::{
     control::repository::ControlRepository,
     domain::clock::Clock,
     error::HarnessError,
-    git::backup::{BundleReport, create_bundle, fsck, require_independent, verify_bundle},
+    git::backup::{
+        BundleReport, create_bundle, fsck, has_refs_matching, require_independent, verify_bundle,
+    },
 };
 
 /// Subcommands under `backup`.
@@ -59,12 +61,61 @@ pub fn execute(command: &BackupCommand, clock: &dyn Clock) -> Result<CommandOutc
     }
 }
 
-/// The two repositories worth backing up, with the bundle name each gets.
-fn subjects(config: &crate::config::ProjectConfig) -> [(&'static str, std::path::PathBuf); 2] {
+/// The archive namespace, as `git for-each-ref` matches it.
+///
+/// A trailing slash rather than `refs/archive/*`, because `for-each-ref` uses
+/// fnmatch and its `*` does not cross a `/` — so the glob form silently matches
+/// nothing while looking correct. `git bundle`'s `--glob` is rev-list globbing,
+/// where `*` does cross, so the two spellings below are deliberately different.
+const ARCHIVE_REF_PREFIX: &str = "refs/archive/";
+
+/// One thing worth backing up: where it lives and which refs it contributes.
+struct Subject {
+    name: &'static str,
+    source: std::path::PathBuf,
+    revisions: &'static [&'static str],
+}
+
+/// What a backup covers.
+///
+/// The authority owns the protected ref and control owns every record, and for
+/// a long time those were the whole list. They are not: `archive close` deletes
+/// card branches and worktrees, and the only thing that justifies it is the
+/// archive refs keeping those commits reachable. Those refs live in the
+/// candidate repository, so the evidence authorizing the deletion was in no
+/// backup at all — and the test named
+/// `a_backup_contains_every_archive_ref_the_source_holds` checked the authority
+/// bundle for `refs/heads/main` and never looked at an archive ref.
+///
+/// The candidate is bundled selectively rather than whole. Its working history
+/// is the operator's own repository, backed up however they back up source; the
+/// archive namespace is the part only this harness knows to keep.
+fn subjects(config: &crate::config::ProjectConfig) -> [Subject; 3] {
     [
-        ("authority", config.authority_repository.clone()),
-        ("control", config.control_repository.clone()),
+        Subject {
+            name: "authority",
+            source: config.authority_repository.clone(),
+            revisions: &["--all"],
+        },
+        Subject {
+            name: "control",
+            source: config.control_repository.clone(),
+            revisions: &["--all"],
+        },
+        Subject {
+            name: "archive",
+            source: config.repository.clone(),
+            revisions: &["--glob=refs/archive/*"],
+        },
     ]
+}
+
+/// Whether this subject currently has anything to bundle.
+fn has_content(subject: &Subject) -> Result<bool, HarnessError> {
+    if subject.revisions == ["--all"] {
+        return Ok(true);
+    }
+    has_refs_matching(&subject.source, ARCHIVE_REF_PREFIX)
 }
 
 /// Checks independence unless the caller accepted the weaker guarantee.
@@ -85,12 +136,15 @@ fn run_create(args: &CreateArgs, _clock: &dyn Clock) -> Result<CommandOutcome, H
 
     if args.dry_run {
         let mut planned = Vec::new();
-        for (name, source) in subjects(&config) {
-            let weakness = check_destination(args, &source)?;
+        for subject in subjects(&config) {
+            if !has_content(&subject)? {
+                continue;
+            }
+            let weakness = check_destination(args, &subject.source)?;
             planned.push(serde_json::json!({
-                "subject": name,
-                "source": source,
-                "bundle": args.destination.join(format!("{name}.bundle")),
+                "subject": subject.name,
+                "source": subject.source,
+                "bundle": args.destination.join(format!("{}.bundle", subject.name)),
                 "independence_warning": weakness,
             }));
         }
@@ -108,20 +162,33 @@ fn run_create(args: &CreateArgs, _clock: &dyn Clock) -> Result<CommandOutcome, H
 
     let mut reports = Vec::new();
     let mut warnings = Vec::new();
-    for (name, source) in subjects(&config) {
-        if let Some(weakness) = check_destination(args, &source)? {
+    for subject in subjects(&config) {
+        // A project that has archived nothing yet has no archive bundle to
+        // write, and `git bundle create` refuses an empty one. The skip is
+        // recorded rather than silent, and `verify` re-derives the same
+        // condition, so an absent bundle is only ever accepted when there is
+        // genuinely nothing it should have held.
+        if !has_content(&subject)? {
+            warnings.push(format!(
+                "{} holds no {ARCHIVE_REF_PREFIX} refs yet; no {} bundle was written",
+                subject.source.display(),
+                subject.name
+            ));
+            continue;
+        }
+        if let Some(weakness) = check_destination(args, &subject.source)? {
             warnings.push(weakness);
         }
         // The source is checked before it is copied. Bundling a repository that
         // is already damaged produces a backup of the damage.
-        fsck(&source)?;
+        fsck(&subject.source)?;
 
-        let bundle = args.destination.join(format!("{name}.bundle"));
-        create_bundle(&source, &bundle)?;
+        let bundle = args.destination.join(format!("{}.bundle", subject.name));
+        create_bundle(&subject.source, &bundle, subject.revisions)?;
         // Verified immediately, by reading the bundle back. An unverified
         // backup is the thing this command exists to stop producing.
-        let report = verify_bundle(&source, &bundle)?;
-        reports.push((name, report));
+        let report = verify_bundle(&subject.source, &bundle)?;
+        reports.push((subject.name, report));
     }
 
     Ok(report_backups(
@@ -137,15 +204,20 @@ fn run_verify(args: &CreateArgs) -> Result<CommandOutcome, HarnessError> {
     let config = control.project()?;
 
     let mut reports = Vec::new();
-    for (name, source) in subjects(&config) {
-        let bundle = args.destination.join(format!("{name}.bundle"));
+    for subject in subjects(&config) {
+        let bundle = args.destination.join(format!("{}.bundle", subject.name));
         if !bundle.exists() {
+            // Absent is acceptable only when the source holds nothing this
+            // bundle would have carried. Anything else is a missing backup.
+            if !has_content(&subject)? {
+                continue;
+            }
             return Err(HarnessError::Control {
-                reason: format!("no {name} backup at {}", bundle.display()),
+                reason: format!("no {} backup at {}", subject.name, bundle.display()),
                 code: crate::error::ErrorCode::PreconditionNotFound,
             });
         }
-        reports.push((name, verify_bundle(&source, &bundle)?));
+        reports.push((subject.name, verify_bundle(&subject.source, &bundle)?));
     }
 
     Ok(report_backups("backup.verify", &reports, &[], &config))

@@ -118,23 +118,45 @@ pub fn require_independent(source: &Path, destination: &Path) -> Result<(), Harn
 ///
 /// Returns an external-tool error when Git refuses, or an I/O error when the
 /// destination directory cannot be created.
-pub fn create_bundle(repository: &Path, destination: &Path) -> Result<(), HarnessError> {
+pub fn create_bundle(
+    repository: &Path,
+    destination: &Path,
+    revisions: &[&str],
+) -> Result<(), HarnessError> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    run_ok(
-        &GitScope::work_tree(repository),
-        [
-            "bundle".as_ref(),
-            "create".as_ref(),
-            destination.as_os_str(),
-            "--all".as_ref(),
-        ],
-    )?;
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "bundle".as_ref(),
+        "create".as_ref(),
+        destination.as_os_str(),
+    ];
+    args.extend(
+        revisions
+            .iter()
+            .map(|revision| std::ffi::OsStr::new(*revision)),
+    );
+    run_ok(&GitScope::work_tree(repository), args)?;
     Ok(())
+}
+
+/// Whether a repository holds any ref matching a glob.
+///
+/// `git bundle create` refuses to write an empty bundle, so a selective backup
+/// has to know whether there is anything to write before it asks.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot be executed.
+pub fn has_refs_matching(repository: &Path, glob: &str) -> Result<bool, HarnessError> {
+    let listed = run_ok(
+        &GitScope::work_tree(repository),
+        ["for-each-ref", "--format=%(refname)", glob],
+    )?;
+    Ok(!listed.trimmed_stdout().is_empty())
 }
 
 /// Verifies a bundle by restoring it and checking what came out.
@@ -333,7 +355,7 @@ mod tests {
     fn a_bundle_carries_every_ref_and_verifies_from_the_file() {
         let (temp, repo) = repository();
         let bundle = temp.path().join("out").join("repo.bundle");
-        create_bundle(&repo, &bundle).expect("a bundle");
+        create_bundle(&repo, &bundle, &["--all"]).expect("a bundle");
 
         let report = verify_bundle(&repo, &bundle).expect("verification");
         assert!(report.refs.iter().any(|name| name == "refs/heads/main"));
@@ -345,7 +367,7 @@ mod tests {
     fn a_corrupted_bundle_fails_verification() {
         let (temp, repo) = repository();
         let bundle = temp.path().join("repo.bundle");
-        create_bundle(&repo, &bundle).expect("a bundle");
+        create_bundle(&repo, &bundle, &["--all"]).expect("a bundle");
 
         // Truncate the middle rather than the header, so the file still looks
         // like a bundle to anything that only checks the first bytes.
@@ -372,7 +394,7 @@ mod tests {
         // restore step could be reconsidered — but not before.
         let (temp, repo) = repository();
         let bundle = temp.path().join("repo.bundle");
-        create_bundle(&repo, &bundle).expect("a bundle");
+        create_bundle(&repo, &bundle, &["--all"]).expect("a bundle");
         let mut contents = fs::read(&bundle).unwrap();
         contents.truncate(contents.len() / 2);
         fs::write(&bundle, &contents).unwrap();
@@ -396,7 +418,7 @@ mod tests {
         // pass a bundle of zeroes, because the source is perfectly fine.
         let (temp, repo) = repository();
         let bundle = temp.path().join("repo.bundle");
-        create_bundle(&repo, &bundle).expect("a bundle");
+        create_bundle(&repo, &bundle, &["--all"]).expect("a bundle");
         fs::write(&bundle, vec![0u8; 4096]).unwrap();
 
         verify_bundle(&repo, &bundle).expect_err("a bundle of zeroes must fail");
@@ -406,7 +428,7 @@ mod tests {
     fn a_restore_drill_reconstructs_the_repository_from_the_bundle_alone() {
         let (temp, repo) = repository();
         let bundle = temp.path().join("repo.bundle");
-        create_bundle(&repo, &bundle).expect("a bundle");
+        create_bundle(&repo, &bundle, &["--all"]).expect("a bundle");
         let expected = String::from_utf8_lossy(
             &std::process::Command::new("git")
                 .arg("-C")
