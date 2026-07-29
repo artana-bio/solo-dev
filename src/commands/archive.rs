@@ -367,8 +367,115 @@ fn clean_up_card(
     Ok(removed)
 }
 
+/// Reports what `archive close` would remove, without removing it.
+///
+/// `close` is the most destructive command here: it removes worktrees, deletes
+/// branches, and closes cards. It accepted `--dry-run` and never read it — the
+/// dispatch arm passed only `args.common` to a function with no access to the
+/// flag — so asking to preview the destruction performed it, and reported
+/// success as though it had previewed.
+///
+/// Every check the real close makes runs here too. A preview that skips checks
+/// is worse than no preview, because it tells an operator a destructive command
+/// will succeed when it will not.
+fn preview_close(
+    args: &CommonArgs,
+    integration_id: &IntegrationId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, integration_id)?;
+
+    if record.status == IntegrationStatus::Archived {
+        return Ok(CommandOutcome::new(
+            "archive.close",
+            format!("Dry run: integration {integration_id} is already closed; nothing to do"),
+            serde_json::json!({
+                "dry_run": true,
+                "integration_id": integration_id.to_string(),
+                "status": IntegrationStatus::Archived.name(),
+                "would_remove": Vec::<String>::new(),
+                "changed": false,
+            }),
+        )
+        .with_project(config.project_id));
+    }
+
+    record
+        .status
+        .check_transition(IntegrationStatus::Archived)?;
+    let archive = load_archive(&control, integration_id)?;
+    for archived in &archive.refs {
+        if let Some(defect) = verify(&config.repository, archived)? {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "archived ref {} is {defect:?}; refusing to remove anything",
+                    archived.reference
+                ),
+                code: ErrorCode::PolicyArchiveBroken,
+            });
+        }
+    }
+
+    // The same refusals `clean_up_card` makes, without the removals it makes
+    // alongside them: a branch holding commits nothing else reaches, or a
+    // worktree with uncommitted work.
+    let scope = GitScope::work_tree(&config.repository);
+    let mut would_remove = Vec::new();
+    for member in &record.members {
+        let card_id = &member.card_id;
+        let branch = format!("card/{card_id}");
+        let outstanding = unarchived_commits(&config.repository, &format!("refs/heads/{branch}"))?;
+        if !outstanding.is_empty() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "branch `{branch}` holds {} commit(s) reachable from nowhere else; archive them before cleanup",
+                    outstanding.len()
+                ),
+                code: ErrorCode::PreconditionUnmergedWork,
+            });
+        }
+        if let Some(lease) = held_lease(&control, card_id)?
+            && lease.worktree_path.exists()
+        {
+            if !is_clean(&lease.worktree_path)? {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "worktree {} holds uncommitted or untracked work",
+                        lease.worktree_path.display()
+                    ),
+                    code: ErrorCode::PreconditionWorktreeDirty,
+                });
+            }
+            would_remove.push(lease.worktree_path.display().to_string());
+        }
+        if crate::git::worktree::branch_exists(&scope, &branch)? {
+            would_remove.push(branch);
+        }
+    }
+
+    Ok(CommandOutcome::new(
+        "archive.close",
+        format!(
+            "Dry run: would remove {} item(s) closing {integration_id}\nnothing was changed",
+            would_remove.len()
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "integration_id": integration_id.to_string(),
+            "would_remove": would_remove,
+            "changed": false,
+        }),
+    )
+    .with_project(config.project_id))
+}
+
 fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        return preview_close(args, &integration_id);
+    }
 
     with_transaction(
         &args.control,

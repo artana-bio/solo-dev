@@ -32,7 +32,7 @@ proposition.
 | # | Defect |
 | --- | --- |
 | 6 | **`project init` adopts an occupied directory and overwrites its `.gitignore`**, reporting success. Section 9.1 requires refusal. The protection exists for the authority path and was never written for control. **[V]** |
-| 7 | **`archive close --dry-run` performs a real close** — worktrees removed, branches deleted, cards closed, committed. The function never reads the flag. **[V]** |
+| 7 | ✅ **FIXED.** **`archive close --dry-run` performs a real close** — worktrees removed, branches deleted, cards closed, committed. The function never reads the flag. **[V]** Fixed: `preview_close` runs every check the real close makes — archive integrity, transition legality, unarchived commits, worktree cleanliness — and removes nothing. A preview that skips checks is worse than none, so both are tested: it removes nothing, and it refuses for the same reason the real command would. |
 | 8 | **`recover --resume` marks failed operations complete without recovering them**, destroying the only record that a partial mutation occurred. Found independently by three reviewers. **[V]** |
 | 9 | **`git add -A` sweeps a crashed operation's residue into authoritative history**, including the lock's own scratch file, which the ignore list does not cover. **[R]** |
 | 10 | **Archive refs are in no backup.** Those refs are the sole justification for `archive close` deleting branches and worktrees; they live in the candidate repository, and backups cover only authority and control. **[R]** |

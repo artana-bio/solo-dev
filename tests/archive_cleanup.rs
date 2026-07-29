@@ -379,3 +379,63 @@ fn an_archive_dry_run_changes_nothing() {
         "a dry run must create no refs"
     );
 }
+
+#[test]
+fn a_close_dry_run_removes_nothing() {
+    // Tier 2, defect 7. `archive close` accepted `--dry-run` and never read it:
+    // the dispatch arm passed only `args.common` to a function that has no
+    // access to the flag. The most destructive command in the harness — it
+    // removes worktrees, deletes branches, and closes cards — performed the
+    // real close when asked to preview it, and reported success as though it
+    // had previewed.
+    let (workspace, id) = archived(1);
+    let worktree = workspace.worktrees.join("F-001");
+    assert!(
+        worktree.exists(),
+        "the fixture must have a worktree to lose, or this proves nothing"
+    );
+
+    let envelope = workspace.archive_json(&["close", "--integration-id", &id, "--dry-run"]);
+    assert_eq!(envelope["data"]["dry_run"], true);
+
+    assert!(
+        worktree.exists(),
+        "a dry run must not remove the worktree at {}",
+        worktree.display()
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.control.join(format!("integrations/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record["status"], "promoted",
+        "a dry run must not advance the integration to archived"
+    );
+
+    // And the real close still works, so the fix is not "refuse everything".
+    workspace.archive(&["close", "--integration-id", &id]);
+    assert!(!worktree.exists(), "the real close must still remove it");
+}
+
+#[test]
+fn a_close_dry_run_reports_the_same_refusal_a_real_close_would() {
+    // A preview that skips the checks is worse than no preview: it tells an
+    // operator the destructive command will succeed when it will not.
+    let (workspace, id) = promoted(1);
+
+    // No archive refs were created, so a real close must refuse.
+    let real = workspace.archive_raw(&["close", "--integration-id", &id]);
+    assert!(
+        !real.status.success(),
+        "the fixture must be a refusable one"
+    );
+    let refusal = error_code(&real);
+
+    let preview = workspace.archive_raw(&["close", "--integration-id", &id, "--dry-run"]);
+    assert!(!preview.status.success(), "the preview must refuse too");
+    assert_eq!(
+        error_code(&preview),
+        refusal,
+        "the preview must give the same reason the real command would"
+    );
+}
