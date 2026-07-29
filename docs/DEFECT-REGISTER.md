@@ -103,8 +103,28 @@ emits two NUL-separated fields and the second is a bare path with no `XY `
 prefix, so stripping three bytes turned `src/alpha.rs` into `/alpha.rs`.
 `--no-renames` plus a parser that refuses a malformed record rather than
 truncating it. Recording the disambiguation so the next reader does not
-re-audit `diff.rs`. Dependency SHAs are never bound to
-a review. Cycle status folds card events. Five cycle statuses and one card state
+re-audit `diff.rs`. ✅ **FIXED:** dependency SHAs were never bound to a review. Neither
+`HandoffRecord` nor `ReviewRecord` carried one, so Section 10.7's required
+field did not exist and invariant 7.3.6's invalidation trigger was
+unimplemented: an approval survived its dependency being re-reviewed at a
+different commit.
+
+The rule is **what the candidate incorporates**, not what the dependency's
+current approval names. A handoff records, per declared dependency, the newest
+commit that dependency ever handed off which is an ancestor of this candidate.
+The binding goes stale only when the dependency's standing approval no longer
+*contains* that commit — containment, not equality, because a dependency that
+gained review-requested fixes on top has not moved out from under anyone, while
+a rewrite has.
+
+That resolution rule is what avoids re-serializing the cycle. An earlier design
+compared against the dependency's current approval, which would have invalidated
+a dependent every time its dependency was re-reviewed and forced dependencies to
+be approved in order. The proof it is gone: `tests/integration_plan.rs` still
+approves `F-002` before `F-001` and needed no repair.
+
+Deliberately **not** fixed, and named at the check: the four other Section 15.2
+invalidation triggers this does not reach. Cycle status folds card events. Five cycle statuses and one card state
 are unreachable. Merge honours `commit.gpgsign` and repository hooks,
 contradicting "hooks are advisory".
 

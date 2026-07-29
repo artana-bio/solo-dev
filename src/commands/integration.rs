@@ -20,7 +20,7 @@ use crate::{
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for},
         handoff::latest_handoff,
-        review::{current_approval, reviews_for},
+        review::{current_approval, dependency_standings, reviews_for},
         transaction::{Steps, with_transaction},
         work::held_lease,
     },
@@ -240,6 +240,27 @@ struct Candidacy {
     blocked_by: Option<String>,
 }
 
+/// Why the card's own latest verdict no longer applies, if it does not.
+///
+/// Reported so a coordinator reading `integration ready` sees the dependency
+/// that voided the approval rather than the generic sentence. The latest review
+/// is the standing one; an earlier approval it superseded is not what the
+/// coordinator is waiting on.
+fn latest_review_staleness(
+    control: &ControlRepository,
+    scope: &GitScope,
+    depends_on: &[CardId],
+    reviews: &[ReviewRecord],
+    candidate: Option<&str>,
+    card_digest: &crate::domain::digest::Digest,
+) -> Result<Option<String>, HarnessError> {
+    let (Some(review), Some(candidate)) = (reviews.last(), candidate) else {
+        return Ok(None);
+    };
+    let standings = dependency_standings(control, scope, depends_on, &review.dependency_bindings)?;
+    Ok(review.staleness(candidate, card_digest, &standings))
+}
+
 /// Assesses every card in a cycle.
 ///
 /// The negative cases are collected rather than filtered out. A card sitting in
@@ -250,6 +271,7 @@ fn assess(
     control: &ControlRepository,
     cycle: &CycleRecord,
 ) -> Result<Vec<Candidacy>, HarnessError> {
+    let scope = GitScope::work_tree(&control.project()?.repository);
     let mut assessed = Vec::new();
     for card_id in &cycle.card_ids {
         let Ok((record, state)) = load_card(control, card_id) else {
@@ -287,26 +309,59 @@ fn assess(
                 .map(|handoff| handoff.candidate_sha.clone())
         });
         let approval = match &candidate {
-            Some(candidate) => {
-                current_approval(control, card_id, candidate, &state.current_digest)?
-            }
+            Some(candidate) => current_approval(
+                control,
+                &scope,
+                card_id,
+                candidate,
+                &state.current_digest,
+                &record.depends_on,
+            )?,
             None => None,
         };
 
+        let reviews = reviews_for(control, card_id)?;
         let blocked_by = match (&handoff, &approval) {
             (None, _) => Some("card has no handoff".to_owned()),
             (Some(handoff), None) => Some(
-                // Section 15.2: an approval is void once the candidate SHA or
-                // the card digest changes.
-                if reviews_for(control, card_id)?.is_empty() {
+                // Section 15.2: an approval is void once the candidate SHA, the
+                // card digest, or a required dependency SHA changes. The last
+                // of those can void the review while leaving the handoff
+                // standing, so both are consulted rather than only the first.
+                if reviews.is_empty() {
                     "card has no review".to_owned()
-                } else if let Some(reason) = head
-                    .as_deref()
-                    .and_then(|head| handoff.staleness(head, &state.current_digest))
-                {
-                    format!("approval no longer describes the current candidate: {reason}")
                 } else {
-                    "approval no longer describes the current candidate or card revision".to_owned()
+                    let standings = dependency_standings(
+                        control,
+                        &scope,
+                        &record.depends_on,
+                        &handoff.dependency_bindings,
+                    )?;
+                    let explanation = head
+                        .as_deref()
+                        .and_then(|head| handoff.staleness(head, &state.current_digest, &standings))
+                        .map_or_else(
+                            || {
+                                latest_review_staleness(
+                                    control,
+                                    &scope,
+                                    &record.depends_on,
+                                    &reviews,
+                                    candidate.as_deref(),
+                                    &state.current_digest,
+                                )
+                            },
+                            |reason| Ok(Some(reason)),
+                        )?;
+                    explanation.map_or_else(
+                        || {
+                            "approval no longer describes the current candidate or card revision"
+                                .to_owned()
+                        },
+                        |reason| {
+                            format!("approval no longer describes the current candidate: {reason}")
+                        },
+                    )
                 },
             ),
             (Some(_), Some(_)) => None,
@@ -696,6 +751,7 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             let config = control.project()?;
             let cycle = load_cycle(control, &cycle_id)?;
             let plan = build_plan(control, &cycle, &requested, args)?;
+            let deferred = plan.deferred.clone();
 
             let integration_id = next_integration_id(control)?;
             let record = build_record(
@@ -754,11 +810,9 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                 &format!("integration: prepare {integration_id} for {cycle_id}"),
             )?;
 
-            Ok(report_integration(
-                "integration.prepare",
-                &record,
-                &digest,
-                &config.project_id,
+            Ok(warn_about_deferred(
+                report_integration("integration.prepare", &record, &digest, &config.project_id),
+                &deferred,
             ))
         },
     )
@@ -823,6 +877,16 @@ struct Plan {
     members: Vec<IntegrationMember>,
     atomic_groups: Vec<String>,
     mode: IntegrationMode,
+    /// Cards the cycle holds that this plan left out, and why.
+    ///
+    /// Only ever populated when the coordinator named no cards. `select` then
+    /// takes everything ready, which means a card that stopped being ready is
+    /// dropped rather than refused — deliberately, because a cycle almost
+    /// always holds work that is not finished, and refusing would make the
+    /// common case an error. What was wrong was doing it silently: a batch that
+    /// ships fewer cards than the coordinator believes is the same surprise as
+    /// one that ships more. Named cards still refuse; see `select`.
+    deferred: Vec<(CardId, String)>,
 }
 
 /// Validates a selection and derives its plan, changing nothing.
@@ -864,11 +928,39 @@ fn build_plan(
     let mode = resolve_mode(args.mode, selected.len())?;
     let members = plan_members(control, cycle, &selected)?;
 
+    let deferred = if requested.is_empty() {
+        assessed
+            .iter()
+            .filter_map(|candidacy| {
+                candidacy
+                    .blocked_by
+                    .as_ref()
+                    .map(|reason| (candidacy.record.card_id.clone(), reason.clone()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(Plan {
         members,
         atomic_groups,
         mode,
+        deferred,
     })
+}
+
+/// Attaches one advisory per card a plan left out.
+fn warn_about_deferred(
+    mut outcome: CommandOutcome,
+    deferred: &[(CardId, String)],
+) -> CommandOutcome {
+    for (card_id, reason) in deferred {
+        outcome = outcome.with_warning(format!(
+            "card {card_id} is in this cycle but was left out of the plan: {reason}"
+        ));
+    }
+    outcome
 }
 
 fn preview_prepare(
@@ -886,7 +978,7 @@ fn preview_prepare(
         .iter()
         .map(|member| member.card_id.to_string())
         .collect();
-    Ok(CommandOutcome::new(
+    let outcome = CommandOutcome::new(
         "integration.prepare",
         format!(
             "Dry run: would prepare a {} integration of {} card(s)\nmerge order: {}\nnothing was changed",
@@ -900,9 +992,16 @@ fn preview_prepare(
             "mode": plan.mode.name(),
             "merge_order": order,
             "atomic_groups": plan.atomic_groups,
+            "deferred": plan.deferred.iter().map(|(card_id, reason)| serde_json::json!({
+                "card_id": card_id.to_string(),
+                "reason": reason,
+            })).collect::<Vec<_>>(),
         }),
-    )
-    .with_project(config.project_id))
+    );
+    Ok(warn_about_deferred(
+        outcome.with_project(config.project_id),
+        &plan.deferred,
+    ))
 }
 
 /// Turns a recorded integration into the command's outcome.

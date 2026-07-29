@@ -10,6 +10,7 @@ use crate::{
     commands::{
         card::{load_card, store_card_state},
         gate::{load_gate, receipts_for},
+        review::dependency_standings,
         transaction::with_transaction,
         work::held_lease,
     },
@@ -20,8 +21,8 @@ use crate::{
         cycle::CycleRecord,
         digest::CANONICAL_ALGORITHM,
         handoff::{
-            ActorDeclaration, EvidenceEntry, HANDOFF_DIR, HANDOFF_SCHEMA, HandoffRecord,
-            HandoffStatus, check_delivered_sha,
+            ActorDeclaration, DependencyBinding, EvidenceEntry, HANDOFF_DIR, HANDOFF_SCHEMA,
+            HandoffRecord, HandoffStatus, check_delivered_sha,
         },
         ids::CardId,
     },
@@ -198,6 +199,113 @@ pub fn latest_handoff(
         }
     }
     Ok(None)
+}
+
+/// Every handoff written for a card, oldest first.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be read.
+pub fn handoffs_for(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<Vec<HandoffRecord>, HarnessError> {
+    let directory = control.path(HANDOFF_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory,
+            source,
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension()? == "json")
+                .then(|| path.file_stem()?.to_str().map(ToOwned::to_owned))?
+        })
+        .collect();
+    names.sort();
+
+    let mut records = Vec::new();
+    for name in &names {
+        let raw = control.read(&HandoffRecord::relative_path(name))?;
+        let record: HandoffRecord =
+            serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+                reason: format!("handoff {name} is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        if record.card_id == *card_id {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// Whether `ancestor` is in `descendant`'s history, or `None` if unanswerable.
+///
+/// An object Git no longer has is not an error here, and it is not an answer
+/// either. A card's candidate can become unreachable once its branch is deleted
+/// and its objects collected, and the two callers of this want opposite
+/// defaults in that case — binding a dependency treats it as not incorporated,
+/// checking one treats it as not superseded — so the ambiguity is returned
+/// rather than resolved here.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot be executed.
+pub(crate) fn ancestry(
+    scope: &GitScope,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<Option<bool>, HarnessError> {
+    if inspect::object_type(scope, ancestor).is_err()
+        || inspect::object_type(scope, descendant).is_err()
+    {
+        return Ok(None);
+    }
+    inspect::is_ancestor(scope, ancestor, descendant).map(Some)
+}
+
+/// Binds each declared dependency to the commit of it this candidate holds.
+///
+/// Section 10.7's `dependency SHAs`. The question asked is deliberately "which
+/// commit of the dependency is inside this candidate", not "which commit is the
+/// dependency approved at". A dependent branched from the cycle baseline
+/// incorporates nothing and binds `None`, and stays valid however often its
+/// dependency is re-reviewed; a dependent branched from — or merged with — the
+/// dependency's candidate binds that exact commit, and goes stale when the
+/// dependency is re-approved somewhere else, because the candidate then carries
+/// a superseded version of code that is about to land twice.
+///
+/// Handoffs are searched newest first so the binding is the most recent version
+/// of the dependency the candidate actually has.
+fn resolve_dependency_bindings(
+    control: &ControlRepository,
+    scope: &GitScope,
+    depends_on: &[CardId],
+    candidate_sha: &str,
+) -> Result<Vec<DependencyBinding>, HarnessError> {
+    let mut ordered: Vec<CardId> = depends_on.to_vec();
+    ordered.sort();
+    ordered.dedup();
+
+    let mut bindings = Vec::with_capacity(ordered.len());
+    for card_id in ordered {
+        let mut incorporated_sha = None;
+        for handoff in handoffs_for(control, &card_id)?.iter().rev() {
+            if ancestry(scope, &handoff.candidate_sha, candidate_sha)?.unwrap_or(false) {
+                incorporated_sha = Some(handoff.candidate_sha.clone());
+                break;
+            }
+        }
+        bindings.push(DependencyBinding {
+            card_id,
+            incorporated_sha,
+        });
+    }
+    Ok(bindings)
 }
 
 /// Reads and parses an actor declaration.
@@ -387,6 +495,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &record.named_gates.feature,
                 &candidate_sha,
             )?;
+            let dependency_bindings =
+                resolve_dependency_bindings(control, &scope, &record.depends_on, &candidate_sha)?;
 
             let id = next_handoff_id(control)?;
             let handoff = HandoffRecord {
@@ -400,6 +510,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 branch: lease.branch.clone(),
                 candidate_sha: candidate_sha.clone(),
                 commits,
+                dependency_bindings,
                 changed_paths,
                 receipts,
                 worktree_clean: true,
@@ -459,7 +570,7 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
-    let (_record, state) = load_card(&control, &card_id)?;
+    let (record, state) = load_card(&control, &card_id)?;
 
     let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
@@ -469,9 +580,15 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
     let current_candidate = held_lease(&control, &card_id)?.and_then(|lease| {
         inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD").ok()
     });
+    let standings = dependency_standings(
+        &control,
+        &GitScope::work_tree(&config.repository),
+        &record.depends_on,
+        &handoff.dependency_bindings,
+    )?;
     let staleness = current_candidate
         .as_ref()
-        .and_then(|sha| handoff.staleness(sha, &state.current_digest));
+        .and_then(|sha| handoff.staleness(sha, &state.current_digest, &standings));
 
     let mut text = format!(
         "Handoff {} for card {card_id}\ncandidate: {}\nbranch: {}\ndigest: {}\ncommits: {}\nchanged paths: {}\nevidence: {}\nstatus: {}",
