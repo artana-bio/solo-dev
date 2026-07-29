@@ -404,6 +404,111 @@ impl Workspace {
         serde_json::from_slice(&self.review(args).stdout).expect("the JSON envelope")
     }
 
+    /// Runs an `integration` subcommand, returning the raw output.
+    pub fn integration_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "integration".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs an `integration` subcommand, asserting success.
+    pub fn integration(&self, args: &[&str]) -> Output {
+        let output = self.integration_raw(args);
+        assert!(
+            output.status.success(),
+            "integration {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs an `integration` subcommand and parses its JSON envelope.
+    pub fn integration_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Activates a card that declares dependencies on other cards.
+    pub fn activate_card_depending_on(&self, card_id: &str, include: &[&str], depends_on: &[&str]) {
+        let list = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\ndepends_on: [{deps}]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = self.authority_head(),
+            inc = list(include),
+            deps = list(depends_on),
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Carries an activated card all the way to `approved`.
+    ///
+    /// Work, gate, handoff, and an approval by a reviewer distinct from the
+    /// feature actor — the whole pre-integration path, which every integration
+    /// test needs and none of them is testing.
+    pub fn approve_card(&self, card_id: &str, file: &str) {
+        self.work(&["start", "--card-id", card_id]);
+
+        let worktree = self.worktrees.join(card_id);
+        let path = worktree.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("// {card_id}\n")).unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &["commit", "-q", "-m", &format!("feat: {card_id}")],
+        );
+
+        self.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = self.root.join(format!("{card_id}-declaration.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: adds {file}\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        self.handoff(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration.display().to_string(),
+        ]);
+
+        self.review(&["begin", "--card-id", card_id]);
+        let verdict = self.root.join(format!("{card_id}-verdict.yaml"));
+        fs::write(
+            &verdict,
+            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n",
+        )
+        .unwrap();
+        self.review(&[
+            "record",
+            "--card-id",
+            card_id,
+            "--verdict",
+            &verdict.display().to_string(),
+        ]);
+    }
+
     /// Revises a card, moving its digest.
     pub fn revise_card(&self, card_id: &str, include: &[&str], reason: &str) {
         let list = include

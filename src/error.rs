@@ -75,6 +75,12 @@ pub enum ErrorCode {
     PolicyDependencyUnsatisfied,
     /// Declared dependencies form a cycle.
     PolicyDependencyCycle,
+    /// A card is not in a state that permits integration.
+    PolicyNotIntegrable,
+    /// An integration would land only part of an atomic group.
+    PolicyAtomicGroupSplit,
+    /// The cycle already has an outstanding integration.
+    PolicyIntegrationOpen,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A card's declared base commit does not exist in the repository.
@@ -127,7 +133,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 57] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -158,6 +164,9 @@ impl ErrorCode {
         Self::PolicyResourceConflict,
         Self::PolicyDependencyUnsatisfied,
         Self::PolicyDependencyCycle,
+        Self::PolicyNotIntegrable,
+        Self::PolicyAtomicGroupSplit,
+        Self::PolicyIntegrationOpen,
         Self::PreconditionNotFound,
         Self::PreconditionBaseMissing,
         Self::PreconditionBranchExists,
@@ -219,6 +228,9 @@ impl ErrorCode {
             | Self::PolicyResourceConflict
             | Self::PolicyDependencyUnsatisfied
             | Self::PolicyDependencyCycle
+            | Self::PolicyNotIntegrable
+            | Self::PolicyAtomicGroupSplit
+            | Self::PolicyIntegrationOpen
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
@@ -278,6 +290,9 @@ impl ErrorCode {
             Self::PolicyResourceConflict => "RESOURCE-CONFLICT",
             Self::PolicyDependencyUnsatisfied => "DEPENDENCY-UNSATISFIED",
             Self::PolicyDependencyCycle => "DEPENDENCY-CYCLE",
+            Self::PolicyNotIntegrable => "NOT-INTEGRABLE",
+            Self::PolicyAtomicGroupSplit => "ATOMIC-GROUP-SPLIT",
+            Self::PolicyIntegrationOpen => "INTEGRATION-OPEN",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
@@ -407,6 +422,13 @@ impl ErrorCode {
             }
             Self::PolicyDependencyCycle => {
                 "Break the reported cycle by removing one dependency edge."
+            }
+            Self::PolicyNotIntegrable => {
+                "Run `integration ready` to see why, then re-review or re-hand-off the card."
+            }
+            Self::PolicyAtomicGroupSplit => "Select the whole atomic group, or none of it.",
+            Self::PolicyIntegrationOpen => {
+                "Promote, archive, or abandon the open integration before preparing another."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {

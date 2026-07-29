@@ -13,7 +13,7 @@ use crate::{
     },
     domain::{
         clock::Clock,
-        cycle::{CYCLE_SCHEMA, CycleRecord, CycleStatus, status_from_events},
+        cycle::{AtomicGroup, CYCLE_SCHEMA, CycleRecord, CycleStatus, status_from_events},
         digest::Digest,
         ids::CycleId,
     },
@@ -28,6 +28,8 @@ pub enum CycleCommand {
     Create(CreateArgs),
     /// Freeze the cycle baseline and open it for cards.
     Activate(ActivateArgs),
+    /// Declare a set of cards that must land together.
+    DeclareGroup(DeclareGroupArgs),
     /// Report a cycle's derived status.
     Status(StatusArgs),
     /// Abandon a cycle that will not be landed.
@@ -77,6 +79,25 @@ pub struct ActivateArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `cycle declare-group`.
+#[derive(Debug, Args)]
+pub struct DeclareGroupArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The cycle the group belongs to.
+    #[arg(long)]
+    pub cycle_id: String,
+    /// Name for the group.
+    #[arg(long)]
+    pub name: String,
+    /// A card in the group. Repeat the option; at least two are expected.
+    #[arg(long = "card-id")]
+    pub card_ids: Vec<String>,
+    /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments accepted by `cycle status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -112,6 +133,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
     match command {
         CycleCommand::Create(args) => run_create(args, clock),
         CycleCommand::Activate(args) => run_activate(args, clock),
+        CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
         CycleCommand::Status(args) => run_status(args),
         CycleCommand::Abandon(args) => run_abandon(args, clock),
     }
@@ -395,6 +417,136 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         ));
     }
     Ok(outcome)
+}
+
+/// Declares an atomic group over cards already in the cycle.
+///
+/// `WP-200` defined `atomic_groups` on the cycle record and validated them, but
+/// left no way to declare one, so the validation was unreachable. A group is
+/// declared after its cards exist, because `CycleRecord::validate` requires
+/// every member to already be declared in the cycle.
+fn run_declare_group(
+    args: &DeclareGroupArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+    let card_ids: Vec<crate::domain::ids::CardId> = args
+        .card_ids
+        .iter()
+        .map(|raw| raw.parse())
+        .collect::<Result<_, _>>()?;
+
+    if card_ids.len() < 2 {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "atomic group `{}` needs at least two cards; a single card is already atomic",
+                args.name
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+
+    if args.dry_run {
+        return preview_declare_group(args, &cycle_id, &card_ids);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "cycle.declare-group",
+        clock,
+        |control, events, expected| {
+            let mut cycle = load(control, &cycle_id)?;
+            if cycle
+                .atomic_groups
+                .iter()
+                .any(|group| group.name == args.name)
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "cycle {cycle_id} already declares an atomic group named `{}`",
+                        args.name
+                    ),
+                    code: ErrorCode::PolicyInvalidCycle,
+                });
+            }
+
+            let config = control.project()?;
+            cycle.atomic_groups.push(AtomicGroup {
+                name: args.name.clone(),
+                card_ids: card_ids.clone(),
+            });
+            // Membership, duplication, and overlap are all checked here rather
+            // than piecemeal above, so one rule set governs every writer.
+            cycle.validate()?;
+            store(control, &cycle)?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("cycle.group-declared", &args.common.actor)
+                    .cycle(cycle_id.clone())
+                    .meta("name", serde_json::json!(args.name))
+                    .meta(
+                        "card_ids",
+                        serde_json::json!(
+                            card_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                        ),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("cycle: declare atomic group {} in {cycle_id}", args.name),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "cycle.declare-group",
+                format!(
+                    "Declared atomic group `{}` in cycle {cycle_id}\ncards: {}",
+                    args.name,
+                    card_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                serde_json::json!({
+                    "cycle_id": cycle_id.to_string(),
+                    "name": args.name,
+                    "card_ids": card_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Validates a group declaration against the stored cycle, changing nothing.
+fn preview_declare_group(
+    args: &DeclareGroupArgs,
+    cycle_id: &CycleId,
+    card_ids: &[crate::domain::ids::CardId],
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let mut cycle = load(&control, cycle_id)?;
+    cycle.atomic_groups.push(AtomicGroup {
+        name: args.name.clone(),
+        card_ids: card_ids.to_vec(),
+    });
+    cycle.validate()?;
+    Ok(CommandOutcome::new(
+        "cycle.declare-group",
+        format!(
+            "Dry run: would declare atomic group `{}` over {} cards; nothing was changed",
+            args.name,
+            card_ids.len()
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "cycle_id": cycle_id.to_string(),
+            "name": args.name,
+            "card_ids": card_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+    ))
 }
 
 fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

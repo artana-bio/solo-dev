@@ -7,5 +7,6 @@ pub mod digest;
 pub mod gate;
 pub mod handoff;
 pub mod ids;
+pub mod integration;
 pub mod lease;
 pub mod review;

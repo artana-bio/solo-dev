@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand,
-        handoff::HandoffCommand, project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
+        handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
+        review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -81,6 +82,12 @@ pub enum Command {
     Review {
         #[command(subcommand)]
         command: ReviewCommand,
+    },
+
+    /// Select approved candidates into a deterministic integration plan.
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
     },
 }
 
