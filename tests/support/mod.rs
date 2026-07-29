@@ -440,6 +440,43 @@ impl Workspace {
         serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
     }
 
+    /// Runs the harness and parses its JSON envelope, asserting nothing.
+    pub fn run_json(args: &[String]) -> serde_json::Value {
+        let output = Self::run(args);
+        serde_json::from_slice(&output.stdout).expect("the JSON envelope")
+    }
+
+    /// Runs an `acceptance` subcommand, returning the raw output.
+    pub fn acceptance_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "acceptance".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs an `acceptance` subcommand, asserting success.
+    pub fn acceptance(&self, args: &[&str]) -> Output {
+        let output = self.acceptance_raw(args);
+        assert!(
+            output.status.success(),
+            "acceptance {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs an `acceptance` subcommand and parses its JSON envelope.
+    pub fn acceptance_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.acceptance(args).stdout).expect("the JSON envelope")
+    }
+
     /// Activates a card naming explicit feature and integration gate sets.
     pub fn activate_card_with_gate_sets(
         &self,

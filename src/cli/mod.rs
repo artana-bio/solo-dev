@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     commands::{
-        card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand,
-        handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
-        review::ReviewCommand, work::WorkCommand,
+        acceptance::AcceptanceCommand, card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs,
+        gate::GateCommand, handoff::HandoffCommand, integration::IntegrationCommand,
+        project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -88,6 +88,12 @@ pub enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+
+    /// Record the decision that authorizes promotion.
+    Acceptance {
+        #[command(subcommand)]
+        command: AcceptanceCommand,
     },
 }
 

@@ -46,7 +46,8 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         | Command::Gate { .. }
         | Command::Handoff { .. }
         | Command::Review { .. }
-        | Command::Integration { .. } => None,
+        | Command::Integration { .. }
+        | Command::Acceptance { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -64,6 +65,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Handoff { .. } => "handoff",
         Command::Review { .. } => "review",
         Command::Integration { .. } => "integration",
+        Command::Acceptance { .. } => "acceptance",
     }
 }
 
@@ -164,6 +166,15 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         Command::Integration { command } => {
             let resolved = resolve_output(cli.output, None)?;
             let outcome = commands::integration::execute(&command, &domain::clock::SystemClock)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
+        Command::Acceptance { command } => {
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome = commands::acceptance::execute(&command, &domain::clock::SystemClock)?;
             Ok(Execution {
                 stdout: outcome.render(resolved.format)?,
                 warnings: outcome.warnings().to_vec(),

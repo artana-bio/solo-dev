@@ -1,0 +1,447 @@
+//! `WP-450` acceptance: acceptance decisions and promotion.
+//!
+//! Promotion is the only irreversible step in the whole harness. Every test
+//! here is about the same question from a different angle: does everything that
+//! can be checked get checked *before* the protected branch moves, and does
+//! nothing rewind it afterwards?
+
+mod support;
+
+use std::fs;
+
+use support::Workspace;
+
+/// A cycle carried all the way to a reviewed integration.
+fn reviewed(count: usize) -> (Workspace, String) {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
+        workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+        workspace.approve_card(&card, &format!("src/{card}/a.rs"));
+    }
+
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    (workspace, id)
+}
+
+/// The same, accepted by the named owner.
+fn accepted(count: usize) -> (Workspace, String) {
+    let (workspace, id) = reviewed(count);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    (workspace, id)
+}
+
+fn error_code(output: &std::process::Output) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    envelope["error"]["code"].as_str().unwrap().to_owned()
+}
+
+fn landing_of(workspace: &Workspace, id: &str) -> String {
+    workspace.integration_json(&["inspect", "--integration-id", id])["data"]["landing_sha"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn an_acceptance_binds_the_exact_landing_commit_and_its_evidence() {
+    let (workspace, id) = reviewed(2);
+    let landing = landing_of(&workspace, &id);
+
+    let envelope = workspace.acceptance_json(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+        "--residual-risk",
+        "the migration is untested at scale",
+    ]);
+    assert_eq!(envelope["data"]["landing_sha"], landing);
+    assert_eq!(envelope["data"]["decision"], "accepted");
+    assert_eq!(envelope["data"]["authorizes_promotion"], true);
+    assert_eq!(envelope["data"]["acceptance_owner"], "owner");
+    assert!(
+        !envelope["data"]["receipt_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the decision must name the evidence it rests on"
+    );
+    assert!(
+        envelope["data"]["rollback_reference"]
+            .as_str()
+            .unwrap()
+            .contains(&landing),
+        "a rollback reference that does not name the commit is useless"
+    );
+
+    assert_eq!(
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+        "accepted"
+    );
+}
+
+#[test]
+fn an_unreviewed_integration_cannot_be_accepted() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}
+
+#[test]
+fn a_rejection_is_recorded_and_blocks_promotion() {
+    let (workspace, id) = reviewed(1);
+    let envelope = workspace.acceptance_json(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+        "--reject",
+    ]);
+    assert_eq!(envelope["data"]["decision"], "rejected");
+    assert_eq!(envelope["data"]["authorizes_promotion"], false);
+
+    // A rejection advances nothing: the work reaching review is a fact worth
+    // keeping, and there is no Section 11.3 transition for a refusal.
+    assert_eq!(
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+        "reviewed"
+    );
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(5));
+}
+
+#[test]
+fn an_exact_accepted_landing_promotes() {
+    let (workspace, id) = accepted(2);
+    let landing = landing_of(&workspace, &id);
+    let before = workspace.authority_head();
+
+    let envelope =
+        workspace.integration_json(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(envelope["data"]["landing_sha"], landing);
+    assert_eq!(envelope["data"]["previous_main_sha"], before);
+    assert_eq!(envelope["data"]["status"], "promoted");
+
+    assert_eq!(
+        workspace.authority_head(),
+        landing,
+        "the protected branch must now be the accepted commit"
+    );
+    assert_eq!(
+        workspace.candidate_head(),
+        landing,
+        "the local protected worktree must be fast-forwarded to match"
+    );
+    for card in ["F-001", "F-002"] {
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", card])["data"]["state"],
+            "landed"
+        );
+    }
+}
+
+#[test]
+fn a_moved_authority_branch_fails_before_the_update() {
+    let (workspace, id) = accepted(1);
+    // Someone lands directly on the protected branch after acceptance.
+    let moved = workspace.advance_authority();
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(error_code(&output), "CH-CONFLICT-CONTROL-HEAD-MOVED");
+    assert_eq!(
+        workspace.authority_head(),
+        moved,
+        "a refused promotion must leave the branch exactly as it found it"
+    );
+}
+
+#[test]
+fn a_dirty_local_main_fails_before_the_authority_update() {
+    let (workspace, id) = accepted(1);
+    let authority_before = workspace.authority_head();
+    // Uncommitted work in the protected worktree, which promotion would
+    // otherwise fast-forward over.
+    fs::write(workspace.repository.join("scratch.txt"), "in progress\n").unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(error_code(&output), "CH-PRECONDITION-WORKTREE-DIRTY");
+    assert_eq!(
+        workspace.authority_head(),
+        authority_before,
+        "the authority must not move when a later step would have failed"
+    );
+    assert!(
+        workspace.repository.join("scratch.txt").exists(),
+        "the uncommitted work must be untouched"
+    );
+}
+
+#[test]
+fn a_stale_local_main_fails_before_the_authority_update() {
+    let (workspace, id) = accepted(1);
+    let authority_before = workspace.authority_head();
+    // The local protected branch moves away from the commit the plan expects.
+    workspace.commit_candidate("local-only.txt", "not pushed\n");
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(error_code(&output), "CH-PRECONDITION-LOCAL-MAIN-STALE");
+    assert_eq!(workspace.authority_head(), authority_before);
+}
+
+#[test]
+fn promotion_without_an_acceptance_is_refused() {
+    let (workspace, id) = reviewed(1);
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}
+
+#[test]
+fn an_integration_cannot_be_accepted_twice() {
+    let (workspace, id) = accepted(1);
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "someone-else",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}
+
+#[test]
+fn an_integration_cannot_be_promoted_twice() {
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    let landing = workspace.authority_head();
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        workspace.authority_head(),
+        landing,
+        "a refused second promotion must not disturb the branch"
+    );
+}
+
+#[test]
+fn a_promote_dry_run_checks_everything_and_moves_nothing() {
+    let (workspace, id) = accepted(2);
+    let authority_before = workspace.authority_head();
+    let control_before = workspace.control_head();
+
+    let envelope = workspace.integration_json(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "promoter",
+        "--dry-run",
+    ]);
+    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_eq!(envelope["data"]["landing_sha"], landing_of(&workspace, &id));
+
+    assert_eq!(workspace.authority_head(), authority_before);
+    assert_eq!(workspace.control_head(), control_before);
+}
+
+#[test]
+fn a_dry_run_surfaces_the_same_refusal_a_real_promotion_would() {
+    let (workspace, id) = accepted(1);
+    fs::write(workspace.repository.join("scratch.txt"), "in progress\n").unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+
+    let output = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "promoter",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        error_code(&output),
+        "CH-PRECONDITION-WORKTREE-DIRTY",
+        "a dry run that cannot predict the real refusal is worthless"
+    );
+}
+
+#[test]
+fn promotion_records_evidence_naming_the_acceptance_it_rested_on() {
+    let (workspace, id) = accepted(1);
+    let landing = landing_of(&workspace, &id);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+
+    let event = workspace
+        .events()
+        .into_iter()
+        .find(|event| event["event_type"] == "integration.promoted")
+        .expect("promotion must be recorded");
+    assert_eq!(event["head_sha"], landing);
+    assert_eq!(event["metadata"]["landing_sha"], landing);
+    assert!(
+        event["metadata"]["acceptance_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("ACC-"),
+        "the authorizing decision must be named: {event}"
+    );
+}
+
+#[test]
+fn acceptance_inspect_reports_the_decision_without_promoting() {
+    let (workspace, id) = accepted(1);
+    let authority_before = workspace.authority_head();
+
+    let envelope = workspace.acceptance_json(&["inspect", "--integration-id", &id]);
+    assert_eq!(envelope["data"]["decision"], "accepted");
+    assert_eq!(
+        envelope["status"], "success",
+        "inspection is a read, not a decision"
+    );
+    assert!(
+        envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("promote")),
+        "inspection must not read as though it promoted anything"
+    );
+    assert_eq!(workspace.authority_head(), authority_before);
+}
+
+#[test]
+fn a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind() {
+    let (workspace, id) = accepted(1);
+    let landing = landing_of(&workspace, &id);
+    let authority_before = workspace.authority_head();
+
+    // Under normal conditions the fast-forward cannot fail — the landing
+    // commit descends from the commit the precondition check confirmed. The
+    // realistic trigger is another Git process holding the index lock, which
+    // is exactly the interruption Section 13.6 anticipates.
+    fs::write(workspace.repository.join(".git/index.lock"), "").unwrap();
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "a promoted authority with an unsynchronized local is recovery-required"
+    );
+    let message = {
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        envelope["error"]["message"].as_str().unwrap().to_owned()
+    };
+    assert!(
+        message.contains("authority_promoted_local_sync_pending"),
+        "the recorded state must be named: {message}"
+    );
+
+    // Section 13.6: the authority must NOT be rolled back automatically.
+    assert_eq!(
+        workspace.authority_head(),
+        landing,
+        "promotion happened; rewinding a published branch would be worse than the gap"
+    );
+    assert_ne!(workspace.authority_head(), authority_before);
+
+    // And the operation must be journaled as needing recovery, not as a clean
+    // failure — the control tree is clean here, so only the error's own
+    // category can tell the difference.
+    let status = Workspace::run_json(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        status["data"]["unresolved_operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "`project recover` must be able to see this: {}",
+        status["data"]
+    );
+}

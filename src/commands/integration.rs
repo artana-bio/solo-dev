@@ -15,6 +15,7 @@ use clap::{Args, Subcommand};
 use crate::{
     cli::output::CommandOutcome,
     commands::{
+        acceptance::acceptance_for,
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for},
         handoff::latest_handoff,
@@ -38,8 +39,11 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{
-        authority::inspect_authority,
-        command::GitScope,
+        authority::{
+            PromotionOutcome, inspect_authority, promote as promote_authority, stage_objects,
+            unstage_objects,
+        },
+        command::{GitScope, run, run_ok},
         inspect, integration_worktree, landing,
         merge::{Conflict, ConflictClass, merge_tree},
     },
@@ -67,6 +71,8 @@ pub enum IntegrationCommand {
     Verify(MergeArgs),
     /// Record an independent review of the verified integration.
     Review(ReviewArgs),
+    /// Move the protected branch to the accepted landing commit.
+    Promote(PromoteArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
 }
@@ -175,6 +181,7 @@ pub fn execute(
         IntegrationCommand::Land(args) => run_land(args, clock),
         IntegrationCommand::Verify(args) => run_verify(args, clock),
         IntegrationCommand::Review(args) => run_integration_review(args, clock),
+        IntegrationCommand::Promote(args) => run_promote(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
     }
 }
@@ -920,7 +927,12 @@ fn report_integration(
 }
 
 /// Reads one integration record.
-fn load_integration(
+///
+/// # Errors
+///
+/// Returns a precondition error when it does not exist, or an internal error
+/// when the stored record cannot be parsed.
+pub fn load_integration(
     control: &ControlRepository,
     integration_id: &IntegrationId,
 ) -> Result<IntegrationRecord, HarnessError> {
@@ -1974,7 +1986,11 @@ pub struct ReviewArgs {
 }
 
 /// Reads an integration's verification record.
-fn load_verification(
+///
+/// # Errors
+///
+/// Returns a precondition error when the integration has not been verified.
+pub fn load_verification(
     control: &ControlRepository,
     integration_id: &IntegrationId,
 ) -> Result<VerificationRecord, HarnessError> {
@@ -2126,6 +2142,384 @@ fn run_integration_review(
                     "landing_sha": verification.landing_sha,
                     "residual_risks": args.residual_risks,
                     "invariants_held": args.invariants_held,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Arguments accepted by `integration promote`.
+#[derive(Debug, Args)]
+pub struct PromoteArgs {
+    /// Path to the control repository.
+    #[arg(long)]
+    pub control: std::path::PathBuf,
+    /// The integration to promote.
+    #[arg(long)]
+    pub integration_id: String,
+    /// Who is promoting.
+    #[arg(long)]
+    pub actor_id: String,
+    /// Run every precondition check and report, promoting nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The Section 13.6 preconditions, checked before anything is published.
+///
+/// All of them are verified before step 9 moves the authority, because that
+/// step is the only irreversible one in the sequence. Anything that can be
+/// discovered afterwards is worth discovering first.
+struct PromotionChecks {
+    landing_sha: String,
+    landing_tree: String,
+    acceptance_id: String,
+}
+
+/// Verifies everything Section 13.6 requires before the authority is touched.
+fn check_promotion(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<PromotionChecks, HarnessError> {
+    if record.status != IntegrationStatus::Accepted {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} is `{}`; only an accepted integration may be promoted",
+                record.integration_id,
+                record.status.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let Some(landing_sha) = record.landing_sha.clone() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} has no landing commit",
+                record.integration_id
+            ),
+            code: ErrorCode::PreconditionNotFound,
+        });
+    };
+
+    // Step 2 and 3: reload every object and verify it still says what the
+    // decision was made against.
+    let acceptance =
+        acceptance_for(control, &record.integration_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "integration {} has no recorded acceptance",
+                record.integration_id
+            ),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+    if let Some(reason) = acceptance.blocks_promotion_of(&landing_sha) {
+        return Err(HarnessError::Control {
+            reason: format!("promotion is not authorized: {reason}"),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    let verification = load_verification(control, &record.integration_id)?;
+    if verification.landing_sha != landing_sha {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "verification covered landing commit {} but the integration holds {landing_sha}",
+                verification.landing_sha
+            ),
+            code: ErrorCode::PolicyNotVerified,
+        });
+    }
+
+    // Step 4: the authority must still be where the plan expected.
+    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    if authority.protected_sha.as_deref() != Some(record.expected_main_sha.as_str()) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "authority `{}` is now {} but the landing was built for {}",
+                config.protected_branch,
+                authority.protected_sha.as_deref().unwrap_or("unborn"),
+                record.expected_main_sha
+            ),
+            code: ErrorCode::ConflictControlHeadMoved,
+        });
+    }
+
+    // Steps 5 and 6: the landing commit itself must have the shape promotion
+    // assumes, read from the object rather than from the record that describes
+    // it.
+    let object = landing::inspect(&config.repository, &landing_sha)?;
+    if object.first_parent() != Some(record.expected_main_sha.as_str()) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "landing commit {landing_sha} has first parent {} but the authority is at {}",
+                object.first_parent().unwrap_or("none"),
+                record.expected_main_sha
+            ),
+            code: ErrorCode::PolicyLandingMismatch,
+        });
+    }
+    if Some(object.tree.as_str()) != record.integration_tree.as_deref() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "landing commit {landing_sha} carries tree {} but the verified tree was {}",
+                object.tree,
+                record.integration_tree.as_deref().unwrap_or("none")
+            ),
+            code: ErrorCode::PolicyLandingMismatch,
+        });
+    }
+
+    // Step 8: the local main worktree must be clean and at the expected commit,
+    // so step 11 can fast-forward it without touching anyone's work.
+    require_local_main_ready(config, &record.expected_main_sha)?;
+
+    Ok(PromotionChecks {
+        landing_sha,
+        landing_tree: object.tree,
+        acceptance_id: acceptance.acceptance_id.to_string(),
+    })
+}
+
+/// Refuses promotion when the candidate's protected worktree is not ready.
+///
+/// Section 13.6 step 8. Promotion fast-forwards this worktree afterwards, and
+/// fast-forwarding over uncommitted work would destroy it. Checking first means
+/// the refusal costs nothing; checking after the authority moved would leave
+/// the two out of step with no way back.
+fn require_local_main_ready(
+    config: &crate::config::ProjectConfig,
+    expected: &str,
+) -> Result<(), HarnessError> {
+    let scope = GitScope::work_tree(&config.repository);
+    let head = run(
+        &scope,
+        [
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{}^{{commit}}", config.protected_branch),
+        ],
+    )?;
+    if !head.success() || head.trimmed_stdout() != expected {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "local `{}` is at {} but promotion expects {expected}",
+                config.protected_branch,
+                if head.success() {
+                    head.trimmed_stdout()
+                } else {
+                    "no such branch"
+                }
+            ),
+            code: ErrorCode::PreconditionLocalMainStale,
+        });
+    }
+
+    let status = run_ok(
+        &scope,
+        ["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+    if !status.trimmed_stdout().is_empty() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "local `{}` worktree is not clean; promotion would fast-forward over uncommitted work",
+                config.protected_branch
+            ),
+            code: ErrorCode::PreconditionWorktreeDirty,
+        });
+    }
+    Ok(())
+}
+
+/// Fast-forwards the candidate's protected worktree onto the promoted commit.
+///
+/// Section 13.6 step 11. `--ff-only` is the point: if this cannot be a
+/// fast-forward, something changed the worktree between the precondition check
+/// and now, and merging instead would invent a commit nobody accepted.
+fn synchronize_local_main(
+    config: &crate::config::ProjectConfig,
+    landing_sha: &str,
+) -> Result<(), HarnessError> {
+    let scope = GitScope::work_tree(&config.repository);
+    let output = run(&scope, ["merge", "--ff-only", landing_sha])?;
+    if !output.success() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "authority_promoted_local_sync_pending: the authority was promoted to {landing_sha} but local `{}` could not fast-forward: {}. The authority is NOT rolled back; run `project recover`",
+                config.protected_branch,
+                output.diagnostic()
+            ),
+            code: ErrorCode::RecoveryIncomplete,
+        });
+    }
+    Ok(())
+}
+
+/// Runs every Section 13.6 precondition and reports, promoting nothing.
+fn preview_promote(
+    args: &PromoteArgs,
+    integration_id: &IntegrationId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, integration_id)?;
+    let checks = check_promotion(&control, &config, &record)?;
+
+    Ok(CommandOutcome::new(
+        "integration.promote",
+        format!(
+            "Dry run: every precondition for promoting {integration_id} holds\n  landing commit: {}\n  authority `{}`: {} → {}\nnothing was changed",
+            checks.landing_sha,
+            config.protected_branch,
+            record.expected_main_sha,
+            checks.landing_sha
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "integration_id": integration_id.to_string(),
+            "landing_sha": checks.landing_sha,
+            "expected_main_sha": record.expected_main_sha,
+            "acceptance_id": checks.acceptance_id,
+        }),
+    )
+    .with_project(config.project_id))
+}
+
+/// Moves the authority branch, staging objects first and cleaning up after.
+///
+/// This is the one irreversible step in the sequence, isolated so the code
+/// around it reads as "everything before" and "everything after".
+fn publish(
+    config: &crate::config::ProjectConfig,
+    integration_id: &IntegrationId,
+    landing_sha: &str,
+    expected_main_sha: &str,
+) -> Result<(), HarnessError> {
+    let incoming = stage_objects(
+        &config.repository,
+        &config.authority_repository,
+        landing_sha,
+        integration_id.as_str(),
+    )?;
+    let outcome = promote_authority(
+        &config.authority_repository,
+        &config.protected_branch,
+        landing_sha,
+        expected_main_sha,
+    );
+    unstage_objects(&config.authority_repository, &incoming);
+
+    match outcome? {
+        PromotionOutcome::Rejected {
+            expected_sha,
+            actual_sha,
+        } => Err(HarnessError::Control {
+            reason: format!(
+                "authority `{}` moved to {actual_sha} while promoting; it was {expected_sha} when the checks ran",
+                config.protected_branch
+            ),
+            code: ErrorCode::ConflictControlHeadMoved,
+        }),
+        PromotionOutcome::Promoted { current_sha, .. } => {
+            // Confirm rather than assume. `update-ref` reported success; this
+            // checks what the branch actually resolves to now.
+            if current_sha == landing_sha {
+                Ok(())
+            } else {
+                Err(HarnessError::Control {
+                    reason: format!(
+                        "authority `{}` resolves to {current_sha} after promotion, not {landing_sha}",
+                        config.protected_branch
+                    ),
+                    code: ErrorCode::RecoveryIncomplete,
+                })
+            }
+        }
+    }
+}
+
+fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        return preview_promote(args, &integration_id);
+    }
+
+    with_transaction(
+        &args.control,
+        "integration.promote",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            let checks = check_promotion(control, &config, &record)?;
+
+            // Steps 7, 9, and 10.
+            publish(
+                &config,
+                &integration_id,
+                &checks.landing_sha,
+                &record.expected_main_sha,
+            )?;
+
+            // Past this point the authority has moved. Section 13.6 is
+            // explicit that a local synchronization failure must NOT roll it
+            // back: the promotion happened, and rewinding a published branch
+            // is worse than leaving a recoverable gap.
+            synchronize_local_main(&config, &checks.landing_sha)?;
+
+            record.status = IntegrationStatus::Promoted;
+            control.write_atomic(
+                &IntegrationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+            for member in &record.members {
+                let (card, state) = load_card(control, &member.card_id)?;
+                state.state.check_transition(CardState::Landed)?;
+                crate::commands::card::store_card_state(control, &card, &state, CardState::Landed)?;
+            }
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.promoted", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(checks.landing_sha.clone())
+                    .transition(
+                        Some(IntegrationStatus::Accepted.name()),
+                        IntegrationStatus::Promoted.name(),
+                    )
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("acceptance_id", serde_json::json!(checks.acceptance_id))
+                    .meta("landing_sha", serde_json::json!(checks.landing_sha))
+                    .meta("landing_tree", serde_json::json!(checks.landing_tree))
+                    .meta(
+                        "previous_main_sha",
+                        serde_json::json!(record.expected_main_sha),
+                    ),
+                clock,
+            )?;
+            control.commit(expected, &format!("integration: promote {integration_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "integration.promote",
+                format!(
+                    "Promoted {integration_id}\nauthority `{}`: {} → {}\ncards landed: {}\nlocal `{}` fast-forwarded",
+                    config.protected_branch,
+                    record.expected_main_sha,
+                    checks.landing_sha,
+                    record.members.len(),
+                    config.protected_branch,
+                ),
+                serde_json::json!({
+                    "integration_id": integration_id.to_string(),
+                    "status": IntegrationStatus::Promoted.name(),
+                    "landing_sha": checks.landing_sha,
+                    "landing_tree": checks.landing_tree,
+                    "previous_main_sha": record.expected_main_sha,
+                    "acceptance_id": checks.acceptance_id,
+                    "cards": record.card_ids().map(ToString::to_string).collect::<Vec<_>>(),
                 }),
             )
             .with_project(config.project_id.clone()))

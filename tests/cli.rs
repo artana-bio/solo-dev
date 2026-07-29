@@ -30,15 +30,13 @@ fn help_identifies_the_cli() {
 #[test]
 fn help_does_not_advertise_unimplemented_commands() {
     let stdout = String::from_utf8(run(&["--help"]).stdout).expect("help should be UTF-8");
-    // Section 12.3 lists these, but they must stay absent until their owning
-    // work packages implement them. This list shrinks as packages land, which
-    // is the point: help must never advertise a command that does nothing.
-    for absent in ["acceptance", "archive"] {
-        assert!(
-            !stdout.contains(&format!("  {absent}")),
-            "help advertises unimplemented `{absent}`"
-        );
-    }
+    // Section 12.3 lists `archive`, but it must stay absent until `WP-460`
+    // implements it: help must never advertise a command that does nothing.
+    // This assertion disappears when that package lands.
+    assert!(
+        !stdout.contains("  archive"),
+        "help advertises unimplemented `archive`"
+    );
 }
 
 #[test]

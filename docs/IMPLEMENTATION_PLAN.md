@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 22 |
+| Plan revision | 23 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `7c0ae0e` (`feat(WP-430): landing commit construction`) |
+| Previous plan commit | `4a27c10` (`feat(WP-440): combined verification and integration review`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-440` complete; 595 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
-| Next executable work package | `WP-450` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-450` complete; 613 tests passing. A change can now travel end to end from card to promoted commit. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
+| Next executable work package | `WP-460` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2317,9 +2317,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-400`, `WP-430`, `WP-440` |
 | Target release | Single-repository MVP |
+| Evidence | `src/domain/acceptance.rs`, `src/commands/acceptance.rs`, `integration promote` in `src/commands/integration.rs`, `tests/promotion.rs` (15 acceptance tests) |
 
 Deliverables:
 
@@ -2337,6 +2338,29 @@ Acceptance:
 - exact accepted landing succeeds;
 - authority success/local-sync interruption returns recovery-required state;
 - no command rewinds authority automatically.
+
+Delivered notes:
+
+- Every Section 13.6 precondition is checked before the authority moves,
+  because that is the only irreversible step in the harness. Anything
+  discoverable afterwards is worth discovering first.
+- The landing commit's shape is read back from the object — first parent, tree
+  — rather than trusted from the record that describes it. Verifying a record
+  against itself proves nothing.
+- A rejection is recorded but advances nothing. Section 11.3 has no transition
+  out of `reviewed` for a refusal, and inventing one would erase the fact that
+  the work reached review at all.
+- Fixes a real gap this package exposed (D-048): `with_transaction` decided
+  between `failed_clean` and `failed_partial` by checking whether the control
+  worktree was clean. Promotion's irreversible step happens in the *authority*,
+  which that check cannot see, so an authority-promoted, local-sync-failed run
+  would have been journaled as a clean failure and `project recover` would have
+  stayed silent about it. An error whose category is `recovery-required` is now
+  taken at its word.
+- The partial-success path is exercised by a real failure — another process
+  holding the index lock — not by inspection. Under normal conditions the
+  fast-forward cannot fail, since the landing commit descends from the commit
+  the precondition check confirmed.
 
 ### WP-460 — Archive, close, and cleanup
 
@@ -2772,7 +2796,7 @@ All must be true:
 
 
 
-| Integration | `IN_PROGRESS` | Through verification and review; acceptance next | `WP-450` onward |
+| Integration | `IN_PROGRESS` | Through promotion; archive and cleanup next | `WP-460` |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2789,8 +2813,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-450` |
-| Next branch name | `wp/WP-450-acceptance-promotion` |
+| Next work package | `WP-460` |
+| Next branch name | `wp/WP-460-archive-cleanup` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2933,6 +2957,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-045 | Add `integration ready`, `preflight`, `merge`, and `land` to the Section 12.3 command surface | Accepted | Section 12.3 lists `prepare`, `verify`, `inspect`, `review`, and `promote`. `ready` is required by `WP-410` for `SPIKE-001` finding F-3; `preflight`, `merge`, and `land` are the separately observable steps `WP-420` and `WP-430` deliver, and Section 13.5 requires the landing commit to exist before final verification, which is impossible if landing is folded into `verify` or `promote`. |
 | D-046 | Give receipts an integration scope, making `card_id` optional | Accepted, amends Section 10.6 | `WP-440` reruns gates against the landing commit, which belongs to every member card and to none of them individually. The original schema required `card_id`, leaving two options: attribute a combined run to an arbitrary member, or run each gate once per card. The first is a false claim about what was checked; the second multiplies a long test suite by the batch size while adding no information, since the gate does not know which card asked for it. Naming the real subject is the honest third option. |
 | D-047 | Refuse an integration review that leaves a declared cycle invariant unconfirmed | Accepted | Section 10.2 lets a cycle declare release invariants in free text, which no gate can evaluate. If the review can pass without addressing them, they are decorative. Requiring each to be named explicitly is the only mechanism available for a condition a machine cannot check. |
+| D-048 | Journal a `recovery-required` error as a partial failure regardless of control-tree cleanliness | Accepted | `with_transaction` inferred "nothing was written" from a clean control worktree. That inference holds for every command that only mutates control state, but `integration promote` moves the authority branch — a repository the check cannot see. An authority-promoted, local-sync-failed run leaves control clean, so it would have been recorded `failed_clean` and `project recover` would have stayed silent about precisely the state Section 13.6 requires it to surface. An error that declares itself recovery-required is now taken at its word. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

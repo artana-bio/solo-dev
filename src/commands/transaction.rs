@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::{
-    cli::output::CommandOutcome,
+    cli::{exit::ExitCategory, output::CommandOutcome},
     control::{
         event_store::EventStore,
         journal::{Journal, OperationState},
@@ -60,7 +60,16 @@ where
             // A failure that left the working tree clean wrote nothing, so it
             // does not need recovery. Recording the difference is what lets
             // `project recover` stay quiet about ordinary rejections.
-            let state = if control.is_clean().unwrap_or(false) {
+            //
+            // The clean tree is not sufficient on its own: `integration
+            // promote` mutates the authority repository, which this check
+            // cannot see, so a failure after the protected branch moved would
+            // look clean. An error that asks for recovery is taken at its
+            // word. Section 13.6 requires exactly this for the
+            // authority-promoted, local-sync-pending case.
+            let state = if error.category() == ExitCategory::RecoveryRequired {
+                OperationState::FailedPartial
+            } else if control.is_clean().unwrap_or(false) {
                 OperationState::FailedClean
             } else {
                 OperationState::FailedPartial

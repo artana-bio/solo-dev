@@ -87,6 +87,12 @@ pub enum ErrorCode {
     PolicyInvariantUnaddressed,
     /// One actor attempted two roles that must be held by different actors.
     PolicySameActor,
+    /// Promotion was attempted without an acceptance that authorizes it.
+    PolicyNotAccepted,
+    /// The landing commit was not covered by the recorded verification.
+    PolicyNotVerified,
+    /// The landing commit does not have the shape promotion requires.
+    PolicyLandingMismatch,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A card's declared base commit does not exist in the repository.
@@ -99,6 +105,8 @@ pub enum ErrorCode {
     PreconditionWorktreeDirty,
     /// A branch holds commits that are not merged elsewhere.
     PreconditionUnmergedWork,
+    /// The local protected worktree is not at the commit promotion expects.
+    PreconditionLocalMainStale,
     /// A card already holds an active lease.
     PolicyLeaseHeld,
     /// A worktree locator disagrees with authoritative control state.
@@ -141,7 +149,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 65] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -178,12 +186,16 @@ impl ErrorCode {
         Self::PolicyUnsupportedUntilWp540,
         Self::PolicyInvariantUnaddressed,
         Self::PolicySameActor,
+        Self::PolicyNotAccepted,
+        Self::PolicyNotVerified,
+        Self::PolicyLandingMismatch,
         Self::PreconditionNotFound,
         Self::PreconditionBaseMissing,
         Self::PreconditionBranchExists,
         Self::PreconditionWorktreeExists,
         Self::PreconditionWorktreeDirty,
         Self::PreconditionUnmergedWork,
+        Self::PreconditionLocalMainStale,
         Self::PolicyLeaseHeld,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
@@ -246,6 +258,9 @@ impl ErrorCode {
             | Self::PolicyUnsupportedUntilWp540
             | Self::PolicyInvariantUnaddressed
             | Self::PolicySameActor
+            | Self::PolicyNotAccepted
+            | Self::PolicyNotVerified
+            | Self::PolicyLandingMismatch
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
@@ -263,7 +278,8 @@ impl ErrorCode {
             | Self::PreconditionBranchExists
             | Self::PreconditionWorktreeExists
             | Self::PreconditionWorktreeDirty
-            | Self::PreconditionUnmergedWork => ExitCategory::Precondition,
+            | Self::PreconditionUnmergedWork
+            | Self::PreconditionLocalMainStale => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
             Self::ConflictControlHeadMoved | Self::ConflictMergeFailed => ExitCategory::Conflict,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
@@ -311,12 +327,16 @@ impl ErrorCode {
             Self::PolicyUnsupportedUntilWp540 => "UNSUPPORTED-UNTIL-WP-540",
             Self::PolicyInvariantUnaddressed => "INVARIANT-UNADDRESSED",
             Self::PolicySameActor => "SAME-ACTOR",
+            Self::PolicyNotAccepted => "NOT-ACCEPTED",
+            Self::PolicyNotVerified => "NOT-VERIFIED",
+            Self::PolicyLandingMismatch => "LANDING-MISMATCH",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
             Self::PreconditionWorktreeExists => "WORKTREE-EXISTS",
             Self::PreconditionWorktreeDirty => "WORKTREE-DIRTY",
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
+            Self::PreconditionLocalMainStale => "LOCAL-MAIN-STALE",
             Self::PolicyLeaseHeld => "LEASE-HELD",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
@@ -457,6 +477,15 @@ impl ErrorCode {
             }
             Self::PolicySameActor => {
                 "Have a different actor perform this step; the two roles must be held separately."
+            }
+            Self::PolicyNotAccepted => {
+                "Record an acceptance for this exact landing commit before promoting."
+            }
+            Self::PolicyNotVerified => {
+                "Re-run `integration verify`; the recorded verification covers a different commit."
+            }
+            Self::PolicyLandingMismatch => {
+                "Rebuild the landing commit; it no longer matches the plan it was built from."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {
