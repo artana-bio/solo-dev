@@ -14,6 +14,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,9 @@ pub fn process_start_time(pid: u32) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Distinguishes one acquisition attempt's scratch file from another's.
+static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// A held project lock, released when dropped.
 ///
 /// Release happens in `Drop` so an early return or a panic cannot strand the
@@ -138,20 +142,49 @@ impl ProjectLock {
             process_start: process_start_time(pid),
         };
 
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                let encoded = serde_json::to_string_pretty(&holder)?;
-                file.write_all(encoded.as_bytes())
-                    .map_err(|source| HarnessError::ControlIo {
-                        path: path.clone(),
-                        source,
-                    })?;
-                file.sync_all().map_err(|source| HarnessError::ControlIo {
-                    path: path.clone(),
+        // The contents are written to a scratch file first and linked into
+        // place, rather than creating the lock and filling it in afterwards.
+        // `create_new` makes acquisition exclusive either way, but it also
+        // makes the file *visible* before it has contents — and a contender
+        // that reads it in that window sees an unparseable holder and reports
+        // the lock as ambiguous, telling an operator to check whether a
+        // command is running while one plainly is. `hard_link` fails when the
+        // destination exists, so it keeps the exclusion and the file is
+        // complete the instant it appears.
+        //
+        // The scratch name is unique per *attempt*, not per process: threads
+        // inside one process share a pid, and two of them racing on one name
+        // would each delete the other's file mid-flight.
+        let attempt = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let scratch = path.with_extension(format!("staging.{pid}.{attempt}"));
+        let encoded = serde_json::to_string_pretty(&holder)?;
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&scratch)
+                .map_err(|source| HarnessError::ControlIo {
+                    path: scratch.clone(),
                     source,
                 })?;
-                Ok(Self { path, holder })
-            }
+            file.write_all(encoded.as_bytes())
+                .map_err(|source| HarnessError::ControlIo {
+                    path: scratch.clone(),
+                    source,
+                })?;
+            file.sync_all().map_err(|source| HarnessError::ControlIo {
+                path: scratch.clone(),
+                source,
+            })?;
+        }
+
+        let linked = fs::hard_link(&scratch, &path);
+        // The scratch file has done its job either way; leaving it behind
+        // would make the next acquisition by this pid see stale contents.
+        let _ = fs::remove_file(&scratch);
+        match linked {
+            Ok(()) => Ok(Self { path, holder }),
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(match Self::diagnose(control) {
                     LockDiagnosis::Held(held) => HarnessError::Control {

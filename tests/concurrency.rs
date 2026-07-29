@@ -373,3 +373,174 @@ fn a_lock_survives_being_diagnosed_under_a_different_locale() {
         envelope["data"]["lock"]
     );
 }
+
+/// How many rounds the contention tests run.
+///
+/// A race that shows up one time in twenty would pass a single round more than
+/// half the time, which is indistinguishable from correct. Enough rounds to
+/// make that unlikely, few enough to stay inside an ordinary test run.
+const ROUNDS: usize = 40;
+
+/// How many contenders each round starts.
+const CONTENDERS: usize = 8;
+
+#[test]
+fn many_threads_contending_for_one_lock_produce_exactly_one_winner() {
+    use std::sync::{Arc, Barrier};
+
+    use change_harness::{control::lock::ProjectLock, domain::clock::SystemClock};
+
+    for round in 0..ROUNDS {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let control = temp.path().to_path_buf();
+        // A barrier is the point: without it the threads start staggered and
+        // the first one finishes before the last one begins, which is the
+        // sequential case wearing a thread pool.
+        let gate = Arc::new(Barrier::new(CONTENDERS));
+
+        // The acquired locks are *kept* until every contender has finished.
+        // Returning `is_ok()` would drop each one at the end of its closure,
+        // releasing it in time for the next thread to acquire cleanly — which
+        // measures nothing and passes trivially. The first version of this
+        // test did exactly that.
+        let held: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..CONTENDERS)
+                .map(|index| {
+                    let control = control.clone();
+                    let gate = Arc::clone(&gate);
+                    scope.spawn(move || {
+                        gate.wait();
+                        ProjectLock::acquire(&control, &format!("worker-{index}"), &SystemClock)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect()
+        });
+        let winners = held.iter().filter(|outcome| outcome.is_ok()).count();
+
+        assert_eq!(
+            winners, 1,
+            "round {round}: exactly one of {CONTENDERS} contenders may hold the lock"
+        );
+
+        // Every loser must be told the lock is *held*, not that its state is
+        // unknowable. An ambiguous verdict during ordinary contention would
+        // send an operator looking for a process that is running normally.
+        for outcome in &held {
+            if let Err(error) = outcome {
+                assert_eq!(
+                    error.code(),
+                    change_harness::error::ErrorCode::PolicyLockHeld,
+                    "round {round}: a loser saw `{error}`"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn many_processes_mutating_one_project_produce_one_commit_each_round() {
+    // Threads share an address space; separate processes do not, and the lock
+    // has to work across both. This is the case an operator actually hits when
+    // two terminals run a command at once.
+    let workspace = Workspace::initialized();
+    let mut created = 0usize;
+
+    for round in 0..ROUNDS {
+        let before = workspace.control_head();
+        let cycle = format!("C-{round:03}");
+
+        let children: Vec<_> = (0..CONTENDERS)
+            .map(|_| {
+                std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+                    .args([
+                        "cycle",
+                        "create",
+                        "--control",
+                        &workspace.control.display().to_string(),
+                        "--cycle-id",
+                        &cycle,
+                        "--objective",
+                        "contention",
+                        "--output",
+                        "json",
+                    ])
+                    .spawn()
+                    .expect("the CLI should start")
+            })
+            .collect();
+
+        let successes = children
+            .into_iter()
+            .filter_map(|mut child| child.wait().ok())
+            .filter(std::process::ExitStatus::success)
+            .count();
+
+        // At most one may succeed. Zero is legitimate: a contender that finds
+        // the lock held fails, and if the winner is slow every other process
+        // can lose before it commits.
+        assert!(
+            successes <= 1,
+            "round {round}: {successes} processes each believed they created {cycle}"
+        );
+        if successes == 1 {
+            created += 1;
+            assert_ne!(
+                workspace.control_head(),
+                before,
+                "round {round}: a success must have committed something"
+            );
+        } else {
+            assert_eq!(
+                workspace.control_head(),
+                before,
+                "round {round}: no winner must mean no commit"
+            );
+        }
+    }
+
+    assert!(
+        created > 0,
+        "the fixture must actually have let someone through, or this proves nothing"
+    );
+}
+
+#[test]
+fn a_losing_contender_never_leaves_the_lock_behind() {
+    // The failure that would matter most: a process that loses the race must
+    // not release a lock it never held, or the winner is left unprotected.
+    let workspace = Workspace::initialized();
+
+    for round in 0..ROUNDS {
+        let cycle = format!("C-{round:03}");
+        let children: Vec<_> = (0..CONTENDERS)
+            .map(|_| {
+                std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+                    .args([
+                        "cycle",
+                        "create",
+                        "--control",
+                        &workspace.control.display().to_string(),
+                        "--cycle-id",
+                        &cycle,
+                        "--objective",
+                        "contention",
+                    ])
+                    .spawn()
+                    .expect("the CLI should start")
+            })
+            .collect();
+        for mut child in children {
+            let _ = child.wait();
+        }
+
+        assert_eq!(
+            lock_state(&workspace)["state"],
+            "free",
+            "round {round}: every contender exited, so the lock must be released"
+        );
+    }
+}

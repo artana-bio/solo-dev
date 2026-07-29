@@ -251,7 +251,10 @@ fn a_held_lock_makes_a_second_mutation_fail_as_policy() {
 }
 
 #[test]
-fn concurrent_lock_acquisition_has_exactly_one_winner() {
+fn a_second_acquisition_loses_while_the_first_is_held() {
+    // Sequential, and named for what it is. Real contention is exercised by
+    // `tests/concurrency.rs`, which this used to claim to do and did not: two
+    // calls on one thread never contend for anything.
     let temp = tempfile::tempdir().unwrap();
     let control = temp.path().to_path_buf();
 
