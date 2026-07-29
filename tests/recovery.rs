@@ -393,3 +393,73 @@ fn every_mutating_command_names_at_least_one_boundary() {
         "these command modules open transactions but name no boundary: {missing:?}"
     );
 }
+
+#[test]
+fn resume_does_not_mark_an_operation_it_cannot_resume_as_complete() {
+    // Tier 2, defect 8, found independently by three reviewers. `--resume`
+    // marked *every* unresolved entry `Completed` and then called a resume path
+    // that only knows how to finish promotions. For anything else — an
+    // allocation, a merge, an activation — the entry was closed as though its
+    // work had been done, the resume reported "nothing to resume", and the only
+    // record that a partial mutation had happened was gone. `project status`
+    // then reported a healthy project over a half-made allocation.
+    //
+    // The guard against over-narrowing this is
+    // `an_interruption_after_the_authority_moves_is_resumable`, which holds the
+    // one case `--resume` exists for: it must still settle the entry and
+    // complete the promotion.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    let args: Vec<String> = vec![
+        "work".into(),
+        "start".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--card-id".into(),
+        "F-001".into(),
+    ];
+    assert!(!run_failing_at("worktree-added", &args).status.success());
+
+    // The fixture must actually be unresolved, or the rest proves nothing.
+    assert_eq!(
+        unresolved(&workspace).len(),
+        1,
+        "the interruption must have left an unresolved entry"
+    );
+
+    let output = Workspace::run(&[
+        "project".into(),
+        "recover".into(),
+        "--resume".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--actor-id".into(),
+        "operator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "resume must not report success for an operation it cannot resume: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        unresolved(&workspace).len(),
+        1,
+        "the entry must survive: it is the only record that a partial mutation happened"
+    );
+    assert!(
+        workspace.candidate_branch_exists("card/F-001"),
+        "and the half-made allocation must still be there to recover"
+    );
+}

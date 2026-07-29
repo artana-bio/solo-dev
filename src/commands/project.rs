@@ -574,6 +574,13 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
 /// only one where a command can die having already changed something outside
 /// the control repository. Every other boundary either wrote nothing or wrote
 /// only to control, where the next command's compare-and-swap sorts it out.
+/// The one journaled command `--resume` knows how to finish.
+///
+/// `resume_promotion` re-derives its state from the authority branch rather
+/// than from a journal step, which is what makes it safe to run again. Nothing
+/// else has an equivalent, so nothing else may be settled by this command.
+const PROMOTE_COMMAND: &str = "integration.promote";
+
 fn run_resume(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     with_transaction(
         &args.control,
@@ -643,9 +650,33 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             )
             .with_project(config.project_id.clone()));
         }
+        // `resume_promotion` is the only recovery this command performs, so it
+        // is the only kind of entry that may be settled here. Marking every
+        // unresolved entry completed and then resuming only promotions closed
+        // an interrupted allocation or merge as though its work had been done,
+        // reported "nothing to resume", and destroyed the sole record that a
+        // partial mutation happened — after which `project status` reported a
+        // healthy project over a half-made one. Three reviewers found this
+        // independently.
+        let unresumable: Vec<&str> = unresolved
+            .iter()
+            .filter(|record| record.command != PROMOTE_COMMAND)
+            .map(|record| record.command.as_str())
+            .collect();
+        if !unresumable.is_empty() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "cannot resume: {} interrupted operation(s) are not promotions ({}); `project recover` without `--resume` reports what each one left behind, and their disposition is an operator decision",
+                    unresumable.len(),
+                    unresumable.join(", ")
+                ),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+
         // The journal is settled first so the resuming transaction can open its
         // own entry; the interrupted one is marked completed because its work
-        // is about to be finished, not abandoned.
+        // is about to be finished by `run_resume`, not abandoned.
         let mut records = unresolved.clone();
         for record in &mut records {
             journal.finish(record, OperationState::Completed, None, clock)?;
