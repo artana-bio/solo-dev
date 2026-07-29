@@ -16,7 +16,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::{
         card::load_card,
-        gate::load_gate,
+        gate::{load_gate, receipts_for},
         handoff::latest_handoff,
         review::{current_approval, reviews_for},
         transaction::with_transaction,
@@ -39,7 +39,7 @@ use crate::{
     git::{
         authority::inspect_authority,
         command::GitScope,
-        inspect, integration_worktree,
+        inspect, integration_worktree, landing,
         merge::{Conflict, ConflictClass, merge_tree},
     },
     runner::{receipt::LOG_DIR, run_attempt},
@@ -56,6 +56,8 @@ pub enum IntegrationCommand {
     Preflight(InspectArgs),
     /// Combine the selected candidates in a disposable worktree.
     Merge(MergeArgs),
+    /// Build the landing commit without moving the protected branch.
+    Land(MergeArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
 }
@@ -161,6 +163,7 @@ pub fn execute(
         IntegrationCommand::Prepare(args) => run_prepare(args, clock),
         IntegrationCommand::Preflight(args) => run_preflight(args),
         IntegrationCommand::Merge(args) => run_merge(args, clock),
+        IntegrationCommand::Land(args) => run_land(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
     }
 }
@@ -761,6 +764,8 @@ fn build_record(
         integration_head: None,
         integration_tree: None,
         merged_at: None,
+        landing_sha: None,
+        landed_at: None,
         prepared_by: actor_id.to_owned(),
         prepared_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
@@ -866,8 +871,8 @@ fn report_integration(
         .iter()
         .map(|member| format!("{} at {}", member.card_id, &member.candidate_sha))
         .collect();
-    let text = format!(
-        "Prepared integration {} ({})\ncycle: {}\nmode: {}\nexpected authority baseline: {}\nmerge order:\n  {}",
+    let mut text = format!(
+        "Integration {} ({})\ncycle: {}\nmode: {}\nexpected authority baseline: {}\nmerge order:\n  {}",
         record.integration_id,
         record.status.name(),
         record.cycle_id,
@@ -875,6 +880,12 @@ fn report_integration(
         record.expected_main_sha,
         order.join("\n  ")
     );
+    if let Some(head) = &record.integration_head {
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nintegration head: {head}"));
+    }
+    if let Some(landing) = &record.landing_sha {
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nlanding commit: {landing}"));
+    }
 
     CommandOutcome::new(
         command,
@@ -888,6 +899,9 @@ fn report_integration(
             "baseline_sha": record.baseline_sha,
             "expected_main_sha": record.expected_main_sha,
             "atomic_groups": record.atomic_groups,
+            "integration_head": record.integration_head,
+            "integration_tree": record.integration_tree,
+            "landing_sha": record.landing_sha,
             "members": record.members,
         }),
     )
@@ -1317,6 +1331,290 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                 }),
             )
             .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Refuses an integration whose cards declare shared generated artifacts.
+///
+/// `WP-540` owns integration-owned artifact generation. Landing such a project
+/// now would produce a tree missing whatever the artifacts were meant to be, so
+/// this refuses with a stable code rather than landing something incomplete.
+fn require_no_generated_artifacts(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    for member in &record.members {
+        let (card, _) = load_card(control, &member.card_id)?;
+        if !card.generated_artifacts.is_empty() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "card {} declares generated artifacts ({}), which integration-owned generation does not support until WP-540",
+                    member.card_id,
+                    card.generated_artifacts.join(", ")
+                ),
+                code: ErrorCode::PolicyUnsupportedUntilWp540,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Builds the Section 13.5 trailers for an integration.
+///
+/// Every identifier a later reader needs to re-derive the landing is present in
+/// the commit itself, so the commit remains explicable even to someone who has
+/// only the candidate repository and not the control repository.
+fn landing_trailers(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    digest: &crate::domain::digest::Digest,
+) -> Result<Vec<(String, String)>, HarnessError> {
+    let mut trailers = vec![
+        (
+            landing::TRAILER_INTEGRATION.to_owned(),
+            record.integration_id.to_string(),
+        ),
+        (
+            landing::TRAILER_INTEGRATION_DIGEST.to_owned(),
+            digest.as_str().to_owned(),
+        ),
+        (
+            landing::TRAILER_CYCLE.to_owned(),
+            record.cycle_id.to_string(),
+        ),
+    ];
+    for member in &record.members {
+        trailers.push((
+            landing::TRAILER_CARD.to_owned(),
+            format!(
+                "{} r{} {} review {}",
+                member.card_id, member.card_revision, member.candidate_sha, member.review_id
+            ),
+        ));
+        for receipt in receipts_for(control, &member.card_id)? {
+            trailers.push((
+                landing::TRAILER_RECEIPT.to_owned(),
+                format!(
+                    "{} {} {}",
+                    receipt.receipt_id, receipt.gate_id, receipt.evaluated_sha
+                ),
+            ));
+        }
+    }
+    Ok(trailers)
+}
+
+/// The deterministic subject Section 13.5 requires.
+fn landing_subject(record: &IntegrationRecord) -> String {
+    format!(
+        "Land {} ({} card{}, {})",
+        record.integration_id,
+        record.members.len(),
+        if record.members.len() == 1 { "" } else { "s" },
+        record.mode.name()
+    )
+}
+
+/// Validates a merged integration and returns everything landing needs.
+fn landing_inputs(
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<(String, String), HarnessError> {
+    if record.status != IntegrationStatus::Prepared {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} is `{}`; a landing commit is built from a prepared, merged integration",
+                record.integration_id,
+                record.status.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let (Some(head), Some(tree)) = (&record.integration_head, &record.integration_tree) else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} has not been merged; run `integration merge` first",
+                record.integration_id
+            ),
+            code: ErrorCode::PreconditionNotFound,
+        });
+    };
+
+    // Exact tree validation: the recorded tree must still be what the
+    // integration head carries. If they disagree, something rewrote the head
+    // after the merge and the recorded tree describes a state that no longer
+    // exists.
+    let actual = integration_worktree::tree_of(&config.repository, head)?;
+    if actual != *tree {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} recorded tree {tree} but head {head} now carries {actual}",
+                record.integration_id
+            ),
+            code: ErrorCode::ConflictMergeFailed,
+        });
+    }
+
+    // The authority must not have moved since the plan was built, or the
+    // landing's first parent would not be the branch promotion updates.
+    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    if authority.protected_sha.as_deref() != Some(record.expected_main_sha.as_str()) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "authority `{}` is now {} but the integration was planned against {}; re-prepare it",
+                config.protected_branch,
+                authority.protected_sha.as_deref().unwrap_or("unborn"),
+                record.expected_main_sha
+            ),
+            code: ErrorCode::ConflictControlHeadMoved,
+        });
+    }
+
+    Ok((head.clone(), tree.clone()))
+}
+
+/// Validates everything landing needs and reports it, building nothing.
+fn preview_land(
+    args: &MergeArgs,
+    integration_id: &IntegrationId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, integration_id)?;
+    require_no_generated_artifacts(&control, &record)?;
+    let (head, tree) = landing_inputs(&config, &record)?;
+
+    Ok(CommandOutcome::new(
+        "integration.land",
+        format!(
+            "Dry run: would build `{}`\n  first parent: {}\n  second parent: {head}\n  tree: {tree}\nnothing was changed",
+            landing_subject(&record),
+            record.expected_main_sha
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "integration_id": integration_id.to_string(),
+            "subject": landing_subject(&record),
+            "first_parent": record.expected_main_sha,
+            "second_parent": head,
+            "tree": tree,
+        }),
+    )
+    .with_project(config.project_id))
+}
+
+/// Turns a built landing commit into the command's outcome.
+fn report_landing(
+    object: &landing::LandingObject,
+    integration_id: &IntegrationId,
+    digest: &crate::domain::digest::Digest,
+    project_id: &crate::domain::ids::ProjectId,
+) -> CommandOutcome {
+    let reference = landing::landing_ref(integration_id.as_str());
+    CommandOutcome::new(
+        "integration.land",
+        format!(
+            "Built landing commit {}\nsubject: {}\nfirst parent: {}\nsecond parent: {}\ntree: {}\nretained at {reference}\nthe protected branch was not moved",
+            object.sha,
+            object.subject,
+            object.first_parent().unwrap_or("none"),
+            object.second_parent().unwrap_or("none"),
+            object.tree,
+        ),
+        serde_json::json!({
+            "integration_id": integration_id.to_string(),
+            "integration_digest": digest.as_str(),
+            "landing_sha": object.sha,
+            "landing_ref": reference,
+            "subject": object.subject,
+            "first_parent": object.first_parent(),
+            "second_parent": object.second_parent(),
+            "tree": object.tree,
+            "trailers": object.trailers,
+        }),
+    )
+    .with_project(project_id.clone())
+}
+
+fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        return preview_land(args, &integration_id);
+    }
+
+    with_transaction(
+        &args.control,
+        "integration.land",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            if let Some(existing) = &record.landing_sha {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {integration_id} already has landing commit {existing}"
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            require_no_generated_artifacts(control, &record)?;
+            let (head, tree) = landing_inputs(&config, &record)?;
+
+            // The record's digest goes into a trailer, so it is taken before
+            // the landing SHA is written back into the record.
+            let planned_digest = record.digest()?;
+            let message = landing::compose_message(
+                &landing_subject(&record),
+                &landing_trailers(control, &record, &planned_digest)?,
+            );
+            let landing_sha = landing::create(
+                &config.repository,
+                &tree,
+                &record.expected_main_sha,
+                &head,
+                &message,
+            )?;
+            // Held by a harness ref so collection cannot take it before
+            // promotion; the protected branch is untouched.
+            landing::retain(&config.repository, integration_id.as_str(), &landing_sha)?;
+
+            record.landing_sha = Some(landing_sha.clone());
+            record.landed_at = Some(clock.now());
+            let digest = record.digest()?;
+            control.write_atomic(
+                &IntegrationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.landing-built", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(landing_sha.clone())
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("integration_digest", serde_json::json!(digest.as_str()))
+                    .meta("landing_sha", serde_json::json!(landing_sha))
+                    .meta("first_parent", serde_json::json!(record.expected_main_sha))
+                    .meta("second_parent", serde_json::json!(head)),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("integration: build landing commit for {integration_id}"),
+            )?;
+
+            let object = landing::inspect(&config.repository, &landing_sha)?;
+            Ok(report_landing(
+                &object,
+                &integration_id,
+                &digest,
+                &config.project_id,
+            ))
         },
     )
 }

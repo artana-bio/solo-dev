@@ -12,6 +12,7 @@ pub mod command;
 pub mod diff;
 pub mod inspect;
 pub mod integration_worktree;
+pub mod landing;
 pub mod merge;
 pub mod worktree;
 

@@ -211,6 +211,15 @@ pub struct IntegrationRecord {
     pub integration_tree: Option<String>,
     /// When the candidates were combined.
     pub merged_at: Option<Timestamp>,
+    /// The landing commit promotion will publish, once it has been built.
+    ///
+    /// Section 13.5 requires it to exist before final verification and to stay
+    /// unreachable from the protected branch until accepted, so it is recorded
+    /// here rather than inferred from a ref: a ref can be deleted, and the
+    /// record is what promotion reloads.
+    pub landing_sha: Option<String>,
+    /// When the landing commit was built.
+    pub landed_at: Option<Timestamp>,
     /// Who prepared it. Declared, not proven; see D-013.
     pub prepared_by: String,
     /// When it was prepared.

@@ -81,6 +81,8 @@ pub enum ErrorCode {
     PolicyAtomicGroupSplit,
     /// The cycle already has an outstanding integration.
     PolicyIntegrationOpen,
+    /// The project uses a capability no shipped work package implements yet.
+    PolicyUnsupportedUntilWp540,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A card's declared base commit does not exist in the repository.
@@ -135,7 +137,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 58] = [
+    pub const ALL: [Self; 59] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -169,6 +171,7 @@ impl ErrorCode {
         Self::PolicyNotIntegrable,
         Self::PolicyAtomicGroupSplit,
         Self::PolicyIntegrationOpen,
+        Self::PolicyUnsupportedUntilWp540,
         Self::PreconditionNotFound,
         Self::PreconditionBaseMissing,
         Self::PreconditionBranchExists,
@@ -234,6 +237,7 @@ impl ErrorCode {
             | Self::PolicyNotIntegrable
             | Self::PolicyAtomicGroupSplit
             | Self::PolicyIntegrationOpen
+            | Self::PolicyUnsupportedUntilWp540
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
@@ -296,6 +300,7 @@ impl ErrorCode {
             Self::PolicyNotIntegrable => "NOT-INTEGRABLE",
             Self::PolicyAtomicGroupSplit => "ATOMIC-GROUP-SPLIT",
             Self::PolicyIntegrationOpen => "INTEGRATION-OPEN",
+            Self::PolicyUnsupportedUntilWp540 => "UNSUPPORTED-UNTIL-WP-540",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
@@ -433,6 +438,9 @@ impl ErrorCode {
             Self::PolicyAtomicGroupSplit => "Select the whole atomic group, or none of it.",
             Self::PolicyIntegrationOpen => {
                 "Promote, archive, or abandon the open integration before preparing another."
+            }
+            Self::PolicyUnsupportedUntilWp540 => {
+                "Remove the shared generated artifacts from the cards, or wait for WP-540."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {

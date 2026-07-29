@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 20 |
+| Plan revision | 21 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `fb291c0` (`feat(WP-410): integration plan, ordering, and the ready view`) |
+| Previous plan commit | `2e40bc7` (`feat(WP-420): merge preflight, conflict classification, disposable integration`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-420` complete; 559 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
-| Next executable work package | `WP-430` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-430` complete; 579 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
+| Next executable work package | `WP-440` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2207,9 +2207,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-420` |
 | Target release | Single-repository MVP |
+| Evidence | `src/git/landing.rs`, `integration land` in `src/commands/integration.rs`, `tests/landing_commit.rs` (13 acceptance tests) |
 
 Deliverables:
 
@@ -2226,6 +2227,28 @@ Acceptance:
 - the landing commit is created without changing the protected authority ref;
 - projects declaring shared generated artifacts fail with a stable
   `unsupported-until-WP-540` policy error.
+
+Delivered notes:
+
+- The landing commit is built with `commit-tree`, so building it moves no
+  branch, and is then held by `refs/harness/landing/<INT-id>` (D-044).
+  Section 13.5 requires it to be unreachable *from the protected branch*, not
+  unreachable outright; an object nothing points at is a collection candidate,
+  and losing it between construction and promotion would mean rebuilding and
+  re-verifying everything.
+- Exact tree validation compares the recorded integration tree against what
+  the integration head carries *now*, not against what the merge reported. If
+  they disagree, something rewrote the head after the merge.
+- Landing also refuses when the authority has moved since the plan was built,
+  because the first parent would then not be the branch promotion updates.
+- Trailers follow Git's own convention, so `git interpret-trailers` reads them
+  without knowing about this harness. They name the cycle, every card with its
+  revision, candidate SHA and approving review, the integration record digest,
+  and every gate receipt — enough to explain the commit from the candidate
+  repository alone, without the control repository.
+- `integration inspect` now surfaces `integration_head`, `integration_tree`,
+  and `landing_sha`. Promotion reloads through it, and a field it cannot see
+  is a field promotion cannot verify.
 
 `WP-540` extends this path with integration-owned artifact generation. It is
 not a prerequisite for MVP projects that declare no shared generated
@@ -2715,7 +2738,7 @@ All must be true:
 
 
 
-| Integration | `IN_PROGRESS` | Plan, ordering, and preflight done; landing next | `WP-430` onward |
+| Integration | `IN_PROGRESS` | Plan, preflight, and landing done; verification next | `WP-440` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2732,8 +2755,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-430` |
-| Next branch name | `wp/WP-430-landing-commit` |
+| Next work package | `WP-440` |
+| Next branch name | `wp/WP-440-combined-verification` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2872,6 +2895,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-041 | Judge integration readiness against the candidate branch head rather than the handoff's recorded SHA | Accepted | Comparing an approval to the handoff it was recorded against is a tautology: they always agree. A branch that gained a commit after approval would stay ready and integrate a commit no reviewer saw, which is `SPIKE-001` finding F-1 one stage later. `review record` already refuses a superseded handoff; selection now applies the same rule. |
 | D-042 | Carry the preflight forward with unreachable `commit-tree` objects | Accepted | `merge-tree` produces a tree, but merging the next candidate needs a commit, so simulating a multi-card sequence needs intermediate commits. Writing unreachable objects changes no state a reader can observe — no ref moves, no index or worktree is touched, and `git gc` collects them — which keeps the preflight non-destructive in the sense that matters. The alternative, merging in a real worktree, would make the preflight as risky as the operation it is meant to de-risk. |
 | D-043 | Refuse a second `integration merge` on an already-merged plan | Accepted | Merging twice builds a different head from the same plan and overwrites the recorded one, leaving anything `WP-430` or `WP-440` had already done pointing at a commit the record no longer names. Rebuilding requires abandoning the integration and preparing again, which is visible in the record rather than silent. |
+| D-044 | Hold the landing commit with `refs/harness/landing/<INT-id>` | Accepted | Section 13.5 requires the landing commit to stay unreachable from the protected branch until accepted, which is not the same as unreachable outright. An object no ref points at can be garbage-collected, and losing the landing commit between construction and promotion would force a rebuild and a full re-verification. A harness ref keeps it alive without putting it anywhere a reader would mistake for promoted. |
+| D-045 | Add `integration ready`, `preflight`, `merge`, and `land` to the Section 12.3 command surface | Accepted | Section 12.3 lists `prepare`, `verify`, `inspect`, `review`, and `promote`. `ready` is required by `WP-410` for `SPIKE-001` finding F-3; `preflight`, `merge`, and `land` are the separately observable steps `WP-420` and `WP-430` deliver, and Section 13.5 requires the landing commit to exist before final verification, which is impossible if landing is folded into `verify` or `promote`. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later
