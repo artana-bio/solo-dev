@@ -583,3 +583,99 @@ fn a_card_whose_candidate_moved_during_review_can_be_taken_back() {
     let status = workspace.card_json(&["status", "--card-id", "F-001"]);
     assert_eq!(status["data"]["state"], "active");
 }
+
+#[test]
+fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
+    // Tier 3, defect 22. `Risk::requires_human_review` exists, is unit-tested,
+    // and was called from nowhere. Section 15.3 requires a human reviewer for
+    // `high` and `critical` cards, and a critical-risk card received exactly
+    // the treatment a low-risk one did: the policy was documented, modelled,
+    // and never enforced.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_risk("F-001", &["src/**"], "high");
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, &approval("reviewer-session-a")),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a high-risk card must not be approved without a human reviewer"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-RISK-REVIEW");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("declared"),
+        "the message must not claim the harness can tell: {message}"
+    );
+
+    // Declaring it is the way through. Like every other identity in this
+    // harness it is a claim, not a proof — D-013 — so this must be recorded on
+    // the review rather than checked.
+    let human = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\nhuman_reviewer: true\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, human),
+    ]);
+    assert_eq!(envelope["data"]["state"], "approved");
+    assert_eq!(
+        envelope["data"]["review"]["human_reviewer"], true,
+        "the claim must be on the record, so an auditor can see who made it"
+    );
+}
+
+#[test]
+fn a_low_risk_card_needs_no_human_declaration() {
+    // The guard: the check must key on the card's risk, not become a blanket
+    // requirement that makes every agent review impossible.
+    let (workspace, _) = handed_off();
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, &approval("reviewer-session-a")),
+    ]);
+    assert_eq!(envelope["data"]["state"], "approved");
+    assert_eq!(envelope["data"]["review"]["human_reviewer"], false);
+}

@@ -113,6 +113,8 @@ pub enum ErrorCode {
     PreconditionLocalMainStale,
     /// A path initialization would adopt already holds content nobody checked.
     PreconditionOccupiedPath,
+    /// The card's risk level requires a human reviewer and none was declared.
+    PolicyRiskReview,
     /// A card already holds an active lease.
     PolicyLeaseHeld,
     /// The project lock was left behind by a process that has exited.
@@ -169,7 +171,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 75] = [
+    pub const ALL: [Self; 76] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -219,6 +221,7 @@ impl ErrorCode {
         Self::PreconditionUnmergedWork,
         Self::PreconditionLocalMainStale,
         Self::PreconditionOccupiedPath,
+        Self::PolicyRiskReview,
         Self::PolicyLeaseHeld,
         Self::PolicyStaleLock,
         Self::PolicyLockAmbiguous,
@@ -306,6 +309,7 @@ impl ErrorCode {
             | Self::PolicyIncompleteHandoff
             | Self::PolicyDeliveredShaMismatch
             | Self::PolicySelfReview
+            | Self::PolicyRiskReview
             | Self::PolicyOpenFindings
             | Self::PolicyIncompleteReview
             | Self::PolicyStaleHandoff => ExitCategory::Policy,
@@ -396,6 +400,7 @@ impl ErrorCode {
             Self::PolicyIncompleteHandoff => "INCOMPLETE-HANDOFF",
             Self::PolicyDeliveredShaMismatch => "DELIVERED-SHA-MISMATCH",
             Self::PolicySelfReview => "SELF-REVIEW",
+            Self::PolicyRiskReview => "RISK-REVIEW",
             Self::PolicyOpenFindings => "OPEN-FINDINGS",
             Self::PolicyIncompleteReview => "INCOMPLETE-REVIEW",
             Self::PolicyStaleHandoff => "STALE-HANDOFF",
@@ -588,6 +593,9 @@ impl ErrorCode {
             }
             Self::PolicyDeliveredShaMismatch => {
                 "The branch moved after delivery. Re-verify the candidate and hand off the commit that is actually there."
+            }
+            Self::PolicyRiskReview => {
+                "Have a human review this card and record `human_reviewer: true` on the verdict, or lower the card's risk if that was set wrongly."
             }
             Self::PolicySelfReview => {
                 "Have a different actor review this candidate in a fresh context."

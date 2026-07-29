@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::{
+        card::Risk,
         clock::Timestamp,
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, ReviewId},
@@ -176,6 +177,9 @@ pub struct ReviewRecord {
     pub gate_adequacy: GateAdequacy,
     /// Risks accepted if this is an approval.
     pub residual_risks: Vec<String>,
+    /// Whether a human performed this review. Declared, not proven; see D-013.
+    #[serde(default)]
+    pub human_reviewer: bool,
     /// The review this one supersedes, when it is a re-review.
     pub supersedes: Option<ReviewId>,
     /// When it was recorded.
@@ -282,6 +286,42 @@ impl ReviewRecord {
         }
 
         Ok(())
+    }
+
+    /// Refuses an approval that Section 15.3's risk policy does not permit.
+    ///
+    /// `Risk::requires_human_review` existed, was unit-tested, and was called
+    /// from nowhere, so a `critical`-risk card received exactly the treatment a
+    /// `low`-risk one did — the policy was documented, modelled, and never
+    /// enforced.
+    ///
+    /// What is enforced is the declaration, not the fact. D-013 makes every
+    /// identity in this harness a claim rather than a proof, and nothing here
+    /// can tell a human from an agent. Requiring the claim turns an unstated
+    /// rule into a recorded, refusable step and puts the assertion on the
+    /// review where an auditor can see who made it.
+    ///
+    /// Section 15.3's further requirements for `critical` — a rollback exercise
+    /// and a second human approval — are **not** enforced here. Recorded as
+    /// unenforced rather than implied.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy error when an approval lacks a required declaration.
+    pub fn check_risk_policy(&self, risk: Risk) -> Result<(), HarnessError> {
+        if self.decision != Decision::Approved
+            || !risk.requires_human_review()
+            || self.human_reviewer
+        {
+            return Ok(());
+        }
+        Err(HarnessError::Control {
+            reason: format!(
+                "card risk `{}` requires a human reviewer under Section 15.3 and this review declared none; set `human_reviewer: true` on the verdict. Declared, not proven: see D-013",
+                risk.name()
+            ),
+            code: ErrorCode::PolicyRiskReview,
+        })
     }
 
     /// Refuses a re-review that drops a prior open finding instead of
@@ -394,6 +434,7 @@ mod tests {
             findings,
             gate_adequacy: adequacy(),
             residual_risks: vec![],
+            human_reviewer: false,
             supersedes: None,
             reviewed_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
             canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
@@ -465,6 +506,48 @@ mod tests {
             .validate()
             .expect_err("must refuse");
         assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+    }
+
+    #[test]
+    fn a_low_risk_card_may_be_approved_without_a_human() {
+        // The check must key on the card's risk. A blanket requirement would
+        // make every agent review impossible, which is the model this harness
+        // exists to serve.
+        let approved = review(Decision::Approved, vec![]);
+        assert!(approved.check_risk_policy(Risk::Low).is_ok());
+        assert!(approved.check_risk_policy(Risk::Medium).is_ok());
+    }
+
+    #[test]
+    fn a_high_or_critical_card_needs_the_declaration() {
+        // Tier 3, defect 22. `requires_human_review` was modelled, unit-tested,
+        // and called from nowhere, so a critical-risk card received exactly the
+        // treatment a low-risk one did.
+        let approved = review(Decision::Approved, vec![]);
+        assert!(approved.check_risk_policy(Risk::High).is_err());
+        assert!(approved.check_risk_policy(Risk::Critical).is_err());
+
+        let declared = ReviewRecord {
+            human_reviewer: true,
+            ..review(Decision::Approved, vec![])
+        };
+        assert!(declared.check_risk_policy(Risk::High).is_ok());
+        assert!(declared.check_risk_policy(Risk::Critical).is_ok());
+    }
+
+    #[test]
+    fn the_risk_policy_gates_approval_and_nothing_else() {
+        // A reviewer must still be able to request changes on, or block, a
+        // high-risk card without claiming to be human. Those verdicts land
+        // nothing, and refusing them would leave the card with no exit — the
+        // defect two entries above this one.
+        for decision in [Decision::ChangesRequested, Decision::Blocked] {
+            let verdict = review(decision, vec![finding(Disposition::Open)]);
+            assert!(
+                verdict.check_risk_policy(Risk::Critical).is_ok(),
+                "{decision:?} lands nothing and must not need the declaration"
+            );
+        }
     }
 
     #[test]

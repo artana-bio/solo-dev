@@ -112,6 +112,14 @@ pub struct Verdict {
     /// Risks accepted if this is an approval.
     #[serde(default)]
     pub residual_risks: Vec<String>,
+    /// Whether a human performed this review.
+    ///
+    /// Section 15.3 requires one for `high` and `critical` cards. Declared,
+    /// never proven — D-013 makes every identity here a claim — so this is
+    /// recorded on the review and refusable, in the same way and with the same
+    /// limits as `check_independence`. It catches the omission, not the liar.
+    #[serde(default)]
+    pub human_reviewer: bool,
 }
 
 /// Executes a `review` subcommand.
@@ -423,11 +431,13 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 findings: verdict.findings.clone(),
                 gate_adequacy: verdict.gate_adequacy.clone(),
                 residual_risks: verdict.residual_risks.clone(),
+                human_reviewer: verdict.human_reviewer,
                 supersedes: previous.as_ref().map(|review| review.review_id.clone()),
                 reviewed_at: clock.now(),
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
             review.validate()?;
+            review.check_risk_policy(record.risk)?;
             if let Some(superseded) = previous.as_ref() {
                 review.check_supersedes(superseded)?;
             }

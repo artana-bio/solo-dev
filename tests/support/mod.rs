@@ -310,6 +310,23 @@ impl Workspace {
         self.card(&["activate", "--card-id", card_id]);
     }
 
+    /// Creates and activates a card at a named risk level.
+    pub fn activate_card_with_risk(&self, card_id: &str, include: &[&str], risk: &str) {
+        let inc = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = self.authority_head(),
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
+    }
+
     /// Creates and activates a card with an explicit exclude list.
     pub fn activate_card_excluding(&self, card_id: &str, include: &[&str], exclude: &[&str]) {
         let list = |values: &[&str]| {
