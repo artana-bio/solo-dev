@@ -349,6 +349,7 @@ fn check_repository_and_branch(config: &ProjectConfig) -> Result<String, Harness
     }
 
     let scope = crate::git::command::GitScope::work_tree(&config.repository);
+    check_candidate_is_settled(config, &scope)?;
     inspect::resolve_commit(&scope, &format!("refs/heads/{}", config.protected_branch)).map_err(
         |_| {
             FieldError::new(
@@ -362,6 +363,50 @@ fn check_repository_and_branch(config: &ProjectConfig) -> Result<String, Harness
             .into_error()
         },
     )
+}
+
+/// Refuses a candidate repository that is mid-operation or holds loose changes.
+///
+/// Section 9.1 requires initialization to fail on unresolved Git operations.
+/// Cleanliness is checked alongside it for the same reason: the harness is
+/// about to make this repository's protected branch the thing every card is
+/// measured against, and a branch with a half-finished merge or uncommitted
+/// changes sitting on it is not a baseline anyone can reason about.
+fn check_candidate_is_settled(
+    config: &ProjectConfig,
+    scope: &crate::git::command::GitScope,
+) -> Result<(), HarnessError> {
+    let operations = inspect::in_progress_operations(scope)?;
+    if !operations.is_empty() {
+        return Err(FieldError::new(
+            "repository",
+            format!(
+                "the candidate repository has unresolved Git operations: {}",
+                operations
+                    .iter()
+                    .map(|operation| format!("{operation:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ErrorCode::ConfigCandidateUnsettled,
+        )
+        .into_error());
+    }
+
+    let state = inspect::worktree_state(scope)?;
+    if !state.clean {
+        return Err(FieldError::new(
+            "repository",
+            format!(
+                "the candidate repository has uncommitted or untracked changes: {}",
+                state.dirty_paths.join(", ")
+            ),
+            ErrorCode::ConfigCandidateUnsettled,
+        )
+        .into_error());
+    }
+    let _ = config;
+    Ok(())
 }
 
 #[cfg(test)]

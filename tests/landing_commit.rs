@@ -341,3 +341,62 @@ fn the_landing_is_recorded_so_promotion_can_reload_it() {
     assert_eq!(event["head_sha"], landing);
     assert_eq!(event["metadata"]["landing_sha"], landing);
 }
+
+#[test]
+fn scenario_30_a_landing_tree_that_no_longer_matches_the_merge_is_refused() {
+    let (workspace, id) = merged(1);
+
+    // Rewrite the integration head so it carries a different tree than the one
+    // the merge recorded. This is what a hand-edited or amended integration
+    // looks like from the outside, and it must not reach a landing commit.
+    let head = workspace.integration_json(&["inspect", "--integration-id", &id])["data"]
+        ["integration_head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tampered = tamper_tree(&workspace, &head);
+    assert_ne!(tampered, head);
+    set_integration_head(&workspace, &id, &tampered);
+
+    let output =
+        workspace.integration_raw(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(error_code(&output), "CH-CONFLICT-MERGE-FAILED");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("recorded tree"),
+        "the mismatch must be named: {envelope}"
+    );
+}
+
+/// Builds a commit with the same parents as `head` but a different tree.
+fn tamper_tree(workspace: &Workspace, head: &str) -> String {
+    let parent = support::capture(&workspace.repository, &["rev-parse", &format!("{head}^1")]);
+    let other_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{parent}^{{tree}}")],
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace.repository)
+        .args(["commit-tree", &other_tree, "-p", &parent, "-m", "tampered"])
+        .output()
+        .expect("git should run");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Rewrites the recorded integration head, simulating an external edit.
+fn set_integration_head(workspace: &Workspace, id: &str, head: &str) {
+    let path = workspace.control.join(format!("integrations/{id}.json"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["integration_head"] = serde_json::json!(head);
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+}

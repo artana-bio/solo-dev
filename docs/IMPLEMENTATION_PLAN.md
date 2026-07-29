@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 26 |
+| Plan revision | 27 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `7be867d` (`test: demonstrate the full lifecycle twice, and trace the §19.3 gate`) |
+| Previous plan commit | `1f15876` (`docs: rewrite the README, and fix a dry-run that was silently ignored`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 638 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 644 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -1216,6 +1216,58 @@ Before Single-repository MVP acceptance, tests MUST cover:
 38. successful cleanup after archival;
 39. JSON success envelope;
 40. JSON error envelope and stable exit code.
+
+
+Coverage trace. Every scenario is mapped to the test that exercises it, so a
+claim of coverage can be checked rather than taken on faith.
+
+| # | Scenario | Test |
+| --- | --- | --- |
+| 1 | new project initialization | `init_creates_a_committed_control_repository`, `init_creates_a_bare_authority` |
+| 2 | incompatible existing authority path | `init_refuses_a_path_holding_unrelated_content`, `init_refuses_an_authority_with_a_working_tree` |
+| 3 | incompatible existing control path | `incompatible_reinitialization_fails_without_altering_anything` |
+| 4 | dirty candidate main | `scenario_4_a_dirty_candidate_is_refused` |
+| 5 | active Git merge/rebase state | `scenario_5_an_unresolved_git_operation_is_refused` |
+| 6 | exact baseline worktree creation | `allocation_creates_a_branch_at_the_exact_card_base` |
+| 7 | duplicate branch | `an_existing_branch_blocks_allocation` |
+| 8 | duplicate worktree path | `an_existing_worktree_path_blocks_allocation` |
+| 9 | overlapping write scope | `overlapping_cards_cannot_both_activate` |
+| 10 | overlapping contract domain | `contract_overlap_is_refused_even_when_paths_are_disjoint` |
+| 11 | duplicate exclusive resource | `an_exclusive_resource_cannot_be_double_booked` |
+| 12 | invalid dependency DAG | `a_dependency_cycle_is_refused_with_an_explanatory_path` |
+| 13 | out-of-scope modification | `scenario_13_an_out_of_scope_modification_blocks`, `an_out_of_scope_modification_refuses_handoff` |
+| 14 | excluded-path modification | `scenario_14_an_excluded_path_blocks_and_is_named_distinctly` |
+| 15 | rename across ownership boundary | `scenario_15_a_rename_across_an_ownership_boundary_blocks` |
+| 16 | deletion outside scope | `scenario_16_a_deletion_outside_scope_blocks` |
+| 17 | executable-bit change | `scenario_17_an_executable_bit_change_is_reported` |
+| 18 | symlink addition | `scenario_18_a_symlink_addition_blocks` |
+| 19 | `.gitmodules` change | `scenario_19_a_gitmodules_change_blocks` |
+| 20 | stale handoff | `reviewing_a_superseded_handoff_is_refused`, `a_head_change_invalidates_an_existing_handoff` |
+| 21 | stale review | `a_candidate_change_invalidates_an_approval`, `a_card_revision_invalidates_an_approval` |
+| 22 | self-review declaration | `self_review_is_refused` |
+| 23 | feature gate failure | `a_failing_gate_refuses_but_still_records_its_receipt` |
+| 24 | feature gate timeout | `a_timeout_is_recorded_distinctly_from_a_failure` |
+| 25 | retry-policy violation | `a_pass_beyond_the_declared_attempts_is_not_acceptable_evidence` |
+| 26 | clean disposable integration | `a_clean_merge_records_the_integration_head_and_tree`, `the_disposable_worktree_is_removed_after_a_successful_merge` |
+| 27 | textual merge conflict | `a_candidate_conflicting_with_the_moved_branch_is_reported_as_textual`, `a_textual_conflict_blocks_the_merge_without_landing_anything` |
+| 28 | semantic-fix card requirement | `scenario_28_a_semantic_conflict_cannot_be_resolved_in_place` |
+| 29 | combined gate failure | `a_combined_gate_failure_blocks_acceptance` |
+| 30 | landing-tree mismatch | `scenario_30_a_landing_tree_that_no_longer_matches_the_merge_is_refused` |
+| 31 | authority `main` moved before promotion | `a_moved_authority_branch_fails_before_the_update` |
+| 32 | dirty local main before promotion | `a_dirty_local_main_fails_before_the_authority_update` |
+| 33 | promotion and local sync both succeed | `an_exact_accepted_landing_promotes` |
+| 34 | promotion succeeds, local sync interrupted | `a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind` |
+| 35 | recovery at each MVP mutation boundary | `scenario_35_both_mvp_mutation_boundaries_are_recoverable`, `scenario_35_an_allocation_boundary_is_recoverable`, `an_interruption_at_any_journal_boundary_is_diagnosable` |
+| 36 | archive reachability | `landed_commits_remain_reachable_after_cleanup` |
+| 37 | cleanup rejection for unarchived commits | `unarchived_unique_commits_block_cleanup` |
+| 38 | successful cleanup after archival | `closing_removes_the_worktrees_and_branches` |
+| 39 | JSON success envelope | `output_option_emits_the_stable_result_envelope` |
+| 40 | JSON error envelope and stable exit code | `json_mode_renders_failures_as_the_error_envelope` |
+
+Tracing the list found four genuine gaps rather than confirming what was
+already there: scenarios 4 and 5 had no enforcement at all — Section 9.1
+requires initialization to fail on unresolved Git operations, and nothing
+checked it — and scenarios 28 and 30 had only their positive cases tested.
 
 Scenario ownership for the two recovery scenarios is explicit because both were
 previously claimed by a post-MVP work package:
@@ -2769,7 +2821,7 @@ Progress against each criterion:
 | Criterion | Status | Evidence or what remains |
 | --- | --- | --- |
 | All twenty work packages `DONE` | ✅ | This document's per-package entries |
-| All 40 mandatory scenarios pass | ⏳ | Section 16.2 scenarios are covered piecemeal by the per-package suites; they have not been enumerated and traced one by one |
+| All 40 mandatory scenarios pass | ✅ | Section 16.2 carries a per-scenario trace to the test that exercises it |
 | No unclassified failure path mutates authority | ✅ | `no_failure_path_in_the_lifecycle_leaves_the_authority_moved`, which also asserts exit 1 is never produced |
 | Exact-SHA review and acceptance invalidation demonstrated | ✅ | `an_invalidated_approval_is_reported_as_stale_rather_than_absent`, `an_acceptance_binds_the_exact_landing_commit_and_its_evidence` |
 | One temporary project completes the full lifecycle twice | ✅ | `one_project_completes_the_full_lifecycle_twice` |

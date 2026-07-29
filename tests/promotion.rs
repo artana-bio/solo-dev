@@ -445,3 +445,86 @@ fn a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind() 
         status["data"]
     );
 }
+
+#[test]
+fn scenario_35_both_mvp_mutation_boundaries_are_recoverable() {
+    // Section 16.2 scenario 35, scoped by the plan to the two boundaries MVP
+    // packages journal: worktree allocation and promotion.
+    let (workspace, id) = accepted(1);
+
+    // Promotion boundary: the authority moved, the local did not.
+    fs::write(workspace.repository.join(".git/index.lock"), "").unwrap();
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(9));
+
+    // `project recover` must name the operation and say what it was doing,
+    // rather than reporting a generic unfinished state.
+    let recover = Workspace::run_json(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    let unresolved = recover["data"]["unresolved_operations"]
+        .as_array()
+        .expect("an operation list");
+    assert_eq!(unresolved.len(), 1, "unexpected: {}", recover["data"]);
+    assert_eq!(unresolved[0]["command"], "integration.promote");
+    assert!(
+        unresolved[0]["operation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("OP-"),
+        "the operation must be identifiable: {}",
+        unresolved[0]
+    );
+}
+
+#[test]
+fn scenario_35_an_allocation_boundary_is_recoverable() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    // An allocation that cannot complete: the branch it would create is taken.
+    support::git(
+        &workspace.repository,
+        &["branch", "card/F-001", "refs/heads/main"],
+    );
+    let output = workspace.work_raw(&["start", "--card-id", "F-001"]);
+    assert!(!output.status.success());
+
+    // A refusal that wrote nothing must not demand recovery — a recover
+    // command that cries wolf is one nobody reads.
+    let status = Workspace::run_json(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        status["data"]["unresolved_operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a clean refusal is not an interrupted operation: {}",
+        status["data"]
+    );
+
+    // And the next mutation is not blocked by it.
+    support::git(&workspace.repository, &["branch", "-D", "card/F-001"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+}

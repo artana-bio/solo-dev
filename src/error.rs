@@ -41,6 +41,8 @@ pub enum ErrorCode {
     ConfigPathNested,
     /// The configured candidate path is not a Git repository.
     ConfigNotRepository,
+    /// The candidate repository is mid-operation or holds uncommitted changes.
+    ConfigCandidateUnsettled,
     /// The configured protected branch does not resolve to one commit.
     ConfigProtectedBranch,
     /// The installed Git is older than the configured minimum.
@@ -151,7 +153,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 67] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -165,6 +167,7 @@ impl ErrorCode {
         Self::ConfigPathAlias,
         Self::ConfigPathNested,
         Self::ConfigNotRepository,
+        Self::ConfigCandidateUnsettled,
         Self::ConfigProtectedBranch,
         Self::ConfigGitVersion,
         Self::ConfigUnsupportedHost,
@@ -238,6 +241,7 @@ impl ErrorCode {
             | Self::ConfigPathAlias
             | Self::ConfigPathNested
             | Self::ConfigNotRepository
+            | Self::ConfigCandidateUnsettled
             | Self::ConfigProtectedBranch
             | Self::ConfigGitVersion
             | Self::ConfigUnsupportedHost
@@ -308,6 +312,7 @@ impl ErrorCode {
             Self::ConfigPathAlias => "PATH-ALIAS",
             Self::ConfigPathNested => "PATH-NESTED",
             Self::ConfigNotRepository => "NOT-REPOSITORY",
+            Self::ConfigCandidateUnsettled => "CANDIDATE-UNSETTLED",
             Self::ConfigProtectedBranch => "PROTECTED-BRANCH",
             Self::ConfigGitVersion => "GIT-VERSION",
             Self::ConfigUnsupportedHost => "UNSUPPORTED-HOST",

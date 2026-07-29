@@ -472,3 +472,69 @@ fn the_merge_order_follows_the_recorded_plan() {
         );
     }
 }
+
+#[test]
+fn scenario_28_a_semantic_conflict_cannot_be_resolved_in_place() {
+    // A "semantic conflict" is two changes that merge cleanly and are wrong
+    // together. Git cannot see it; only a gate can. The requirement is that
+    // the harness never lets someone fix it inside the integration — the
+    // resolution has to become a card, which is reviewable.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.register_gate(
+        "gate.combined",
+        &[
+            "sh",
+            "-c",
+            "! (test -f src/F-001/a.rs && test -f src/F-002/a.rs)",
+        ],
+    );
+    for card in ["F-001", "F-002"] {
+        workspace.activate_card_with_gate_sets(
+            card,
+            &[&format!("src/{card}/**")],
+            &["gate.unit"],
+            &["gate.combined"],
+        );
+        workspace.approve_card(card, &format!("src/{card}/a.rs"));
+    }
+    let id = prepare(&workspace);
+
+    // The candidates merge cleanly — the conflict is not textual.
+    let preflight = workspace.integration_json(&["preflight", "--integration-id", &id]);
+    assert_eq!(
+        preflight["data"]["clean"], true,
+        "the fixture must be a semantic conflict, not a textual one"
+    );
+    workspace.integration(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    workspace.integration(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+
+    // Verification catches it, and leaves nothing to edit.
+    let output =
+        workspace.integration_raw(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    assert_eq!(output.status.code(), Some(7));
+    assert!(
+        !workspace.worktrees.join(".integration").join(&id).exists(),
+        "no worktree may survive for someone to resolve the conflict in place"
+    );
+
+    // And the integration cannot advance, so the only route forward is a new
+    // card whose change goes through review like any other.
+    assert_eq!(
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+        "prepared"
+    );
+}

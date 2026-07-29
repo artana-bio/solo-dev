@@ -399,3 +399,46 @@ fn cli_validate_reports_a_text_diagnostic_on_stderr() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("configuration field"), "{stderr}");
 }
+
+#[test]
+fn scenario_4_a_dirty_candidate_is_refused() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repository.join("scratch.txt"), "uncommitted\n").unwrap();
+
+    let error = validate(&fixture.config()).expect_err("a dirty candidate is refused");
+    assert_eq!(error.code(), ErrorCode::ConfigCandidateUnsettled);
+    assert!(
+        error.to_string().contains("scratch.txt"),
+        "the offending path must be named: {error}"
+    );
+}
+
+#[test]
+fn scenario_5_an_unresolved_git_operation_is_refused() {
+    let fixture = Fixture::new();
+    // A real conflicted merge, not a fabricated marker file: the check exists
+    // for repositories someone left mid-operation, and that is how they look.
+    git(&fixture.repository, &["checkout", "-q", "-b", "other"]);
+    fs::write(fixture.repository.join("README.md"), "theirs\n").unwrap();
+    git(&fixture.repository, &["commit", "-qam", "theirs"]);
+    git(&fixture.repository, &["checkout", "-q", "main"]);
+    fs::write(fixture.repository.join("README.md"), "ours\n").unwrap();
+    git(&fixture.repository, &["commit", "-qam", "ours"]);
+    let merge = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fixture.repository)
+        .args(["merge", "other"])
+        .output()
+        .expect("git should run");
+    assert!(
+        !merge.status.success(),
+        "the fixture must actually conflict"
+    );
+
+    let error = validate(&fixture.config()).expect_err("an unresolved merge is refused");
+    assert_eq!(error.code(), ErrorCode::ConfigCandidateUnsettled);
+    assert!(
+        error.to_string().contains("Merge"),
+        "the operation must be named: {error}"
+    );
+}
