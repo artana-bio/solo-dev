@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 17 |
+| Plan revision | 18 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `0c27d43` (`feat(WP-250): exact-SHA handoff, closing SPIKE-001 finding F-1`) |
+| Previous plan commit | `dc9e490` (`docs: validate workflow before implementation`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320` complete; 487 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-4, and F-5 are closed. |
-| Next executable work package | `WP-400` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400` complete; 507 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-4, and F-5 are closed. |
+| Next executable work package | `WP-410` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2057,9 +2057,10 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-120`, `WP-130` |
 | Target release | Single-repository MVP |
+| Evidence | `src/git/authority.rs`, `establish_authority` in `src/commands/project.rs`, `tests/authority.rs` (13 acceptance tests) |
 
 Deliverables:
 
@@ -2077,6 +2078,22 @@ Acceptance:
 - protected branch matches the configured baseline;
 - candidate repo retains existing remotes;
 - rerun with identical state is idempotent.
+
+Delivered notes:
+
+- `project init` gained an `authority-initialized` journal step, so an
+  interrupted initialization is attributable to the authority boundary rather
+  than guessed at.
+- The health check lives in `project status` rather than `doctor`. `doctor`
+  inspects a path with no project configuration and therefore cannot know which
+  authority to check; `project status` already opens the control repository and
+  reads the configuration. It reports the authority as data — reachability,
+  bareness, protected SHA, and whether the candidate's remote still points at
+  it — and never fails because the authority is unhealthy, since that is
+  exactly when the report is needed.
+- Seeding transfers objects through a staging ref under
+  `refs/harness/incoming` and deletes it afterwards, so a fresh authority ends
+  initialization holding exactly one ref: the protected branch.
 
 ### WP-410 — Integration plan and dependency order
 
@@ -2640,13 +2657,13 @@ All must be true:
 | Gate runner and receipts | `DONE` | `WP-310`, 37 tests | Preserve |
 | Handoff | `DONE` | `WP-250`, 24 tests | Preserve |
 | Independent review | `DONE` | `WP-320`, 27 tests | Preserve |
-| Bare authority | `READY` | `WP-120` and `WP-130` complete | `WP-400` |
+| Bare authority | `DONE` | Established, health-checked, and covered | `WP-400` |
 
 
 
 
 
-| Integration | `NOT_STARTED` | None | `WP-410` onward |
+| Integration | `READY` | `WP-320` and `WP-400` complete | `WP-410` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2663,8 +2680,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-400` |
-| Next branch name | `wp/WP-400-bare-authority` |
+| Next work package | `WP-410` |
+| Next branch name | `wp/WP-410-integration-plan` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2797,6 +2814,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-032 | Add `work verify` to the Section 12.3 command surface | Accepted | `WP-240` produces a structured verification report, and without a command it would only be observable through `handoff create` in `WP-250`. A separate read-only command lets an actor check scope before attempting handoff. |
 | D-033 | Treat a failed verification as a policy refusal rather than a successful report | Accepted | Returning exit 0 with `passed: false` would let a caller pipe the result onward and treat an out-of-scope candidate as ready. The verdict is the command's outcome, not its payload. |
 | D-031 | Include `created_at` and `base_sha` in the card digest | Accepted | The digest identifies one exact record instance, not a class of equivalent cards. Two identical drafts activated at different times digest differently, which is the correct behavior when the digest is what reviews and receipts bind to. |
+| D-038 | Allocate handoff identifiers monotonically rather than deriving them from the candidate SHA | Accepted | `WP-250` derived the identifier as `{card_id}-r{revision}-{sha[..12]}`, which is deterministic but unordered. "The latest handoff for this card" is a question the review path asks constantly, and answering it by sorting those names returns whichever candidate happened to hash higher. A second handoff at the same revision therefore resolved to the wrong record whenever the SHA prefixes sorted against issue order — latent until `WP-400` changed the SHAs. Identifiers are now `H-000001`, allocated like every other record type, so lexical order is issue order. |
+| D-039 | Report authority health from `project status` rather than `doctor` | Accepted | `WP-400` requires an authority health check. `doctor` inspects a bare path with no project configuration and therefore cannot know which authority to check, while `project status` already opens the control repository and reads the configuration. The check reports rather than refuses: an unreachable or repointed authority is described in the payload, because a diagnostic that fails when its subject is broken is useless exactly when it is needed. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

@@ -17,6 +17,13 @@ use crate::{
     },
     domain::{clock::Clock, ids::ProjectId},
     error::{ErrorCode, HarnessError},
+    git::{
+        authority::{
+            initialize as initialize_authority, inspect_authority, stage_objects, unstage_objects,
+        },
+        command::{GitScope, run, run_ok},
+        inspect,
+    },
 };
 
 /// Subcommands under `project`.
@@ -177,6 +184,8 @@ fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
     let outcome = (|| -> Result<Option<String>, HarnessError> {
         journal.step(&mut operation, "control-git-initialized")?;
         control.initialize_git()?;
+        journal.step(&mut operation, "authority-initialized")?;
+        establish_authority(&config)?;
         journal.step(&mut operation, "project-document-written")?;
         write_project(&control, &config, expected_head.as_deref(), clock)
     })();
@@ -299,6 +308,43 @@ fn run_validate(args: &ValidateArgs) -> Result<CommandOutcome, HarnessError> {
     Ok(outcome)
 }
 
+/// What `project status` can determine about the authority right now.
+///
+/// Every field is optional or boolean because this is a health report: an
+/// authority that has been moved, emptied, or replaced must be *described*,
+/// not turned into an error. A command that refuses to run because the thing
+/// it is diagnosing is unhealthy is useless exactly when it is needed.
+fn authority_health(config: &ProjectConfig) -> serde_json::Value {
+    let (bare, protected_sha, diagnostic) =
+        match inspect_authority(&config.authority_repository, &config.protected_branch) {
+            Ok(state) => (state.bare, state.protected_sha, None),
+            Err(error) => (false, None, Some(error.to_string())),
+        };
+
+    // The remote is read from the candidate, so a repointed remote shows up
+    // here rather than silently sending the next promotion elsewhere.
+    let remote_url = run(
+        &GitScope::work_tree(&config.repository),
+        ["remote", "get-url", &config.authority_remote],
+    )
+    .ok()
+    .and_then(|output| output.success().then(|| output.trimmed_stdout().to_owned()));
+    let remote_matches = remote_url
+        .as_ref()
+        .is_some_and(|url| std::path::Path::new(url) == config.authority_repository);
+
+    serde_json::json!({
+        "path": config.authority_repository,
+        "bare": bare,
+        "protected_branch": config.protected_branch,
+        "protected_sha": protected_sha,
+        "remote": config.authority_remote,
+        "remote_url": remote_url,
+        "remote_matches": remote_matches,
+        "diagnostic": diagnostic,
+    })
+}
+
 fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
@@ -319,6 +365,22 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         },
         unresolved.len()
     );
+    let authority = authority_health(&config);
+    let _ = write!(
+        text,
+        "\nauthority: {} ({})\nprotected branch: {} at {}",
+        config.authority_repository.display(),
+        authority["diagnostic"]
+            .as_str()
+            .unwrap_or(if authority["remote_matches"] == true {
+                "healthy"
+            } else {
+                "reachable, but the candidate's remote points elsewhere"
+            }),
+        config.protected_branch,
+        authority["protected_sha"].as_str().unwrap_or("unborn"),
+    );
+
     for record in &unresolved {
         let _ = write!(
             text,
@@ -343,6 +405,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "control_head": head,
             "control_commits": control.commit_count()?,
             "lock_held": ProjectLock::is_held(control.root()),
+            "authority": authority,
             "unresolved_operations": unresolved,
         }),
     )
@@ -410,4 +473,63 @@ fn run_recover(args: &RecoverArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// Creates the bare authority, registers its remote, and seeds the protected
+/// branch.
+///
+/// Seeding matters: a cycle freezes its baseline from the *authority*, so an
+/// authority with no protected branch would make the first cycle unactivatable.
+/// The transfer is a staged push followed by a ref update, never a force push.
+///
+/// # Errors
+///
+/// Returns a configuration error when the authority path is unusable, or an
+/// external-tool error when Git fails.
+fn establish_authority(config: &ProjectConfig) -> Result<(), HarnessError> {
+    initialize_authority(&config.authority_repository, &config.protected_branch)?;
+
+    // The remote is added only when absent. Section 9.1: initialization never
+    // overwrites a remote, because repointing someone's existing remote is how
+    // a push ends up somewhere nobody expected.
+    let candidate = GitScope::work_tree(&config.repository);
+    let existing = run(&candidate, ["remote", "get-url", &config.authority_remote])?;
+    if !existing.success() {
+        run_ok(
+            &candidate,
+            [
+                "remote".as_ref(),
+                "add".as_ref(),
+                config.authority_remote.as_ref(),
+                config.authority_repository.as_os_str(),
+            ],
+        )?;
+    }
+
+    let state = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    if state.protected_sha.is_some() {
+        return Ok(());
+    }
+
+    // The authority is empty, so transfer the candidate's protected branch.
+    let head = inspect::resolve_commit(
+        &candidate,
+        &format!("refs/heads/{}", config.protected_branch),
+    )?;
+    let incoming = stage_objects(
+        &config.repository,
+        &config.authority_repository,
+        &head,
+        "bootstrap",
+    )?;
+    run_ok(
+        &GitScope::git_dir(&config.authority_repository),
+        [
+            "update-ref",
+            &format!("refs/heads/{}", config.protected_branch),
+            &head,
+        ],
+    )?;
+    unstage_objects(&config.authority_repository, &incoming);
+    Ok(())
 }

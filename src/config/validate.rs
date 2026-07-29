@@ -61,9 +61,10 @@ pub const VALIDATION_SCHEMA: &str = "harness.project-validation/v1";
 
 /// Which paths are allowed to be absent.
 ///
-/// `project init` creates the control repository and the worktree root, so
-/// requiring them to exist would make initialization impossible. Every other
-/// command validates an established project, where absence is a real fault.
+/// `project init` creates the control repository, the bare authority, and the
+/// worktree root, so requiring them to exist would make initialization
+/// impossible. Every other command validates an established project, where
+/// absence of control or authority is a real fault.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     /// Validating before initialization: control and worktree root may be absent.
@@ -77,9 +78,10 @@ impl Mode {
     /// exist yet.
     const fn allows_absent(self, field: &str) -> bool {
         match self {
-            Self::Initializing => {
-                matches!(field.as_bytes(), b"control_repository" | b"worktree_root")
-            }
+            Self::Initializing => matches!(
+                field.as_bytes(),
+                b"control_repository" | b"authority_repository" | b"worktree_root"
+            ),
             Self::Established => matches!(field.as_bytes(), b"worktree_root"),
         }
     }

@@ -42,21 +42,8 @@ impl Workspace {
         git(&repository, &["add", "-A"]);
         git(&repository, &["commit", "-q", "-m", "initial"]);
 
-        Command::new("git")
-            .args(["init", "-q", "--bare", "-b", "main"])
-            .arg(&authority)
-            .output()
-            .expect("git init --bare");
-        git(
-            &repository,
-            &[
-                "remote",
-                "add",
-                "harness-authority",
-                authority.to_str().unwrap(),
-            ],
-        );
-        git(&repository, &["push", "-q", "harness-authority", "main"]);
+        // `project init` creates the bare authority, registers its remote, and
+        // seeds the protected branch, so the fixture leaves that to the harness.
 
         Self {
             _temp: temp,

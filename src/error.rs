@@ -55,6 +55,8 @@ pub enum ErrorCode {
     ConfigUnknownGate,
     /// An existing control repository does not match the supplied configuration.
     ConfigControlIncompatible,
+    /// The authority path is not a usable bare repository.
+    ConfigAuthorityIncompatible,
     /// Another process holds the project mutation lock.
     PolicyLockHeld,
     /// A state transition outside the documented state machine was requested.
@@ -125,7 +127,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 54] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -146,6 +148,7 @@ impl ErrorCode {
         Self::ConfigInvalidGate,
         Self::ConfigUnknownGate,
         Self::ConfigControlIncompatible,
+        Self::ConfigAuthorityIncompatible,
         Self::PolicyLockHeld,
         Self::PolicyInvalidTransition,
         Self::PolicyInvalidCycle,
@@ -205,7 +208,8 @@ impl ErrorCode {
             | Self::ConfigInvalidValue
             | Self::ConfigInvalidGate
             | Self::ConfigUnknownGate
-            | Self::ConfigControlIncompatible => ExitCategory::Configuration,
+            | Self::ConfigControlIncompatible
+            | Self::ConfigAuthorityIncompatible => ExitCategory::Configuration,
             Self::PolicyLockHeld
             | Self::PolicyInvalidTransition
             | Self::PolicyInvalidCycle
@@ -264,6 +268,7 @@ impl ErrorCode {
             Self::ConfigInvalidGate => "INVALID-GATE",
             Self::ConfigUnknownGate => "UNKNOWN-GATE",
             Self::ConfigControlIncompatible => "CONTROL-INCOMPATIBLE",
+            Self::ConfigAuthorityIncompatible => "AUTHORITY-INCOMPATIBLE",
             Self::PolicyLockHeld => "LOCK-HELD",
             Self::PolicyInvalidTransition => "INVALID-TRANSITION",
             Self::PolicyInvalidCycle => "INVALID-CYCLE",
@@ -367,6 +372,9 @@ impl ErrorCode {
             }
             Self::ConfigControlIncompatible => {
                 "Point at the matching control repository, or initialize a new project elsewhere."
+            }
+            Self::ConfigAuthorityIncompatible => {
+                "Point at an empty directory or an existing bare repository; an authority must have no working tree."
             }
             _ => "Correct the reported field to a value the schema accepts.",
         }

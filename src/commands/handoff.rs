@@ -109,16 +109,35 @@ pub fn execute(
     }
 }
 
-/// Deterministic handoff identifier: card, revision, and candidate prefix.
+/// Allocates the next handoff identifier.
 ///
-/// Derived rather than allocated, so the same candidate always yields the same
-/// identifier and a duplicate handoff is a collision rather than a silent
-/// second record.
-fn handoff_id(card_id: &CardId, revision: u32, candidate_sha: &str) -> String {
-    format!(
-        "{card_id}-r{revision}-{}",
-        &candidate_sha[..12.min(candidate_sha.len())]
-    )
+/// Monotonic rather than derived from the candidate SHA. A derived identifier
+/// would be deterministic but unordered, and "the latest handoff" is a question
+/// this code asks constantly: sorting SHA-prefixed names returns whichever
+/// candidate happened to hash lower, not the most recent one.
+fn next_handoff_id(control: &ControlRepository) -> Result<String, HarnessError> {
+    let directory = control.path(HANDOFF_DIR);
+    let highest = if directory.exists() {
+        fs::read_dir(&directory)
+            .map_err(|source| HarnessError::ControlIo {
+                path: directory.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.strip_prefix("H-"))
+                    .and_then(|digits| digits.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(format!("H-{:06}", highest + 1))
 }
 
 /// The most recently written handoff for a card, if any.
@@ -145,20 +164,23 @@ pub fn latest_handoff(
             (path.extension()? == "json")
                 .then(|| path.file_stem()?.to_str().map(ToOwned::to_owned))?
         })
-        .filter(|name| name.starts_with(&format!("{card_id}-r")))
         .collect();
+    // Identifiers are zero-padded and monotonic, so lexical order is issue
+    // order.
     names.sort();
 
-    let Some(name) = names.last() else {
-        return Ok(None);
-    };
-    let raw = control.read(&HandoffRecord::relative_path(name))?;
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|source| HarnessError::Control {
-            reason: format!("handoff {name} is malformed: {source}"),
-            code: ErrorCode::InternalControlCorrupt,
-        })
+    for name in names.iter().rev() {
+        let raw = control.read(&HandoffRecord::relative_path(name))?;
+        let record: HandoffRecord =
+            serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+                reason: format!("handoff {name} is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        if record.card_id == *card_id {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads and parses an actor declaration.
@@ -348,7 +370,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &candidate_sha,
             )?;
 
-            let id = handoff_id(&card_id, state.current_revision, &candidate_sha);
+            let id = next_handoff_id(control)?;
             let handoff = HandoffRecord {
                 schema: HANDOFF_SCHEMA.to_owned(),
                 handoff_id: id.clone(),
