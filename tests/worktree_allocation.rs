@@ -367,3 +367,61 @@ fn the_lease_and_allocation_are_recorded_in_control_history() {
     assert_eq!(started["head_sha"], workspace.authority_head());
     assert_eq!(started["next_state"], "active");
 }
+
+#[test]
+fn a_card_revised_while_allocated_can_be_resumed() {
+    // Revising returns a card to `ready` while its lease survives. Before this
+    // was handled, `work start` refused because the lease existed and resume
+    // refused because `ready` was not a state it covered, so the card could
+    // never be handed off again.
+    let workspace = with_ready_card();
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let worktree = workspace.worktrees.join("F-001");
+    let before = support::capture(&worktree, &["rev-parse", "HEAD"]);
+
+    workspace.revise_card("F-001", &["src/**", "docs/**"], "widen the write scope");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "ready"
+    );
+
+    workspace.work(&["resume", "--card-id", "F-001"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active",
+        "a revised, allocated card must be able to get back to work"
+    );
+
+    // The allocation is reused, not rebuilt: same worktree, same commits.
+    assert_eq!(support::capture(&worktree, &["rev-parse", "HEAD"]), before);
+    assert_eq!(
+        workspace.work_json(&["status", "--card-id", "F-001"])["data"]["lease_count"],
+        1,
+        "resuming must not allocate a second lease"
+    );
+}
+
+#[test]
+fn resuming_a_revised_card_still_checks_the_locator() {
+    // The regression that would matter: `ready` must not become a state where
+    // resume skips the checks it performs everywhere else.
+    let workspace = with_ready_card();
+    workspace.work(&["start", "--card-id", "F-001"]);
+    workspace.revise_card("F-001", &["src/**", "docs/**"], "widen the write scope");
+
+    let locator = workspace.worktrees.join("F-001/.agent/project.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&locator).unwrap()).unwrap();
+    value["lease_id"] = serde_json::json!("L-999999");
+    fs::write(
+        &locator,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    let output = workspace.work_raw(&["resume", "--card-id", "F-001"]);
+    assert!(
+        !output.status.success(),
+        "a disagreeing locator must still refuse"
+    );
+}

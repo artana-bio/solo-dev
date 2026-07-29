@@ -723,8 +723,18 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 }
 
 /// True when resuming should move the card back to active work.
+///
+/// `Ready` is included for one specific situation: revising a card returns it
+/// to `ready`, and if the card was already allocated the lease survives. That
+/// combination strands it — `work start` refuses because a lease exists, and
+/// resume would refuse because the state is not one it handles. The allocation
+/// is right there and the actor is plainly picking the work back up, which is
+/// exactly what resuming means.
 const fn resumes_to_active(state: CardState) -> bool {
-    matches!(state, CardState::ChangesRequested | CardState::Blocked)
+    matches!(
+        state,
+        CardState::ChangesRequested | CardState::Blocked | CardState::Ready
+    )
 }
 
 /// Performs the `changes_requested`/`blocked` to `active` transition.
@@ -742,6 +752,16 @@ fn resume_to_active(
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
             verify_locator(control, &lease, &config.project_id)?;
+            // Section 11.2 routes `ready` to `active` through `leased`, which
+            // is the same path `work start` takes. Stepping through it rather
+            // than widening the state machine keeps one definition of what a
+            // legal transition is.
+            let mut state = state;
+            if state.state == CardState::Ready {
+                state.state.check_transition(CardState::Leased)?;
+                store_card_state(control, &record, &state, CardState::Leased)?;
+                state.state = CardState::Leased;
+            }
             state.state.check_transition(CardState::Active)?;
             store_card_state(control, &record, &state, CardState::Active)?;
 
