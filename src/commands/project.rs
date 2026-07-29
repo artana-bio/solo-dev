@@ -629,6 +629,7 @@ fn run_resume(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, H
                 events,
                 &args.actor_id,
                 expected,
+                steps,
                 clock,
             )? {
                 ResumeOutcome::Completed(outcome) => Ok(*outcome),

@@ -21,7 +21,7 @@ use crate::{
         gate::{load_gate, next_receipt_id, receipts_for},
         handoff::latest_handoff,
         review::{current_approval, reviews_for},
-        transaction::with_transaction,
+        transaction::{Steps, with_transaction},
         work::held_lease,
     },
     control::{event_store::EventDraft, repository::ControlRepository},
@@ -2580,16 +2580,25 @@ fn settle_promotion(
     checks: &PromotionChecks,
     actor_id: &str,
     expected: Option<&str>,
+    steps: &mut Steps<'_>,
     clock: &dyn Clock,
 ) -> Result<CommandOutcome, HarnessError> {
     let integration_id = record.integration_id.clone();
+    // Everything from here happens after the authority has already moved, and
+    // none of it was journaled. Section 7.4 requires a step before the mutation
+    // it names; without one, an interruption anywhere in this stretch was
+    // attributable to nothing and could not be reproduced deliberately, which
+    // is why the window went unnoticed.
+    steps.outside_control("local-main-synced")?;
     synchronize_local_main(config, &checks.landing_sha)?;
 
+    steps.at("integration-marked-promoted")?;
     record.status = IntegrationStatus::Promoted;
     control.write_atomic(
         &IntegrationRecord::relative_path(&integration_id),
         &format!("{}\n", serde_json::to_string_pretty(&record)?),
     )?;
+    steps.at("cards-marked-landed")?;
     for member in &record.members {
         let (card, state) = load_card(control, &member.card_id)?;
         // A resumed promotion may find cards already landed, which is the
@@ -2689,6 +2698,7 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                 &checks,
                 &args.actor_id,
                 expected,
+                steps,
                 clock,
             )
         },
@@ -2719,6 +2729,7 @@ pub fn resume_promotion(
     events: &crate::control::event_store::EventStore<'_>,
     actor_id: &str,
     expected: Option<&str>,
+    steps: &mut Steps<'_>,
     clock: &dyn Clock,
 ) -> Result<ResumeOutcome, HarnessError> {
     let config = control.project()?;
@@ -2751,9 +2762,39 @@ pub fn resume_promotion(
     for name in names {
         let integration_id: IntegrationId = name.parse()?;
         let mut record = load_integration(control, &integration_id)?;
-        if record.status != IntegrationStatus::Accepted
-            || record.landing_sha.as_deref() != Some(protected.as_str())
-        {
+        if record.landing_sha.as_deref() != Some(protected.as_str()) {
+            continue;
+        }
+        // `Accepted` is the shape when the local sync never ran. `Promoted`
+        // with a card still short of `landed` is the shape when it ran and
+        // something after it did not: the record was written, the cards were
+        // not, and nothing had committed. Requiring `Accepted` alone made that
+        // second window unrecoverable, and reported "no promotion reached the
+        // authority" over an authority that plainly held the landing commit.
+        let resumable = match record.status {
+            // The local sync never ran.
+            IntegrationStatus::Accepted => true,
+            // The sync ran and something after it did not: the record was
+            // written, the cards were not, and nothing had committed. Requiring
+            // `Accepted` alone made this window unrecoverable and reported "no
+            // promotion reached the authority" over an authority plainly
+            // holding the landing commit.
+            IntegrationStatus::Promoted => {
+                let mut pending = false;
+                for member in &record.members {
+                    let (_card, state) = load_card(control, &member.card_id)?;
+                    if state.state != CardState::Landed {
+                        pending = true;
+                        break;
+                    }
+                }
+                pending
+            }
+            // Anything else means the update never landed, or the whole thing
+            // finished and moved on.
+            _ => false,
+        };
+        if !resumable {
             continue;
         }
 
@@ -2777,6 +2818,7 @@ pub fn resume_promotion(
             &checks,
             actor_id,
             expected,
+            steps,
             clock,
         )?;
         return Ok(ResumeOutcome::Completed(Box::new(outcome)));

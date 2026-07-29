@@ -518,3 +518,95 @@ fn an_allocation_that_created_a_worktree_is_reported_as_needing_recovery() {
         "a half-made allocation is not a clean failure: {report}"
     );
 }
+
+#[test]
+fn an_interruption_after_the_local_sync_is_recoverable() {
+    // Tier 3, defect 15. `settle_promotion` runs after the authority has
+    // already moved, and journaled nothing at all — contrary to Section 7.4,
+    // which requires a step before the mutation it names. So an interruption
+    // between the local fast-forward and the control commit was attributable to
+    // nothing, could not be reproduced deliberately, and left the integration
+    // marked `promoted` with its cards short of `landed`. `resume_promotion`
+    // required the record to be exactly `Accepted`, so it skipped that shape
+    // and reported "no promotion reached the authority" over an authority
+    // plainly holding the landing commit.
+    let workspace = approved();
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    let landing =
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["landing_sha"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    // Interrupt after the record says promoted but before the cards do.
+    let args: Vec<String> = vec![
+        "integration".into(),
+        "promote".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--integration-id".into(),
+        id.clone(),
+        "--actor-id".into(),
+        "promoter".into(),
+    ];
+    let output = run_failing_at("cards-marked-landed", &args);
+    assert_eq!(output.status.code(), Some(9), "recovery is required");
+    assert_eq!(
+        workspace.authority_head(),
+        landing,
+        "the fixture must be past the publish, or it proves nothing"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "accepted",
+        "and the cards must not yet be landed"
+    );
+
+    let resumed = Workspace::run_json(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--resume".into(),
+        "--actor-id".into(),
+        "recoverer".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        resumed["data"]["status"], "promoted",
+        "recovery must finish it rather than report that nothing happened"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed"
+    );
+    assert!(unresolved(&workspace).is_empty());
+}
