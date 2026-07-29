@@ -474,3 +474,45 @@ fn an_ambient_git_author_does_not_reach_control_history() {
         "control history must not carry whoever's shell ran the command"
     );
 }
+
+#[test]
+fn a_control_path_reaching_the_candidate_through_a_symlink_is_refused() {
+    // Tier 3, defect 18. A path that does not exist yet is recorded
+    // uncanonicalized, because there is nothing to canonicalize. The candidate
+    // repository does exist and so is canonicalized — and the nesting and alias
+    // checks then compare the two in different forms. A control path reaching
+    // the candidate through a symlink slipped past both, and the control
+    // repository, which Section 9.2 places deliberately outside any candidate
+    // worktree so a candidate actor cannot rewrite the policy judging it, was
+    // created inside one.
+    let workspace = Workspace::new();
+    let link = workspace.root.join("link");
+    std::os::unix::fs::symlink(&workspace.repository, &link).expect("a symlink");
+
+    let output = Workspace::run(&[
+        "project".into(),
+        "init".into(),
+        "--output".into(),
+        "json".into(),
+        "--project-id".into(),
+        "example".into(),
+        "--repository".into(),
+        workspace.repository.display().to_string(),
+        "--control".into(),
+        link.join("control").display().to_string(),
+        "--authority".into(),
+        workspace.authority.display().to_string(),
+        "--worktree-root".into(),
+        workspace.worktrees.display().to_string(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "the control repository must not be created inside the candidate: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !workspace.repository.join("control").exists(),
+        "and nothing may have been created there"
+    );
+}

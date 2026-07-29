@@ -87,6 +87,56 @@ impl Mode {
     }
 }
 
+/// Resolves as much of a not-yet-existing path as the filesystem can answer.
+///
+/// `.` and `..` are applied lexically first, then the longest existing prefix is
+/// canonicalized and the rest rejoined. A path with no existing ancestor comes
+/// back normalized but unresolved, which is all that can honestly be said about
+/// it.
+///
+/// Both halves are needed. Lexical normalization alone would miss a symlinked
+/// ancestor, which is the case that let a control path reach inside the
+/// candidate repository. Canonicalizing alone cannot start: `canonicalize`
+/// resolves component by component and fails the moment it meets one that does
+/// not exist, and `Path::file_name` is `None` for a path ending in `..`, so
+/// walking up from `inner/x/../../out` stops without finding anything.
+///
+/// Applying `..` lexically is not the same as resolving it against the
+/// filesystem when a symlink is involved. For a path whose directories do not
+/// exist yet there is nothing else available, and leaving it in place would let
+/// `repo/sub/../../elsewhere` read as nested under `repo`.
+fn canonicalize_ancestors(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+
+    let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = normalized.as_path();
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(suffix.iter().rev());
+            return resolved;
+        }
+        let (Some(name), Some(parent)) = (cursor.file_name(), cursor.parent()) else {
+            return normalized.clone();
+        };
+        suffix.push(name);
+        cursor = parent;
+    }
+}
+
 /// Validates a project configuration without mutating anything.
 ///
 /// Checks run in a deliberate order: cheap structural checks first, then
@@ -190,10 +240,16 @@ fn resolve_paths(config: &ProjectConfig, mode: Mode) -> Result<Vec<ResolvedPath>
                 )
                 .into_error());
             }
+            // Canonicalized as far as anything exists. Recording the raw path
+            // meant the nesting and alias checks compared a canonicalized
+            // candidate against an uncanonicalized control, so a control path
+            // reaching the candidate through a symlink matched neither — and
+            // the control repository, which Section 9.2 places outside any
+            // candidate worktree on purpose, could be created inside one.
             resolved.push(ResolvedPath {
                 field: field.to_owned(),
                 configured: path.clone(),
-                resolved: path.clone(),
+                resolved: canonicalize_ancestors(path),
                 via_symlink: false,
             });
             continue;
@@ -411,6 +467,52 @@ fn check_candidate_is_settled(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_absent_path_resolves_through_its_existing_ancestors() {
+        // Tier 3, defect 18. The whole point: a path that does not exist yet
+        // still has to be comparable with one that does.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap();
+        let inner = real.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+
+        assert_eq!(
+            canonicalize_ancestors(&link.join("control")),
+            inner.join("control"),
+            "a symlinked ancestor must resolve even though the leaf is absent"
+        );
+        assert_eq!(
+            canonicalize_ancestors(&link.join("a").join("b")),
+            inner.join("a").join("b"),
+            "several absent components are fine"
+        );
+    }
+
+    #[test]
+    fn parent_components_below_the_existing_part_are_applied() {
+        // `..` cannot be resolved against a filesystem that has not been
+        // created yet, and leaving it in place would let `inner/x/../../out`
+        // read as nested under `inner`.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap();
+        let inner = real.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        assert_eq!(
+            canonicalize_ancestors(&inner.join("x").join("..").join("..").join("out")),
+            real.join("out")
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_existing_ancestor_is_left_alone() {
+        // Nothing can honestly be said about it, so nothing is.
+        let path = Path::new("/nonexistent-root-xyz/a/b");
+        assert_eq!(canonicalize_ancestors(path), path.to_path_buf());
+    }
     use super::*;
 
     #[test]
