@@ -480,17 +480,28 @@ pub fn receipts_for(
 fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let gate = load_gate(&control, &args.gate_id)?;
+    // The card and its lease, checked the way the real run checks them. This
+    // preview reported that it would run a gate for a card with no worktree to
+    // run it in, which is not something the real command can do.
+    let (_record, _state) = load_card(&control, card_id)?;
+    let lease = held_lease(&control, card_id)?.ok_or_else(|| HarnessError::Control {
+        reason: format!("card {card_id} holds no lease; run `work start` first"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
     Ok(CommandOutcome::new(
         "gate.run",
         format!(
-            "Dry run: would run gate `{}` for card {card_id} as {:?}; nothing was changed",
-            gate.gate_id, gate.argv
+            "Dry run: would run gate `{}` for card {card_id} as {:?} in {}; nothing was changed",
+            gate.gate_id,
+            gate.argv,
+            lease.worktree_path.display()
         ),
         serde_json::json!({
             "dry_run": true,
             "card_id": card_id.to_string(),
             "gate_id": gate.gate_id,
             "argv": gate.argv,
+            "worktree_path": lease.worktree_path,
         }),
     ))
 }

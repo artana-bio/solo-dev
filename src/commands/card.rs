@@ -411,27 +411,65 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     )
 }
 
+/// Reports what `card activate` would do, without doing it.
+///
+/// Runs every check the real activation makes, in the same order. This preview
+/// used to validate the draft and stop, so it reported that a card would
+/// activate when its write scope overlapped an active card's — the one refusal
+/// `card activate` exists to make.
+fn preview_activate(
+    args: &ActivateArgs,
+    card_id: &CardId,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    // Every check the real activation makes, in the same order. This
+    // preview validated the draft and stopped, so it reported that a card
+    // would activate when its write scope overlapped an active card's —
+    // the one refusal `card activate` exists to make.
+    if let Some(state) = state_of(&control, card_id)? {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {card_id} is already activated at revision {}; an activated card is immutable, use `card revise`",
+                state.current_revision
+            ),
+            code: ErrorCode::PolicyInvalidCard,
+        });
+    }
+    let draft = stored_draft(&control, card_id)?;
+    draft.validate()?;
+    let cycle = cycle_accepting_cards(&control, &draft)?;
+    let preview = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
+    require_registered(
+        &control,
+        preview
+            .named_gates
+            .feature
+            .iter()
+            .chain(&preview.named_gates.review)
+            .chain(&preview.named_gates.integration),
+    )?;
+    check_allocation(&control, &cycle, &preview)?;
+    Ok(CommandOutcome::new(
+        "card.activate",
+        format!(
+            "Dry run: would activate card {card_id} at revision 1 with digest {}; nothing was changed",
+            preview.digest()?
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "revision": 1,
+            "digest": preview.digest()?.as_str(),
+        }),
+    ))
+}
+
 fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
 
     if args.dry_run {
-        let control = ControlRepository::open(&args.common.control)?;
-        let draft = stored_draft(&control, &card_id)?;
-        draft.validate()?;
-        let preview = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
-        return Ok(CommandOutcome::new(
-            "card.activate",
-            format!(
-                "Dry run: would activate card {card_id} at revision 1 with digest {}; nothing was changed",
-                preview.digest()?
-            ),
-            serde_json::json!({
-                "dry_run": true,
-                "card_id": card_id.to_string(),
-                "revision": 1,
-                "digest": preview.digest()?.as_str(),
-            }),
-        ));
+        return preview_activate(args, &card_id, clock);
     }
 
     with_transaction(
@@ -468,15 +506,6 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             )?;
             // Ownership, contract, resource, and dependency checks run before
             // anything is written, so a refused card leaves no trace.
-            require_registered(
-                control,
-                record
-                    .named_gates
-                    .feature
-                    .iter()
-                    .chain(&record.named_gates.review)
-                    .chain(&record.named_gates.integration),
-            )?;
             check_allocation(control, &cycle, &record)?;
             let digest = record.digest()?;
             write_revision(control, &record, &digest, CardState::Ready)?;

@@ -342,21 +342,26 @@ fn preview_start(args: &StartArgs, card_id: &CardId) -> Result<CommandOutcome, H
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
-    state.state.check_transition(CardState::Leased)?;
-    let branch = branch_for(card_id);
-    let path = worktree_for(&config.worktree_root, card_id);
+    // `preflight_start` is by definition every check that can refuse, and it
+    // resolves the base commit rather than echoing what the card asked for.
+    // This preview reimplemented a subset: it checked the state transition and
+    // not the lease, so a card that already held one was refused with "cannot
+    // move from active to leased" instead of "you hold lease L-000001 at
+    // <path>, resume it" — the distinction `preflight_start`'s own comment
+    // exists to preserve. It also never checked whether the branch or worktree
+    // was already there.
+    let (base, branch, path) = preflight_start(&control, &config, card_id, &record, &state)?;
     Ok(CommandOutcome::new(
         "work.start",
         format!(
-            "Dry run: would allocate card {card_id}\nbranch: {branch} at {}\nworktree: {}\nnothing was changed",
-            record.base_sha,
+            "Dry run: would allocate card {card_id}\nbranch: {branch} at {base}\nworktree: {}\nnothing was changed",
             path.display()
         ),
         serde_json::json!({
             "dry_run": true,
             "card_id": card_id.to_string(),
             "branch": branch,
-            "base_sha": record.base_sha,
+            "base_sha": base,
             "worktree_path": path,
         }),
     ))
