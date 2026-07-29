@@ -83,8 +83,20 @@ the category reserved for "the harness is broken, file a bug". A read-only
 filesystem, a permissions mistake, a full disk are all the operator's to fix.
 Those kinds are now `CH-PRECONDITION-CONTROL-ACCESS`, exit 4. `NotFound` stays
 internal on purpose: a control file missing when the state says it exists is
-corruption, and nothing here can tell that from someone deleting the directory. The conflict-token table does not
-match git's real output and binary conflicts are double-counted. ✅ **FIXED:** rename records were mis-parsed into paths that do not exist —
+corruption, and nothing here can tell that from someone deleting the directory. ✅ **FIXED:** the conflict-token table did not match Git's real output. Two of
+its six tokens were strings no supported Git emits — `CONFLICT
+(directory/file)` and `CONFLICT (distinct types)`, the latter being message prose
+where the real token is `CONFLICT (distinct modes)` — so
+`ConflictKind::DistinctTypes` was unreachable and every type change was reported
+as `other`. `CONFLICT (binary)` was absent, so Git's binary triple produced
+**two** conflict rows for one path, one of them labelled *textual*: an actor was
+told to edit conflict markers Git had not written, because it wrote "our" side
+verbatim instead. Fixed, with the duplicate `contents` record dropped and
+`Binary` classified structural.
+`an_unknown_conflict_token_is_kept_and_treated_as_structural` used `CONFLICT
+(submodule)` — a *real* Git 2.50 token — so it pinned the gap open rather than
+guarding the default. Nine further real tokens still land in `other`, which is
+the right class; naming them is cosmetic and left undone. ✅ **FIXED:** rename records were mis-parsed into paths that do not exist —
 specifically in the `status --porcelain=v1 -z` parser, **not** the `--raw -z`
 diff parser, which is correct and consumes its second field properly. A rename
 emits two NUL-separated fields and the second is a bare path with no `XY `
