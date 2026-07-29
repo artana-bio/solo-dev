@@ -13,7 +13,7 @@ use crate::{
     },
     control::{
         journal::{Journal, OperationState},
-        lock::ProjectLock,
+        lock::{LockDiagnosis, ProjectLock},
         repository::{ControlRepository, write_project},
     },
     domain::{clock::Clock, ids::ProjectId},
@@ -369,10 +369,13 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         control.root().display(),
         head.as_deref().unwrap_or("unborn"),
         control.commit_count()?,
-        if ProjectLock::is_held(control.root()) {
-            "held"
-        } else {
-            "free"
+        match ProjectLock::diagnose(control.root()) {
+            LockDiagnosis::Free => "free".to_owned(),
+            LockDiagnosis::Held(owner) => format!("held by live process {}", owner.pid),
+            LockDiagnosis::Stale { holder, reason } => {
+                format!("STALE (left by process {}): {reason}", holder.pid)
+            }
+            LockDiagnosis::Ambiguous { reason, .. } => format!("AMBIGUOUS: {reason}"),
         },
         unresolved.len()
     );
@@ -416,6 +419,16 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "control_head": head,
             "control_commits": control.commit_count()?,
             "lock_held": ProjectLock::is_held(control.root()),
+            "lock": match ProjectLock::diagnose(control.root()) {
+                LockDiagnosis::Free => serde_json::json!({"state": "free"}),
+                LockDiagnosis::Held(owner) => serde_json::json!({"state": "held", "holder": owner}),
+                LockDiagnosis::Stale { holder, reason } => {
+                    serde_json::json!({"state": "stale", "holder": holder, "reason": reason})
+                }
+                LockDiagnosis::Ambiguous { holder, reason } => {
+                    serde_json::json!({"state": "ambiguous", "holder": holder, "reason": reason})
+                }
+            },
             "authority": authority,
             "unresolved_operations": unresolved,
         }),
@@ -469,16 +482,30 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     let unresolved = journal.unresolved()?;
 
     if args.resume {
+        // Cleared before the journal is consulted, because a process killed
+        // outright leaves a lock and no unresolved entry at all — so gating
+        // this on the journal would leave the commonest stale lock permanent.
+        // Only a *provably* stale lock is removed; `clear_stale` refuses
+        // anything whose holder might still be running.
+        let diagnosis = ProjectLock::diagnose(control.root());
+        let cleared_lock = ProjectLock::clear_stale(control.root(), &diagnosis)?;
+
         if unresolved.is_empty() {
             return Ok(CommandOutcome::new(
                 "project.recover",
                 format!(
-                    "Project {} has no interrupted operations; nothing to resume",
-                    config.project_id
+                    "Project {} has no interrupted operations{}",
+                    config.project_id,
+                    if cleared_lock {
+                        "; cleared the stale lock its dead holder left behind"
+                    } else {
+                        "; nothing to resume"
+                    }
                 ),
                 serde_json::json!({
                     "project_id": config.project_id.to_string(),
                     "resumed": false,
+                    "cleared_stale_lock": cleared_lock,
                     "unresolved_operations": [],
                 }),
             )
