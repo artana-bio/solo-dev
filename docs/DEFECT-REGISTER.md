@@ -106,8 +106,17 @@ limitation so the next person reaching for injection sees why it will not work.
 Roughly forty-five tests assert less than their names claim. Four mutations were
 confirmed to survive the entire suite of 732 tests:
 
-- deleting the Git version-compliance check
-- deleting the worktree-support probe
+- deleting the Git version-compliance check — ⚠️ **partly addressed.** The
+  probe test asserted `meets_minimum_version == (parsed_version >= MINIMUM)`,
+  restating the implementation, so hardcoding `true` left it passing. It now
+  asserts the value, and a separate test exercises the ordering with versions
+  this host cannot supply. A hardcoded `true` would still slip past without an
+  old Git to run against — but that field only feeds `doctor`'s report. The
+  check with teeth is `check_git_version`, and
+  `an_unsatisfiable_minimum_git_version_fails_explicitly` already exercises it
+- deleting the worktree-support probe — **still open.** Report-only: nothing
+  acts on `supports_worktrees`, and it cannot be forced false on a host whose
+  Git supports worktrees. Recorded rather than papered over
 - adding an illegal `Draft → Promoted` transition to the authoritative table
 - replacing the system clock with a fixed constant, so every timestamp in the
   audit trail becomes the same fabricated instant — ✅ **FIXED**, one test now

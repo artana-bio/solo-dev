@@ -104,13 +104,44 @@ mod tests {
 
     #[test]
     fn probe_reports_minimum_version_compliance_and_worktree_support() {
+        // This asserted `meets_minimum_version == (parsed_version >= MINIMUM)`,
+        // which restates the implementation rather than checking it: replacing
+        // the field with a hardcoded `true` left it passing, because on any
+        // supported host the right-hand side is also true. It now asserts the
+        // value itself, which is at least a claim about the world.
+        //
+        // What a hardcoded `true` would still slip past here is unavoidable
+        // without an old Git to test against. The check that has teeth is
+        // `check_git_version`, which refuses a project whose configured minimum
+        // exceeds the installed version, and
+        // `an_unsatisfiable_minimum_git_version_fails_explicitly` exercises it
+        // in both directions. This field only feeds `doctor`'s report.
         let probe = GitClient::probe(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         assert_eq!(probe.minimum_version, MINIMUM_GIT_VERSION);
-        assert_eq!(
-            probe.meets_minimum_version,
-            probe.parsed_version >= MINIMUM_GIT_VERSION
-        );
+        assert!(probe.meets_minimum_version);
+        assert!(probe.parsed_version >= MINIMUM_GIT_VERSION);
         assert!(probe.supports_worktrees);
+    }
+
+    #[test]
+    fn version_comparison_discriminates_around_the_minimum() {
+        // The ordering the compliance field rests on, exercised with values
+        // this host cannot supply. Without this, nothing anywhere asserts that
+        // an older Git compares as older.
+        let minimum: GitVersion = format!("git version {MINIMUM_GIT_VERSION}")
+            .parse()
+            .unwrap();
+        let older: GitVersion = "git version 2.39.5".parse().unwrap();
+        let newer: GitVersion = "git version 2.99.0".parse().unwrap();
+
+        assert!(older < minimum, "an older Git must compare as older");
+        assert!(newer >= minimum);
+        assert!(minimum >= minimum);
+        // The compliance field is exactly this comparison, so an older Git has
+        // to land on its failing side.
+        let compliant = |version: GitVersion| version >= minimum;
+        assert!(!compliant(older), "an older Git must fail compliance");
+        assert!(compliant(newer));
     }
 
     #[test]
