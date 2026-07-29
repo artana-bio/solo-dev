@@ -46,7 +46,7 @@ proposition.
 | --- | --- |
 | 12 | An interrupted `project init` wedges the project: `init` says run recover, recover says run init. **[R]** |
 | 13 | A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** |
-| 14 | Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** |
+| 14 | ✅ **FIXED.** Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** Fixed: the preconditions now check which branch is checked out before checking where it points, so the refusal lands before the authority moves. Every other local check described the protected branch only if HEAD happened to be it. |
 | 15 | A post-publish failure is unrecoverable, and recover falsely reports that no promotion reached the authority. **[R]** |
 | 16 | ✅ **FIXED.** Ambient `GIT_DIR`/`GIT_WORK_TREE` override every git call. The gate runner clears its environment; the git layer does not. **[V]** Reproduced: `doctor --workspace <repo>` reported a decoy directory. Fixed: the Git helper removes what redirects — repository, objects, index, config — and also the author/committer identity variables, which outrank repository config and so quietly undid the fixed control identity Section 9.2 requires. |
 | 17 | "Already up to date." counts as a successful merge, so the harness reports work landed when it published nothing. **[R]** |

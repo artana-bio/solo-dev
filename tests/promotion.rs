@@ -688,3 +688,49 @@ fn the_acceptance_digest_ignores_the_status_it_necessarily_changes() {
     .unwrap();
     assert_eq!(record["status"], "promoted");
 }
+
+#[test]
+fn promoting_from_a_different_checked_out_branch_is_refused() {
+    // Tier 3, defect 14. The local sync is `git merge --ff-only <landing>` in
+    // the candidate repository, which fast-forwards whatever branch HEAD is on.
+    // The preconditions check that `refs/heads/<protected>` is at the expected
+    // commit and that the worktree is clean, but never that HEAD is that
+    // branch. An operator sitting on a feature branch — the ordinary state —
+    // had the landing commit fast-forwarded onto it, and the command reported
+    // "local `main` fast-forwarded".
+    let (workspace, id) = accepted(1);
+    let landing = landing_of(&workspace, &id);
+    let authority_before = workspace.authority_head();
+
+    support::git(
+        &workspace.repository,
+        &["checkout", "-q", "-b", "sidetrack"],
+    );
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert!(
+        !output.status.success(),
+        "promotion must refuse rather than move the wrong branch"
+    );
+    assert_eq!(
+        workspace.authority_head(),
+        authority_before,
+        "and it must refuse before the authority moves, not after"
+    );
+    assert_eq!(
+        support::capture(&workspace.repository, &["rev-parse", "HEAD"]),
+        support::capture(&workspace.repository, &["rev-parse", "refs/heads/main"]),
+        "sidetrack must not have been fast-forwarded to the landing commit"
+    );
+    assert_ne!(
+        support::capture(&workspace.repository, &["rev-parse", "HEAD"]),
+        landing
+    );
+
+    // The guard: checking the protected branch back out makes it work. The
+    // refusal must be about which branch is out, not a new blanket blocker.
+    support::git(&workspace.repository, &["checkout", "-q", "main"]);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(workspace.authority_head(), landing);
+}

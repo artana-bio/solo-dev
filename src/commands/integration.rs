@@ -2394,6 +2394,30 @@ fn require_local_main_ready(
     expected: &str,
 ) -> Result<(), HarnessError> {
     let scope = GitScope::work_tree(&config.repository);
+
+    // Which branch is checked out, before anything about where it points. The
+    // sync below is `git merge --ff-only`, which moves whatever HEAD is on —
+    // so every check that follows describes the protected branch only if HEAD
+    // is the protected branch. An operator sitting on a feature branch, which
+    // is the ordinary state, had the landing commit fast-forwarded onto that
+    // instead, and the command reported the protected branch synchronized.
+    let checked_out = run(&scope, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let current = checked_out.trimmed_stdout();
+    if !checked_out.success() || current != config.protected_branch {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "local repository has `{}` checked out but promotion fast-forwards `{}`; check it out first",
+                if checked_out.success() {
+                    current
+                } else {
+                    "a detached HEAD"
+                },
+                config.protected_branch
+            ),
+            code: ErrorCode::PreconditionLocalMainStale,
+        });
+    }
+
     let head = run(
         &scope,
         [
