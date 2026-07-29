@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 38 |
+| Plan revision | 39 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -3026,6 +3026,31 @@ that actually tests D-001 — a profile that required changing the engine would
 mean the independence was nominal.
 
 | D-060 | Write the lock file to a scratch path and link it into place | Accepted | `create_new` makes acquisition exclusive, but it also makes the lock file *visible* before its contents are written. A contender reading it in that window sees an unparseable holder and is told the lock's disposition cannot be established — sending an operator to check whether a command is running while one plainly is, which is the worst possible advice at that moment. Writing the contents to a scratch file and `hard_link`ing it in keeps the exclusion, since the link fails when the destination exists, and makes the file complete the instant it appears. The scratch name is unique per attempt rather than per process, because threads within one process share a pid and would delete each other's scratch file. Both defects were found by writing a contention test that actually contends. |
+
+| D-061 | Rename a test whose assertions were narrowed without narrowing its name | Accepted | D-052 correctly stopped `probe_identifies_this_path_as_a_linked_worktree_or_the_main_one` from asserting anything environment-dependent, leaving a single claim: the path is a non-bare repository. The name was not narrowed with it, so the test went on advertising an identification it no longer performed. Renaming costs nothing and removes a false signal from the one place a reader looks first when deciding whether a behaviour is covered. |
+
+#### On tests that claim more than they check
+
+Five instances of one defect surfaced during implementation: two tests pinning
+values that depend on where the suite runs, one asserting an actor and a reason
+but never the head its name promised, one claiming concurrency while making two
+sequential calls on a single thread, and one left advertising a check that a
+correct narrowing had removed.
+
+A systematic sweep for the pattern was attempted and largely failed, which is
+worth recording. Comparing a test's name against the words in its body flags
+almost every test, because English verbs like "refuses" and "reports" do not
+appear literally in assertion code. Filtering to tests whose only assertions are
+pass or fail flags a hundred and seventeen, nearly all of them legitimately
+boolean. The sweep found exactly one real instance — the one recorded above,
+and the one this document's own author had introduced.
+
+The four that mattered were found by *running* something: pointing the harness
+at itself, mutation-testing a review's own claim, and writing a contention test
+that actually contended. The pattern is a mismatch between a claim and an
+absent assertion, and no analysis of names detects an assertion that was never
+written. The practice that works is the one already recorded against `WP-500`
+and `WP-510`: check a claim before writing it down.
 
 ### 19.5 Multi-repository gate
 
