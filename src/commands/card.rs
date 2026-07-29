@@ -366,7 +366,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.common.control,
         "card.create",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let cycle = cycle_accepting_cards(control, &draft)?;
             if let Some(state) = state_of(control, &draft.card_id)? {
                 return Err(HarnessError::Control {
@@ -436,7 +437,8 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
         &args.common.control,
         "card.activate",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             if let Some(state) = state_of(control, &card_id)? {
                 return Err(HarnessError::Control {
                     reason: format!(
@@ -582,7 +584,8 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.common.control,
         "card.revise",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let state = state_of(control, &card_id)?.ok_or_else(|| HarnessError::Control {
                 reason: format!("card {card_id} is not activated; use `card activate`"),
                 code: ErrorCode::PreconditionNotFound,
