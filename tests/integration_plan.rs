@@ -452,3 +452,144 @@ fn an_atomic_group_must_name_cards_the_cycle_declares() {
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
 }
+
+#[test]
+fn an_abandoned_integration_releases_its_cycle_and_returns_its_cards() {
+    let workspace = cycle_with(2);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.approve_card("F-002", "src/F-002/a.rs");
+    let first = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "integrating"
+    );
+
+    let envelope = workspace.integration_json(&[
+        "abandon",
+        "--integration-id",
+        &first,
+        "--actor-id",
+        "coordinator",
+        "--reason",
+        "the combination cannot be made to work in this cycle",
+    ]);
+    assert_eq!(envelope["data"]["status"], "abandoned");
+
+    // The approvals were never the problem — the combination was — so the
+    // cards go back to `approved` rather than back to work.
+    for card in ["F-001", "F-002"] {
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", card])["data"]["state"],
+            "approved"
+        );
+    }
+
+    // And the cycle is free again, which is the whole point: without this,
+    // a plan that cannot land holds its cycle forever.
+    let second = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_ne!(second["data"]["integration_id"], first.as_str());
+}
+
+#[test]
+fn abandoning_releases_the_landing_ref() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+
+    workspace.integration(&[
+        "abandon",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+        "--reason",
+        "superseded",
+    ]);
+    // A landing commit nobody will promote must not be kept alive forever.
+    assert!(
+        support::capture(
+            &workspace.repository,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/harness/landing"
+            ]
+        )
+        .is_empty(),
+        "the landing ref must be released"
+    );
+}
+
+#[test]
+fn a_promoted_integration_cannot_be_abandoned() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+
+    let output = workspace.integration_raw(&[
+        "abandon",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+        "--reason",
+        "too late",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}

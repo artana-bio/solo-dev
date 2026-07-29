@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 28 |
+| Plan revision | 29 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `3e2a6ff` (`test: trace all 40 mandatory scenarios, closing four real gaps`) |
+| Previous plan commit | `30204fc` (`feat: recover an interrupted promotion, closing the last §19.3 code criterion`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 646 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 649 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2835,7 +2835,7 @@ Progress against each criterion:
 | Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
 | No critical or high open defect | ✅ | No open defect is recorded; every defect found during implementation was fixed in the package that exposed it |
 | README documents installation and operator workflow | ✅ | `README.md`: installation, the three-repository model, the eleven-step operator workflow, recovery, and the exit-code table |
-| `SELFHOST-001` completes without manual Git mutation | ⏳ | Not run. `tests/lifecycle.rs` proves the machinery works on a temporary project; `SELFHOST-001` is the same claim against this repository |
+| `SELFHOST-001` completes without manual Git mutation | ⏳ | First attempt reached combined verification and was blocked by two real defects it exposed (D-052, D-053), both now fixed. The run restarts against the corrected harness |
 | Acceptance owner signs the release record | ⏳ | Alvaro Alvarez, after the above |
 
 The recovery criterion was the one structural problem: Section 19.3 required a
@@ -3065,6 +3065,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-049 | Verify worktree cleanliness before unlocking, rather than relying on the lock to refuse | Accepted | `WP-130` locks card worktrees so `git worktree prune` cannot reclaim them, which meant every cleanup removal failed on the lock instead of on the real question. Unlocking first and letting `git worktree remove` decide would leave a worktree holding uncommitted work unlocked on the failure path — protection removed at exactly the moment it was needed. Cleanup now establishes cleanliness itself, then unlocks, then removes without forcing. |
 | D-050 | Check authority freshness at `integration merge`, not only at `land` | Accepted | A plan built against a superseded protected branch is refused at landing and again at promotion, so merging one is not unsafe. It is, however, wasted work that produces an integration head missing whatever landed in the meantime — exactly the kind of object someone inspects and misreads. Every other stage in the harness refuses as early as it can detect a problem; this one now does too. |
 | D-051 | Pull promotion recovery into the MVP rather than narrowing the Section 19.3 criterion | Accepted 2026-07-28 by Alvaro Alvarez | The gate requires the recovery-required promotion state to be "demonstrated and recovered", and recovery sat in `WP-500`, a hardened-release package. Narrowing the criterion to "reached and does not rewind" was the alternative. Recovering was chosen because the state is the one place a command can die having already changed something outside the control repository, so leaving it operator-only is the weakest point in the whole lifecycle. `project recover --resume` re-derives what happened from the authority branch rather than from a journal marker, and shares the settlement code with `integration promote`, so a resumed promotion cannot record something subtly different from an uninterrupted one. |
+| D-052 | Stop asserting `detached_head` in the repository-probe test | Accepted | The test asserted the source checkout is on a branch, which is a claim about the environment rather than about the code. The harness runs its own integration gates in a detached worktree by design (`WP-420`), so the suite failed the first time the harness was pointed at itself. The comment beside it already applied the right reasoning to `linked_worktree` and then did the opposite for `detached_head`. Found by `SELFHOST-001`, and unreachable by any temporary-project test. |
+| D-053 | Add `integration abandon` | Accepted | Section 11.3 permits `abandoned` from every pre-promoted state and `holds_lease` treats it as terminal, but no command could reach it. An integration that failed verification therefore held its cycle's integration lease permanently, with no way to plan another. This is the third instance of the same pattern — a state the model defines and no command reaches — after `WP-120`'s event store and `WP-200`'s atomic groups. Member cards return to `approved` rather than to work, because their approvals remained valid: the combination failed, not the candidates. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

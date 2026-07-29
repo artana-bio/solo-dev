@@ -73,6 +73,8 @@ pub enum IntegrationCommand {
     Review(ReviewArgs),
     /// Move the protected branch to the accepted landing commit.
     Promote(PromoteArgs),
+    /// Abandon an integration that will not land, releasing its cycle.
+    Abandon(AbandonArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
 }
@@ -182,6 +184,7 @@ pub fn execute(
         IntegrationCommand::Verify(args) => run_verify(args, clock),
         IntegrationCommand::Review(args) => run_integration_review(args, clock),
         IntegrationCommand::Promote(args) => run_promote(args, clock),
+        IntegrationCommand::Abandon(args) => run_abandon(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
     }
 }
@@ -2713,4 +2716,130 @@ pub fn resume_promotion(
     }
 
     Ok(ResumeOutcome::NothingHappened)
+}
+
+/// Arguments accepted by `integration abandon`.
+#[derive(Debug, Args)]
+pub struct AbandonArgs {
+    /// Path to the control repository.
+    #[arg(long)]
+    pub control: std::path::PathBuf,
+    /// The integration to abandon.
+    #[arg(long)]
+    pub integration_id: String,
+    /// Who is abandoning it.
+    #[arg(long)]
+    pub actor_id: String,
+    /// Why it is being abandoned.
+    #[arg(long)]
+    pub reason: String,
+    /// Report the outcome without recording it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Abandons an integration that will not land, releasing its cycle.
+///
+/// Section 11.3 permits this from every pre-promoted state, and without it a
+/// plan that fails verification holds its cycle's integration lease forever —
+/// a state the model defines and nothing could reach. The member cards return
+/// to `approved`, because their approvals are still valid: it was the
+/// combination that failed, not the candidates.
+fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        let record = load_integration(&control, &integration_id)?;
+        record
+            .status
+            .check_transition(IntegrationStatus::Abandoned)?;
+        return Ok(CommandOutcome::new(
+            "integration.abandon",
+            format!(
+                "Dry run: would abandon {integration_id}, returning {} card(s) to `approved`\nnothing was changed",
+                record.members.len()
+            ),
+            serde_json::json!({
+                "dry_run": true,
+                "integration_id": integration_id.to_string(),
+                "reason": args.reason,
+            }),
+        )
+        .with_project(config.project_id));
+    }
+
+    with_transaction(
+        &args.control,
+        "integration.abandon",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            let previous = record.status;
+            previous.check_transition(IntegrationStatus::Abandoned)?;
+
+            record.status = IntegrationStatus::Abandoned;
+            control.write_atomic(
+                &IntegrationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+            for member in &record.members {
+                let (card, state) = load_card(control, &member.card_id)?;
+                if state.state == CardState::Integrating {
+                    crate::commands::card::store_card_state(
+                        control,
+                        &card,
+                        &state,
+                        CardState::Approved,
+                    )?;
+                }
+            }
+            // The landing commit, if one was built, has no further purpose and
+            // its ref would otherwise keep an unreachable commit alive forever.
+            landing::release(&config.repository, integration_id.as_str())?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.abandoned", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .transition(Some(previous.name()), IntegrationStatus::Abandoned.name())
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("reason", serde_json::json!(args.reason))
+                    .meta(
+                        "cards",
+                        serde_json::json!(
+                            record
+                                .card_ids()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        ),
+                    ),
+                clock,
+            )?;
+            control.commit(expected, &format!("integration: abandon {integration_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "integration.abandon",
+                format!(
+                    "Abandoned {integration_id} (was `{}`)\nreason: {}\ncards returned to `approved`: {}",
+                    previous.name(),
+                    args.reason,
+                    record.members.len()
+                ),
+                serde_json::json!({
+                    "integration_id": integration_id.to_string(),
+                    "status": IntegrationStatus::Abandoned.name(),
+                    "previous_status": previous.name(),
+                    "reason": args.reason,
+                    "cards": record.card_ids().map(ToString::to_string).collect::<Vec<_>>(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
 }

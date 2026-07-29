@@ -125,10 +125,14 @@ mod tests {
             panic!("expected a repository");
         };
         assert!(!bare, "the source checkout is not bare");
-        assert!(!detached_head, "the source checkout is on a branch");
-        // This crate is developed from linked worktrees, so only assert the
-        // field is populated rather than pinning a value that depends on where
-        // the test runs.
+        // Neither `linked_worktree` nor `detached_head` is pinned. This crate
+        // is developed from linked worktrees, and its own integration gates run
+        // in a *detached* worktree by design, so both values depend on where
+        // the suite happens to run. Asserting either would make the test a
+        // statement about the environment rather than about the code — which
+        // is exactly how it failed the first time the harness ran its own
+        // gates against itself.
         let _ = linked_worktree;
+        let _ = detached_head;
     }
 }
