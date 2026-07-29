@@ -244,6 +244,31 @@ impl IntegrationRecord {
         Digest::of_canonical(self)
     }
 
+    /// The digest of everything acceptance binds, ignoring lifecycle position.
+    ///
+    /// Acceptance authorizes one exact set of members landing as one exact
+    /// commit. It does not authorize the record's `status`, which necessarily
+    /// moves `reviewed → accepted → promoted → archived` afterwards. Recording
+    /// [`digest`](Self::digest) at acceptance and re-deriving it at promotion
+    /// therefore compares a value against one that changed for a reason
+    /// acceptance never objected to, and would refuse every promotion.
+    ///
+    /// That is why the recorded digest was never checked: the check could not
+    /// have passed. Excluding `status` is what makes checking it possible, and
+    /// a check that runs is worth more than a field that binds everything and
+    /// is consulted by nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be serialized.
+    pub fn substantive_digest(&self) -> Result<Digest, HarnessError> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("status");
+        }
+        Digest::of_canonical(&value)
+    }
+
     /// The canonicalization algorithm integrations are digested under.
     #[must_use]
     pub const fn canonical_algorithm() -> &'static str {

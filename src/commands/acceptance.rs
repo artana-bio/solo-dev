@@ -227,7 +227,7 @@ fn build_acceptance(
         acceptance_id: next_acceptance_id(control)?,
         integration_id: record.integration_id.clone(),
         landing_sha: landing_sha.clone(),
-        integration_record_digest: record.digest()?,
+        integration_record_digest: record.substantive_digest()?,
         receipt_ids: verification.receipt_ids.clone(),
         acceptance_owner: args.acceptance_owner.clone(),
         decision,

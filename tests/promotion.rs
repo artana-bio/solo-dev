@@ -630,3 +630,61 @@ fn resuming_when_the_authority_never_moved_completes_nothing() {
         "accepted"
     );
 }
+
+#[test]
+fn a_plan_changed_after_acceptance_is_refused_at_promotion() {
+    // Tier 1, defect 3. Acceptance recorded `integration_record_digest` and
+    // nothing ever compared it to anything. Worse, it was computed over the
+    // whole record including `status`, which necessarily moves `reviewed →
+    // accepted` immediately afterwards — so the check could not have passed had
+    // anyone written it. A member appended after acceptance promoted: never
+    // verified, never accepted, not in the tree the owner signed off.
+    let (workspace, id) = accepted(2);
+
+    let path = workspace.control.join(format!("integrations/{id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+    // The fixture must be a real tamper, not a no-op rewrite: the members list
+    // has to actually grow, or a refusal below proves nothing.
+    let members = record["members"].as_array_mut().unwrap();
+    let before = members.len();
+    let mut extra = members[0].clone();
+    extra["card_id"] = serde_json::json!("F-999");
+    members.push(extra);
+    assert_eq!(members.len(), before + 1, "the tamper must change the plan");
+
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(&workspace.control, &["commit", "-q", "-m", "tamper"]);
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert!(
+        !output.status.success(),
+        "a plan that changed after acceptance must not promote"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("changed after it was accepted"),
+        "the refusal must say what is wrong: {message}"
+    );
+}
+
+#[test]
+fn the_acceptance_digest_ignores_the_status_it_necessarily_changes() {
+    // The guard on the fix above. Acceptance sets `status` to `accepted` as
+    // part of recording itself, so a digest covering `status` can never match
+    // at promotion and every promotion would be refused. This asserts the
+    // ordinary path still works — which is the whole reason the recorded digest
+    // went unchecked for as long as it did.
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.control.join(format!("integrations/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["status"], "promoted");
+}

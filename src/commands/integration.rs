@@ -2308,6 +2308,20 @@ fn check_promotion(
             code: ErrorCode::PolicyNotAccepted,
         });
     }
+    // Acceptance recorded a digest of the integration it authorized, and until
+    // now nothing compared it to anything. Append a member after acceptance and
+    // promotion landed it: never verified, never accepted, not in the tree the
+    // acceptance owner signed off.
+    let substantive = record.substantive_digest()?;
+    if acceptance.integration_record_digest != substantive {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "acceptance {} authorized integration digest {} but the record now digests to {substantive}; the plan changed after it was accepted",
+                acceptance.acceptance_id, acceptance.integration_record_digest
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
     let verification = load_verification(control, &record.integration_id)?;
     if verification.landing_sha != landing_sha {
         return Err(HarnessError::Control {
