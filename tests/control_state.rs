@@ -7,6 +7,7 @@ use std::{
 };
 
 use change_harness::{
+    cli::exit::ExitCategory,
     control::{
         journal::{Journal, OperationState},
         lock::{LOCK_FILE, ProjectLock},
@@ -591,4 +592,46 @@ fn status_says_nothing_when_the_locator_agrees() {
         "an agreeing locator must be silent: {envelope}"
     );
     assert!(envelope["data"]["locator_disagreement"].is_null());
+}
+
+#[test]
+fn an_environment_io_failure_is_not_reported_as_a_harness_defect() {
+    // Tier 4. Every `ControlIo` failure was classified `InternalControlCorrupt`
+    // — exit 10, the category reserved for "the harness is broken, file a bug".
+    // A read-only filesystem, a permissions mistake, a full disk: all
+    // environment problems the operator can fix, all reported as harness
+    // defects, which sends them to exactly the wrong place.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("control");
+    fs::create_dir_all(&root).unwrap();
+
+    // The fixture must genuinely be unwritable, or the classification under
+    // test is never reached.
+    let mut permissions = fs::metadata(&root).unwrap().permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(&root, permissions).unwrap();
+    assert!(
+        fs::write(root.join("probe"), "x").is_err(),
+        "the fixture must be unwritable"
+    );
+
+    let control = ControlRepository::at(&root);
+    let error = control
+        .write_atomic("cards/F-001.json", "{}\n")
+        .expect_err("writing into an unwritable directory must fail");
+
+    // Restore before asserting, so a failure does not leave an undeletable
+    // temporary directory behind.
+    let mut permissions = fs::metadata(&root).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&root, permissions).unwrap();
+
+    assert_eq!(
+        error.category(),
+        ExitCategory::Precondition,
+        "a permissions problem is the operator's to fix, not a harness defect"
+    );
+    assert_eq!(error.code().as_string(), "CH-PRECONDITION-CONTROL-ACCESS");
 }

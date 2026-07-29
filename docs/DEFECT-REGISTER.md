@@ -78,7 +78,12 @@ usage text on stderr and nothing on stdout — and a malformed invocation is the
 failure an agent is most likely to hit. Parsing failures now render through the
 envelope when JSON was requested, and keep clap's own help when it was not.
 
-**Still open:** every I/O failure is classified as a harness defect. The conflict-token table does not
+✅ **FIXED:** every I/O failure was classified as a harness defect — exit 10,
+the category reserved for "the harness is broken, file a bug". A read-only
+filesystem, a permissions mistake, a full disk are all the operator's to fix.
+Those kinds are now `CH-PRECONDITION-CONTROL-ACCESS`, exit 4. `NotFound` stays
+internal on purpose: a control file missing when the state says it exists is
+corruption, and nothing here can tell that from someone deleting the directory. The conflict-token table does not
 match git's real output and binary conflicts are double-counted. Rename records
 are mis-parsed into paths that do not exist. Dependency SHAs are never bound to
 a review. Cycle status folds card events. Five cycle statuses and one card state

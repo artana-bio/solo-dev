@@ -115,6 +115,8 @@ pub enum ErrorCode {
     PreconditionLocalMainStale,
     /// A path initialization would adopt already holds content nobody checked.
     PreconditionOccupiedPath,
+    /// The control repository could not be read or written by this process.
+    PreconditionControlAccess,
     /// The card's risk level requires a human reviewer and none was declared.
     PolicyRiskReview,
     /// A card already holds an active lease.
@@ -171,9 +173,30 @@ pub enum ErrorCode {
     InternalEncoding,
 }
 
+/// Classifies a filesystem failure as the environment's or the harness's.
+///
+/// Every `ControlIo` failure used to become `InternalControlCorrupt` — exit 10,
+/// the category reserved for "the harness is broken, file a bug". A read-only
+/// filesystem, a permissions mistake, a full disk: all environment problems the
+/// operator can fix, all reported as harness defects, which sends them to
+/// exactly the wrong place and makes exit 10 mean nothing.
+///
+/// Only the unambiguous cases are reclassified. `NotFound` stays internal on
+/// purpose: a control file missing when the state says it exists is corruption,
+/// and there is no way here to tell that from someone deleting the directory.
+fn classify_io(source: &std::io::Error) -> ErrorCode {
+    match source.kind() {
+        std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::ReadOnlyFilesystem
+        | std::io::ErrorKind::StorageFull
+        | std::io::ErrorKind::QuotaExceeded => ErrorCode::PreconditionControlAccess,
+        _ => ErrorCode::InternalControlCorrupt,
+    }
+}
+
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 77] = [
+    pub const ALL: [Self; 78] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -224,6 +247,7 @@ impl ErrorCode {
         Self::PreconditionUnmergedWork,
         Self::PreconditionLocalMainStale,
         Self::PreconditionOccupiedPath,
+        Self::PreconditionControlAccess,
         Self::PolicyRiskReview,
         Self::PolicyLeaseHeld,
         Self::PolicyStaleLock,
@@ -325,6 +349,7 @@ impl ErrorCode {
             | Self::PreconditionBranchExists
             | Self::PreconditionWorktreeExists
             | Self::PreconditionOccupiedPath
+            | Self::PreconditionControlAccess
             | Self::PreconditionWorktreeDirty
             | Self::PreconditionUnmergedWork
             | Self::PreconditionLocalMainStale => ExitCategory::Precondition,
@@ -386,6 +411,7 @@ impl ErrorCode {
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
             Self::PreconditionWorktreeExists => "WORKTREE-EXISTS",
             Self::PreconditionOccupiedPath => "OCCUPIED-PATH",
+            Self::PreconditionControlAccess => "CONTROL-ACCESS",
             Self::PreconditionWorktreeDirty => "WORKTREE-DIRTY",
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
             Self::PreconditionLocalMainStale => "LOCAL-MAIN-STALE",
@@ -645,6 +671,9 @@ impl ErrorCode {
             Self::PreconditionOccupiedPath => {
                 "Point the flag at an empty or new directory, or move the existing contents aside."
             }
+            Self::PreconditionControlAccess => {
+                "Check permissions and free space on the control repository, then retry."
+            }
             _ => "Satisfy the reported precondition, then retry.",
         }
     }
@@ -811,14 +840,14 @@ impl HarnessError {
 
     /// The stable code for this failure.
     #[must_use]
-    pub const fn code(&self) -> ErrorCode {
+    pub fn code(&self) -> ErrorCode {
         match self {
             Self::InvalidId { .. } => ErrorCode::UsageInvalidId,
             Self::InvalidDigest { .. } => ErrorCode::UsageInvalidDigest,
             Self::InvalidTimestamp { .. } => ErrorCode::UsageInvalidTimestamp,
             Self::ConflictingOptions(_) => ErrorCode::UsageConflictingOptions,
             Self::Config { code, .. } | Self::Control { code, .. } => *code,
-            Self::ControlIo { .. } => ErrorCode::InternalControlCorrupt,
+            Self::ControlIo { source, .. } => classify_io(source),
             Self::WorkspaceNotFound(_) => ErrorCode::PreconditionWorkspaceMissing,
             Self::WorkspaceAccess { .. } => ErrorCode::PreconditionWorkspaceAccess,
             Self::GitUnavailable(_) => ErrorCode::ExternalGitUnavailable,
@@ -829,7 +858,7 @@ impl HarnessError {
 
     /// The exit category for this failure.
     #[must_use]
-    pub const fn category(&self) -> ExitCategory {
+    pub fn category(&self) -> ExitCategory {
         self.code().category()
     }
 
