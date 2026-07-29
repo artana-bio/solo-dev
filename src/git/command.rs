@@ -114,6 +114,50 @@ impl GitScope {
     }
 }
 
+/// Environment variables that would override where and how Git operates.
+///
+/// Every scope this module builds says which repository to use with `-C`, and
+/// `GIT_DIR` beats `-C`. A shell that exported it — an ordinary thing to do
+/// while working on a bare repository — silently pointed every harness command
+/// at a different repository, and the command then succeeded against the wrong
+/// one. Nothing downstream could catch that, because nothing was wrong except
+/// which repository it was.
+///
+/// The identity variables are here for a second reason. Section 9.2 keeps
+/// workflow actor identity in the authoritative event rather than in Git author
+/// configuration, so control history stays byte-identical regardless of who ran
+/// the command — and `initialize_git` sets that identity in the repository
+/// config. Environment identity outranks repository config, so an exported
+/// `GIT_AUTHOR_NAME` quietly undid it.
+///
+/// `GIT_CONFIG_COUNT` is enough to disable the `GIT_CONFIG_KEY_<n>` and
+/// `GIT_CONFIG_VALUE_<n>` pairs it counts, which cannot be enumerated here.
+///
+/// The gate runner clears its environment outright for this class of reason;
+/// Git needs `PATH` and `HOME` to work at all, so this removes what redirects
+/// rather than everything.
+const AMBIENT_OVERRIDES: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+];
+
 /// Runs Git and captures its result without interpreting the exit status.
 ///
 /// A non-zero exit is a normal answer for many queries, so classification is
@@ -136,6 +180,9 @@ where
     command.env("GIT_PAGER", "cat");
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_OPTIONAL_LOCKS", "0");
+    for name in AMBIENT_OVERRIDES {
+        command.env_remove(name);
+    }
 
     let output = command.output().map_err(HarnessError::GitUnavailable)?;
     Ok(GitOutput {

@@ -372,3 +372,44 @@ fn project_init_deliberately_ignores_the_environment() {
         "init must not advertise an environment fallback: {stdout}"
     );
 }
+
+#[test]
+fn an_ambient_git_dir_does_not_redirect_the_harness() {
+    // Tier 3, defect 16. Every Git call goes through one helper that sets three
+    // environment variables and clears none. `GIT_DIR` and `GIT_WORK_TREE`
+    // override `-C`, so a shell that exported either — a common thing to do
+    // while working on a bare repository — silently pointed every harness
+    // command at a different repository. The gate runner clears its environment
+    // for exactly this class of reason; the Git layer never did.
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let output = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(elsewhere.path())
+        .output()
+        .expect("git should run");
+    assert!(output.status.success(), "the decoy repository must exist");
+
+    let output = harness_command()
+        .env("GIT_DIR", elsewhere.path().join(".git"))
+        .env("GIT_WORK_TREE", elsewhere.path())
+        .args([
+            "doctor",
+            "--workspace",
+            env!("CARGO_MANIFEST_DIR"),
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("the CLI should start");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_json(&output)["data"]["repository_root"],
+        env!("CARGO_MANIFEST_DIR"),
+        "the workspace flag must win over an exported GIT_DIR"
+    );
+}

@@ -427,3 +427,50 @@ fn init_still_accepts_an_empty_directory_that_already_exists() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn an_ambient_git_author_does_not_reach_control_history() {
+    // Tier 3, defect 16, second half. Section 9.2 keeps workflow actor identity
+    // in the authoritative event rather than in Git author configuration, so
+    // control history stays byte-identical regardless of who ran the command —
+    // and `initialize_git` sets that identity in the repository config.
+    // Environment identity outranks repository config, so an exported
+    // `GIT_AUTHOR_NAME` quietly undid it.
+    let workspace = Workspace::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("GIT_AUTHOR_NAME", "Somebody Else")
+        .env("GIT_AUTHOR_EMAIL", "else@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Somebody Else")
+        .env("GIT_COMMITTER_EMAIL", "else@example.invalid")
+        .args([
+            "project".to_owned(),
+            "init".to_owned(),
+            "--project-id".to_owned(),
+            "example".to_owned(),
+            "--repository".to_owned(),
+            workspace.repository.display().to_string(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--authority".to_owned(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".to_owned(),
+            workspace.worktrees.display().to_string(),
+        ])
+        .output()
+        .expect("the CLI should start");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let identity = capture(
+        &workspace.control,
+        &["log", "-1", "--format=%an <%ae>|%cn <%ce>"],
+    );
+    assert_eq!(
+        identity.trim(),
+        "Change Harness <change-harness@local.invalid>|Change Harness <change-harness@local.invalid>",
+        "control history must not carry whoever's shell ran the command"
+    );
+}

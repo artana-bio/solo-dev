@@ -48,7 +48,7 @@ proposition.
 | 13 | A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** |
 | 14 | Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** |
 | 15 | A post-publish failure is unrecoverable, and recover falsely reports that no promotion reached the authority. **[R]** |
-| 16 | Ambient `GIT_DIR`/`GIT_WORK_TREE` override every git call. The gate runner clears its environment; the git layer does not. **[V]** |
+| 16 | ✅ **FIXED.** Ambient `GIT_DIR`/`GIT_WORK_TREE` override every git call. The gate runner clears its environment; the git layer does not. **[V]** Reproduced: `doctor --workspace <repo>` reported a decoy directory. Fixed: the Git helper removes what redirects — repository, objects, index, config — and also the author/committer identity variables, which outrank repository config and so quietly undid the fixed control identity Section 9.2 requires. |
 | 17 | "Already up to date." counts as a successful merge, so the harness reports work landed when it published nothing. **[R]** |
 | 18 | Path validation is bypassed at init — uncanonicalized paths defeat the alias and nesting checks, and a control repository can be created inside the candidate worktree. **[V]** |
 | 19 | `card revise` performs an unchecked transition; from `landed` it permanently strands the card and its integration. **[R]** |
