@@ -9,18 +9,27 @@ will not own the workflow engine.
 
 ## Status
 
-Every Single-repository MVP work package is implemented. A change travels the
-full path — card, work, gates, handoff, independent review, integration,
-merge preflight, landing commit, combined verification, integration review,
-acceptance, promotion, archive, close — using only harness commands.
+Every Single-repository MVP work package is implemented, along with three
+hardening packages: failure injection at every journaled boundary, stale-lock
+diagnosis with explicit lease reclaim, and verified backups.
 
-The Section 19.3 release gate is not yet met. Three criteria remain: the forty
-mandatory scenarios have not been enumerated and traced one by one,
-`SELFHOST-001` has not been run against this repository, and the acceptance
-owner has not signed the release record. One further criterion is structurally
-blocked and flagged in the plan rather than skipped. See
-[the implementation plan](./docs/IMPLEMENTATION_PLAN.md) for the per-criterion
-status.
+**Eleven of the twelve Section 19.3 release criteria are met. The remaining one
+is the acceptance owner's signature on the release record.** The per-criterion
+status, with the test that demonstrates each, is in
+[the implementation plan](./docs/IMPLEMENTATION_PLAN.md).
+
+The harness runs its own development. `SELFHOST-001` took a documentation-only
+card through every lifecycle stage against this repository and promoted the
+result; every package since has been built the same way. That run is recorded
+in [its report](./docs/SELFHOST-001.md), including the two attempts that failed
+first and the three defects they exposed — which is the reason Threshold C
+exists.
+
+One limitation is worth knowing before relying on the evidence: the reviews in
+these runs were recorded by distinct declared actors but not from genuinely
+fresh contexts. D-013 makes actor identity declared rather than proven, so the
+harness cannot detect this. It is recorded as an accepted-risk finding on each
+review rather than left for a reader to infer.
 
 The `SPIKE-001` walking skeleton that preceded implementation is recorded in
 [its report](./docs/spikes/SPIKE-001-REPORT.md). No prototype code was merged;

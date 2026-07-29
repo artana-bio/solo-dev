@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 33 |
+| Plan revision | 34 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 688 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
-| Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 690 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
