@@ -41,7 +41,43 @@ pub const CONTROL_AUTHOR_EMAIL: &str = "change-harness@local.invalid";
 /// rather than permanence, and a passing gate's output is large and
 /// uninteresting. Invariant 7.4.2 is satisfied by the receipt, which records
 /// each log's location and digest.
-const CONTROL_IGNORE: &str = "harness.lock\njournal/\nlogs/\n";
+///
+/// The lock's scratch file and the atomic-write temporary are both listed
+/// because both exist for a window on every write, and a crash inside that
+/// window leaves one behind. `harness.lock` alone did not match
+/// `harness.lock.staging.<pid>.<n>`.
+const CONTROL_IGNORE: &str = "harness.lock\nharness.lock.staging.*\n*.tmp\njournal/\nlogs/\n";
+
+/// Every path the control repository stages.
+///
+/// Staging used to be `git add -A`, which swept whatever happened to be sitting
+/// in the control directory into authoritative history: a crashed gate's dump,
+/// a half-written record, the lock's own scratch file. Naming the paths makes
+/// inclusion deliberate, the way everything else in this crate is
+/// deny-by-default.
+///
+/// The trade is real and runs the other way: a record type added here and not
+/// added to this list would be written to disk and never committed, so control
+/// state would diverge from control history silently. That is worse than the
+/// residue, which is why `control_history_holds_everything_a_lifecycle_writes`
+/// exists — it runs a full lifecycle and refuses to let anything the harness
+/// wrote stay untracked.
+const CONTROL_TRACKED_PATHS: &[&str] = &[
+    ".gitignore",
+    "project",
+    "cards",
+    "cycles",
+    "events",
+    "gates",
+    "handoffs",
+    "reviews",
+    "receipts",
+    "leases",
+    "integrations",
+    "verifications",
+    "acceptances",
+    "archives",
+];
 
 /// A control repository on disk.
 #[derive(Clone, Debug)]
@@ -248,8 +284,25 @@ impl ControlRepository {
             });
         }
 
-        run_ok(&self.scope(), ["add", "-A"])?;
-        if self.is_clean()? {
+        // `--all` within each named path, so a deletion inside one is staged as
+        // well as an addition. Paths absent from disk are dropped first: `git
+        // add` treats a pathspec matching nothing as a fatal error, and most of
+        // these do not exist until the lifecycle stage that creates them.
+        let present: Vec<&str> = CONTROL_TRACKED_PATHS
+            .iter()
+            .copied()
+            .filter(|relative| self.path(relative).exists())
+            .collect();
+        if !present.is_empty() {
+            let mut stage: Vec<&str> = vec!["add", "--all", "--"];
+            stage.extend_from_slice(&present);
+            run_ok(&self.scope(), stage)?;
+        }
+        // Whether anything is *staged*, not whether the worktree is clean.
+        // Staging is selective now, so residue outside the allowlist leaves the
+        // worktree permanently dirty; asking `is_clean` would send every commit
+        // into `git commit` with nothing staged, which fails.
+        if run(&self.scope(), ["diff", "--cached", "--quiet"])?.success() {
             return Ok(None);
         }
         run_ok(&self.scope(), ["commit", "-q", "-m", message])?;
@@ -371,10 +424,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let control = ControlRepository::at(temp.path());
         control.initialize_git().unwrap();
-        control.write_atomic("a.json", "1\n").unwrap();
+        // Real control paths: staging is by allowlist, so a file at a path the
+        // harness never writes is deliberately not tracked.
+        control.write_atomic("cards/a.json", "1\n").unwrap();
         let first = control.commit(None, "first").unwrap().unwrap();
 
-        control.write_atomic("b.json", "2\n").unwrap();
+        control.write_atomic("cards/b.json", "2\n").unwrap();
         // Claiming control is still unborn, when it is actually at `first`.
         let error = control.commit(None, "second").expect_err("must refuse");
         assert_eq!(error.code(), ErrorCode::ConflictControlHeadMoved);
@@ -386,10 +441,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let control = ControlRepository::at(temp.path());
         control.initialize_git().unwrap();
-        control.write_atomic("a.json", "1\n").unwrap();
+        // Real control paths: staging is by allowlist, so a file written where
+        // the harness never writes is deliberately not tracked.
+        control.write_atomic("cards/a.json", "1\n").unwrap();
         let first = control.commit(None, "first").unwrap().unwrap();
 
-        control.write_atomic("b.json", "2\n").unwrap();
+        control.write_atomic("cards/b.json", "2\n").unwrap();
         let second = control.commit(Some(&first), "second").unwrap().unwrap();
         assert_ne!(first, second);
         assert_eq!(control.commit_count().unwrap(), 2);
@@ -400,12 +457,38 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let control = ControlRepository::at(temp.path());
         control.initialize_git().unwrap();
-        control.write_atomic("a.json", "1\n").unwrap();
+        control.write_atomic("cards/a.json", "1\n").unwrap();
         let first = control.commit(None, "first").unwrap().unwrap();
 
         // This is what makes repeated initialization idempotent.
         assert!(control.commit(Some(&first), "again").unwrap().is_none());
         assert_eq!(control.commit_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_file_at_an_unowned_path_is_not_committed() {
+        // Tier 2, defect 9. Staging was `git add -A`, so anything in the
+        // control directory when a mutation committed went into authoritative
+        // history — a crashed gate's dump, a half-written record, the lock's
+        // own scratch file.
+        let temp = tempfile::tempdir().unwrap();
+        let control = ControlRepository::at(temp.path());
+        control.initialize_git().unwrap();
+        control.write_atomic("cards/a.json", "1\n").unwrap();
+        let first = control.commit(None, "first").unwrap().unwrap();
+
+        std::fs::write(temp.path().join("crash-dump.txt"), "secrets\n").unwrap();
+        std::fs::write(temp.path().join("harness.lock.staging.1.0"), "pid\n").unwrap();
+        assert!(
+            control.commit(Some(&first), "again").unwrap().is_none(),
+            "residue must not produce a commit at all"
+        );
+
+        let listed = run(&control.scope(), ["ls-files"]).unwrap();
+        let tracked = listed.trimmed_stdout();
+        assert!(tracked.contains("cards/a.json"), "{tracked}");
+        assert!(!tracked.contains("crash-dump"), "{tracked}");
+        assert!(!tracked.contains("staging"), "{tracked}");
     }
 
     #[test]

@@ -270,3 +270,70 @@ fn the_report_is_reproducible_from_control_state_alone() {
         "two runs over unchanged state must agree exactly"
     );
 }
+
+#[test]
+fn a_crashed_operations_residue_never_reaches_control_history() {
+    // Tier 2, defect 9. Control commits staged with `git add -A`, so anything
+    // sitting in the control directory when a mutation committed was swept into
+    // authoritative history. The ignore list covered `harness.lock` exactly and
+    // therefore missed the lock's own scratch file, `harness.lock.staging.<pid>
+    // .<n>`, which exists for a window on every single acquisition. A gate's
+    // crash dump or a half-written record went in the same way.
+    let workspace = Workspace::initialized();
+
+    // Residue of three kinds: the lock's scratch file, an interrupted atomic
+    // write, and something a crashed process left behind.
+    fs::write(
+        workspace.control.join("harness.lock.staging.4242.0"),
+        "pid: 4242\n",
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.control.join("cards")).unwrap();
+    fs::write(workspace.control.join("cards/F-001.tmp"), "half a card\n").unwrap();
+    fs::write(workspace.control.join("crash-dump.txt"), "secrets\n").unwrap();
+
+    // Any mutating command commits control state.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+
+    let tracked = workspace.control_tracked_files();
+    // The fixture must have committed something, or "nothing was swept in" is
+    // true for the wrong reason.
+    assert!(
+        tracked.iter().any(|path| path.starts_with("cycles/")),
+        "the cycle must actually have been recorded: {tracked:?}"
+    );
+    for residue in [
+        "harness.lock.staging.4242.0",
+        "cards/F-001.tmp",
+        "crash-dump.txt",
+    ] {
+        assert!(
+            !tracked.iter().any(|path| path == residue),
+            "{residue} reached authoritative history: {tracked:?}"
+        );
+    }
+}
+
+#[test]
+fn control_history_holds_everything_a_lifecycle_writes() {
+    // The guard on the fix above. Staging by allowlist trades sweeping things
+    // in for leaving things out, and leaving a record out is worse: control
+    // state on disk would diverge from control state in Git, silently. After a
+    // full lifecycle nothing the harness wrote may be untracked.
+    let workspace = completed();
+
+    let status = support::capture(
+        &workspace.control,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(
+        status.trim().is_empty(),
+        "control state on disk must match control state in Git:\n{status}"
+    );
+}
