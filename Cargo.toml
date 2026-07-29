@@ -7,7 +7,7 @@ publish = false
 description = "A local, project-neutral change-control harness for humans and coding agents"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10.0"

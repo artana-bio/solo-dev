@@ -12,6 +12,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{gate::receipts_for, review::reviews_for},
     control::{event_store::EventStore, repository::ControlRepository},
     domain::{
@@ -35,7 +36,7 @@ pub enum AuditCommand {
 #[derive(Debug, Args)]
 pub struct CycleArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The cycle to report on.
     #[arg(long)]

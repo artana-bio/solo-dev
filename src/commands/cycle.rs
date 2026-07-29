@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::transaction::with_transaction,
     control::{
         event_store::{EventDraft, EventStore},
@@ -40,7 +41,7 @@ pub enum CycleCommand {
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
