@@ -7,10 +7,10 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     commands::{
-        acceptance::AcceptanceCommand, archive::ArchiveCommand, card::CardCommand,
-        cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand, handoff::HandoffCommand,
-        integration::IntegrationCommand, project::ProjectCommand, review::ReviewCommand,
-        work::WorkCommand,
+        acceptance::AcceptanceCommand, archive::ArchiveCommand, backup::BackupCommand,
+        card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand,
+        handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
+        review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -101,6 +101,12 @@ pub enum Command {
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
+    },
+
+    /// Write and verify backups of the repositories that hold the record.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
     },
 }
 

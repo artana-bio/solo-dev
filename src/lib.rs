@@ -48,7 +48,8 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         | Command::Review { .. }
         | Command::Integration { .. }
         | Command::Acceptance { .. }
-        | Command::Archive { .. } => None,
+        | Command::Archive { .. }
+        | Command::Backup { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -68,6 +69,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Integration { .. } => "integration",
         Command::Acceptance { .. } => "acceptance",
         Command::Archive { .. } => "archive",
+        Command::Backup { .. } => "backup",
     }
 }
 
@@ -149,6 +151,9 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         }),
         Command::Archive { command } => dispatch(cli.output, |clock| {
             commands::archive::execute(&command, clock)
+        }),
+        Command::Backup { command } => dispatch(cli.output, |clock| {
+            commands::backup::execute(&command, clock)
         }),
     }
 }

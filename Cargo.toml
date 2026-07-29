@@ -12,11 +12,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10.0"
 sha2 = "0.10"
+# Backup verification restores a bundle into a scratch directory to read every
+# object, so this is a runtime need rather than a test-only one.
+tempfile = "3.23"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
-
-[dev-dependencies]
-tempfile = "3.23"
 
 [lints.rust]
 unsafe_code = "forbid"
