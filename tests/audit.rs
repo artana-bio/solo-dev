@@ -337,3 +337,77 @@ fn control_history_holds_everything_a_lifecycle_writes() {
         "control state on disk must match control state in Git:\n{status}"
     );
 }
+
+#[test]
+fn recorded_timestamps_come_from_the_host_clock() {
+    // The audit's fourth surviving mutation: replacing `SystemClock::now` with
+    // a fixed constant passed the entire suite. Every timestamp in the audit
+    // trail — when a card was activated, when a gate ran, when an authority
+    // moved — became the same fabricated instant, and nothing noticed. The
+    // whole value of the trail is that it says when things happened.
+    //
+    // Every other test uses `FixedClock` on purpose, for determinism. That is
+    // correct and is exactly why nothing was left checking the real one.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+
+    let recorded = workspace
+        .events()
+        .into_iter()
+        .find(|event| event["event_type"] == "cycle.created")
+        .expect("the cycle must have been recorded");
+    let stamp = recorded["occurred_at"]
+        .as_str()
+        .expect("a timestamp on the event");
+
+    // Parsed as seconds since the epoch by hand rather than by pulling in a
+    // date library: the point is only that it sits between two readings of the
+    // host clock taken around the command.
+    let seconds = unix_seconds(stamp);
+    assert!(
+        seconds >= before && seconds <= after,
+        "recorded {stamp} ({seconds}) is outside [{before}, {after}], so it did not come from this machine's clock"
+    );
+}
+
+/// Converts an RFC 3339 UTC timestamp to seconds since the epoch.
+fn unix_seconds(stamp: &str) -> u64 {
+    let (date, rest) = stamp.split_once('T').expect("an RFC 3339 timestamp");
+    let time = rest.trim_end_matches('Z');
+    let part = |text: &str, index: usize, separator: char| -> u64 {
+        text.split(separator)
+            .nth(index)
+            .expect("a component")
+            .parse()
+            .expect("a number")
+    };
+    let (year, month, day) = (part(date, 0, '-'), part(date, 1, '-'), part(date, 2, '-'));
+    let time = time.split('.').next().expect("a time");
+    let (hour, minute, second) = (part(time, 0, ':'), part(time, 1, ':'), part(time, 2, ':'));
+
+    // Days since the epoch, by the civil-from-days algorithm.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+
+    days * 86_400 + hour * 3_600 + minute * 60 + second
+}

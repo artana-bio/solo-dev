@@ -110,7 +110,10 @@ confirmed to survive the entire suite of 732 tests:
 - deleting the worktree-support probe
 - adding an illegal `Draft → Promoted` transition to the authoritative table
 - replacing the system clock with a fixed constant, so every timestamp in the
-  audit trail becomes the same fabricated instant
+  audit trail becomes the same fabricated instant — ✅ **FIXED**, one test now
+  requires a recorded timestamp to fall between two readings of the host clock
+  taken around the command. Every other test uses `FixedClock` for determinism,
+  which is correct and is exactly why nothing was left checking the real one
 
 The sharpest single instance: `git rev-parse --verify` echoes any 40-character
 hex string and exits 0 whether or not the object exists. Both tests asserting
