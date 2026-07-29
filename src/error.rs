@@ -111,6 +111,8 @@ pub enum ErrorCode {
     PreconditionUnmergedWork,
     /// The local protected worktree is not at the commit promotion expects.
     PreconditionLocalMainStale,
+    /// A path initialization would adopt already holds content nobody checked.
+    PreconditionOccupiedPath,
     /// A card already holds an active lease.
     PolicyLeaseHeld,
     /// The project lock was left behind by a process that has exited.
@@ -167,7 +169,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 74] = [
+    pub const ALL: [Self; 75] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -216,6 +218,7 @@ impl ErrorCode {
         Self::PreconditionWorktreeDirty,
         Self::PreconditionUnmergedWork,
         Self::PreconditionLocalMainStale,
+        Self::PreconditionOccupiedPath,
         Self::PolicyLeaseHeld,
         Self::PolicyStaleLock,
         Self::PolicyLockAmbiguous,
@@ -313,6 +316,7 @@ impl ErrorCode {
             | Self::PreconditionBaseMissing
             | Self::PreconditionBranchExists
             | Self::PreconditionWorktreeExists
+            | Self::PreconditionOccupiedPath
             | Self::PreconditionWorktreeDirty
             | Self::PreconditionUnmergedWork
             | Self::PreconditionLocalMainStale => ExitCategory::Precondition,
@@ -372,6 +376,7 @@ impl ErrorCode {
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
             Self::PreconditionWorktreeExists => "WORKTREE-EXISTS",
+            Self::PreconditionOccupiedPath => "OCCUPIED-PATH",
             Self::PreconditionWorktreeDirty => "WORKTREE-DIRTY",
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
             Self::PreconditionLocalMainStale => "LOCAL-MAIN-STALE",
@@ -620,6 +625,9 @@ impl ErrorCode {
             }
             Self::PreconditionUnmergedWork => {
                 "Land or archive the branch's commits before deleting it."
+            }
+            Self::PreconditionOccupiedPath => {
+                "Point the flag at an empty or new directory, or move the existing contents aside."
             }
             _ => "Satisfy the reported precondition, then retry.",
         }

@@ -13,11 +13,24 @@ use crate::{
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
-        journal::{Journal, OperationState},
-        lock::{LockDiagnosis, ProjectLock},
+        event_store::EVENT_DIR,
+        journal::{JOURNAL_DIR, Journal, OperationState},
+        lock::{LOCK_FILE, LockDiagnosis, ProjectLock},
         repository::{ControlRepository, write_project},
     },
-    domain::{clock::Clock, ids::ProjectId},
+    domain::{
+        acceptance::ACCEPTANCE_DIR,
+        archive::ARCHIVE_DIR,
+        card::CARD_DIR,
+        clock::Clock,
+        cycle::CYCLE_DIR,
+        gate::GATE_DIR,
+        handoff::HANDOFF_DIR,
+        ids::ProjectId,
+        integration::{INTEGRATION_DIR, VERIFICATION_DIR},
+        lease::LEASE_DIR,
+        review::REVIEW_DIR,
+    },
     error::{ErrorCode, HarnessError},
     git::{
         authority::{
@@ -26,6 +39,7 @@ use crate::{
         command::{GitScope, run, run_ok},
         inspect,
     },
+    runner::receipt::{LOG_DIR, RECEIPT_DIR},
 };
 
 /// Subcommands under `project`.
@@ -146,6 +160,79 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
     })
 }
 
+/// Every entry `project init` may find in a directory it is about to adopt.
+///
+/// An interrupted `init` leaves the lock and the journal behind before Git is
+/// even initialized, so those have to be admissible or a crash would wedge the
+/// project harder than it already does. Everything else means the directory
+/// belongs to someone.
+const CONTROL_OWNED_ENTRIES: &[&str] = &[
+    ".git",
+    ".gitignore",
+    ".DS_Store",
+    LOCK_FILE,
+    JOURNAL_DIR,
+    "project",
+    CARD_DIR,
+    CYCLE_DIR,
+    EVENT_DIR,
+    GATE_DIR,
+    HANDOFF_DIR,
+    REVIEW_DIR,
+    RECEIPT_DIR,
+    LOG_DIR,
+    LEASE_DIR,
+    INTEGRATION_DIR,
+    VERIFICATION_DIR,
+    ACCEPTANCE_DIR,
+    ARCHIVE_DIR,
+];
+
+/// Refuses to adopt a control directory holding anything the harness did not
+/// put there.
+///
+/// Section 9.1 requires this and it was written only for the authority path.
+/// Control adopted whatever was at `--control` and then overwrote its
+/// `.gitignore` with the control one, reporting success — so pointing the flag
+/// at a notes folder, a checkout, or a home directory destroyed a file and said
+/// the project was initialized.
+///
+/// The test is what is present rather than emptiness, because an interrupted
+/// `init` leaves a lock and a journal behind before Git exists, and refusing
+/// those would turn a crash into an unrecoverable state.
+///
+/// # Errors
+///
+/// Returns a precondition error naming what it found.
+fn refuse_occupied_control(path: &std::path::Path) -> Result<(), HarnessError> {
+    let Ok(entries) = fs::read_dir(path) else {
+        // Absent is the ordinary case, and unreadable is reported by the
+        // creation that follows with a better message than this could give.
+        return Ok(());
+    };
+
+    let mut foreign: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !CONTROL_OWNED_ENTRIES.contains(&name.as_str()))
+        .collect();
+
+    if foreign.is_empty() {
+        return Ok(());
+    }
+
+    foreign.sort();
+    foreign.truncate(5);
+    Err(HarnessError::Control {
+        reason: format!(
+            "control path {} already holds {}; initialization will not adopt a directory whose contents nobody checked",
+            path.display(),
+            foreign.join(", ")
+        ),
+        code: ErrorCode::PreconditionOccupiedPath,
+    })
+}
+
 fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let config = config_from_args(args)?;
     // Validation runs before anything is created, so an invalid configuration
@@ -157,6 +244,8 @@ fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
     if control.is_initialized() {
         return reinitialize(&control, &config, args.dry_run);
     }
+
+    refuse_occupied_control(&config.control_repository)?;
 
     if args.dry_run {
         return Ok(CommandOutcome::new(

@@ -345,3 +345,85 @@ fn card_work_does_not_move_the_protected_branch() {
         "only promotion may move the protected branch"
     );
 }
+
+#[test]
+fn init_refuses_to_adopt_an_occupied_control_directory() {
+    // Tier 2, defect 6. Section 9.1 requires initialization to refuse a
+    // directory whose contents nobody checked. The protection was written for
+    // the authority path and never for control: `init` adopted whatever was
+    // there and overwrote its `.gitignore` with the control one, then reported
+    // success. An operator who pointed `--control` at the wrong directory —
+    // a notes folder, a checkout, their home directory — lost that file and was
+    // told the project was initialized.
+    let workspace = Workspace::new();
+    let occupied = workspace.root.join("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("notes.txt"), "months of work\n").unwrap();
+    fs::write(occupied.join(".gitignore"), "*.secret\n").unwrap();
+
+    let output = Workspace::run(&[
+        "project".into(),
+        "init".into(),
+        "--output".into(),
+        "json".into(),
+        "--project-id".into(),
+        "example".into(),
+        "--repository".into(),
+        workspace.repository.display().to_string(),
+        "--control".into(),
+        occupied.display().to_string(),
+        "--authority".into(),
+        workspace.authority.display().to_string(),
+        "--worktree-root".into(),
+        workspace.worktrees.display().to_string(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "init must refuse a directory it did not create: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(occupied.join(".gitignore")).unwrap(),
+        "*.secret\n",
+        "the operator's ignore file must survive"
+    );
+    assert_eq!(
+        fs::read_to_string(occupied.join("notes.txt")).unwrap(),
+        "months of work\n"
+    );
+    assert!(
+        !occupied.join(".git").exists(),
+        "nothing should have been initialized in it"
+    );
+}
+
+#[test]
+fn init_still_accepts_an_empty_directory_that_already_exists() {
+    // The guard on the fix above. Creating the directory first and then
+    // initializing into it is ordinary — `mkdir -p` in a setup script, a mounted
+    // volume — and refusing it would make the check a nuisance rather than a
+    // protection.
+    let workspace = Workspace::new();
+    fs::create_dir_all(&workspace.control).unwrap();
+
+    let output = Workspace::run(&[
+        "project".into(),
+        "init".into(),
+        "--project-id".into(),
+        "example".into(),
+        "--repository".into(),
+        workspace.repository.display().to_string(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--authority".into(),
+        workspace.authority.display().to_string(),
+        "--worktree-root".into(),
+        workspace.worktrees.display().to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "an empty existing directory is fine: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
