@@ -240,13 +240,32 @@ pub fn promote(
         &scope,
         ["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
     )?;
+    let actual_sha = if actual.success() {
+        actual.trimmed_stdout().to_owned()
+    } else {
+        "unborn".to_owned()
+    };
+
+    // A failed swap was reported as a lost race whatever caused it, and Git's
+    // diagnostic was discarded. If the ref still holds exactly what the caller
+    // expected, no race was lost: something else stopped the write — a stale
+    // `refs/heads/<branch>.lock`, a permissions problem, a damaged ref store —
+    // and reporting "the baseline moved" sends the operator to re-plan an
+    // integration that was never the problem. A stale lock file does not clear
+    // itself, so that message would have repeated forever.
+    if actual_sha == expected_sha {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "could not update `{reference}` even though it still holds the expected {expected_sha}: {}",
+                swap.diagnostic()
+            ),
+            code: ErrorCode::ExternalGitCommand,
+        });
+    }
+
     Ok(PromotionOutcome::Rejected {
         expected_sha: expected_sha.to_owned(),
-        actual_sha: if actual.success() {
-            actual.trimmed_stdout().to_owned()
-        } else {
-            "unborn".to_owned()
-        },
+        actual_sha,
     })
 }
 
@@ -471,6 +490,48 @@ mod tests {
             inspect_authority(&authority, "main").unwrap().protected_sha,
             Some(first),
             "a rejected promotion must leave the authority exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_write_that_failed_for_another_reason_is_not_reported_as_a_lost_race() {
+        // Tier 3, defect 23. Any `update-ref` failure was reported as
+        // `Rejected`, with Git's diagnostic discarded — so a stale
+        // `refs/heads/main.lock` told the operator the baseline had moved when
+        // it had not, and the record it produced said expected and actual were
+        // the same commit. A lock file does not clear itself, so that message
+        // would have repeated forever while the operator re-planned an
+        // integration that was never the problem.
+        let temp = tempfile::tempdir().unwrap();
+        let (candidate, first) = candidate_with_commit(temp.path());
+        let authority = temp.path().join("authority.git");
+        initialize(&authority, "main").unwrap();
+
+        let staged = stage_objects(&candidate, &authority, &first, "seed").unwrap();
+        run_ok(
+            &GitScope::git_dir(&authority),
+            ["update-ref", "refs/heads/main", &first],
+        )
+        .unwrap();
+
+        // The fixture: a lock file left behind by a process that died mid-write.
+        let lock = authority.join("refs/heads/main.lock");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, "").unwrap();
+
+        let error = promote(&authority, "main", &first, &first)
+            .expect_err("a write that failed for another reason is not a lost race");
+        unstage_objects(&authority, &staged);
+        let _ = fs::remove_file(&lock);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("still holds the expected"),
+            "the message must say the baseline did not move: {message}"
+        );
+        assert!(
+            message.contains("lock") || message.contains("unable"),
+            "and must carry Git's own diagnostic: {message}"
         );
     }
 }
