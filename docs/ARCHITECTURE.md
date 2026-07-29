@@ -4,10 +4,11 @@ This document is the concise architecture summary. The authoritative work
 packages, requirements, acceptance gates, and current status are maintained in
 [Implementation Plan and Status Ledger](./IMPLEMENTATION_PLAN.md).
 
-## Recommendation
+## Shape
 
-Build one thin, complete workflow before adding distributed coordination,
-runtime-resource brokers, or cross-repository transactions.
+One thin, complete workflow, built before any distributed coordination,
+runtime-resource broker, or cross-repository transaction. That whole path now
+exists for a single repository:
 
 ```text
 configure
@@ -20,6 +21,9 @@ configure
   → accept and promote
   → archive and close
 ```
+
+Each arrow is a command that refuses rather than guesses when its preconditions
+do not hold, and every refusal carries a stable code and exit category.
 
 ## Boundaries
 
@@ -62,69 +66,58 @@ is accidental agent drift, not a malicious local actor.
 
 ## Canonical Git authority
 
-Promotion must not directly update a branch checked out in a working tree.
-The intended design uses a separate local bare repository as the canonical ref
-authority. Candidate and integration worktrees operate in ordinary clones or
-linked worktrees; accepted commits are promoted to the bare authority with an
-expected-old-SHA check.
+Promotion must not directly update a branch checked out in a working tree, so a
+separate local bare repository owns the protected ref. Candidate and integration
+work happens in ordinary clones and linked worktrees; accepted commits reach the
+authority through a compare-and-swap against the exact commit the plan was built
+against.
 
-This boundary is not implemented in the foundation release.
+The ordering is what matters. Every precondition — the acceptance authorizes
+this exact commit, the verification covered it, the landing commit's parents and
+tree are right, the local protected worktree is clean and where it should be —
+is checked before the authority moves, because that update is the only
+irreversible step in the system. If it succeeds and the local fast-forward then
+fails, the authority is deliberately *not* rolled back: rewinding a published
+branch is worse than leaving a recoverable gap, so the command exits 9 and the
+resolution is an operator decision.
 
-## Initial delivery sequence
+## Delivery sequence
 
-### Spike 0: walking skeleton
+**Spike 0, walking skeleton — done.** One disposable, timeboxed lifecycle run
+before any production schema was stabilized: a bounded card in a fresh context,
+an exact-baseline worktree, an exact-SHA handoff, a fresh-context review with a
+seeded omission, two candidates combined into one landing commit, an
+expected-old-SHA promotion, and a deliberate stale-promotion rejection. Only its
+findings and plan revisions entered `main`; the prototype survives under
+`refs/archive/spikes/SPIKE-001`. Three of its seven findings changed the design
+before implementation started, which was the point.
 
-Before stabilizing production schemas, run one disposable, timeboxed lifecycle:
+**Slices 1 and 2, single-repository candidate through landing — done.**
+Versioned configuration, immutable digested cards, exact-baseline worktrees,
+overlap and scope validation, read-only verification, exact-SHA handoff,
+independent review, named gates with structured receipts, disposable
+integration, exact landing-commit validation, promotion to the bare authority,
+and reachability-checked archive and cleanup.
 
-- one bounded card given to a fresh implementation context;
-- one exact-baseline worktree;
-- one exact-SHA handoff;
-- one fresh-context independent review with a seeded omission;
-- two candidate changes combined into one landing commit;
-- one expected-old-SHA promotion to a disposable bare authority;
-- one deliberate stale-promotion rejection.
+**Slice 3, operational hardening — partial.** Concurrency locks and leases
+exist, and every mutating command journals its steps so an interruption is
+attributable to a boundary. Systematic failure injection, idempotent automated
+recovery, generated-artifact classification, and backup verification are
+`WP-500` onward.
 
-Only findings and plan revisions enter `main`; prototype code does not.
-
-### Slice 1: single-repository candidate
-
-- Versioned project configuration
-- Immutable card schema and digest
-- Worktree creation from an exact baseline
-- Overlap and scope validation
-- Read-only verification and exact-SHA handoff
-
-### Slice 2: review and landing
-
-- Independent review record
-- Named gates and structured receipts
-- Disposable integration worktree
-- Exact landing-commit validation
-- Accepted promotion to a local bare authority
-- Reachability-checked archive and cleanup
-
-### Slice 3: operational hardening
-
-- Idempotent recovery after interrupted commands
-- Concurrency locks and leases
-- Generated-artifact classifications
-- Backup verification
-
-### Slice 4: project adapters
-
-- Multiple repository manifests
-- Cross-repository gates
-- Namespaced runtime resources
-- Optional constrained gate execution
+**Slice 4, project adapters — not started.** Multiple repository manifests,
+cross-repository gates, namespaced runtime resources, and constrained gate
+execution.
 
 ## Dogfooding thresholds
 
-- After worktree allocation is accepted, Change Harness creates its own new
-  implementation worktrees.
-- After handoff and review are accepted, Change Harness uses its own cards,
-  handoffs, and fresh-context reviews while landing remains manual.
-- After archive and cleanup are accepted, complete self-hosting is mandatory
-  for subsequent Change Harness feature work.
+- **A — done.** After worktree allocation was accepted, Change Harness creates
+  its own implementation worktrees.
+- **B — done.** After handoff and review were accepted, Change Harness uses its
+  own cards, handoffs, and fresh-context reviews while landing stays manual.
+- **C — pending.** After archive and cleanup were accepted, complete
+  self-hosting becomes mandatory for subsequent feature work. `SELFHOST-001`
+  is the bounded card that proves it, and it has not been run.
 
 ## Explicitly deferred
 
