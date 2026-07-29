@@ -1,0 +1,102 @@
+# Independent review — defect register
+
+Eight independent reviewers, each given the source and the specification and
+nothing else: no narrative from the author, no knowledge of who wrote the code
+or what had been claimed about it. Each was instructed to find defects rather
+than confirm correctness, and to attach a concrete failure scenario to every
+finding.
+
+Every reviewer found defects that invalidate a claim recorded in the plan.
+
+Legend: **[V]** reproduced directly during consolidation. **[R]** reproduced by
+the reviewer with concrete output.
+
+## Tier 1 — the evidence chain does not hold
+
+Until these are fixed, a landed change carries evidence that cannot be trusted,
+which is the product's entire proposition.
+
+| # | Defect |
+| --- | --- |
+| 1 | **A gate passes on uncommitted content while the receipt binds the pass to HEAD.** Write a file, do not commit it, the gate passes, delete it. A signed receipt asserts that this commit passed a gate its own tree fails. `handoff` checks cleanliness; `gate run` does not. **[V]** |
+| 2 | **A re-review approves away a prior critical finding.** Validation inspects only the current review's open findings, never the superseded review's. `WP-320`'s own acceptance line requiring this was never implemented, and the test named for it asserts the defective behaviour is correct. **[V]** |
+| 3 | **Acceptance's integration digest is never checked, and is computed so it can never match.** Append a member to an integration after acceptance and promotion marks that card landed — never verified, never accepted, not in the landing tree. **[R]** |
+| 4 | **Two cards can own the same file.** Overlap detection misses patterns carrying a wildcard in the same segment: `src/api_*.rs` against `src/*_handler.rs`. **[V]** |
+| 5 | **A gate's timeout does not bound the gate.** A surviving background process blocks the runner past the deadline; the overrun is recorded as a clean pass. **[R]** |
+
+## Tier 2 — destroys or loses data
+
+| # | Defect |
+| --- | --- |
+| 6 | **`project init` adopts an occupied directory and overwrites its `.gitignore`**, reporting success. Section 9.1 requires refusal. The protection exists for the authority path and was never written for control. **[V]** |
+| 7 | **`archive close --dry-run` performs a real close** — worktrees removed, branches deleted, cards closed, committed. The function never reads the flag. **[V]** |
+| 8 | **`recover --resume` marks failed operations complete without recovering them**, destroying the only record that a partial mutation occurred. Found independently by three reviewers. **[V]** |
+| 9 | **`git add -A` sweeps a crashed operation's residue into authoritative history**, including the lock's own scratch file, which the ignore list does not cover. **[R]** |
+| 10 | **Archive refs are in no backup.** Those refs are the sole justification for `archive close` deleting branches and worktrees; they live in the candidate repository, and backups cover only authority and control. **[R]** |
+| 11 | **A failed `work start` strands a card permanently and journals that nothing happened.** The branch, worktree, lock and locator are created before the lease is written; the partial/clean decision inspects only the control repository, which is genuinely clean. `recover` then reports nothing is wrong. **[R]** |
+
+## Tier 3 — wedges, false reports, wrong targets
+
+| # | Defect |
+| --- | --- |
+| 12 | An interrupted `project init` wedges the project: `init` says run recover, recover says run init. **[R]** |
+| 13 | A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** |
+| 14 | Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** |
+| 15 | A post-publish failure is unrecoverable, and recover falsely reports that no promotion reached the authority. **[R]** |
+| 16 | Ambient `GIT_DIR`/`GIT_WORK_TREE` override every git call. The gate runner clears its environment; the git layer does not. **[V]** |
+| 17 | "Already up to date." counts as a successful merge, so the harness reports work landed when it published nothing. **[R]** |
+| 18 | Path validation is bypassed at init — uncanonicalized paths defeat the alias and nesting checks, and a control repository can be created inside the candidate worktree. **[V]** |
+| 19 | `card revise` performs an unchecked transition; from `landed` it permanently strands the card and its integration. **[R]** |
+| 20 | A review can reach a state with no exit; the only escape is defect 19. **[R]** |
+| 21 | A reviewer cannot record `blocked` — the command fails and no review record is written at all. **[R]** |
+| 22 | Risk policy is dead code; a `critical`-risk card receives no human gate. **[R]** |
+| 23 | `update-ref` failures are reported as a lost compare-and-swap with the diagnostic discarded, so a stale lock file tells the operator the baseline moved, forever. **[R]** |
+| 24 | Seven further `--dry-run` paths skip checks the real command enforces. **[R]** |
+
+## Tier 4 — contract and correctness
+
+The error envelope reports a different `command` granularity than the success
+envelope. Argument-parsing failures escape the JSON contract entirely. Every I/O
+failure is classified as a harness defect. The conflict-token table does not
+match git's real output and binary conflicts are double-counted. Rename records
+are mis-parsed into paths that do not exist. Dependency SHAs are never bound to
+a review. Cycle status folds card events. Five cycle statuses and one card state
+are unreachable. Generated-artifact scope checks compare globs with `==`. Merge
+honours `commit.gpgsign` and repository hooks, contradicting "hooks are
+advisory".
+
+## The test suite
+
+Roughly forty-five tests assert less than their names claim. Four mutations were
+confirmed to survive the entire suite of 732 tests:
+
+- deleting the Git version-compliance check
+- deleting the worktree-support probe
+- adding an illegal `Draft → Promoted` transition to the authoritative table
+- replacing the system clock with a fixed constant, so every timestamp in the
+  audit trail becomes the same fabricated instant
+
+The sharpest single instance: `git rev-parse --verify` echoes any 40-character
+hex string and exits 0 whether or not the object exists. Both tests asserting
+that commits survive garbage collection use it, so deleting the ref-retention
+mechanism they exist to defend is undetected.
+
+## Cause
+
+Not carelessness on any individual test. The implementation and the tests that
+certified it were written by the same author, so each test could only check a
+case that author had already considered. The defects cluster precisely in the
+cases they had not — and several tests do not merely miss a defect, they assert
+the defective behaviour is correct.
+
+The mechanism that reliably separates the sound tests from the over-claiming
+ones is a guard proving the fixture is not vacuous: "the fixture must actually
+have written the secret", "gates must actually have run", removing the source
+repositories before a restore drill. Where that guard is present the test holds.
+
+## Consequence for self-hosting
+
+Threshold C made the harness's own lifecycle mandatory for further work. That is
+suspended until Tier 1 is repaired: certifying the repair of an evidence chain
+using the same evidence chain is circular. Repairs land as ordinary reviewed
+commits, each with an independent reviewer that did not write it.
