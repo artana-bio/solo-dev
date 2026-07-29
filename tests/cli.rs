@@ -133,9 +133,17 @@ fn doctor_reports_version_compliance_worktree_support_and_role() {
     assert_eq!(data["minimum_git_version"], "2.50.0");
     assert!(data["supports_worktrees"].as_bool().unwrap());
     assert_eq!(data["repository"]["kind"], "repository");
+    // Any non-bare role is admissible. This crate is developed from linked
+    // worktrees and its own integration gates run in a detached one, so
+    // pinning the value would make the test a statement about where it happens
+    // to run. Both narrower forms of this assertion have already failed that
+    // way — see D-052 and D-054.
     let role = data["workspace_role"].as_str().unwrap();
     assert!(
-        role == "main worktree" || role == "linked worktree",
+        matches!(
+            role,
+            "main worktree" | "linked worktree" | "detached worktree"
+        ),
         "unexpected role: {role}"
     );
 }
