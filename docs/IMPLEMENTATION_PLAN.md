@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 37 |
+| Plan revision | 38 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 718 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 721 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2995,8 +2995,8 @@ than narrow the criterion (D-051), so the gate now reads as written.
 
 ### 19.4 Hardened single-repository gate
 
-Status: `IN_PROGRESS`. Five of the seven criteria are met. The two outstanding
-ones both need something outside this repository.
+Status: `IN_PROGRESS`. Six of the seven criteria are met. The one outstanding
+needs a second repository.
 
 All must be true:
 
@@ -3016,15 +3016,16 @@ Progress against each criterion:
 | Every mutation boundary has failure-injection coverage | ✅ | `INJECT_FAILURE_VAR` reaches every boundary any command names, and `every_mutating_command_names_at_least_one_boundary` asserts against the source that no command module opens a transaction without naming one |
 | Backup and restore drill passes | ✅ | `a_restore_drill_reconstructs_authority_and_control_from_the_backup_alone` deletes both source repositories before restoring, so it cannot pass by reading them |
 | Generated-artifact governance is demonstrated | ⚠️ | Classification and ownership are enforced and tested (`tests/artifacts.rs`). Integration-owned generation and deterministic regeneration checking are **not built**, so a shared artifact is classified but cannot land. Whether the criterion means what shipped or the full deliverable list is the acceptance owner's call, recorded here rather than resolved unilaterally |
-| Concurrency tests pass repeatedly | ⚠️ | `tests/concurrency.rs` covers stale locks, PID reuse, ambiguous ownership, and lease reclaim, and `concurrent_lock_acquisition_has_exactly_one_winner` covers real contention. "Repeatedly" is not demonstrated: nothing runs them in a loop or under load, and a race that appears once in a hundred runs would not have been seen |
+| Concurrency tests pass repeatedly | ✅ | `many_threads_contending_for_one_lock_produce_exactly_one_winner`, `many_processes_mutating_one_project_produce_one_commit_each_round`, and `a_losing_contender_never_leaves_the_lock_behind` each run 40 rounds of 8 contenders, across threads and across processes. The test that previously claimed this made two sequential calls on one thread and contended for nothing; writing the real one found a genuine race (D-060) |
 | One ARTANA profile trial | ⏳ | Not run, and not runnable from this repository — it needs an ARTANA checkout. D-001 keeps the engine independent, so the trial is the check that the independence holds in practice |
 | No critical or high risk unmitigated | ✅ | No open defect is recorded; each found during implementation was fixed in the package that exposed it, and the two high-severity review findings this session (`WP-520`'s bundle verification, `WP-510`'s locale comparison) were resolved before their cards landed |
 
-The two outstanding criteria are honest gaps rather than oversights.
-"Repeatedly" wants a soak run, which is a different kind of test from anything
-here. The ARTANA trial needs a second repository, and it is the criterion that
-actually tests D-001 — a profile that required changing the engine would mean
-the independence was nominal.
+One outstanding criterion remains, and it is an honest gap rather than an
+oversight: the ARTANA trial needs a second repository, and it is the criterion
+that actually tests D-001 — a profile that required changing the engine would
+mean the independence was nominal.
+
+| D-060 | Write the lock file to a scratch path and link it into place | Accepted | `create_new` makes acquisition exclusive, but it also makes the lock file *visible* before its contents are written. A contender reading it in that window sees an unparseable holder and is told the lock's disposition cannot be established — sending an operator to check whether a command is running while one plainly is, which is the worst possible advice at that moment. Writing the contents to a scratch file and `hard_link`ing it in keeps the exclusion, since the link fails when the destination exists, and makes the file complete the instant it appears. The scratch name is unique per attempt rather than per process, because threads within one process share a pid and would delete each other's scratch file. Both defects were found by writing a contention test that actually contends. |
 
 ### 19.5 Multi-repository gate
 
