@@ -1252,6 +1252,7 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         let control = ControlRepository::open(&args.control)?;
         let config = control.project()?;
         let record = load_integration(&control, &integration_id)?;
+        require_fresh_authority(&config, &record)?;
         require_pinned_candidates(&config.repository, &record)?;
         let preflight = simulate(&config.repository, &record)?;
         let mut payload = preflight.payload(&record);
@@ -1291,6 +1292,7 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     code: ErrorCode::PolicyInvalidTransition,
                 });
             }
+            require_fresh_authority(&config, &record)?;
             require_pinned_candidates(&config.repository, &record)?;
 
             // The preflight runs first so a conflict is reported with its
@@ -1439,6 +1441,32 @@ fn landing_subject(record: &IntegrationRecord) -> String {
     )
 }
 
+/// Refuses an integration whose plan was built against a superseded authority.
+///
+/// Checked at merge as well as at landing. Merging against a stale base is not
+/// unsafe — landing and promotion both refuse it later — but it is wasted work
+/// that produces an integration head missing whatever landed in the meantime,
+/// which is exactly the kind of object someone inspects and misreads.
+fn require_fresh_authority(
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    if authority.protected_sha.as_deref() == Some(record.expected_main_sha.as_str()) {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "authority `{}` is now {} but integration {} was planned against {}; re-prepare it",
+            config.protected_branch,
+            authority.protected_sha.as_deref().unwrap_or("unborn"),
+            record.integration_id,
+            record.expected_main_sha
+        ),
+        code: ErrorCode::ConflictControlHeadMoved,
+    })
+}
+
 /// Validates a merged integration and returns everything landing needs.
 fn landing_inputs(
     config: &crate::config::ProjectConfig,
@@ -1479,21 +1507,7 @@ fn landing_inputs(
         });
     }
 
-    // The authority must not have moved since the plan was built, or the
-    // landing's first parent would not be the branch promotion updates.
-    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
-    if authority.protected_sha.as_deref() != Some(record.expected_main_sha.as_str()) {
-        return Err(HarnessError::Control {
-            reason: format!(
-                "authority `{}` is now {} but the integration was planned against {}; re-prepare it",
-                config.protected_branch,
-                authority.protected_sha.as_deref().unwrap_or("unborn"),
-                record.expected_main_sha
-            ),
-            code: ErrorCode::ConflictControlHeadMoved,
-        });
-    }
-
+    require_fresh_authority(config, record)?;
     Ok((head.clone(), tree.clone()))
 }
 

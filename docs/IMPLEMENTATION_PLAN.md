@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 24 |
+| Plan revision | 25 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `6adb02f` (`feat(WP-450): acceptance decisions and promotion`) |
+| Previous plan commit | `5551887` (`feat(WP-460): archive refs, reachability verification, and safe cleanup`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 633 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 637 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2742,7 +2742,9 @@ prototype path.
 
 ### 19.3 Single-repository MVP gate
 
-Status: `NOT_STARTED`.
+Status: `IN_PROGRESS`. Every work-package criterion is met and four of the
+behavioural criteria are demonstrated by `tests/lifecycle.rs`; the remainder
+are listed below with what each still needs.
 
 All must be true:
 
@@ -2761,6 +2763,30 @@ All must be true:
 - README documents installation and operator workflow;
 - `SELFHOST-001` completes every lifecycle stage without manual Git mutation;
 - acceptance owner signs the release record.
+
+Progress against each criterion:
+
+| Criterion | Status | Evidence or what remains |
+| --- | --- | --- |
+| All twenty work packages `DONE` | ✅ | This document's per-package entries |
+| All 40 mandatory scenarios pass | ⏳ | Section 16.2 scenarios are covered piecemeal by the per-package suites; they have not been enumerated and traced one by one |
+| No unclassified failure path mutates authority | ✅ | `no_failure_path_in_the_lifecycle_leaves_the_authority_moved`, which also asserts exit 1 is never produced |
+| Exact-SHA review and acceptance invalidation demonstrated | ✅ | `an_invalidated_approval_is_reported_as_stale_rather_than_absent`, `an_acceptance_binds_the_exact_landing_commit_and_its_evidence` |
+| One temporary project completes the full lifecycle twice | ✅ | `one_project_completes_the_full_lifecycle_twice` |
+| Second lifecycle proves stale-main rejection | ✅ | `the_second_cycle_rejects_a_plan_built_against_a_stale_main` |
+| Recovery-required promotion state demonstrated and recovered | ⚠️ | `a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind` demonstrates the state and proves the authority is not rewound. *Recovering* from it is `WP-500`, which is not an MVP package — the gate as written depends on a hardened-release package |
+| Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
+| No critical or high open defect | ✅ | No open defect is recorded; every defect found during implementation was fixed in the package that exposed it |
+| README documents installation and operator workflow | ⏳ | Not written |
+| `SELFHOST-001` completes without manual Git mutation | ⏳ | Not run. `tests/lifecycle.rs` proves the machinery works on a temporary project; `SELFHOST-001` is the same claim against this repository |
+| Acceptance owner signs the release record | ⏳ | Alvaro Alvarez, after the above |
+
+The recovery criterion is the one structural problem: Section 19.3 requires a
+recovery that `WP-500` owns, and `WP-500` is scoped to the hardened release
+rather than the MVP. Either the criterion narrows to "the state is reached,
+recorded, and does not rewind the authority" — which is demonstrated — or
+`WP-500`'s recovery path is pulled into the MVP. That is a scope decision for
+the acceptance owner, recorded here rather than resolved unilaterally.
 
 ### 19.4 Hardened single-repository gate
 
@@ -2982,6 +3008,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-047 | Refuse an integration review that leaves a declared cycle invariant unconfirmed | Accepted | Section 10.2 lets a cycle declare release invariants in free text, which no gate can evaluate. If the review can pass without addressing them, they are decorative. Requiring each to be named explicitly is the only mechanism available for a condition a machine cannot check. |
 | D-048 | Journal a `recovery-required` error as a partial failure regardless of control-tree cleanliness | Accepted | `with_transaction` inferred "nothing was written" from a clean control worktree. That inference holds for every command that only mutates control state, but `integration promote` moves the authority branch — a repository the check cannot see. An authority-promoted, local-sync-failed run leaves control clean, so it would have been recorded `failed_clean` and `project recover` would have stayed silent about precisely the state Section 13.6 requires it to surface. An error that declares itself recovery-required is now taken at its word. |
 | D-049 | Verify worktree cleanliness before unlocking, rather than relying on the lock to refuse | Accepted | `WP-130` locks card worktrees so `git worktree prune` cannot reclaim them, which meant every cleanup removal failed on the lock instead of on the real question. Unlocking first and letting `git worktree remove` decide would leave a worktree holding uncommitted work unlocked on the failure path — protection removed at exactly the moment it was needed. Cleanup now establishes cleanliness itself, then unlocks, then removes without forcing. |
+| D-050 | Check authority freshness at `integration merge`, not only at `land` | Accepted | A plan built against a superseded protected branch is refused at landing and again at promotion, so merging one is not unsafe. It is, however, wasted work that produces an integration head missing whatever landed in the meantime — exactly the kind of object someone inspects and misreads. Every other stage in the harness refuses as early as it can detect a problem; this one now does too. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later
