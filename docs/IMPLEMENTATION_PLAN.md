@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 15 |
+| Plan revision | 16 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `d96c9eb` (`feat(WP-300): named gate registry`) |
+| Previous plan commit | `a5b5704` (`feat(WP-310): gate runner and receipts`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240`, `WP-300`, `WP-310` complete; 436 tests passing. Threshold A is live. |
-| Next executable work package | `WP-250` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`, `WP-310` complete; 460 tests passing. Threshold A is live. `SPIKE-001` finding F-1 is closed. |
+| Next executable work package | `WP-320` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1843,9 +1843,31 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-240`, `WP-310` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 13 workspace tests plus 11 unit tests;
+- **`SPIKE-001` finding F-1 is closed.** A branch amended after delivery is
+  refused with `CH-POLICY-DELIVERED-SHA-MISMATCH`, and the refusal names both
+  the delivered and the actual SHA. The spike's implementer caught this by
+  reading a reflog; it is now a control;
+- a declaration missing narrative fields is refused, while empty assumption and
+  risk lists are permitted, because an empty list is a claim and an absent field
+  is not;
+- a dirty worktree, missing gate evidence, and stale gate evidence each refuse
+  with their own code;
+- a head change or a card revision invalidates an existing handoff, and
+  `handoff inspect` names which binding broke and warns that a review recorded
+  against it would be reviewing different code;
+- the handoff is reproducible: `create` and `inspect` produce identical records
+  and digests, and the record names its canonicalization algorithm (F-2);
+- revoking returns the card to active work and a revoked handoff never applies
+  again.
 
 Deliverables:
 
@@ -2588,7 +2610,8 @@ All must be true:
 | Candidate verification | `DONE` | `WP-240`, 32 tests | Preserve |
 | Gate registry | `DONE` | `WP-300`, 31 tests | Preserve |
 | Gate runner and receipts | `DONE` | `WP-310`, 37 tests | Preserve |
-| Handoff | `READY` | `WP-240` and `WP-310` complete | `WP-250` |
+| Handoff | `DONE` | `WP-250`, 24 tests | Preserve |
+| Independent review | `READY` | `WP-250` and `WP-310` complete | `WP-320` |
 
 
 
@@ -2611,8 +2634,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-250` |
-| Next branch name | `wp/WP-250-handoff` |
+| Next work package | `WP-320` |
+| Next branch name | `wp/WP-320-independent-review` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2701,7 +2724,7 @@ commands before commit even though Rust behavior is unchanged.
 | R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | Complete `SPIKE-001` before `WP-100`; keep Sections 9–15 provisional | Production code begins before accepted spike evidence | Actively controlled |
 | R-015 | Full-plan reading consumes feature-agent context | Reduced implementation focus and higher error rate | Role-specific reading contract and explicit per-item reading list | Feature agent is instructed to load the complete plan without a coordination role | Mitigated by plan revision 2 |
 | R-016 | Review reuses implementation context | Nominally independent review repeats the implementer's assumptions | Fresh session, review packet only, different session ID, no branch edits | Reviewer inherits or forks implementation conversation | Mitigated procedurally; not a security boundary |
-| R-017 | Candidate branch is rewritten between actor delivery and handoff creation | A structurally valid handoff describes code the feature actor never delivered, and review evaluates the wrong objects | Record the actor-declared `delivered_sha` and compare it at handoff creation; reject on mismatch | Any handoff whose candidate SHA differs from the declared delivered SHA | Open; observed in `SPIKE-001` finding F-1 and confirmed by reflog |
+| R-017 | Candidate branch is rewritten between actor delivery and handoff creation | A structurally valid handoff describes code the feature actor never delivered, and review evaluates the wrong objects | Record the actor-declared `delivered_sha` and compare it at handoff creation; reject on mismatch | Any handoff whose candidate SHA differs from the declared delivered SHA | Closed 2026-07-28 by `WP-250`, with a named regression test reproducing the spike's amend |
 | R-018 | Evidence records cannot be independently verified by their holder | An auditor can check records against each other but cannot recompute any digest, so internal consistency is mistaken for correctness | Records name their canonicalization algorithm and carry or reference the card; commit digest vectors before activation | Any record whose digest cannot be recomputed from the record plus Git objects | Open; observed in `SPIKE-001` finding F-2 |
 | R-019 | Independent reviewers reach different verdicts on identical code | Approval depends on which reviewer is assigned rather than on the code | Comparability guidance in Section 15.3; required gate-adequacy output | Same construct flagged in one card and not another | Open; observed in `SPIKE-001` finding F-6 |
 

@@ -97,6 +97,10 @@ pub enum ErrorCode {
     GateFailed,
     /// Required gate evidence is missing or no longer applies.
     GateEvidenceStale,
+    /// A handoff declaration is missing a required field.
+    PolicyIncompleteHandoff,
+    /// The branch was rewritten between delivery and handoff creation.
+    PolicyDeliveredShaMismatch,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -113,7 +117,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 49] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -155,6 +159,8 @@ impl ErrorCode {
         Self::GateRunnerError,
         Self::GateFailed,
         Self::GateEvidenceStale,
+        Self::PolicyIncompleteHandoff,
+        Self::PolicyDeliveredShaMismatch,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -199,7 +205,9 @@ impl ErrorCode {
             | Self::PolicyDependencyCycle
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
-            | Self::PolicyCandidateOutOfScope => ExitCategory::Policy,
+            | Self::PolicyCandidateOutOfScope
+            | Self::PolicyIncompleteHandoff
+            | Self::PolicyDeliveredShaMismatch => ExitCategory::Policy,
             Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
                 ExitCategory::Gate
             }
@@ -261,6 +269,8 @@ impl ErrorCode {
             Self::GateRunnerError => "RUNNER-ERROR",
             Self::GateFailed => "FAILED",
             Self::GateEvidenceStale => "EVIDENCE-STALE",
+            Self::PolicyIncompleteHandoff => "INCOMPLETE-HANDOFF",
+            Self::PolicyDeliveredShaMismatch => "DELIVERED-SHA-MISMATCH",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -376,6 +386,12 @@ impl ErrorCode {
             }
             Self::PolicyCandidateOutOfScope => {
                 "Revert the out-of-scope changes, or revise the card to declare them."
+            }
+            Self::PolicyIncompleteHandoff => {
+                "Supply every declaration field; an empty list is a claim, an absent one is not."
+            }
+            Self::PolicyDeliveredShaMismatch => {
+                "The branch moved after delivery. Re-verify the candidate and hand off the commit that is actually there."
             }
             _ => "Resolve the reported policy violation.",
         }

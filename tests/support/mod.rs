@@ -355,6 +355,70 @@ impl Workspace {
         self.card(&["activate", "--card-id", card_id]);
     }
 
+    /// Runs a `handoff` subcommand in JSON mode without asserting success.
+    pub fn handoff_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "handoff".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs a `handoff` subcommand, asserting success.
+    pub fn handoff(&self, args: &[&str]) -> Output {
+        let output = self.handoff_raw(args);
+        assert!(
+            output.status.success(),
+            "handoff {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a `handoff` subcommand and parses its JSON envelope.
+    pub fn handoff_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.handoff(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Revises a card, moving its digest.
+    pub fn revise_card(&self, card_id: &str, include: &[&str], reason: &str) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = self.authority_head(),
+        );
+        let path = self.root.join(format!("{card_id}-revised.yaml"));
+        fs::write(&path, body).unwrap();
+        let output = Self::run(&[
+            "card".into(),
+            "revise".into(),
+            "--control".into(),
+            self.control.display().to_string(),
+            "--card-id".into(),
+            card_id.into(),
+            "--draft".into(),
+            path.display().to_string(),
+            "--reason".into(),
+            reason.into(),
+        ]);
+        assert!(
+            output.status.success(),
+            "card revise failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Resolves a revision in the candidate repository.
     pub fn candidate_rev(&self, revision: &str) -> String {
         capture(&self.repository, &["rev-parse", revision])
