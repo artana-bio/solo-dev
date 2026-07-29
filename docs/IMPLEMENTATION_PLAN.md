@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 42 |
+| Plan revision | 43 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 732 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 732 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects, 5 of which mean the evidence chain does not hold. The previous claim that eleven of twelve criteria were met was the author assessing their own work against their own tests, and it was wrong. See `docs/DEFECT-REGISTER.md`. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2950,8 +2950,12 @@ prototype path.
 
 ### 19.3 Single-repository MVP gate
 
-Status: `IN_PROGRESS`. Eleven of the twelve criteria are met. Only the
-acceptance owner's signature on the release record remains.
+Status: `BLOCKED`. This section previously read "eleven of the twelve criteria
+are met; only the acceptance owner's signature remains." That was wrong, and the
+way it was wrong matters more than the count: the criteria were assessed by the
+author of the code against tests written by that same author. An independent
+review (Section 19.6) disproved it. Three criteria now fail, and one of them —
+"no critical or high open defect" — fails with twenty-four findings behind it.
 
 All must be true:
 
@@ -2976,17 +2980,17 @@ Progress against each criterion:
 | Criterion | Status | Evidence or what remains |
 | --- | --- | --- |
 | All twenty work packages `DONE` | ✅ | This document's per-package entries |
-| All 40 mandatory scenarios pass | ✅ | Section 16.2 carries a per-scenario trace to the test that exercises it |
+| All 40 mandatory scenarios pass | ❌ | The trace in Section 16.2 is sound in structure, but the test audit found ~45 tests that assert less than their names claim, and four mutations that survive the whole suite. A scenario traced to an over-claiming test is not demonstrated. Re-assessment requires the Tier-1 repairs and a guard on each cited test proving its fixture is not vacuous |
 | No unclassified failure path mutates authority | ✅ | `no_failure_path_in_the_lifecycle_leaves_the_authority_moved`, which also asserts exit 1 is never produced |
 | Exact-SHA review and acceptance invalidation demonstrated | ✅ | `an_invalidated_approval_is_reported_as_stale_rather_than_absent`, `an_acceptance_binds_the_exact_landing_commit_and_its_evidence` |
 | One temporary project completes the full lifecycle twice | ✅ | `one_project_completes_the_full_lifecycle_twice` |
 | Second lifecycle proves stale-main rejection | ✅ | `the_second_cycle_rejects_a_plan_built_against_a_stale_main` |
 | Recovery-required promotion state demonstrated and recovered | ✅ | `a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind` reaches the state; `a_recovery_required_promotion_can_be_resumed_to_completion` recovers it via `project recover --resume`. Scope decision recorded as D-051 |
 | Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
-| No critical or high open defect | ✅ | No open defect is recorded; every defect found during implementation was fixed in the package that exposed it |
+| No critical or high open defect | ❌ | 24 open defects, `docs/DEFECT-REGISTER.md`. Five are critical: a gate passes on uncommitted content while the receipt binds the pass to HEAD; a re-review approves away a prior critical finding; acceptance never checks its recorded digest; two cards can own the same file; a gate's timeout does not bound the gate. The previous entry — "no open defect is recorded" — was true and meaningless, because the only party looking was the author |
 | README documents installation and operator workflow | ✅ | `README.md`: installation, the three-repository model, the eleven-step operator workflow, recovery, and the exit-code table |
 | `SELFHOST-001` completes without manual Git mutation | ✅ | Completed on the third attempt; landing commit `c51f2dc` on `main`, archive refs `refs/archive/cards/F-001` and `refs/archive/integrations/INT-001`, integration `archived`, card `closed`. The first two attempts exposed three real defects (D-052, D-053, D-054), which is recorded in `docs/SELFHOST-001.md` rather than smoothed over |
-| Acceptance owner signs the release record | ⏳ | Alvaro Alvarez. Every other criterion is now met |
+| Acceptance owner signs the release record | ⛔ | Alvaro Alvarez. **Must not be signed.** Signing certifies criteria that are now known to fail |
 
 The recovery criterion was the one structural problem: Section 19.3 required a
 recovery that `WP-500` owned, and `WP-500` is scoped to the hardened release.
@@ -2995,8 +2999,11 @@ than narrow the criterion (D-051), so the gate now reads as written.
 
 ### 19.4 Hardened single-repository gate
 
-Status: `IN_PROGRESS`. Six of the seven criteria are met. The one outstanding
-needs a second repository.
+Status: `BLOCKED`. Previously recorded as six of seven met. "No critical/high
+risk remains unmitigated" fails on the same 24 findings as Section 19.3, and
+"every mutation boundary has failure-injection coverage" is unproven for the
+same reason the scenario trace is: coverage was assessed against tests the
+author wrote to confirm their own implementation.
 
 All must be true:
 
@@ -3057,6 +3064,9 @@ and `WP-510`: check a claim before writing it down.
 | D-063 | Test project neutrality directly rather than only through the ARTANA trial | Accepted | Every fixture, and the harness's own self-hosted development, is a Rust project checked by cargo. A language assumption baked into the engine would have passed all 726 tests and been discovered by the ARTANA trial — the most expensive place to find it. Driving a lifecycle against a Python project with `python3` and `make` gates costs three tests and catches it immediately. It found something on its first run: the compile gate writes `__pycache__` into the worktree, and an untracked file blocks handoff by design, so a project whose gates emit build output cannot complete a lifecycle unless it ignores that output. True of any project, invisible here because this repository ignores `target/` and nobody had to think about it. |
 
 | D-064 | Report a worktree locator that names a different control repository, and never refuse on it | Accepted | `CHANGE_HARNESS_CONTROL` (D-062) makes it possible to run a command for one project with a variable exported for another, and the command succeeds — correctly, against the wrong records. Nothing downstream can catch that, because nothing is wrong except the operator's intent. The worktree locator is the only artifact that knows which project a directory belongs to, so `project status` compares them. It reports and never refuses, because Section 9.3 makes the locator advisory: it lives in a tree the actor can edit, and a check that refused on it would be trusting exactly what the design says not to trust. |
+|  |  |  |  |
+| D-065 | Suspend Threshold C until Tier 1 of the defect register is closed | Accepted | Threshold C made the harness's own lifecycle mandatory for further work, on the reasoning that a tool which cannot govern its own development cannot be trusted to govern anyone else's. The independent review (Section 19.6) found that five defects break the evidence chain the lifecycle produces: a gate can pass on uncommitted content while the receipt binds the pass to HEAD, a re-review can approve away a prior critical finding, and acceptance never checks the digest it recorded. Continuing to land repairs *through* that lifecycle would mean certifying the repair of an evidence chain using the same chain, which proves nothing about either. Repairs therefore land as ordinary reviewed commits with an independent reviewer that did not write them, and Threshold C resumes the moment Tier 1 closes — at which point the harness's own lifecycle becomes the first real test of the repair. |
+| D-066 | Record the review's findings in the repository rather than only in the conversation that produced them | Accepted | The findings arrived as eight separate reports and would have stayed there. Everything that made this project's status wrong for weeks was a claim that lived where no one had to re-read it: a criterion marked met, a test named for a behaviour it did not check. A register in the tree is the artifact a future reader meets before the README's status line, and the README now points at it rather than at a count of criteria. It records the reproduction for each finding, so a repair can be checked against the failure rather than against a description of it. |
 
 ### 19.5 Multi-repository gate
 
@@ -3070,6 +3080,46 @@ All must be true:
 - partial landing is detected and recovered;
 - cross-repository test evidence is retained;
 - documentation explicitly avoids atomicity claims.
+
+### 19.6 Independent review (2026-07)
+
+Eight reviewers, each in a fresh context, each given the source and this
+specification and nothing else: no account from the author of what the code was
+meant to do, and no knowledge of what had already been claimed about it. Each
+was instructed to find defects rather than confirm correctness, and to attach a
+concrete failure scenario to every finding. One reviewer audited the test suite
+by mutation rather than by reading.
+
+Every reviewer found defects that invalidate a claim recorded in this document.
+Twenty-four findings are catalogued in `docs/DEFECT-REGISTER.md` across four
+tiers; four mutations survive all 732 tests, including replacing the system
+clock with a constant, which fabricates every timestamp in the audit trail.
+
+Three reviewers independently found that `recover --resume` marks failed
+operations complete without recovering them — the same defect, from three
+contexts that could not see each other's work.
+
+The cause is not carelessness on any individual test. The implementation and the
+tests certifying it were written by the same author, so each test could only
+check a case that author had already considered, and the defects cluster
+precisely in the cases they had not. Several tests do not merely miss a defect;
+they assert the defective behaviour is correct. `WP-320`'s own acceptance line
+requiring that a re-review cannot approve away a prior critical finding was
+never implemented, and the test named for it asserts the opposite.
+
+This is the finding of record for the project. Section 7.2's independence
+requirement was written for cards; it was not applied to the harness's own
+construction, and the gap it was written to close is exactly the gap that
+opened. D-064 records the consequence: independence is a property of the
+reviewer's context, not of the actor identifier, and the harness cannot detect
+the difference (D-013). Until a repair lands, the reviews recorded in this
+repository's own self-hosted releases should be read as author self-checks.
+
+**Self-hosting is suspended.** Threshold C made the harness's own lifecycle
+mandatory; certifying the repair of an evidence chain using that same evidence
+chain is circular. Repairs land as ordinary reviewed commits, each with an
+independent reviewer that did not write it, and Threshold C resumes when
+Tier 1 of the register is closed.
 
 ## 20. Current status tracker
 
