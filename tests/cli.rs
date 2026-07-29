@@ -497,3 +497,58 @@ fn every_subcommand_group_reports_a_dotted_path_on_failure() {
         );
     }
 }
+
+#[test]
+fn an_argument_error_still_honours_the_json_contract() {
+    // Tier 4. `Cli::parse()` exits inside clap, before anything can render, so
+    // a caller that asked for `--output json` got clap's usage text on stderr
+    // and nothing at all on stdout. An agent driving this CLI — the interface
+    // the JSON envelope exists for — cannot parse that, and the one failure it
+    // is most likely to hit is a malformed invocation.
+    let output = harness_command()
+        .args(["project", "status", "--output", "json"])
+        .env_remove("CHANGE_HARNESS_CONTROL")
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(2), "usage category is exit 2");
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["schema"], "harness.command-error/v1");
+    assert_eq!(envelope["status"], "error");
+    assert_eq!(
+        envelope["command"], "project.status",
+        "the envelope must name what was attempted"
+    );
+    assert_eq!(envelope["error"]["code"], "CH-USAGE-INVALID-ARGUMENTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--control"),
+        "and must carry clap's own diagnostic: {envelope}"
+    );
+}
+
+#[test]
+fn an_argument_error_without_json_keeps_claps_own_output() {
+    // The guard. Clap's usage text is far better for a human than a one-line
+    // envelope, and text mode is the default, so this must not become JSON for
+    // everyone.
+    let output = harness_command()
+        .args(["project", "status"])
+        .env_remove("CHANGE_HARNESS_CONTROL")
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "text mode writes nothing to stdout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--control"), "{stderr}");
+    assert!(
+        stderr.contains("Usage:"),
+        "clap's help must survive: {stderr}"
+    );
+}

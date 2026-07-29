@@ -72,8 +72,13 @@ fixing it: `acceptance inspect` succeeded while reporting
 function it reused. And `cli_validate_reports_the_exact_invalid_field_in_json`
 asserted the group, so it was holding the defect in place.
 
-**Still open:** argument-parsing failures escape the JSON contract entirely.
-Every I/O failure is classified as a harness defect. The conflict-token table does not
+✅ **FIXED:** argument-parsing failures escaped the JSON contract entirely.
+`Cli::parse` exits inside clap, so a caller that asked for `--output json` got
+usage text on stderr and nothing on stdout — and a malformed invocation is the
+failure an agent is most likely to hit. Parsing failures now render through the
+envelope when JSON was requested, and keep clap's own help when it was not.
+
+**Still open:** every I/O failure is classified as a harness defect. The conflict-token table does not
 match git's real output and binary conflicts are double-counted. Rename records
 are mis-parsed into paths that do not exist. Dependency SHAs are never bound to
 a review. Cycle status folds card events. Five cycle statuses and one card state

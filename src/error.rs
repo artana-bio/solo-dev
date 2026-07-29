@@ -23,6 +23,8 @@ pub enum ErrorCode {
     UsageInvalidTimestamp,
     /// Two options were combined in an unsupported way.
     UsageConflictingOptions,
+    /// The command line could not be parsed.
+    UsageInvalidArguments,
     /// The requested workspace path does not exist.
     PreconditionWorkspaceMissing,
     /// The requested workspace path could not be read.
@@ -171,11 +173,12 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 76] = [
+    pub const ALL: [Self; 77] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
         Self::UsageConflictingOptions,
+        Self::UsageInvalidArguments,
         Self::PreconditionWorkspaceMissing,
         Self::PreconditionWorkspaceAccess,
         Self::ConfigMalformed,
@@ -257,7 +260,8 @@ impl ErrorCode {
             Self::UsageInvalidId
             | Self::UsageInvalidDigest
             | Self::UsageInvalidTimestamp
-            | Self::UsageConflictingOptions => ExitCategory::Usage,
+            | Self::UsageConflictingOptions
+            | Self::UsageInvalidArguments => ExitCategory::Usage,
             Self::PreconditionWorkspaceMissing | Self::PreconditionWorkspaceAccess => {
                 ExitCategory::Precondition
             }
@@ -339,6 +343,7 @@ impl ErrorCode {
             Self::UsageInvalidDigest => "INVALID-DIGEST",
             Self::UsageInvalidTimestamp => "INVALID-TIMESTAMP",
             Self::UsageConflictingOptions => "CONFLICTING-OPTIONS",
+            Self::UsageInvalidArguments => "INVALID-ARGUMENTS",
             Self::PreconditionWorkspaceMissing => "WORKSPACE-MISSING",
             Self::PreconditionWorkspaceAccess => "WORKSPACE-ACCESS",
             Self::ConfigMalformed => "MALFORMED",
@@ -446,6 +451,9 @@ impl ErrorCode {
             Self::UsageInvalidDigest => "Supply a digest of the form sha256:<64 lowercase hex>.",
             Self::UsageInvalidTimestamp => "Supply an RFC 3339 UTC timestamp.",
             Self::UsageConflictingOptions => "Remove one of the conflicting options.",
+            Self::UsageInvalidArguments => {
+                "Correct the command line; run the command with `--help` for its arguments."
+            }
             _ => "Correct the command invocation.",
         }
     }
