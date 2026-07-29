@@ -206,7 +206,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.common.control,
         "cycle.create",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             if control
                 .path(&CycleRecord::relative_path(&cycle_id))
                 .exists()
@@ -284,7 +285,8 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
         &args.common.control,
         "cycle.activate",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let mut cycle = load(control, &cycle_id)?;
             let previous = cycle.status;
             previous.check_transition(CycleStatus::Active)?;
@@ -454,7 +456,8 @@ fn run_declare_group(
         &args.common.control,
         "cycle.declare-group",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let mut cycle = load(control, &cycle_id)?;
             if cycle
                 .atomic_groups
@@ -567,7 +570,8 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         &args.common.control,
         "cycle.abandon",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let mut cycle = load(control, &cycle_id)?;
             let previous = cycle.status;
             previous.check_transition(CycleStatus::Abandoned)?;

@@ -51,6 +51,35 @@ impl OperationState {
     }
 }
 
+/// Environment variable naming a journal step that must fail deliberately.
+///
+/// `WP-500` needs every journaled boundary to be interruptible on demand.
+/// Waiting for a natural interruption tests whichever boundary happens to be
+/// slow, which is not the same as testing all of them.
+///
+/// The affordance is compiled in rather than hidden behind a feature flag, so
+/// the code under test is the code that ships. It is safe to leave in: it can
+/// only cause a command to *fail* at a boundary it already journals, which is
+/// a state the harness is required to handle, and it can never cause a silent
+/// success or a partial write that recovery cannot see.
+pub const INJECT_FAILURE_VAR: &str = "CHANGE_HARNESS_FAIL_AT";
+
+/// Fails when the named step was selected for deliberate interruption.
+fn check_injected_failure(step: &str) -> Result<(), HarnessError> {
+    let Ok(target) = std::env::var(INJECT_FAILURE_VAR) else {
+        return Ok(());
+    };
+    if target != step {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "deliberate interruption at journal step `{step}`, requested by {INJECT_FAILURE_VAR}"
+        ),
+        code: ErrorCode::RecoveryIncomplete,
+    })
+}
+
 /// One journaled mutating operation.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -160,12 +189,20 @@ impl<'a> Journal<'a> {
 
     /// Records that an operation reached a named boundary.
     ///
+    /// The step is written *before* the mutation it names, so an interruption
+    /// is attributable to a boundary rather than guessed at. That ordering is
+    /// also what makes [`INJECT_FAILURE_VAR`] useful: a failure injected here
+    /// lands after the boundary was recorded and before its work happened,
+    /// which is the hardest case for recovery to get right.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be written.
+    /// Returns an error when the record cannot be written, or when this step
+    /// was named for deliberate failure.
     pub fn step(&self, record: &mut OperationRecord, step: &str) -> Result<(), HarnessError> {
         record.steps.push(step.to_owned());
-        self.write(record)
+        self.write(record)?;
+        check_injected_failure(step)
     }
 
     /// Marks an operation terminal.

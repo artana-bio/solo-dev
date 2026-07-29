@@ -173,7 +173,8 @@ fn run_create(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.control,
         "archive.create",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let record = load_integration(control, &integration_id)?;
             require_promoted(&record)?;
@@ -372,7 +373,7 @@ fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
         &args.control,
         "archive.close",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
 
@@ -410,6 +411,7 @@ fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                 }
             }
 
+            steps.at("cleanup-started")?;
             let mut removed = Vec::new();
             for member in &record.members {
                 removed.extend(clean_up_card(control, &config, &member.card_id)?);
@@ -418,6 +420,7 @@ fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                 store_card_state(control, &card, &state, CardState::Closed)?;
             }
 
+            steps.at("cleanup-complete")?;
             record.status = IntegrationStatus::Archived;
             control.write_atomic(
                 &IntegrationRecord::relative_path(&integration_id),
