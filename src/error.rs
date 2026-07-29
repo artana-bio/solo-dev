@@ -113,6 +113,10 @@ pub enum ErrorCode {
     PreconditionLocalMainStale,
     /// A card already holds an active lease.
     PolicyLeaseHeld,
+    /// The project lock was left behind by a process that has exited.
+    PolicyStaleLock,
+    /// The project lock exists but its disposition cannot be established.
+    PolicyLockAmbiguous,
     /// A worktree locator disagrees with authoritative control state.
     PolicyLocatorMismatch,
     /// A candidate changed paths outside its card's declared scope.
@@ -153,7 +157,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 67] = [
+    pub const ALL: [Self; 69] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -203,6 +207,8 @@ impl ErrorCode {
         Self::PreconditionUnmergedWork,
         Self::PreconditionLocalMainStale,
         Self::PolicyLeaseHeld,
+        Self::PolicyStaleLock,
+        Self::PolicyLockAmbiguous,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
         Self::GateRunnerError,
@@ -270,6 +276,8 @@ impl ErrorCode {
             | Self::PolicyLandingMismatch
             | Self::PolicyArchiveBroken
             | Self::PolicyLeaseHeld
+            | Self::PolicyStaleLock
+            | Self::PolicyLockAmbiguous
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyIncompleteHandoff
@@ -348,6 +356,8 @@ impl ErrorCode {
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
             Self::PreconditionLocalMainStale => "LOCAL-MAIN-STALE",
             Self::PolicyLeaseHeld => "LEASE-HELD",
+            Self::PolicyStaleLock => "STALE-LOCK",
+            Self::PolicyLockAmbiguous => "LOCK-AMBIGUOUS",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::GateRunnerError => "RUNNER-ERROR",
@@ -501,6 +511,12 @@ impl ErrorCode {
                 "Restore or recreate the archived refs with `archive create` before cleaning up."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
+            Self::PolicyStaleLock => {
+                "Run `project recover --resume` to clear the lock its dead holder left behind."
+            }
+            Self::PolicyLockAmbiguous => {
+                "Confirm no harness command is running, then remove the lock file deliberately."
+            }
             Self::PolicyLocatorMismatch => {
                 "The worktree link disagrees with control state; re-allocate rather than trusting it."
             }
