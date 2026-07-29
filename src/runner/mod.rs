@@ -170,14 +170,23 @@ pub fn run_attempt(
     // block forever waiting for a reader, and the only thing that would end it
     // is its own timeout. Reading concurrently is what makes a chatty gate work
     // rather than mysteriously hang.
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|stream| std::thread::spawn(move || read_bounded(stream)));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|stream| std::thread::spawn(move || read_bounded(stream)));
+    //
+    // Results come back over a channel rather than from `join`, because a join
+    // cannot be given a deadline and this one has to have one. See the drain
+    // below.
+    let (sender, receiver) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    let mut streams = 0usize;
+    if let Some(stream) = child.stdout.take() {
+        streams += 1;
+        let sender = sender.clone();
+        std::thread::spawn(move || sender.send((true, read_bounded(stream))));
+    }
+    if let Some(stream) = child.stderr.take() {
+        streams += 1;
+        let sender = sender.clone();
+        std::thread::spawn(move || sender.send((false, read_bounded(stream))));
+    }
+    drop(sender);
 
     let deadline = Duration::from_secs(gate.timeout_seconds);
     let mut timed_out = false;
@@ -200,14 +209,14 @@ pub fn run_attempt(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    // Joining after the process ends: the pipes are closed by then, so the
-    // reader threads see end-of-file and finish.
-    let stdout = stdout_reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr_reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    let drained = drain(
+        &receiver,
+        streams,
+        pid,
+        deadline.saturating_sub(started.elapsed()),
+    );
+    timed_out |= drained.overran;
+    let (stdout, stderr) = (drained.stdout, drained.stderr);
     write_log(&stdout_path, &stdout)?;
     write_log(&stderr_path, &stderr)?;
 
@@ -247,6 +256,67 @@ fn classify(
         // No exit code on Unix means the process was terminated by a signal.
         Some(_) if exit_code.is_none() => Termination::Signal,
         Some(_) => Termination::Completed,
+    }
+}
+
+/// What the reader threads produced, and whether waiting for them overran.
+struct Drained {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    overran: bool,
+}
+
+/// Collects both output streams under a deadline.
+///
+/// A child exiting does not close its pipes: anything it spawned inherited
+/// them, and a reader waiting on end-of-file waits for that too. This was an
+/// unbounded `join` on the reasoning that the pipes are closed once the process
+/// ends, which holds for the direct child and for nothing else. `sh -c 'sleep
+/// 30 & exit 0'` under a one-second gate therefore returned after thirty
+/// seconds and was recorded as a clean pass, since the timeout flag was only
+/// ever set by the wait loop. The declared deadline has to bound the whole
+/// attempt.
+fn drain(
+    receiver: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>,
+    streams: usize,
+    pid: u32,
+    mut remaining: Duration,
+) -> Drained {
+    let mut result = Drained {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        overran: false,
+    };
+    let started = Instant::now();
+
+    for _ in 0..streams {
+        let Ok((is_stdout, data)) = receiver.recv_timeout(remaining) else {
+            // Past the deadline with a stream still open: something in the
+            // gate's process group is holding it. Killing the group closes it,
+            // which is what putting the gate in its own group is for.
+            result.overran = true;
+            terminate_group(pid);
+            // Whatever arrives now arrives quickly. If something escaped the
+            // kill, its output is lost rather than waited on forever — an
+            // unbounded wait here is the defect this exists to remove.
+            while let Ok((is_stdout, data)) = receiver.recv_timeout(GRACE_PERIOD) {
+                result.assign(is_stdout, data);
+            }
+            return result;
+        };
+        result.assign(is_stdout, data);
+        remaining = remaining.saturating_sub(started.elapsed());
+    }
+    result
+}
+
+impl Drained {
+    fn assign(&mut self, is_stdout: bool, data: Vec<u8>) {
+        if is_stdout {
+            self.stdout = data;
+        } else {
+            self.stderr = data;
+        }
     }
 }
 

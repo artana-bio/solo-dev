@@ -449,3 +449,53 @@ fn a_gate_that_passed_on_uncommitted_content_cannot_satisfy_a_handoff() {
         "the refusal must name the worktree, not a retry: {message}"
     );
 }
+
+#[test]
+fn a_gate_that_leaves_a_process_holding_its_pipes_still_times_out() {
+    // Tier 1, defect 5. The deadline bounded only the direct child. The reader
+    // threads were joined afterwards, on the reasoning that "the pipes are
+    // closed by then" — true of the child, false of anything it spawned that
+    // inherited them. A gate that exits 0 immediately while leaving a
+    // background process holding stdout blocked the runner for as long as that
+    // process lived, and the overrun was then recorded as a clean pass, because
+    // `timed_out` was only ever set by the wait loop.
+    let workspace = Workspace::initialized();
+    let path = workspace.gate_definition(
+        "escapee",
+        &definition("gate.escapee", "[\"sh\", \"-c\", \"sleep 30 & exit 0\"]", 1),
+    );
+    workspace.gate(&["register", "--definition", &path]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let started = std::time::Instant::now();
+    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.escapee"]);
+    let elapsed = started.elapsed();
+
+    // The bound is the point. Without it this returns in about thirty seconds,
+    // whatever the gate declared.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the timeout must bound the whole attempt, not just the direct child: took {elapsed:?}"
+    );
+    assert_eq!(output.status.code(), Some(7));
+
+    let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
+    let receipts = status["data"]["receipts"].as_array().unwrap();
+    assert_eq!(
+        receipts[0]["termination"], "timeout",
+        "an attempt that ran past its deadline is a timeout however the direct child exited"
+    );
+    assert_eq!(
+        receipts[0]["passed"], false,
+        "the direct child exited 0; that must not make an overrun a pass"
+    );
+}

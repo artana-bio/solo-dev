@@ -13,8 +13,11 @@ the reviewer with concrete output.
 
 ## Tier 1 — the evidence chain does not hold
 
-Until these are fixed, a landed change carries evidence that cannot be trusted,
-which is the product's entire proposition.
+**All five are now fixed** (2026-07-29). Each landed with a test that fails
+against the unfixed code and a mutation check confirming the enforcement, not
+merely the recording, is what the test catches. Until they were fixed, a landed
+change carried evidence that could not be trusted, which is the product's entire
+proposition.
 
 | # | Defect |
 | --- | --- |
@@ -22,7 +25,7 @@ which is the product's entire proposition.
 | 2 | ✅ **FIXED.** **A re-review approves away a prior critical finding.** Validation inspects only the current review's open findings, never the superseded review's. `WP-320`'s own acceptance line requiring this was never implemented, and the test named for it asserts the defective behaviour is correct. **[V]** Fixed: `check_supersedes` requires every open finding in the superseded review to be named again with a non-blocking disposition. Applies to every re-review, not only approvals — a `changes_requested` that drops a finding leaves the next reviewer a clean predecessor. The test that asserted the defect was correct now dispositions the finding, which is what its name always claimed. |
 | 3 | ✅ **FIXED.** **Acceptance's integration digest is never checked, and is computed so it can never match.** Append a member to an integration after acceptance and promotion marks that card landed — never verified, never accepted, not in the landing tree. **[R]** Fixed: `substantive_digest` excludes `status`, which acceptance itself changes and which the old digest covered — that is why the check could never have passed and so was never written. Promotion now compares it and refuses a plan that changed after acceptance. |
 | 4 | ✅ **FIXED.** **Two cards can own the same file.** Overlap detection misses patterns carrying a wildcard in the same segment: `src/api_*.rs` against `src/*_handler.rs`. **[V]** Fixed: `segments_intersect` walks both globs together over the string they would have to share, which is exact for `*`-only globs rather than an approximation. Guarded against the opposite failure — `src/a_*.rs` and `src/b_*.rs` still activate together. |
-| 5 | **A gate's timeout does not bound the gate.** A surviving background process blocks the runner past the deadline; the overrun is recorded as a clean pass. **[R]** |
+| 5 | ✅ **FIXED.** **A gate's timeout does not bound the gate.** A surviving background process blocks the runner past the deadline; the overrun is recorded as a clean pass. **[R]** Reproduced at 30.1s for a gate declaring 1s. Fixed: the output drain is bounded by the same deadline, kills the process group when a stream is still held past it, and records the overrun as a timeout. |
 
 ## Tier 2 — destroys or loses data
 
