@@ -1746,6 +1746,12 @@ fn verify_landing(
         for gate_id in required_gates(control, record)? {
             let gate = load_gate(control, &gate_id)?;
             let log_root = control.path(LOG_DIR).join(record.integration_id.as_str());
+            // Checked before each gate rather than once after all of them. The
+            // worktree is clean by construction before the first, but a gate
+            // that leaves residue changes what the next one runs against, and a
+            // single flag for the whole batch cannot say which receipt that
+            // affected.
+            let worktree_clean = integration_worktree::is_clean(&path)?;
             let started_at = clock.now();
             let attempt = run_attempt(&gate, &path, &log_root, 1, clock)?;
             let finished_at = clock.now();
@@ -1774,6 +1780,7 @@ fn verify_landing(
                 log_location: attempt.log_location.clone(),
                 attempt: 1,
                 passed: attempt.passed(),
+                worktree_clean: Some(worktree_clean),
             });
         }
         let clean = integration_worktree::is_clean(&path)?;

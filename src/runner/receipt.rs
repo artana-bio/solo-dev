@@ -118,6 +118,17 @@ pub struct Receipt {
     pub attempt: u32,
     /// True when this attempt satisfied the gate.
     pub passed: bool,
+    /// Whether the worktree matched `evaluated_sha` when the gate ran.
+    ///
+    /// `Some(true)` is the only value that makes `evaluated_sha` mean what it
+    /// says. `Some(false)` records a run against content that was not in the
+    /// named commit — a normal thing to do while developing, and never
+    /// evidence about the commit. `None` is a receipt written before this was
+    /// recorded, which can assert neither; those receipts are treated as
+    /// non-evidence rather than trusted, because the check they predate is
+    /// exactly the one that would have caught the problem.
+    #[serde(default)]
+    pub worktree_clean: Option<bool>,
 }
 
 impl Receipt {
@@ -165,7 +176,16 @@ impl Receipt {
                 self.gate_digest
             ));
         }
-        None
+        match self.worktree_clean {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "receipt ran against uncommitted content in the worktree, not against {evaluated_sha}"
+            )),
+            None => Some(
+                "receipt predates the worktree-cleanliness check and cannot say what it ran against"
+                    .to_owned(),
+            ),
+        }
     }
 }
 
@@ -187,7 +207,10 @@ pub fn attempt_log_paths(log_root: &Path, gate_id: &str, attempt: u32) -> (PathB
 /// point of a gate is to distinguish "this works" from "this worked once".
 #[must_use]
 pub fn evidence_is_acceptable(attempts: &[Receipt], max_attempts: u32) -> bool {
-    let Some(passing) = attempts.iter().find(|receipt| receipt.passed) else {
+    let Some(passing) = attempts
+        .iter()
+        .find(|receipt| receipt.passed && receipt.worktree_clean == Some(true))
+    else {
         return false;
     };
     passing.attempt <= max_attempts
@@ -227,6 +250,15 @@ mod tests {
             log_location: PathBuf::from("/logs/gate.unit/attempt-1"),
             attempt,
             passed,
+            worktree_clean: Some(true),
+        }
+    }
+
+    /// The same receipt, but earned against content that was not committed.
+    fn dirty(attempt: u32, passed: bool) -> Receipt {
+        Receipt {
+            worktree_clean: Some(false),
+            ..receipt(attempt, passed)
         }
     }
 
@@ -271,6 +303,55 @@ mod tests {
             .staleness(&"a".repeat(40), &Digest::of_bytes(b"other gate"))
             .unwrap();
         assert!(moved_gate.contains("registry now holds"), "{moved_gate}");
+    }
+
+    #[test]
+    fn a_pass_earned_on_uncommitted_content_is_not_evidence() {
+        // Tier 1, defect 1. `evaluated_sha` is only a claim about the commit if
+        // the worktree held that commit when the gate ran.
+        assert!(evidence_is_acceptable(&[receipt(1, true)], 1));
+        assert!(
+            !evidence_is_acceptable(&[dirty(1, true)], 1),
+            "a gate that passed on content outside the commit says nothing about it"
+        );
+    }
+
+    #[test]
+    fn a_receipt_predating_the_cleanliness_check_is_not_evidence() {
+        // `worktree_clean` is `#[serde(default)]` so old receipts still parse,
+        // but None means "cannot say", and the check it predates is exactly the
+        // one that would have caught the problem. Trusting it would preserve
+        // the defect for every receipt written before the fix.
+        let legacy = Receipt {
+            worktree_clean: None,
+            ..receipt(1, true)
+        };
+        assert!(!evidence_is_acceptable(&[legacy], 1));
+    }
+
+    #[test]
+    fn a_clean_pass_after_a_dirty_one_is_still_evidence() {
+        // The dirty attempt must not poison the gate. Iterating with
+        // uncommitted changes and then committing is the ordinary loop, and the
+        // committed run is real evidence.
+        assert!(evidence_is_acceptable(
+            &[dirty(1, true), receipt(2, true)],
+            2
+        ));
+    }
+
+    #[test]
+    fn staleness_distinguishes_a_dirty_run_from_a_missing_one() {
+        let gate = Digest::of_bytes(b"gate");
+        let reason = dirty(1, true).staleness(&"a".repeat(40), &gate).unwrap();
+        assert!(reason.contains("uncommitted"), "{reason}");
+
+        let legacy = Receipt {
+            worktree_clean: None,
+            ..receipt(1, true)
+        };
+        let reason = legacy.staleness(&"a".repeat(40), &gate).unwrap();
+        assert!(reason.contains("predates"), "{reason}");
     }
 
     #[test]

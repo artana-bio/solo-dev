@@ -18,7 +18,7 @@ which is the product's entire proposition.
 
 | # | Defect |
 | --- | --- |
-| 1 | **A gate passes on uncommitted content while the receipt binds the pass to HEAD.** Write a file, do not commit it, the gate passes, delete it. A signed receipt asserts that this commit passed a gate its own tree fails. `handoff` checks cleanliness; `gate run` does not. **[V]** |
+| 1 | ✅ **FIXED.** **A gate passes on uncommitted content while the receipt binds the pass to HEAD.** Write a file, do not commit it, the gate passes, delete it. A signed receipt asserts that this commit passed a gate its own tree fails. `handoff` checks cleanliness; `gate run` does not. **[V]** Fixed: the receipt now carries `worktree_clean`, `staleness` reports a dirty or legacy receipt as not applying, and `evidence_is_acceptable` requires `Some(true)`. `gate run` still permits a dirty run — iterating with uncommitted changes is the ordinary loop — it just no longer counts as evidence about the commit. |
 | 2 | **A re-review approves away a prior critical finding.** Validation inspects only the current review's open findings, never the superseded review's. `WP-320`'s own acceptance line requiring this was never implemented, and the test named for it asserts the defective behaviour is correct. **[V]** |
 | 3 | **Acceptance's integration digest is never checked, and is computed so it can never match.** Append a member to an integration after acceptance and promotion marks that card landed — never verified, never accepted, not in the landing tree. **[R]** |
 | 4 | **Two cards can own the same file.** Overlap detection misses patterns carrying a wildcard in the same segment: `src/api_*.rs` against `src/*_handler.rs`. **[V]** |

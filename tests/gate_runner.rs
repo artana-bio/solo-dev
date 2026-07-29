@@ -357,3 +357,95 @@ fn the_run_is_recorded_as_an_event_with_its_verdict() {
     assert_eq!(ran["metadata"]["attempt"], 1);
     assert_eq!(ran["head_sha"], workspace.authority_head());
 }
+
+#[test]
+fn a_gate_that_passed_on_uncommitted_content_cannot_satisfy_a_handoff() {
+    // Tier 1, defect 1. `gate run` resolved `evaluated_sha` from HEAD without
+    // checking that the worktree matched HEAD, so a gate could pass on content
+    // that was never committed and the receipt would bind the pass to a commit
+    // whose own tree fails it. Write a file, do not commit it, let the gate
+    // pass, delete it: a signed receipt asserts something untrue.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.register_gate("gate.scratch", &["sh", "-c", "test -f scratch.txt"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.scratch"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+
+    // The fixture has to discriminate or the rest of this proves nothing: the
+    // gate must fail without the file and pass with it. This runs against an
+    // earlier commit on purpose — spending an attempt against the candidate
+    // itself would make the handoff refuse under the undeclared-retry rule of
+    // Section 14.2, and the test would pass while proving nothing about
+    // cleanliness. It did exactly that on the first draft.
+    let without = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.scratch"]);
+    assert!(
+        !without.status.success(),
+        "the gate must depend on the uncommitted file, or this test is vacuous"
+    );
+
+    fs::write(path.join("src/b.rs"), "fn other() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add b.rs"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+
+    fs::write(path.join("scratch.txt"), "never committed\n").unwrap();
+    let with = workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.scratch"]);
+    assert_eq!(with["data"]["passed"], true);
+    assert_eq!(
+        with["data"]["attempt"], 1,
+        "this must be the first attempt against the candidate, so that a \
+         refusal below is about the worktree and not about retries"
+    );
+    assert_eq!(
+        with["data"]["evaluated_sha"], head,
+        "the receipt names HEAD even though HEAD is not what ran"
+    );
+    assert_eq!(
+        with["data"]["worktree_clean"], false,
+        "the receipt must record that what ran was not the named commit"
+    );
+
+    // Remove it. The worktree is clean at HEAD again, and HEAD's tree has never
+    // contained scratch.txt, so the gate fails against the commit the receipt
+    // names.
+    fs::remove_file(path.join("scratch.txt")).unwrap();
+
+    let body = format!(
+        "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [kept it minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert the commit\n"
+    );
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(&declaration, body).unwrap();
+
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a receipt earned on uncommitted content must not satisfy a handoff: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-GATE-EVIDENCE-STALE");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("uncommitted"),
+        "the refusal must name the worktree, not a retry: {message}"
+    );
+}

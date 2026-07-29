@@ -543,6 +543,13 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let scope = GitScope::work_tree(&lease.worktree_path);
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
+            // A gate run against a dirty worktree is not refused: running gates
+            // while iterating is the normal development loop, and refusing
+            // would make the command useless for the case it exists to serve.
+            // What is refused downstream is treating that run as evidence about
+            // `evaluated_sha`, which it is not. The receipt carries the
+            // distinction so `staleness` can state it plainly.
+            let worktree_clean = inspect::worktree_state(&scope)?.clean;
 
             let existing = receipts_for(control, &card_id)?;
             let attempt =
@@ -579,6 +586,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
                 log_location: outcome.log_location.clone(),
                 attempt,
                 passed: outcome.passed(),
+                worktree_clean: Some(worktree_clean),
             };
 
             control.write_atomic(
