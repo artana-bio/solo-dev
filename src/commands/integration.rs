@@ -2498,6 +2498,89 @@ fn publish(
     }
 }
 
+/// Records everything that follows a successful authority update.
+///
+/// Separated from `run_promote` because recovery needs exactly this and nothing
+/// else: when the authority moved and the command then died, the work left
+/// undone is the local fast-forward and the control bookkeeping. Sharing the
+/// code means a resumed promotion cannot record something subtly different
+/// from one that completed in a single run.
+#[allow(clippy::too_many_arguments)]
+fn settle_promotion(
+    control: &ControlRepository,
+    events: &crate::control::event_store::EventStore<'_>,
+    config: &crate::config::ProjectConfig,
+    record: &mut IntegrationRecord,
+    checks: &PromotionChecks,
+    actor_id: &str,
+    expected: Option<&str>,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let integration_id = record.integration_id.clone();
+    synchronize_local_main(config, &checks.landing_sha)?;
+
+    record.status = IntegrationStatus::Promoted;
+    control.write_atomic(
+        &IntegrationRecord::relative_path(&integration_id),
+        &format!("{}\n", serde_json::to_string_pretty(&record)?),
+    )?;
+    for member in &record.members {
+        let (card, state) = load_card(control, &member.card_id)?;
+        // A resumed promotion may find cards already landed, which is the
+        // expected shape of a half-finished run rather than an error.
+        if state.state != CardState::Landed {
+            state.state.check_transition(CardState::Landed)?;
+            crate::commands::card::store_card_state(control, &card, &state, CardState::Landed)?;
+        }
+    }
+
+    events.append(
+        &config.project_id,
+        EventDraft::new("integration.promoted", actor_id)
+            .cycle(record.cycle_id.clone())
+            .head(checks.landing_sha.clone())
+            .transition(
+                Some(IntegrationStatus::Accepted.name()),
+                IntegrationStatus::Promoted.name(),
+            )
+            .meta(
+                "integration_id",
+                serde_json::json!(integration_id.to_string()),
+            )
+            .meta("acceptance_id", serde_json::json!(checks.acceptance_id))
+            .meta("landing_sha", serde_json::json!(checks.landing_sha))
+            .meta("landing_tree", serde_json::json!(checks.landing_tree))
+            .meta(
+                "previous_main_sha",
+                serde_json::json!(record.expected_main_sha),
+            ),
+        clock,
+    )?;
+    control.commit(expected, &format!("integration: promote {integration_id}"))?;
+
+    Ok(CommandOutcome::new(
+        "integration.promote",
+        format!(
+            "Promoted {integration_id}\nauthority `{}`: {} → {}\ncards landed: {}\nlocal `{}` fast-forwarded",
+            config.protected_branch,
+            record.expected_main_sha,
+            checks.landing_sha,
+            record.members.len(),
+            config.protected_branch,
+        ),
+        serde_json::json!({
+            "integration_id": integration_id.to_string(),
+            "status": IntegrationStatus::Promoted.name(),
+            "landing_sha": checks.landing_sha,
+            "landing_tree": checks.landing_tree,
+            "previous_main_sha": record.expected_main_sha,
+            "acceptance_id": checks.acceptance_id,
+            "cards": record.card_ids().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+    )
+    .with_project(config.project_id.clone()))
+}
+
 fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
 
@@ -2525,65 +2608,109 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             // Past this point the authority has moved. Section 13.6 is
             // explicit that a local synchronization failure must NOT roll it
             // back: the promotion happened, and rewinding a published branch
-            // is worse than leaving a recoverable gap.
-            synchronize_local_main(&config, &checks.landing_sha)?;
-
-            record.status = IntegrationStatus::Promoted;
-            control.write_atomic(
-                &IntegrationRecord::relative_path(&integration_id),
-                &format!("{}\n", serde_json::to_string_pretty(&record)?),
-            )?;
-            for member in &record.members {
-                let (card, state) = load_card(control, &member.card_id)?;
-                state.state.check_transition(CardState::Landed)?;
-                crate::commands::card::store_card_state(control, &card, &state, CardState::Landed)?;
-            }
-
-            events.append(
-                &config.project_id,
-                EventDraft::new("integration.promoted", &args.actor_id)
-                    .cycle(record.cycle_id.clone())
-                    .head(checks.landing_sha.clone())
-                    .transition(
-                        Some(IntegrationStatus::Accepted.name()),
-                        IntegrationStatus::Promoted.name(),
-                    )
-                    .meta(
-                        "integration_id",
-                        serde_json::json!(integration_id.to_string()),
-                    )
-                    .meta("acceptance_id", serde_json::json!(checks.acceptance_id))
-                    .meta("landing_sha", serde_json::json!(checks.landing_sha))
-                    .meta("landing_tree", serde_json::json!(checks.landing_tree))
-                    .meta(
-                        "previous_main_sha",
-                        serde_json::json!(record.expected_main_sha),
-                    ),
+            // is worse than leaving a recoverable gap. `settle_promotion`
+            // performs the sync and everything after it, and `project recover
+            // --resume` re-enters at exactly the same place.
+            settle_promotion(
+                control,
+                events,
+                &config,
+                &mut record,
+                &checks,
+                &args.actor_id,
+                expected,
                 clock,
-            )?;
-            control.commit(expected, &format!("integration: promote {integration_id}"))?;
-
-            Ok(CommandOutcome::new(
-                "integration.promote",
-                format!(
-                    "Promoted {integration_id}\nauthority `{}`: {} → {}\ncards landed: {}\nlocal `{}` fast-forwarded",
-                    config.protected_branch,
-                    record.expected_main_sha,
-                    checks.landing_sha,
-                    record.members.len(),
-                    config.protected_branch,
-                ),
-                serde_json::json!({
-                    "integration_id": integration_id.to_string(),
-                    "status": IntegrationStatus::Promoted.name(),
-                    "landing_sha": checks.landing_sha,
-                    "landing_tree": checks.landing_tree,
-                    "previous_main_sha": record.expected_main_sha,
-                    "acceptance_id": checks.acceptance_id,
-                    "cards": record.card_ids().map(ToString::to_string).collect::<Vec<_>>(),
-                }),
             )
-            .with_project(config.project_id.clone()))
         },
     )
+}
+
+/// What a stalled promotion turned out to be.
+pub enum ResumeOutcome {
+    /// The authority holds the landing commit; the rest was completed.
+    Completed(Box<CommandOutcome>),
+    /// The authority never moved, so nothing was left half-done.
+    NothingHappened,
+}
+
+/// Completes a promotion whose authority update succeeded.
+///
+/// The state is re-derived from the world rather than read from a journal step.
+/// A marker records what the harness *believed* it had done; the authority
+/// branch records what actually happened, and after a crash only the second one
+/// is worth trusting.
+///
+/// # Errors
+///
+/// Returns an error when control state cannot be read, or when the local
+/// fast-forward still cannot be performed.
+pub fn resume_promotion(
+    control: &ControlRepository,
+    events: &crate::control::event_store::EventStore<'_>,
+    actor_id: &str,
+    expected: Option<&str>,
+    clock: &dyn Clock,
+) -> Result<ResumeOutcome, HarnessError> {
+    let config = control.project()?;
+    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    let Some(protected) = authority.protected_sha else {
+        return Ok(ResumeOutcome::NothingHappened);
+    };
+
+    // The one integration this could be: accepted, with a landing commit the
+    // authority is now sitting on. Any other shape means the update never
+    // landed and there is nothing to finish.
+    let directory = control.path(INTEGRATION_DIR);
+    if !directory.exists() {
+        return Ok(ResumeOutcome::NothingHappened);
+    }
+    let mut names: Vec<String> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory,
+            source,
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension()? == "json")
+                .then(|| path.file_stem()?.to_str().map(ToOwned::to_owned))?
+        })
+        .collect();
+    names.sort();
+
+    for name in names {
+        let integration_id: IntegrationId = name.parse()?;
+        let mut record = load_integration(control, &integration_id)?;
+        if record.status != IntegrationStatus::Accepted
+            || record.landing_sha.as_deref() != Some(protected.as_str())
+        {
+            continue;
+        }
+
+        let acceptance =
+            acceptance_for(control, &integration_id)?.ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "integration {integration_id} is accepted but has no acceptance record"
+                ),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        let checks = PromotionChecks {
+            landing_sha: protected.clone(),
+            landing_tree: record.integration_tree.clone().unwrap_or_default(),
+            acceptance_id: acceptance.acceptance_id.to_string(),
+        };
+        let outcome = settle_promotion(
+            control,
+            events,
+            &config,
+            &mut record,
+            &checks,
+            actor_id,
+            expected,
+            clock,
+        )?;
+        return Ok(ResumeOutcome::Completed(Box::new(outcome)));
+    }
+
+    Ok(ResumeOutcome::NothingHappened)
 }

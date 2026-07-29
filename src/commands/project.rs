@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::{integration::ResumeOutcome, transaction::with_transaction},
     config::{
         DEFAULT_AUTHORITY_REMOTE, HostPolicy, PROJECT_SCHEMA, ProjectConfig,
         validate::{Mode, validate, validate_in_mode},
@@ -91,6 +92,16 @@ pub struct RecoverArgs {
     /// Path to the control repository.
     #[arg(long)]
     pub control: PathBuf,
+    /// Finish what can be finished instead of only reporting it.
+    ///
+    /// Off by default. Reporting is always safe; resuming writes, and an
+    /// operator investigating an interruption should not have their diagnostic
+    /// command change state underneath them.
+    #[arg(long)]
+    pub resume: bool,
+    /// Who is resuming.
+    #[arg(long, default_value = "operator")]
+    pub actor_id: String,
 }
 
 /// Executes a `project` subcommand.
@@ -106,7 +117,7 @@ pub fn execute(
         ProjectCommand::Init(args) => run_init(args, clock),
         ProjectCommand::Validate(args) => run_validate(args),
         ProjectCommand::Status(args) => run_status(args),
-        ProjectCommand::Recover(args) => run_recover(args),
+        ProjectCommand::Recover(args) => run_recover(args, clock),
     }
 }
 
@@ -412,11 +423,75 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     .with_project(config.project_id.clone()))
 }
 
-fn run_recover(args: &RecoverArgs) -> Result<CommandOutcome, HarnessError> {
+/// Finishes what an interrupted operation left undone.
+///
+/// Only the promotion boundary is resumable, and deliberately so: it is the
+/// only one where a command can die having already changed something outside
+/// the control repository. Every other boundary either wrote nothing or wrote
+/// only to control, where the next command's compare-and-swap sorts it out.
+fn run_resume(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    with_transaction(
+        &args.control,
+        "project.recover",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            match crate::commands::integration::resume_promotion(
+                control,
+                events,
+                &args.actor_id,
+                expected,
+                clock,
+            )? {
+                ResumeOutcome::Completed(outcome) => Ok(*outcome),
+                ResumeOutcome::NothingHappened => Ok(CommandOutcome::new(
+                    "project.recover",
+                    format!(
+                        "Nothing to resume for project {}: no promotion reached the authority",
+                        config.project_id
+                    ),
+                    serde_json::json!({
+                        "project_id": config.project_id.to_string(),
+                        "resumed": false,
+                    }),
+                )
+                .with_project(config.project_id.clone())),
+            }
+        },
+    )
+}
+
+fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let journal = Journal::new(&control);
     let unresolved = journal.unresolved()?;
+
+    if args.resume {
+        if unresolved.is_empty() {
+            return Ok(CommandOutcome::new(
+                "project.recover",
+                format!(
+                    "Project {} has no interrupted operations; nothing to resume",
+                    config.project_id
+                ),
+                serde_json::json!({
+                    "project_id": config.project_id.to_string(),
+                    "resumed": false,
+                    "unresolved_operations": [],
+                }),
+            )
+            .with_project(config.project_id.clone()));
+        }
+        // The journal is settled first so the resuming transaction can open its
+        // own entry; the interrupted one is marked completed because its work
+        // is about to be finished, not abandoned.
+        let mut records = unresolved.clone();
+        for record in &mut records {
+            journal.finish(record, OperationState::Completed, None, clock)?;
+        }
+        return run_resume(args, clock);
+    }
 
     if unresolved.is_empty() {
         return Ok(CommandOutcome::new(
@@ -459,8 +534,9 @@ fn run_recover(args: &RecoverArgs) -> Result<CommandOutcome, HarnessError> {
         );
     }
     text.push_str(
-        "\n\nEach entry names the last boundary it reached. Inspect the control repository, \
-         resolve the state by hand, then mark the entry completed or abandoned.",
+        "\n\nEach entry names the last boundary it reached. Run `project recover --resume` \
+         to finish a promotion whose authority update succeeded; anything else must be \
+         inspected and resolved by hand.",
     );
 
     Ok(CommandOutcome::new(

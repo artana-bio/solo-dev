@@ -528,3 +528,105 @@ fn scenario_35_an_allocation_boundary_is_recoverable() {
     support::git(&workspace.repository, &["branch", "-D", "card/F-001"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 }
+
+#[test]
+fn a_recovery_required_promotion_can_be_resumed_to_completion() {
+    let (workspace, id) = accepted(2);
+    let landing = landing_of(&workspace, &id);
+
+    // Interrupt the promotion after the authority moves.
+    fs::write(workspace.repository.join(".git/index.lock"), "").unwrap();
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(workspace.authority_head(), landing);
+    assert_eq!(
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+        "accepted",
+        "the control bookkeeping is the part left undone"
+    );
+
+    // Clear what blocked the fast-forward, then resume.
+    fs::remove_file(workspace.repository.join(".git/index.lock")).unwrap();
+    let resumed = Workspace::run_json(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--resume".into(),
+        "--actor-id".into(),
+        "recoverer".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(resumed["data"]["status"], "promoted");
+    assert_eq!(resumed["data"]["landing_sha"], landing);
+
+    // The end state is indistinguishable from an uninterrupted promotion.
+    assert_eq!(workspace.authority_head(), landing);
+    assert_eq!(
+        workspace.candidate_head(),
+        landing,
+        "the local protected worktree must be caught up"
+    );
+    for card in ["F-001", "F-002"] {
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", card])["data"]["state"],
+            "landed"
+        );
+    }
+
+    // And nothing is left demanding attention.
+    let status = Workspace::run_json(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        status["data"]["unresolved_operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a resumed operation must stop blocking further work: {}",
+        status["data"]
+    );
+
+    // The promotion is recorded once, by the actor who finished it.
+    let promotions: Vec<_> = workspace
+        .events()
+        .into_iter()
+        .filter(|event| event["event_type"] == "integration.promoted")
+        .collect();
+    assert_eq!(promotions.len(), 1, "unexpected: {promotions:?}");
+    assert_eq!(promotions[0]["actor_id"], "recoverer");
+}
+
+#[test]
+fn resuming_when_the_authority_never_moved_completes_nothing() {
+    let (workspace, id) = accepted(1);
+    let authority_before = workspace.authority_head();
+
+    let resumed = Workspace::run_json(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--resume".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        resumed["data"]["resumed"], false,
+        "resume must not invent a promotion that never happened"
+    );
+
+    assert_eq!(workspace.authority_head(), authority_before);
+    assert_eq!(
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+        "accepted"
+    );
+}
