@@ -52,8 +52,8 @@ proposition.
 | 17 | ✅ **FIXED.** "Already up to date." counts as a successful merge, so the harness reports work landed when it published nothing. **[R]** Fixed: the merge helper compares HEAD before and after. `--no-ff` forces a merge commit in every case but one — a commit already contained produces exit 0 and no commit — and exit 0 was read as a completed merge. A candidate already in the tree is now refused as a planning error, which is the coordinator's to resolve. |
 | 18 | Path validation is bypassed at init — uncanonicalized paths defeat the alias and nesting checks, and a control repository can be created inside the candidate worktree. **[V]** |
 | 19 | `card revise` performs an unchecked transition; from `landed` it permanently strands the card and its integration. **[R]** |
-| 20 | A review can reach a state with no exit; the only escape is defect 19. **[R]** |
-| 21 | A reviewer cannot record `blocked` — the command fails and no review record is written at all. **[R]** |
+| 20 | ✅ **FIXED.** A review can reach a state with no exit; the only escape is defect 19. **[R]** Fixed: `review_pending → active`, and `work resume` covers it. If the branch moves after the handoff, no verdict is recordable — correctly — and the card had no exit but abandonment. This is the revocation `handed_off → active` already allowed, one stage later. |
+| 21 | ✅ **FIXED.** A reviewer cannot record `blocked` — the command fails and no review record is written at all. **[R]** Fixed: `review_pending → blocked` added. The verdict is one of three the schema offers; the transition table did not admit it, so recording it aborted the transaction and discarded the reviewer's judgement and their gate-adequacy finding rather than filing them. |
 | 22 | Risk policy is dead code; a `critical`-risk card receives no human gate. **[R]** |
 | 23 | `update-ref` failures are reported as a lost compare-and-swap with the diagnostic discarded, so a stale lock file tells the operator the baseline moved, forever. **[R]** |
 | 24 | Seven further `--dry-run` paths skip checks the real command enforces. **[R]** |

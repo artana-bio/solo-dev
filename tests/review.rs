@@ -514,3 +514,72 @@ fn a_dry_run_records_nothing() {
         "review_pending"
     );
 }
+
+#[test]
+fn a_reviewer_can_record_that_a_card_is_blocked() {
+    // Tier 3, defect 21. `Decision::Blocked` exists, parses, validates, and is
+    // one of three verdicts the schema offers — and Section 11.2's table has no
+    // `review_pending → blocked` edge, so recording it failed the transition
+    // check and aborted the whole transaction. No review record was written at
+    // all: the reviewer's judgement, and their gate-adequacy finding with it,
+    // was discarded rather than filed.
+    let (workspace, _) = handed_off();
+
+    let blocked = "reviewer_actor_id: reviewer-session-a\ndecision: blocked\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: needs a decision outside my remit\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [the failure path]\n  basis: read the gate definitions\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, blocked),
+    ]);
+
+    let envelope = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let reviews = envelope["data"]["reviews"].as_array().unwrap();
+    assert_eq!(
+        reviews.len(),
+        1,
+        "the judgement must be filed, not discarded"
+    );
+    assert_eq!(reviews[0]["decision"], "blocked");
+    assert_eq!(
+        reviews[0]["gate_adequacy"]["gates_observe_acceptance"], false,
+        "and the gate-adequacy finding filed with it"
+    );
+
+    // `blocked` already resumes to active, so the card is not stranded by it.
+    workspace.work(&["resume", "--card-id", "F-001"]);
+}
+
+#[test]
+fn a_card_whose_candidate_moved_during_review_can_be_taken_back() {
+    // Tier 3, defect 20. `review begin` moves the card to `review_pending`,
+    // whose only exits were `approved`, `changes_requested` and `abandoned`. If
+    // the branch moves after the handoff — which is exactly what
+    // `reviewing_a_superseded_handoff_is_refused` proves is refused — no
+    // verdict can be recorded at all, and the card has no way back to work. The
+    // only escape was abandoning it, or `card revise`, which is defect 19.
+    // `handed_off` already begins the review, so the card is `review_pending`.
+    let (workspace, _) = handed_off();
+
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(worktree.join("src/b.rs"), "fn b() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: sneak in b.rs"]);
+
+    // The fixture must genuinely be stuck: no verdict is recordable now.
+    let refused = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, &approval("reviewer-session-a")),
+    ]);
+    assert_eq!(error_code(&refused), "CH-POLICY-STALE-HANDOFF");
+
+    // Taking the work back is the way out, the same way a handoff can be
+    // revoked before review starts.
+    workspace.work(&["resume", "--card-id", "F-001"]);
+    let status = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(status["data"]["state"], "active");
+}

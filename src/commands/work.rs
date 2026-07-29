@@ -731,10 +731,19 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 /// resume would refuse because the state is not one it handles. The allocation
 /// is right there and the actor is plainly picking the work back up, which is
 /// exactly what resuming means.
+///
+/// `ReviewPending` is included for the same reason one stage later. If the
+/// branch moves after the handoff, no verdict can be recorded — that refusal is
+/// deliberate and correct — and without a way back the card had no exit but
+/// abandonment. Taking the work back is the revocation `handed_off → active`
+/// already allows.
 const fn resumes_to_active(state: CardState) -> bool {
     matches!(
         state,
-        CardState::ChangesRequested | CardState::Blocked | CardState::Ready
+        CardState::ChangesRequested
+            | CardState::Blocked
+            | CardState::Ready
+            | CardState::ReviewPending
     )
 }
 

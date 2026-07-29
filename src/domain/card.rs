@@ -148,7 +148,23 @@ impl CardState {
             Self::Active => &[Self::HandedOff, Self::Blocked, Self::Abandoned],
             // A handoff can be revoked, returning the card to work.
             Self::HandedOff => &[Self::ReviewPending, Self::Active, Self::Abandoned],
-            Self::ReviewPending => &[Self::Approved, Self::ChangesRequested, Self::Abandoned],
+            // `Blocked` because a reviewer may conclude the card needs a
+            // decision outside their remit, which is a verdict the schema
+            // offers and the table did not admit — so recording it aborted the
+            // transaction and filed nothing at all.
+            //
+            // `Active` because a review can otherwise reach a state with no
+            // exit: if the branch moves after the handoff, no verdict is
+            // recordable, and without this the only escape was abandoning the
+            // card. It is the same revocation `handed_off → active` already
+            // allows, one stage later.
+            Self::ReviewPending => &[
+                Self::Approved,
+                Self::ChangesRequested,
+                Self::Blocked,
+                Self::Active,
+                Self::Abandoned,
+            ],
             Self::ChangesRequested => &[Self::Active, Self::Abandoned],
             // An approval is invalidated by a candidate change, which returns
             // the card to active work.
