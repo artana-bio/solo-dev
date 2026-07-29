@@ -1365,23 +1365,34 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
     )
 }
 
-/// Refuses an integration whose cards declare shared generated artifacts.
+/// Refuses an integration whose cards declare *shared* generated artifacts.
 ///
-/// `WP-540` owns integration-owned artifact generation. Landing such a project
-/// now would produce a tree missing whatever the artifacts were meant to be, so
-/// this refuses with a stable code rather than landing something incomplete.
+/// `WP-540` classified generated paths and enforced their ownership, but did
+/// not build integration-owned generation — a shared artifact still has nobody
+/// to produce it. Landing one would ship a tree missing whatever it was meant
+/// to contain, so it is refused with a stable code.
+///
+/// The other three classes now land normally. Before classification existed
+/// this guard could not tell them apart and refused all of them, which was the
+/// conservative reading available at the time.
 fn require_no_generated_artifacts(
     control: &ControlRepository,
     record: &IntegrationRecord,
 ) -> Result<(), HarnessError> {
     for member in &record.members {
         let (card, _) = load_card(control, &member.card_id)?;
-        if !card.generated_artifacts.is_empty() {
+        let shared: Vec<&str> = card
+            .generated_artifacts
+            .iter()
+            .filter(|artifact| artifact.class == crate::domain::artifact::ArtifactClass::Shared)
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        if !shared.is_empty() {
             return Err(HarnessError::Control {
                 reason: format!(
-                    "card {} declares generated artifacts ({}), which integration-owned generation does not support until WP-540",
+                    "card {} declares shared generated artifacts ({}), and nothing generates them during integration yet",
                     member.card_id,
-                    card.generated_artifacts.join(", ")
+                    shared.join(", ")
                 ),
                 code: ErrorCode::PolicyUnsupportedUntilWp540,
             });

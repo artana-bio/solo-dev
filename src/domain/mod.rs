@@ -2,6 +2,7 @@
 
 pub mod acceptance;
 pub mod archive;
+pub mod artifact;
 pub mod card;
 pub mod clock;
 pub mod cycle;

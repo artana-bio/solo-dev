@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, fmt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    domain::artifact::{ArtifactClass, GeneratedArtifact, require_one_class_each},
     domain::{
         clock::Timestamp,
         digest::{CANONICAL_ALGORITHM, Digest},
@@ -272,7 +273,7 @@ pub struct CardDraft {
     pub acceptance: Acceptance,
     /// Generated paths it produces.
     #[serde(default)]
-    pub generated_artifacts: Vec<String>,
+    pub generated_artifacts: Vec<GeneratedArtifact>,
     /// How review is conducted.
     pub review_policy: String,
     /// How to undo it.
@@ -280,6 +281,57 @@ pub struct CardDraft {
 }
 
 impl CardDraft {
+    /// Checks each generated declaration, and what its class implies about
+    /// this card's write scope.
+    ///
+    /// The scope rules are the point of classifying at all. A per-card artifact
+    /// generated from sources the card does not own would go stale the moment
+    /// somebody else changed them, with nothing to notice. A shared artifact
+    /// inside the card's scope is two owners for one path, which is the exact
+    /// collision the classes exist to prevent.
+    fn validate_generated_artifacts(&self) -> Result<(), HarnessError> {
+        require_one_class_each(&self.generated_artifacts)?;
+
+        for artifact in &self.generated_artifacts {
+            let invalid = |reason: String| HarnessError::Control {
+                reason,
+                code: ErrorCode::PolicyInvalidArtifact,
+            };
+            match artifact.class {
+                ArtifactClass::PerCard => {
+                    for source in &artifact.sources {
+                        if !self
+                            .write_scope
+                            .include
+                            .iter()
+                            .any(|pattern| pattern == source)
+                        {
+                            return Err(invalid(format!(
+                                "per-card artifact `{}` is generated from `{source}`, which this card does not own; it would go stale the moment somebody else changed it",
+                                artifact.path
+                            )));
+                        }
+                    }
+                }
+                ArtifactClass::Shared => {
+                    if self
+                        .write_scope
+                        .include
+                        .iter()
+                        .any(|pattern| pattern == &artifact.path)
+                    {
+                        return Err(invalid(format!(
+                            "shared artifact `{}` is also in this card's write scope; integration generates it, so claiming it here gives one path two owners",
+                            artifact.path
+                        )));
+                    }
+                }
+                ArtifactClass::Transient | ArtifactClass::Serialized => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Parses a draft from YAML or JSON.
     ///
     /// YAML is accepted because drafts are human-authored; JSON is accepted
@@ -349,6 +401,7 @@ impl CardDraft {
                 self.card_id
             )));
         }
+        self.validate_generated_artifacts()?;
 
         for pattern in self
             .write_scope
@@ -432,7 +485,7 @@ pub struct CardRecord {
     /// What it must deliver.
     pub acceptance: Acceptance,
     /// Generated paths it produces.
-    pub generated_artifacts: Vec<String>,
+    pub generated_artifacts: Vec<GeneratedArtifact>,
     /// How review is conducted.
     pub review_policy: String,
     /// How to undo it.
