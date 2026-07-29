@@ -241,9 +241,11 @@ fn landed_commits_remain_reachable_after_cleanup() {
     support::git(&workspace.repository, &["gc", "--prune=now", "--quiet"]);
 
     for candidate in &candidates {
-        assert_eq!(
-            support::capture(&workspace.repository, &["rev-parse", candidate]),
-            *candidate,
+        // `cat-file -e`, not `rev-parse`: given a 40-character hex string
+        // `rev-parse` echoes it and exits 0 whether or not the object is there,
+        // so comparing its output to the SHA proved nothing at all.
+        assert!(
+            support::object_exists(&workspace.repository, candidate),
             "an archived candidate must survive cleanup and collection"
         );
     }

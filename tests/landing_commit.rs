@@ -143,11 +143,28 @@ fn the_landing_commit_is_retained_by_a_harness_ref() {
         format!("refs/harness/landing/{id}")
     );
 
-    // Nothing else points at it, so without the ref, collection would take it
-    // and promotion would have to rebuild and re-verify everything.
+    // The ref has to actually exist and name this commit. Asserting the name
+    // the envelope reported only proves the envelope is consistent with itself
+    // — deleting `landing::retain` outright leaves that assertion passing.
+    assert_eq!(
+        support::capture(
+            &workspace.repository,
+            &["rev-parse", &format!("refs/harness/landing/{id}")]
+        ),
+        landing,
+        "the retention ref must exist in the repository, not just in the report"
+    );
+
+    // And the commit must survive collection. Checked with `cat-file -e`, not
+    // `rev-parse`: given a 40-character hex string `rev-parse` echoes it back
+    // and exits 0 whether or not the object exists, so the assertion this test
+    // used to make — that `rev-parse <landing>` equals `<landing>` — held
+    // whatever the repository contained.
     support::git(&workspace.repository, &["gc", "--prune=now", "--quiet"]);
-    let resolved = support::capture(&workspace.repository, &["rev-parse", landing]);
-    assert_eq!(resolved, landing);
+    assert!(
+        support::object_exists(&workspace.repository, landing),
+        "the landing commit must survive collection"
+    );
 }
 
 #[test]

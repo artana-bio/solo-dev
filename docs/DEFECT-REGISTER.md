@@ -114,8 +114,20 @@ confirmed to survive the entire suite of 732 tests:
 
 The sharpest single instance: `git rev-parse --verify` echoes any 40-character
 hex string and exits 0 whether or not the object exists. Both tests asserting
-that commits survive garbage collection use it, so deleting the ref-retention
-mechanism they exist to defend is undetected.
+that commits survive garbage collection used it, so deleting the ref-retention
+mechanism they exist to defend was undetected.
+
+✅ **FIXED.** Both now use `cat-file -e`, via a `object_exists` helper that says
+at its definition why `rev-parse` cannot be used for this.
+
+Repairing it exposed a second layer worth recording. Swapping the check was not
+enough: with `landing::retain` deleted, the landing commit still survived
+`gc --prune=now` in that fixture, so the test still could not see the mechanism
+go. What detects its removal is asserting that
+`refs/harness/landing/<id>` actually resolves — the test had only asserted that
+the *envelope reported* that ref name, which is the envelope agreeing with
+itself. Confirmed by mutation: deleting `retain` now fails the test named for
+it.
 
 ## Cause
 

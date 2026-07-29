@@ -811,6 +811,28 @@ pub fn git(repo: &Path, args: &[&str]) {
 }
 
 /// Runs Git and returns its trimmed standard output.
+/// Whether a Git object actually exists in a repository.
+///
+/// Not `git rev-parse`. Given a 40-character hex string, `rev-parse` echoes it
+/// back and exits 0 whether or not the object is there — `--verify` too — so
+/// `assert_eq!(capture(repo, &["rev-parse", sha]), sha)` is a tautology. Two
+/// tests written to prove that commits survive garbage collection used exactly
+/// that, which meant deleting the ref-retention mechanism they exist to defend
+/// failed nothing.
+///
+/// `cat-file -e` is the check that answers the question.
+#[must_use]
+pub fn object_exists(repo: &Path, object: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", object])
+        .output()
+        .expect("git should run")
+        .status
+        .success()
+}
+
 pub fn capture(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
