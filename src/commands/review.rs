@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
         handoff::latest_handoff,
@@ -44,7 +45,7 @@ pub enum ReviewCommand {
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]

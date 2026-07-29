@@ -1,5 +1,13 @@
 //! Command implementations.
 
+/// Environment variable supplying `--control` when the flag is omitted.
+///
+/// Every command that operates on an existing project reads it. `project init`
+/// deliberately does not: that flag decides where a control repository is
+/// *created*, and defaulting it from a variable someone exported for a
+/// different project is how a project gets initialized into the wrong place.
+pub const CONTROL_ENV: &str = "CHANGE_HARNESS_CONTROL";
+
 pub mod acceptance;
 pub mod archive;
 pub mod audit;

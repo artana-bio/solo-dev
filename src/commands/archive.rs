@@ -9,6 +9,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
         integration::load_integration,
@@ -49,7 +50,7 @@ pub enum ArchiveCommand {
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to act on.
     #[arg(long)]
@@ -70,7 +71,7 @@ pub struct CommonArgs {
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to check.
     #[arg(long)]

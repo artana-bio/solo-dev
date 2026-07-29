@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{card::load_card, transaction::with_transaction, work::held_lease},
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
@@ -73,7 +74,7 @@ pub struct StatusArgs {
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]

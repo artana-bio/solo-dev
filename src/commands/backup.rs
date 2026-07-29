@@ -9,6 +9,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     control::repository::ControlRepository,
     domain::clock::Clock,
     error::HarnessError,
@@ -28,7 +29,7 @@ pub enum BackupCommand {
 #[derive(Debug, Args)]
 pub struct CreateArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// Directory the bundles are written to. Must be on a different device.
     #[arg(long)]

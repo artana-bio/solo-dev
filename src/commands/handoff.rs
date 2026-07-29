@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
         gate::{load_gate, receipts_for},
@@ -44,7 +45,7 @@ pub enum HandoffCommand {
 #[derive(Debug, Args)]
 pub struct CommonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
