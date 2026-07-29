@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 36 |
+| Plan revision | 37 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -2995,7 +2995,8 @@ than narrow the criterion (D-051), so the gate now reads as written.
 
 ### 19.4 Hardened single-repository gate
 
-Status: `NOT_STARTED`.
+Status: `IN_PROGRESS`. Five of the seven criteria are met. The two outstanding
+ones both need something outside this repository.
 
 All must be true:
 
@@ -3006,6 +3007,24 @@ All must be true:
 - concurrency tests pass repeatedly;
 - one ARTANA profile trial completes without changing the generic engine;
 - no critical/high risk remains unmitigated.
+
+Progress against each criterion:
+
+| Criterion | Status | Evidence or what remains |
+| --- | --- | --- |
+| `WP-500` through `WP-540` are `DONE` | ✅ | This document's per-package entries; all five landed through the harness itself |
+| Every mutation boundary has failure-injection coverage | ✅ | `INJECT_FAILURE_VAR` reaches every boundary any command names, and `every_mutating_command_names_at_least_one_boundary` asserts against the source that no command module opens a transaction without naming one |
+| Backup and restore drill passes | ✅ | `a_restore_drill_reconstructs_authority_and_control_from_the_backup_alone` deletes both source repositories before restoring, so it cannot pass by reading them |
+| Generated-artifact governance is demonstrated | ⚠️ | Classification and ownership are enforced and tested (`tests/artifacts.rs`). Integration-owned generation and deterministic regeneration checking are **not built**, so a shared artifact is classified but cannot land. Whether the criterion means what shipped or the full deliverable list is the acceptance owner's call, recorded here rather than resolved unilaterally |
+| Concurrency tests pass repeatedly | ⚠️ | `tests/concurrency.rs` covers stale locks, PID reuse, ambiguous ownership, and lease reclaim, and `concurrent_lock_acquisition_has_exactly_one_winner` covers real contention. "Repeatedly" is not demonstrated: nothing runs them in a loop or under load, and a race that appears once in a hundred runs would not have been seen |
+| One ARTANA profile trial | ⏳ | Not run, and not runnable from this repository — it needs an ARTANA checkout. D-001 keeps the engine independent, so the trial is the check that the independence holds in practice |
+| No critical or high risk unmitigated | ✅ | No open defect is recorded; each found during implementation was fixed in the package that exposed it, and the two high-severity review findings this session (`WP-520`'s bundle verification, `WP-510`'s locale comparison) were resolved before their cards landed |
+
+The two outstanding criteria are honest gaps rather than oversights.
+"Repeatedly" wants a soak run, which is a different kind of test from anything
+here. The ARTANA trial needs a second repository, and it is the criterion that
+actually tests D-001 — a profile that required changing the engine would mean
+the independence was nominal.
 
 ### 19.5 Multi-repository gate
 

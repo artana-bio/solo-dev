@@ -9,12 +9,16 @@ will not own the workflow engine.
 
 ## Status
 
-Every Single-repository MVP work package is implemented, along with three
+Every Single-repository MVP work package is implemented, along with all five
 hardening packages: failure injection at every journaled boundary, stale-lock
-diagnosis with explicit lease reclaim, and verified backups.
+diagnosis with explicit lease reclaim, verified backups, cycle auditing with
+evidence cross-checking, and generated-artifact classification.
 
 **Eleven of the twelve Section 19.3 release criteria are met. The remaining one
-is the acceptance owner's signature on the release record.** The per-criterion
+is the acceptance owner's signature on the release record.** Five of the seven
+Section 19.4 hardening criteria are met; the two outstanding both need
+something outside this repository — a soak run for "concurrency tests pass
+repeatedly", and an ARTANA checkout for the profile trial. The per-criterion
 status, with the test that demonstrates each, is in
 [the implementation plan](./docs/IMPLEMENTATION_PLAN.md).
 
