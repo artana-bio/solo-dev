@@ -238,7 +238,7 @@ fn an_authority_that_moved_after_the_plan_blocks_landing() {
 }
 
 #[test]
-fn a_card_declaring_generated_artifacts_fails_with_the_wp_540_code() {
+fn a_card_declaring_a_shared_artifact_cannot_land_yet() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -250,7 +250,7 @@ fn a_card_declaring_generated_artifacts_fails_with_the_wp_540_code() {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
 
     let body = format!(
-        "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [\"src/F-001/**\"]\n  exclude: []\ngenerated_artifacts: [\"dist/bundle.js\"]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [\"src/F-001/**\"]\n  exclude: []\ngenerated_artifacts:\n  - path: dist/bundle.js\n    class: shared\n    generator: gate.bundle\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
         base = workspace.authority_head()
     );
     let path = workspace.root.join("F-001.yaml");

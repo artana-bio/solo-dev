@@ -123,6 +123,10 @@ pub enum ErrorCode {
     PolicyBackupCorrupt,
     /// An audit found the record disagreeing with the objects it names.
     PolicyAuditDiscrepancy,
+    /// A generated-artifact declaration is invalid or contradicts another.
+    PolicyInvalidArtifact,
+    /// A candidate committed a path its class forbids it from committing.
+    PolicyArtifactNotOwned,
     /// A worktree locator disagrees with authoritative control state.
     PolicyLocatorMismatch,
     /// A candidate changed paths outside its card's declared scope.
@@ -163,7 +167,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 72] = [
+    pub const ALL: [Self; 74] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -218,6 +222,8 @@ impl ErrorCode {
         Self::PolicyBackupNotIndependent,
         Self::PolicyBackupCorrupt,
         Self::PolicyAuditDiscrepancy,
+        Self::PolicyInvalidArtifact,
+        Self::PolicyArtifactNotOwned,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
         Self::GateRunnerError,
@@ -290,6 +296,8 @@ impl ErrorCode {
             | Self::PolicyBackupNotIndependent
             | Self::PolicyBackupCorrupt
             | Self::PolicyAuditDiscrepancy
+            | Self::PolicyInvalidArtifact
+            | Self::PolicyArtifactNotOwned
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyIncompleteHandoff
@@ -373,6 +381,8 @@ impl ErrorCode {
             Self::PolicyBackupNotIndependent => "BACKUP-NOT-INDEPENDENT",
             Self::PolicyBackupCorrupt => "BACKUP-CORRUPT",
             Self::PolicyAuditDiscrepancy => "AUDIT-DISCREPANCY",
+            Self::PolicyInvalidArtifact => "INVALID-ARTIFACT",
+            Self::PolicyArtifactNotOwned => "ARTIFACT-NOT-OWNED",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::GateRunnerError => "RUNNER-ERROR",
@@ -470,8 +480,38 @@ impl ErrorCode {
     }
 
     /// Guidance for policy failures.
+    /// Guidance for the operational-hardening policy codes.
+    ///
+    /// Split out because `policy_recovery` outgrew its line budget as the
+    /// hardening packages landed, the same way `recovery` was split earlier.
+    const fn hardening_recovery(self) -> &'static str {
+        match self {
+            Self::PolicyBackupNotIndependent => {
+                "Choose a destination on a different device; a copy beside the original protects against almost nothing."
+            }
+            Self::PolicyBackupCorrupt => {
+                "Recreate the backup and verify it again; the stored copy cannot be trusted."
+            }
+            Self::PolicyAuditDiscrepancy => {
+                "Read the reported discrepancies; each names what a record claims and what was found."
+            }
+            Self::PolicyInvalidArtifact => {
+                "Give each generated path exactly one class, with what that class requires."
+            }
+            Self::PolicyArtifactNotOwned => {
+                "Remove the path from the candidate; its class gives ownership to integration or to nobody."
+            }
+            _ => "Report this as a defect; a hardening code reached the wrong recovery table.",
+        }
+    }
+
     const fn policy_recovery(self) -> &'static str {
         match self {
+            Self::PolicyBackupNotIndependent
+            | Self::PolicyBackupCorrupt
+            | Self::PolicyAuditDiscrepancy
+            | Self::PolicyInvalidArtifact
+            | Self::PolicyArtifactNotOwned => Self::hardening_recovery(self),
             Self::PolicyLockHeld => "Wait for the other command to finish, then retry.",
             Self::PolicyInvalidTransition => {
                 "Move through the documented states in order, or abandon the subject."
@@ -531,15 +571,6 @@ impl ErrorCode {
             }
             Self::PolicyLockAmbiguous => {
                 "Confirm no harness command is running, then remove the lock file deliberately."
-            }
-            Self::PolicyBackupNotIndependent => {
-                "Choose a destination on a different device; a copy beside the original protects against almost nothing."
-            }
-            Self::PolicyBackupCorrupt => {
-                "Recreate the backup and verify it again; the stored copy cannot be trusted."
-            }
-            Self::PolicyAuditDiscrepancy => {
-                "Read the reported discrepancies; each names what a record claims and what was found."
             }
             Self::PolicyLocatorMismatch => {
                 "The worktree link disagrees with control state; re-allocate rather than trusting it."
