@@ -206,6 +206,34 @@ change-harness archive close  --control $CONTROL --integration-id INT-001
 Every mutating command accepts `--dry-run`, which validates against real state
 and reports what would change without changing it.
 
+## Backups and the restore drill
+
+Two repositories hold what cannot be reconstructed from the code: the authority
+owns the protected ref, and the control repository owns every card, review,
+receipt, and decision — the record of *why* the code looks the way it does.
+
+```bash
+change-harness backup create --control $CONTROL --destination /Volumes/backup/harness
+change-harness backup verify --control $CONTROL --destination /Volumes/backup/harness
+```
+
+A destination on the same device as its source is **refused**. A copy beside
+the original survives an accidental deletion and nothing else — not a failed
+disk, not a corrupted filesystem, not a lost laptop — and calling it a backup
+is what stops someone making a real one. `--allow-same-device` overrides the
+refusal for a single-disk machine, and the result still says the guarantee is
+weak.
+
+Verification restores the bundle into a throwaway repository and runs `fsck`
+over the result, because `git bundle verify` accepts a bundle truncated
+mid-pack. "Verified" therefore means the thing worth meaning: it restores.
+
+To restore for real, clone the bundle:
+
+```bash
+git clone --mirror /Volumes/backup/harness/authority.bundle restored-authority.git
+```
+
 ## Recovering from an interruption
 
 Mutating commands journal each step before performing it, so an interrupted

@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 32 |
+| Plan revision | 33 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 673 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 688 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2586,9 +2586,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-460` |
 | Target release | Hardened single-repository release |
+| Evidence | `src/git/backup.rs`, `src/commands/backup.rs`, `tests/backup.rs` (9 acceptance tests), restore drill documented in `README.md` |
 
 Deliverables:
 
@@ -2605,6 +2606,31 @@ Acceptance:
 - corrupted backup verification fails;
 - archive refs exist in the backup;
 - one restore drill reconstructs authority and control state.
+
+Delivered notes:
+
+- `git bundle verify` is not sufficient, and finding that out shaped the
+  design. It validates the header and the prerequisite commits and then reports
+  success — a bundle truncated mid-pack passes it cleanly. The first version of
+  this package used it alone and the acceptance test caught it, which is the
+  module's own stated failure mode committed by its author.
+- Verification therefore restores the bundle into a throwaway repository and
+  runs `fsck` over the result (D-057). That reads every object and makes
+  "verified" mean what an operator cares about: it restores. The refs in the
+  report are listed from the restored copy, so the report describes what came
+  out rather than what the file claims.
+- The source is `fsck`ed before it is bundled. Backing up an already-damaged
+  repository produces a faithful backup of the damage.
+- `--allow-same-device` exists because a single-disk laptop is common, and an
+  outright refusal pushes people to skip backups rather than take a weak one.
+  The weakness is reported as a warning on the successful result either way.
+- Independence that cannot be established is refused rather than assumed good,
+  for the same reason an unprovable lock is ambiguous rather than stale.
+- `tempfile` moved from a dev-dependency to a runtime one, which required
+  revising the card: its write scope did not include `Cargo.toml`, and the
+  harness would have refused the handoff.
+
+| D-057 | Verify a backup by restoring it, not by calling `git bundle verify` | Accepted | `bundle verify` checks the header and the prerequisite commits, then returns success; a bundle truncated mid-pack passes. A backup verifier that accepts a half-written file is worse than no verifier, because it converts an unknown into a false assurance. Restoring into a scratch repository and running `fsck` reads every object, costs a full read of the backup — the correct price for the claim — and makes the restore drill a property of every verification rather than a separate ceremony someone remembers to do. A regression test pins the reason: it asserts that `bundle verify` alone still accepts a truncated bundle, so if Git ever gets stricter, the restore step can be reconsidered deliberately. |
 
 ### WP-530 — Audit report and redaction
 
