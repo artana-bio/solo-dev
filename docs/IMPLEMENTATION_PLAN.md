@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 19 |
+| Plan revision | 20 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `6461378` (`feat(WP-400): bare authority initialization and health reporting`) |
+| Previous plan commit | `fb291c0` (`feat(WP-410): integration plan, ordering, and the ready view`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-410` complete; 531 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
-| Next executable work package | `WP-420` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-420` complete; 559 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
+| Next executable work package | `WP-430` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2152,9 +2152,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-410` |
 | Target release | Single-repository MVP |
+| Evidence | `src/git/merge.rs`, `src/git/integration_worktree.rs`, `integration preflight` and `merge` in `src/commands/integration.rs`, `tests/merge_preflight.rs` (15 acceptance tests) |
 
 Deliverables:
 
@@ -2172,6 +2173,35 @@ Acceptance:
 - semantic conflict resolution cannot be silently committed;
 - integration order matches the DAG;
 - worktree is clean after each accepted group.
+
+Delivered notes:
+
+- Section 13.4's precondition is met: `merge-tree --write-tree` output and
+  exit behavior are covered by unit tests against a real repository, including
+  the `-z` framing, the `Auto-merging` records that must not read as
+  conflicts, and the exit-128 refusal of unrelated histories. There is no
+  fallback path — project validation refuses a Git older than
+  `MINIMUM_GIT_VERSION`, which exists for this command.
+- The preflight carries state forward with unreachable `commit-tree` objects
+  (D-042), so simulating a multi-card sequence still writes no ref, index, or
+  worktree.
+- The sequence stops at the first conflict and reports how many members were
+  left unevaluated. Continuing would merge later candidates against a state
+  that will never exist.
+- Conflicts are classified textual or structural, and an unrecognized conflict
+  token is kept and treated as structural rather than dropped — a conflict the
+  code cannot name must not become a clean preflight.
+- Intermediate gates run after each candidate merges, not once at the end, so
+  a failure names the candidate that broke the combination.
+- Note on testing: two cards cannot be made to conflict with each other,
+  because `WP-230` refuses two active cards claiming the same path. A conflict
+  reaches integration by the other route — the protected branch moving under
+  an approved candidate — which is what the acceptance test exercises.
+- The integration-fix-card route is guidance, not a command: a conflicted
+  preflight and the `CH-CONFLICT-MERGE-FAILED` recovery text both direct the
+  actor to resolve it in a new card. The harness never resolves a conflict
+  itself, which is what keeps a semantic resolution from being silently
+  committed.
 
 ### WP-430 — Landing commit construction
 
@@ -2685,7 +2715,7 @@ All must be true:
 
 
 
-| Integration | `IN_PROGRESS` | Plan and ordering done; preflight next | `WP-420` onward |
+| Integration | `IN_PROGRESS` | Plan, ordering, and preflight done; landing next | `WP-430` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2702,8 +2732,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-420` |
-| Next branch name | `wp/WP-420-merge-preflight` |
+| Next work package | `WP-430` |
+| Next branch name | `wp/WP-430-landing-commit` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2840,6 +2870,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-039 | Report authority health from `project status` rather than `doctor` | Accepted | `WP-400` requires an authority health check. `doctor` inspects a bare path with no project configuration and therefore cannot know which authority to check, while `project status` already opens the control repository and reads the configuration. The check reports rather than refuses: an unreachable or repointed authority is described in the payload, because a diagnostic that fails when its subject is broken is useless exactly when it is needed. |
 | D-040 | Make the non-terminal integration record itself the cycle's integration lease | Accepted | `WP-410` requires one integration lease per cycle. A separate lease file would be a second record asserting the same fact, and the two could disagree after a partial failure. Section 11.3 already gives every integration a status, so "an integration exists in a non-terminal state" is the claim, and it cannot drift from itself. |
 | D-041 | Judge integration readiness against the candidate branch head rather than the handoff's recorded SHA | Accepted | Comparing an approval to the handoff it was recorded against is a tautology: they always agree. A branch that gained a commit after approval would stay ready and integrate a commit no reviewer saw, which is `SPIKE-001` finding F-1 one stage later. `review record` already refuses a superseded handoff; selection now applies the same rule. |
+| D-042 | Carry the preflight forward with unreachable `commit-tree` objects | Accepted | `merge-tree` produces a tree, but merging the next candidate needs a commit, so simulating a multi-card sequence needs intermediate commits. Writing unreachable objects changes no state a reader can observe — no ref moves, no index or worktree is touched, and `git gc` collects them — which keeps the preflight non-destructive in the sense that matters. The alternative, merging in a real worktree, would make the preflight as risky as the operation it is meant to de-risk. |
+| D-043 | Refuse a second `integration merge` on an already-merged plan | Accepted | Merging twice builds a different head from the same plan and overwrites the recorded one, leaving anything `WP-430` or `WP-440` had already done pointing at a commit the record no longer names. Rebuilding requires abandoning the integration and preparing again, which is visible in the record rather than silent. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

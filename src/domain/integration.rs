@@ -200,6 +200,17 @@ pub struct IntegrationRecord {
     pub members: Vec<IntegrationMember>,
     /// Atomic groups fully represented in this integration.
     pub atomic_groups: Vec<String>,
+    /// The merged integration commit, once `integration merge` has built it.
+    ///
+    /// Absent until the candidates have actually been combined. `WP-430` makes
+    /// the landing commit from this, and `WP-440` verifies it; both need to
+    /// distinguish "not merged yet" from "merged to nothing", which a plain
+    /// empty string would not.
+    pub integration_head: Option<String>,
+    /// The tree that commit carries.
+    pub integration_tree: Option<String>,
+    /// When the candidates were combined.
+    pub merged_at: Option<Timestamp>,
     /// Who prepared it. Declared, not proven; see D-013.
     pub prepared_by: String,
     /// When it was prepared.

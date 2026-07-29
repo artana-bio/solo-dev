@@ -123,6 +123,8 @@ pub enum ErrorCode {
     InternalControlCorrupt,
     /// The control repository moved under a command that expected a fixed head.
     ConflictControlHeadMoved,
+    /// A candidate could not be merged into the integration.
+    ConflictMergeFailed,
     /// Git could not be executed.
     ExternalGitUnavailable,
     /// A Git command failed.
@@ -133,7 +135,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 57] = [
+    pub const ALL: [Self; 58] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -188,6 +190,7 @@ impl ErrorCode {
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
+        Self::ConflictMergeFailed,
         Self::ExternalGitUnavailable,
         Self::ExternalGitCommand,
         Self::InternalEncoding,
@@ -250,7 +253,7 @@ impl ErrorCode {
             | Self::PreconditionWorktreeDirty
             | Self::PreconditionUnmergedWork => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
-            Self::ConflictControlHeadMoved => ExitCategory::Conflict,
+            Self::ConflictControlHeadMoved | Self::ConflictMergeFailed => ExitCategory::Conflict,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
             Self::InternalControlCorrupt | Self::InternalEncoding => ExitCategory::Internal,
         }
@@ -314,6 +317,7 @@ impl ErrorCode {
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
+            Self::ConflictMergeFailed => "MERGE-FAILED",
             Self::ExternalGitUnavailable => "GIT-UNAVAILABLE",
             Self::ExternalGitCommand => "GIT-COMMAND",
             Self::InternalEncoding => "ENCODING",
@@ -506,6 +510,9 @@ impl ErrorCode {
             }
             Self::ConflictControlHeadMoved => {
                 "Reload the project and retry; another writer advanced control state."
+            }
+            Self::ConflictMergeFailed => {
+                "Run `integration preflight` for the conflict detail, then resolve it in an integration fix card."
             }
             Self::ExternalGitUnavailable => "Install Git and ensure it is on PATH.",
             Self::ExternalGitCommand => "Inspect the reported Git diagnostic and retry.",

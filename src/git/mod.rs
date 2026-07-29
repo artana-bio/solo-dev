@@ -11,6 +11,8 @@ pub mod authority;
 pub mod command;
 pub mod diff;
 pub mod inspect;
+pub mod integration_worktree;
+pub mod merge;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};

@@ -16,6 +16,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::{
         card::load_card,
+        gate::load_gate,
         handoff::latest_handoff,
         review::{current_approval, reviews_for},
         transaction::with_transaction,
@@ -35,7 +36,13 @@ use crate::{
         review::ReviewRecord,
     },
     error::{ErrorCode, HarnessError},
-    git::{authority::inspect_authority, command::GitScope, inspect},
+    git::{
+        authority::inspect_authority,
+        command::GitScope,
+        inspect, integration_worktree,
+        merge::{Conflict, ConflictClass, merge_tree},
+    },
+    runner::{receipt::LOG_DIR, run_attempt},
 };
 
 /// Subcommands under `integration`.
@@ -45,8 +52,36 @@ pub enum IntegrationCommand {
     Ready(ReadyArgs),
     /// Select approved candidates into a deterministic integration plan.
     Prepare(PrepareArgs),
+    /// Simulate the merge sequence without changing anything.
+    Preflight(InspectArgs),
+    /// Combine the selected candidates in a disposable worktree.
+    Merge(MergeArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
+}
+
+/// Arguments accepted by `integration merge`.
+#[derive(Debug, Args)]
+pub struct MergeArgs {
+    /// Path to the control repository.
+    #[arg(long)]
+    pub control: std::path::PathBuf,
+    /// The integration to combine.
+    #[arg(long)]
+    pub integration_id: String,
+    /// Who is performing the merge.
+    #[arg(long)]
+    pub actor_id: String,
+    /// A registered gate to run after each candidate is merged. Repeatable.
+    ///
+    /// These are cheap intermediate checks, not combined verification: their
+    /// job is to name *which* candidate broke the combination, which a single
+    /// run at the end cannot do.
+    #[arg(long = "smoke-gate")]
+    pub smoke_gates: Vec<String>,
+    /// Simulate and report without building the worktree.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments accepted by `integration ready`.
@@ -124,6 +159,8 @@ pub fn execute(
     match command {
         IntegrationCommand::Ready(args) => run_ready(args),
         IntegrationCommand::Prepare(args) => run_prepare(args, clock),
+        IntegrationCommand::Preflight(args) => run_preflight(args),
+        IntegrationCommand::Merge(args) => run_merge(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
     }
 }
@@ -721,6 +758,9 @@ fn build_record(
         expected_main_sha,
         members: plan.members,
         atomic_groups: plan.atomic_groups,
+        integration_head: None,
+        integration_tree: None,
+        merged_at: None,
         prepared_by: actor_id.to_owned(),
         prepared_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
@@ -854,25 +894,29 @@ fn report_integration(
     .with_project(project_id.clone())
 }
 
-fn run_inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
-    let integration_id: IntegrationId = args.integration_id.parse()?;
-    let control = ControlRepository::open(&args.control)?;
-    let config = control.project()?;
-
-    let relative = IntegrationRecord::relative_path(&integration_id);
+/// Reads one integration record.
+fn load_integration(
+    control: &ControlRepository,
+    integration_id: &IntegrationId,
+) -> Result<IntegrationRecord, HarnessError> {
+    let relative = IntegrationRecord::relative_path(integration_id);
     if !control.path(&relative).exists() {
         return Err(HarnessError::Control {
             reason: format!("integration {integration_id} does not exist"),
             code: ErrorCode::PreconditionNotFound,
         });
     }
-    let record: IntegrationRecord =
-        serde_json::from_str(&control.read(&relative)?).map_err(|source| {
-            HarnessError::Control {
-                reason: format!("integration {integration_id} is malformed: {source}"),
-                code: ErrorCode::InternalControlCorrupt,
-            }
-        })?;
+    serde_json::from_str(&control.read(&relative)?).map_err(|source| HarnessError::Control {
+        reason: format!("integration {integration_id} is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+fn run_inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, &integration_id)?;
     let digest = record.digest()?;
 
     Ok(report_integration(
@@ -881,4 +925,398 @@ fn run_inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
         &digest,
         &config.project_id,
     ))
+}
+
+/// Simulates the merge sequence without touching a ref, index, or worktree.
+///
+/// Each step feeds the next: `merge-tree` yields a tree, and merging the next
+/// candidate needs a commit, so an unreachable commit object carries the state
+/// forward. Nothing points at those commits, so a preflight leaves no state a
+/// later reader can observe — which is what makes it safe to run at any time.
+///
+/// The sequence stops at the first conflict. Continuing would merge later
+/// candidates against a state that will never exist, and reporting conflicts
+/// from an imaginary tree is worse than reporting none.
+fn simulate(
+    repository: &std::path::Path,
+    record: &IntegrationRecord,
+) -> Result<Preflight, HarnessError> {
+    let mut head = record.expected_main_sha.clone();
+    let mut steps = Vec::new();
+
+    for (index, member) in record.members.iter().enumerate() {
+        let preview = merge_tree(repository, &head, &member.candidate_sha)?;
+        let clean = preview.is_clean();
+        steps.push(PreflightStep {
+            card_id: member.card_id.clone(),
+            candidate_sha: member.candidate_sha.clone(),
+            conflicts: preview.conflicts.clone(),
+        });
+        if !clean {
+            return Ok(Preflight {
+                steps,
+                unevaluated: record.members.len() - index - 1,
+                tree: None,
+            });
+        }
+        head = integration_worktree::commit_tree(
+            repository,
+            &preview.tree,
+            &[&head, &member.candidate_sha],
+            &format!(
+                "preflight: {} into {}",
+                member.card_id, record.integration_id
+            ),
+        )?;
+    }
+
+    let tree = integration_worktree::tree_of(repository, &head)?;
+    Ok(Preflight {
+        steps,
+        unevaluated: 0,
+        tree: Some(tree),
+    })
+}
+
+/// One candidate's simulated merge.
+struct PreflightStep {
+    card_id: CardId,
+    candidate_sha: String,
+    conflicts: Vec<Conflict>,
+}
+
+/// The whole simulated sequence.
+struct Preflight {
+    steps: Vec<PreflightStep>,
+    /// Members after the first conflict, which were deliberately not simulated.
+    unevaluated: usize,
+    /// The tree the sequence would produce, when it is conflict-free.
+    tree: Option<String>,
+}
+
+impl Preflight {
+    /// True when every member merged cleanly.
+    fn is_clean(&self) -> bool {
+        self.steps.iter().all(|step| step.conflicts.is_empty())
+    }
+
+    /// The first step that conflicted.
+    fn blocking(&self) -> Option<&PreflightStep> {
+        self.steps.iter().find(|step| !step.conflicts.is_empty())
+    }
+
+    /// The machine payload shared by `preflight` and a refused `merge`.
+    fn payload(&self, record: &IntegrationRecord) -> serde_json::Value {
+        serde_json::json!({
+            "integration_id": record.integration_id.to_string(),
+            "expected_main_sha": record.expected_main_sha,
+            "clean": self.is_clean(),
+            "resulting_tree": self.tree,
+            "unevaluated_members": self.unevaluated,
+            "steps": self.steps.iter().map(|step| serde_json::json!({
+                "card_id": step.card_id.to_string(),
+                "candidate_sha": step.candidate_sha,
+                "conflicts": step.conflicts,
+                "textual_conflicts": step.conflicts.iter()
+                    .filter(|conflict| conflict.kind.class() == ConflictClass::Textual)
+                    .count(),
+                "structural_conflicts": step.conflicts.iter()
+                    .filter(|conflict| conflict.kind.class() == ConflictClass::Structural)
+                    .count(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The human rendering.
+    fn text(&self, record: &IntegrationRecord) -> String {
+        let mut text = format!(
+            "Preflight for {} against {}",
+            record.integration_id, record.expected_main_sha
+        );
+        for step in &self.steps {
+            if step.conflicts.is_empty() {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!("\n  {} merges cleanly", step.card_id),
+                );
+                continue;
+            }
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("\n  {} CONFLICTS:", step.card_id),
+            );
+            for conflict in &step.conflicts {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!(
+                        "\n    [{}] {}: {}",
+                        conflict.kind.name(),
+                        conflict.paths.join(", "),
+                        conflict.detail
+                    ),
+                );
+            }
+        }
+        if self.unevaluated > 0 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!(
+                    "\n  {} later member(s) were not simulated: the sequence stops at the first conflict",
+                    self.unevaluated
+                ),
+            );
+        }
+        if !self.is_clean() {
+            text.push_str(
+                "\nresolve this in an integration fix card; the harness never resolves a conflict for you",
+            );
+        }
+        text
+    }
+}
+
+fn run_preflight(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, &integration_id)?;
+
+    let preflight = simulate(&config.repository, &record)?;
+    Ok(CommandOutcome::new(
+        "integration.preflight",
+        preflight.text(&record),
+        preflight.payload(&record),
+    )
+    .with_project(config.project_id))
+}
+
+/// Refuses a member whose branch no longer holds the approved candidate.
+///
+/// The plan pinned an exact commit. If the branch has moved since, merging the
+/// pinned commit would silently drop work the actor believes is included, and
+/// merging the branch would integrate something no reviewer approved. Neither
+/// is acceptable, so the integration is refused and re-prepared instead.
+fn require_pinned_candidates(
+    repository: &std::path::Path,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    for member in &record.members {
+        let actual = inspect::resolve_commit(
+            &GitScope::work_tree(repository),
+            &format!("refs/heads/{}", member.branch),
+        )?;
+        if actual != member.candidate_sha {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "card {} was planned at {} but branch {} is now {actual}; re-prepare the integration",
+                    member.card_id, member.candidate_sha, member.branch
+                ),
+                code: ErrorCode::PolicyNotIntegrable,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Runs the intermediate gates against the integration worktree as it stands.
+///
+/// Failure names the candidate that had just been merged. Running these only
+/// once at the end would prove the combination is broken without saying which
+/// addition broke it, which is the question an actor actually has.
+fn run_smoke_gates(
+    control: &ControlRepository,
+    worktree: &std::path::Path,
+    integration_id: &IntegrationId,
+    after: &CardId,
+    gates: &[String],
+    clock: &dyn Clock,
+) -> Result<(), HarnessError> {
+    for gate_id in gates {
+        let gate = load_gate(control, gate_id)?;
+        let log_root = control
+            .path(LOG_DIR)
+            .join(integration_id.as_str())
+            .join(after.as_str());
+        let outcome = run_attempt(&gate, worktree, &log_root, 1, clock)?;
+        if !outcome.passed() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "smoke gate {gate_id} failed after merging {after} into {integration_id}"
+                ),
+                code: ErrorCode::GateFailed,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Combines the planned candidates in a disposable worktree.
+///
+/// The worktree is removed on every path, success or failure. Leaving a
+/// conflicted merge on disk would block the next attempt and invite someone to
+/// "fix" it by hand, which would produce a landing tree no plan describes.
+fn build_integration(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+    smoke_gates: &[String],
+    clock: &dyn Clock,
+) -> Result<(String, String), HarnessError> {
+    let repository = config.repository.as_path();
+    let path =
+        integration_worktree::path_for(&config.worktree_root, record.integration_id.as_str());
+    integration_worktree::remove(repository, &path)?;
+    integration_worktree::create(repository, &path, &record.expected_main_sha)?;
+
+    let outcome = (|| -> Result<(String, String), HarnessError> {
+        let mut head = record.expected_main_sha.clone();
+        for member in &record.members {
+            head = integration_worktree::merge(
+                &path,
+                &member.candidate_sha,
+                &format!(
+                    "integrate {} into {}",
+                    member.card_id, record.integration_id
+                ),
+            )
+            .inspect_err(|_| integration_worktree::abort_merge(&path))?;
+            run_smoke_gates(
+                control,
+                &path,
+                &record.integration_id,
+                &member.card_id,
+                smoke_gates,
+                clock,
+            )?;
+        }
+        // Section 13.2: the integration worktree must be clean before final
+        // verification. A dirty one here means a merge left something behind.
+        if !integration_worktree::is_clean(&path)? {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration worktree {} is not clean after merging",
+                    path.display()
+                ),
+                code: ErrorCode::ConflictMergeFailed,
+            });
+        }
+        let tree = integration_worktree::tree_of(&path, &head)?;
+        Ok((head, tree))
+    })();
+
+    integration_worktree::remove(repository, &path)?;
+    outcome
+}
+
+fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        let record = load_integration(&control, &integration_id)?;
+        require_pinned_candidates(&config.repository, &record)?;
+        let preflight = simulate(&config.repository, &record)?;
+        let mut payload = preflight.payload(&record);
+        payload["dry_run"] = serde_json::json!(true);
+        return Ok(CommandOutcome::new(
+            "integration.merge",
+            format!("Dry run: {}\nnothing was changed", preflight.text(&record)),
+            payload,
+        )
+        .with_project(config.project_id));
+    }
+
+    with_transaction(
+        &args.control,
+        "integration.merge",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            if record.status != IntegrationStatus::Prepared {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {integration_id} is `{}`; only a prepared integration can be merged",
+                        record.status.name()
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            // Merging twice would build a second head from the same plan and
+            // overwrite the first, leaving whatever `WP-430` and `WP-440`
+            // already did pointing at a commit the record no longer names.
+            if let Some(existing) = &record.integration_head {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {integration_id} was already merged at {existing}; abandon it and prepare again to rebuild"
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            require_pinned_candidates(&config.repository, &record)?;
+
+            // The preflight runs first so a conflict is reported with its
+            // classification rather than as a bare Git failure, and so nothing
+            // is built when the sequence cannot succeed.
+            let preflight = simulate(&config.repository, &record)?;
+            if !preflight.is_clean() {
+                let blocking = preflight
+                    .blocking()
+                    .map_or_else(|| "unknown".to_owned(), |step| step.card_id.to_string());
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {integration_id} cannot be merged: {blocking} conflicts; run `integration preflight` for detail"
+                    ),
+                    code: ErrorCode::ConflictMergeFailed,
+                });
+            }
+
+            let (head, tree) =
+                build_integration(control, &config, &record, &args.smoke_gates, clock)?;
+            record.integration_head = Some(head.clone());
+            record.integration_tree = Some(tree.clone());
+            record.merged_at = Some(clock.now());
+            let digest = record.digest()?;
+
+            control.write_atomic(
+                &IntegrationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.merged", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(head.clone())
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("integration_digest", serde_json::json!(digest.as_str()))
+                    .meta("integration_tree", serde_json::json!(tree))
+                    .meta("members", serde_json::json!(record.members.len())),
+                clock,
+            )?;
+            control.commit(expected, &format!("integration: merge {integration_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "integration.merge",
+                format!(
+                    "Merged integration {integration_id}\nintegration head: {head}\nintegration tree: {tree}\nmembers merged: {}\nthe disposable worktree was removed",
+                    record.members.len()
+                ),
+                serde_json::json!({
+                    "integration_id": integration_id.to_string(),
+                    "integration_digest": digest.as_str(),
+                    "status": record.status.name(),
+                    "expected_main_sha": record.expected_main_sha,
+                    "integration_head": head,
+                    "integration_tree": tree,
+                    "members": record.members,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
 }
