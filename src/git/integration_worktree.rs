@@ -119,6 +119,9 @@ pub fn is_clean(path: &Path) -> Result<bool, HarnessError> {
 /// knows whether the conflicting state is worth reporting first.
 pub fn merge(path: &Path, commit: &str, message: &str) -> Result<String, HarnessError> {
     let scope = GitScope::work_tree(path);
+    let before = run_ok(&scope, ["rev-parse", "HEAD"])?
+        .trimmed_stdout()
+        .to_owned();
     let output = run(
         &scope,
         ["merge", "--no-ff", "--no-edit", "-m", message, commit],
@@ -129,8 +132,25 @@ pub fn merge(path: &Path, commit: &str, message: &str) -> Result<String, Harness
             code: ErrorCode::ConflictMergeFailed,
         });
     }
-    let head = run_ok(&scope, ["rev-parse", "HEAD"])?;
-    Ok(head.trimmed_stdout().to_owned())
+    let head = run_ok(&scope, ["rev-parse", "HEAD"])?
+        .trimmed_stdout()
+        .to_owned();
+    // `--no-ff` forces a merge commit in every case but one: a commit already
+    // contained in HEAD produces "Already up to date.", exit 0, and no commit
+    // at all. Exit zero read as a completed merge, so a candidate that
+    // contributed nothing was recorded as combined and its card could be marked
+    // landed on the strength of it — with no merge commit for the audit to
+    // find. A candidate already in the tree is a planning error, and the
+    // coordinator is the one who can resolve it.
+    if head == before {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "merging {commit} changed nothing: it is already contained in {before}, so this integration contributes nothing for it"
+            ),
+            code: ErrorCode::ConflictMergeFailed,
+        });
+    }
+    Ok(head)
 }
 
 /// Aborts an in-progress merge, leaving the worktree at its previous head.
@@ -231,6 +251,54 @@ mod tests {
             .output()
             .expect("git should run");
         String::from_utf8_lossy(&head.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn merging_a_commit_already_contained_is_refused_rather_than_reported_merged() {
+        // Tier 3, defect 17. `--no-ff` forces a merge commit except when the
+        // commit is already an ancestor, where Git says "Already up to date.",
+        // exits 0, and moves nothing. The caller read exit 0 as a completed
+        // merge and recorded the candidate as combined, so a card could be
+        // marked landed on the strength of a merge that published nothing and
+        // left no merge commit for the audit to find.
+        let (temp, repo, base) = repository();
+        fs::write(repo.join("f.txt"), "second\n").unwrap();
+        let head = commit(&repo, "second");
+        assert_ne!(base, head, "the fixture needs two commits to be meaningful");
+
+        let worktree = path_for(&temp.path().join("worktrees"), "INT-001");
+        create(&repo, &worktree, &head).expect("a worktree");
+
+        // `base` is an ancestor of `head`, so this merge is a no-op.
+        let error = merge(&worktree, &base, "merge base")
+            .expect_err("a merge that changes nothing must not report success");
+        assert!(
+            error.to_string().contains(&base),
+            "the refusal must name the commit that contributed nothing: {error}"
+        );
+
+        // The guard: a commit that genuinely is not contained still merges, and
+        // still produces the merge commit `--no-ff` is there to force.
+        let branch_point = run_ok(&GitScope::work_tree(&repo), ["branch", "-f", "side", &base]);
+        assert!(branch_point.is_ok());
+        let side_work = temp.path().join("side");
+        create(&repo, &side_work, &base).expect("a worktree");
+        fs::write(side_work.join("g.txt"), "divergent\n").unwrap();
+        let divergent = commit(&side_work, "divergent work");
+
+        let merged = merge(&worktree, &divergent, "merge divergent").expect("a real merge");
+        assert_ne!(merged, head, "the integration head must have moved");
+        let parents = run_ok(
+            &GitScope::work_tree(&worktree),
+            ["rev-list", "--parents", "-n", "1", "HEAD"],
+        )
+        .expect("parents");
+        assert_eq!(
+            parents.trimmed_stdout().split_whitespace().count(),
+            3,
+            "a merge commit has two parents: {}",
+            parents.trimmed_stdout()
+        );
     }
 
     #[test]
