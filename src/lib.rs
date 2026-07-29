@@ -47,7 +47,8 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         | Command::Handoff { .. }
         | Command::Review { .. }
         | Command::Integration { .. }
-        | Command::Acceptance { .. } => None,
+        | Command::Acceptance { .. }
+        | Command::Archive { .. } => None,
     };
     cli.output.or(legacy).unwrap_or_default()
 }
@@ -66,7 +67,26 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Review { .. } => "review",
         Command::Integration { .. } => "integration",
         Command::Acceptance { .. } => "acceptance",
+        Command::Archive { .. } => "archive",
     }
+}
+
+/// Runs one subcommand and renders its outcome.
+///
+/// Every subcommand does the same three things — resolve the output format,
+/// execute against the system clock, render — so they say it once here. Only
+/// `doctor` differs, because `WP-100` froze its pre-envelope payload.
+fn dispatch<F>(output: Option<OutputFormat>, run: F) -> Result<Execution, HarnessError>
+where
+    F: FnOnce(&dyn domain::clock::Clock) -> Result<CommandOutcome, HarnessError>,
+{
+    let resolved = resolve_output(output, None)?;
+    let outcome = run(&domain::clock::SystemClock)?;
+    Ok(Execution {
+        stdout: outcome.render(resolved.format)?,
+        warnings: outcome.warnings().to_vec(),
+        format: resolved.format,
+    })
 }
 
 /// Executes one parsed command.
@@ -100,86 +120,35 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
                 format: resolved.format,
             })
         }
-        Command::Project { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::project::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
-        Command::Cycle { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::cycle::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
+        Command::Project { command } => dispatch(cli.output, |clock| {
+            commands::project::execute(&command, clock)
+        }),
+        Command::Cycle { command } => dispatch(cli.output, |clock| {
+            commands::cycle::execute(&command, clock)
+        }),
         Command::Card { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::card::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
+            dispatch(cli.output, |clock| commands::card::execute(&command, clock))
         }
         Command::Work { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::work::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
+            dispatch(cli.output, |clock| commands::work::execute(&command, clock))
         }
         Command::Gate { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::gate::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
+            dispatch(cli.output, |clock| commands::gate::execute(&command, clock))
         }
-        Command::Handoff { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::handoff::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
-        Command::Review { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::review::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
-        Command::Integration { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::integration::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
-        Command::Acceptance { command } => {
-            let resolved = resolve_output(cli.output, None)?;
-            let outcome = commands::acceptance::execute(&command, &domain::clock::SystemClock)?;
-            Ok(Execution {
-                stdout: outcome.render(resolved.format)?,
-                warnings: outcome.warnings().to_vec(),
-                format: resolved.format,
-            })
-        }
+        Command::Handoff { command } => dispatch(cli.output, |clock| {
+            commands::handoff::execute(&command, clock)
+        }),
+        Command::Review { command } => dispatch(cli.output, |clock| {
+            commands::review::execute(&command, clock)
+        }),
+        Command::Integration { command } => dispatch(cli.output, |clock| {
+            commands::integration::execute(&command, clock)
+        }),
+        Command::Acceptance { command } => dispatch(cli.output, |clock| {
+            commands::acceptance::execute(&command, clock)
+        }),
+        Command::Archive { command } => dispatch(cli.output, |clock| {
+            commands::archive::execute(&command, clock)
+        }),
     }
 }

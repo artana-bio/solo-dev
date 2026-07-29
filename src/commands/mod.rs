@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod acceptance;
+pub mod archive;
 pub mod card;
 pub mod cycle;
 pub mod doctor;

@@ -93,6 +93,8 @@ pub enum ErrorCode {
     PolicyNotVerified,
     /// The landing commit does not have the shape promotion requires.
     PolicyLandingMismatch,
+    /// An archived ref no longer resolves to the commit it recorded.
+    PolicyArchiveBroken,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A card's declared base commit does not exist in the repository.
@@ -149,7 +151,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 66] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -189,6 +191,7 @@ impl ErrorCode {
         Self::PolicyNotAccepted,
         Self::PolicyNotVerified,
         Self::PolicyLandingMismatch,
+        Self::PolicyArchiveBroken,
         Self::PreconditionNotFound,
         Self::PreconditionBaseMissing,
         Self::PreconditionBranchExists,
@@ -261,6 +264,7 @@ impl ErrorCode {
             | Self::PolicyNotAccepted
             | Self::PolicyNotVerified
             | Self::PolicyLandingMismatch
+            | Self::PolicyArchiveBroken
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
@@ -330,6 +334,7 @@ impl ErrorCode {
             Self::PolicyNotAccepted => "NOT-ACCEPTED",
             Self::PolicyNotVerified => "NOT-VERIFIED",
             Self::PolicyLandingMismatch => "LANDING-MISMATCH",
+            Self::PolicyArchiveBroken => "ARCHIVE-BROKEN",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
@@ -486,6 +491,9 @@ impl ErrorCode {
             }
             Self::PolicyLandingMismatch => {
                 "Rebuild the landing commit; it no longer matches the plan it was built from."
+            }
+            Self::PolicyArchiveBroken => {
+                "Restore or recreate the archived refs with `archive create` before cleaning up."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {

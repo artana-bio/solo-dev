@@ -28,15 +28,30 @@ fn help_identifies_the_cli() {
 }
 
 #[test]
-fn help_does_not_advertise_unimplemented_commands() {
+fn help_advertises_every_section_12_3_command() {
     let stdout = String::from_utf8(run(&["--help"]).stdout).expect("help should be UTF-8");
-    // Section 12.3 lists `archive`, but it must stay absent until `WP-460`
-    // implements it: help must never advertise a command that does nothing.
-    // This assertion disappears when that package lands.
-    assert!(
-        !stdout.contains("  archive"),
-        "help advertises unimplemented `archive`"
-    );
+    // The inverse of what this test used to assert. Through `WP-450` it named
+    // the commands that must stay absent until their owning package shipped;
+    // `WP-460` was the last of them, so the whole Section 12.3 surface is now
+    // present and the check is that none of it went missing again.
+    for command in [
+        "doctor",
+        "project",
+        "cycle",
+        "card",
+        "work",
+        "gate",
+        "handoff",
+        "review",
+        "integration",
+        "acceptance",
+        "archive",
+    ] {
+        assert!(
+            stdout.contains(&format!("  {command}")),
+            "help omits `{command}`"
+        );
+    }
 }
 
 #[test]

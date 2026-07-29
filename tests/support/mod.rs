@@ -440,6 +440,37 @@ impl Workspace {
         serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
     }
 
+    /// Runs an `archive` subcommand, returning the raw output.
+    pub fn archive_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "archive".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs an `archive` subcommand, asserting success.
+    pub fn archive(&self, args: &[&str]) -> Output {
+        let output = self.archive_raw(args);
+        assert!(
+            output.status.success(),
+            "archive {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs an `archive` subcommand and parses its JSON envelope.
+    pub fn archive_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.archive(args).stdout).expect("the JSON envelope")
+    }
+
     /// Runs the harness and parses its JSON envelope, asserting nothing.
     pub fn run_json(args: &[String]) -> serde_json::Value {
         let output = Self::run(args);

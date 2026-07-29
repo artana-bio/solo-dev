@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 23 |
+| Plan revision | 24 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `4a27c10` (`feat(WP-440): combined verification and integration review`) |
+| Previous plan commit | `6adb02f` (`feat(WP-450): acceptance decisions and promotion`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-450` complete; 613 tests passing. A change can now travel end to end from card to promoted commit. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
-| Next executable work package | `WP-460` |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 633 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2366,9 +2366,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-450` |
 | Target release | Single-repository MVP |
+| Evidence | `src/git/archive.rs`, `src/domain/archive.rs`, `src/commands/archive.rs`, `tests/archive_cleanup.rs` (15 acceptance tests) |
 
 Deliverables:
 
@@ -2386,6 +2387,28 @@ Acceptance:
 - landed/archived commits remain reachable;
 - closed state is terminal;
 - repeated close is idempotent.
+
+Delivered notes:
+
+- Candidates are archived as well as the landing commit. A landing tree does
+  not contain the individual candidate commits, so deleting the card branches
+  without archiving them would lose the record of how the change was made.
+- "Unarchived" is computed, not assumed: `rev-list <branch> --not <every other
+  ref>` names the commits that would become unreachable, and a non-empty
+  result refuses the cleanup. The reachability test asserts survival across
+  `git gc --prune=now`, because a ref that merely exists proves less than an
+  object that survives collection.
+- Fixes a real interaction this package exposed (D-049): `work start` locks
+  card worktrees so `git worktree prune` cannot reclaim them, which made every
+  removal fail on the lock rather than on dirtiness. Cleanup now checks
+  cleanliness itself *before* unlocking, so the refusal never depends on the
+  lock and a dirty worktree is never left unlocked on the failure path.
+  Removal itself stays non-forcing, as invariant 7.2 requires.
+- `archive close` re-verifies every archived ref before removing anything. The
+  archive record's existence is not evidence that the refs still resolve.
+- A repeated close is a no-op that reports `changed: false` rather than an
+  error: an operator unsure whether cleanup finished should be able to ask
+  again.
 
 ### WP-500 — Recovery and failure injection
 
@@ -2796,7 +2819,7 @@ All must be true:
 
 
 
-| Integration | `IN_PROGRESS` | Through promotion; archive and cleanup next | `WP-460` |
+| Integration | `DONE` | Plan through archive and close, all covered | — |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2813,8 +2836,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-460` |
-| Next branch name | `wp/WP-460-archive-cleanup` |
+| Next work package | `SELFHOST-001` |
+| Next branch name | `selfhost/SELFHOST-001` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2958,6 +2981,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-046 | Give receipts an integration scope, making `card_id` optional | Accepted, amends Section 10.6 | `WP-440` reruns gates against the landing commit, which belongs to every member card and to none of them individually. The original schema required `card_id`, leaving two options: attribute a combined run to an arbitrary member, or run each gate once per card. The first is a false claim about what was checked; the second multiplies a long test suite by the batch size while adding no information, since the gate does not know which card asked for it. Naming the real subject is the honest third option. |
 | D-047 | Refuse an integration review that leaves a declared cycle invariant unconfirmed | Accepted | Section 10.2 lets a cycle declare release invariants in free text, which no gate can evaluate. If the review can pass without addressing them, they are decorative. Requiring each to be named explicitly is the only mechanism available for a condition a machine cannot check. |
 | D-048 | Journal a `recovery-required` error as a partial failure regardless of control-tree cleanliness | Accepted | `with_transaction` inferred "nothing was written" from a clean control worktree. That inference holds for every command that only mutates control state, but `integration promote` moves the authority branch — a repository the check cannot see. An authority-promoted, local-sync-failed run leaves control clean, so it would have been recorded `failed_clean` and `project recover` would have stayed silent about precisely the state Section 13.6 requires it to surface. An error that declares itself recovery-required is now taken at its word. |
+| D-049 | Verify worktree cleanliness before unlocking, rather than relying on the lock to refuse | Accepted | `WP-130` locks card worktrees so `git worktree prune` cannot reclaim them, which meant every cleanup removal failed on the lock instead of on the real question. Unlocking first and letting `git worktree remove` decide would leave a worktree holding uncommitted work unlocked on the failure path — protection removed at exactly the moment it was needed. Cleanup now establishes cleanliness itself, then unlocks, then removes without forcing. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

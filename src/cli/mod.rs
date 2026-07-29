@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     commands::{
-        acceptance::AcceptanceCommand, card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs,
-        gate::GateCommand, handoff::HandoffCommand, integration::IntegrationCommand,
-        project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
+        acceptance::AcceptanceCommand, archive::ArchiveCommand, card::CardCommand,
+        cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand, handoff::HandoffCommand,
+        integration::IntegrationCommand, project::ProjectCommand, review::ReviewCommand,
+        work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -94,6 +95,12 @@ pub enum Command {
     Acceptance {
         #[command(subcommand)]
         command: AcceptanceCommand,
+    },
+
+    /// Preserve reachability, then clean up what is safe to remove.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
     },
 }
 

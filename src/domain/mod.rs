@@ -1,6 +1,7 @@
 //! Domain primitives shared by every command.
 
 pub mod acceptance;
+pub mod archive;
 pub mod card;
 pub mod clock;
 pub mod cycle;

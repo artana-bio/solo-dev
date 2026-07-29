@@ -7,6 +7,7 @@
 //! Everything outside [`worktree`] is read-only. Mutation is confined to one
 //! module so the safety rules in invariant 7.2 have a single place to hold.
 
+pub mod archive;
 pub mod authority;
 pub mod command;
 pub mod diff;
