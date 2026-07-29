@@ -117,6 +117,10 @@ pub enum ErrorCode {
     PolicyStaleLock,
     /// The project lock exists but its disposition cannot be established.
     PolicyLockAmbiguous,
+    /// A backup destination shares a device with what it protects.
+    PolicyBackupNotIndependent,
+    /// A backup failed verification.
+    PolicyBackupCorrupt,
     /// A worktree locator disagrees with authoritative control state.
     PolicyLocatorMismatch,
     /// A candidate changed paths outside its card's declared scope.
@@ -157,7 +161,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 71] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -209,6 +213,8 @@ impl ErrorCode {
         Self::PolicyLeaseHeld,
         Self::PolicyStaleLock,
         Self::PolicyLockAmbiguous,
+        Self::PolicyBackupNotIndependent,
+        Self::PolicyBackupCorrupt,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
         Self::GateRunnerError,
@@ -278,6 +284,8 @@ impl ErrorCode {
             | Self::PolicyLeaseHeld
             | Self::PolicyStaleLock
             | Self::PolicyLockAmbiguous
+            | Self::PolicyBackupNotIndependent
+            | Self::PolicyBackupCorrupt
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyIncompleteHandoff
@@ -358,6 +366,8 @@ impl ErrorCode {
             Self::PolicyLeaseHeld => "LEASE-HELD",
             Self::PolicyStaleLock => "STALE-LOCK",
             Self::PolicyLockAmbiguous => "LOCK-AMBIGUOUS",
+            Self::PolicyBackupNotIndependent => "BACKUP-NOT-INDEPENDENT",
+            Self::PolicyBackupCorrupt => "BACKUP-CORRUPT",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::GateRunnerError => "RUNNER-ERROR",
@@ -516,6 +526,12 @@ impl ErrorCode {
             }
             Self::PolicyLockAmbiguous => {
                 "Confirm no harness command is running, then remove the lock file deliberately."
+            }
+            Self::PolicyBackupNotIndependent => {
+                "Choose a destination on a different device; a copy beside the original protects against almost nothing."
+            }
+            Self::PolicyBackupCorrupt => {
+                "Recreate the backup and verify it again; the stored copy cannot be trusted."
             }
             Self::PolicyLocatorMismatch => {
                 "The worktree link disagrees with control state; re-allocate rather than trusting it."

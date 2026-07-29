@@ -9,6 +9,7 @@
 
 pub mod archive;
 pub mod authority;
+pub mod backup;
 pub mod command;
 pub mod diff;
 pub mod inspect;
