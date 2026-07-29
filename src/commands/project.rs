@@ -233,6 +233,40 @@ fn refuse_occupied_control(path: &std::path::Path) -> Result<(), HarnessError> {
     })
 }
 
+/// Clears an earlier `project.init` that never finished, so this one may run.
+///
+/// An interrupted `init` left an unresolved entry, so re-running it failed
+/// `require_settled` with "run `project recover`" — and `recover` opens the
+/// control repository, which needs the project document the interrupted run
+/// never wrote, so it answered "run `project init` first". The project was
+/// wedged with two commands each pointing at the other, and nothing else could
+/// reach that state to break it.
+///
+/// Only `project.init` entries are superseded, and only because every step this
+/// command journals is safe to repeat: `initialize_git` skips an existing
+/// `.git`, `establish_authority` adopts an existing remote and authority
+/// without overwriting either, and the project document is written wholesale.
+/// Re-running is the recovery. An unresolved entry from any other command is
+/// left alone and still blocks, because nothing here knows how to finish it.
+///
+/// # Errors
+///
+/// Returns an error when the journal cannot be written.
+fn supersede_interrupted_init(journal: &Journal, clock: &dyn Clock) -> Result<(), HarnessError> {
+    for mut record in journal.unresolved()? {
+        if record.command != "project.init" {
+            continue;
+        }
+        journal.finish(
+            &mut record,
+            OperationState::FailedClean,
+            Some("superseded by a later `project init`, which repeats every step".to_owned()),
+            clock,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let config = config_from_args(args)?;
     // Validation runs before anything is created, so an invalid configuration
@@ -275,6 +309,7 @@ fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
 
     let _lock = ProjectLock::acquire(control.root(), "project.init", clock)?;
     let journal = Journal::new(&control);
+    supersede_interrupted_init(&journal, clock)?;
     journal.require_settled()?;
 
     let expected_head = control.head()?;

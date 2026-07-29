@@ -44,7 +44,7 @@ proposition.
 
 | # | Defect |
 | --- | --- |
-| 12 | An interrupted `project init` wedges the project: `init` says run recover, recover says run init. **[R]** |
+| 12 | ✅ **FIXED.** An interrupted `project init` wedges the project: `init` says run recover, recover says run init. **[R]** Fixed: `init` supersedes an earlier unfinished `project.init` and repeats every step, all of which are safe to repeat. Only `project.init` entries — an unresolved entry from any other command still blocks, because nothing here knows how to finish it. |
 | 13 | ✅ **FIXED.** A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** Fixed: liveness is three-valued. `ps` failing to run, or refusing to answer, is `Unknown` and routes to the `Ambiguous` diagnosis that already existed for exactly this doctrine. Four fixtures used a pid so large `ps` rejects it as out of range — they were asserting the bug, and now use an absent pid that `ps` genuinely answers about. |
 | 14 | ✅ **FIXED.** Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** Fixed: the preconditions now check which branch is checked out before checking where it points, so the refusal lands before the authority moves. Every other local check described the protected branch only if HEAD happened to be it. |
 | 15 | A post-publish failure is unrecoverable, and recover falsely reports that no promotion reached the authority. **[R]** |

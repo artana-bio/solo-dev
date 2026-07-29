@@ -516,3 +516,73 @@ fn a_control_path_reaching_the_candidate_through_a_symlink_is_refused() {
         "and nothing may have been created there"
     );
 }
+
+#[test]
+fn an_interrupted_init_can_be_completed_by_running_it_again() {
+    // Tier 3, defect 12. An interrupted `init` left an unresolved journal
+    // entry, so re-running it failed `require_settled` with "run project
+    // recover" — and `recover` opens the control repository, which needs the
+    // project document the interrupted run never wrote, so it answered "run
+    // project init first". The project was wedged with two commands each
+    // pointing at the other.
+    let workspace = Workspace::new();
+    let args: Vec<String> = vec![
+        "project".into(),
+        "init".into(),
+        "--project-id".into(),
+        "example".into(),
+        "--repository".into(),
+        workspace.repository.display().to_string(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--authority".into(),
+        workspace.authority.display().to_string(),
+        "--worktree-root".into(),
+        workspace.worktrees.display().to_string(),
+    ];
+
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("CHANGE_HARNESS_FAIL_AT", "project-document-written")
+        .args(&args)
+        .output()
+        .expect("the CLI should start");
+    assert!(
+        !interrupted.status.success(),
+        "the fixture must actually be interrupted"
+    );
+    assert!(
+        workspace.control.join(".git").exists(),
+        "and must have left a partially initialized control repository"
+    );
+
+    // Both halves of the wedge: recover cannot help here, and init must.
+    let recover = Workspace::run(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+    ]);
+    assert!(
+        !recover.status.success(),
+        "recover still cannot open a control repository with no project document"
+    );
+
+    let again = Workspace::run(&args);
+    assert!(
+        again.status.success(),
+        "re-running init must complete it: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(workspace.control.join("project/project.json").exists());
+
+    // And the project works afterwards, rather than merely reporting success.
+    workspace.register_gate("gate.unit", &["true"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+}
