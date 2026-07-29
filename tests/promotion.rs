@@ -734,3 +734,59 @@ fn promoting_from_a_different_checked_out_branch_is_refused() {
     workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
     assert_eq!(workspace.authority_head(), landing);
 }
+
+#[test]
+fn a_landed_card_cannot_be_revised() {
+    // Tier 3, defect 19. `card revise` writes `ready` and never checks the
+    // transition — the only guard was `is_terminal()`, and `landed` is not
+    // terminal because it still has to reach `closed`. So revising a landed
+    // card set it to `ready`, from which the only exits are `leased` and
+    // `abandoned`: it could never be closed, and its integration referenced a
+    // card whose state had gone backwards past the acceptance that authorized
+    // it.
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "the fixture must reach the state under test"
+    );
+
+    let baseline = workspace.authority_head();
+    let draft = workspace.root.join("F-001-v2.yaml");
+    fs::write(
+        &draft,
+        format!(
+            "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Substantially different\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {baseline}\nwrite_scope:\n  include: [src/F-001/**]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        ),
+    )
+    .unwrap();
+
+    let output = workspace.card_raw(&[
+        "revise",
+        "--card-id",
+        "F-001",
+        "--draft",
+        &draft.display().to_string(),
+        "--reason",
+        "second thoughts",
+    ]);
+    assert!(
+        !output.status.success(),
+        "a landed card must not be revisable: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "and the card must be left where it was, still able to close"
+    );
+
+    workspace.archive(&["create", "--integration-id", &id]);
+    workspace.archive(&["close", "--integration-id", &id]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "closed"
+    );
+}

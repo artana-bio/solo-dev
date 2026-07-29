@@ -123,6 +123,27 @@ impl CardState {
         matches!(self, Self::Closed | Self::Abandoned)
     }
 
+    /// True when a new revision may supersede the current one.
+    ///
+    /// Revising returns a card to `ready`, and `card revise` checked only
+    /// [`is_terminal`](Self::is_terminal) before doing so. `landed` is not
+    /// terminal — it still has to reach `closed` — so a landed card could be
+    /// sent back to `ready`, whose only exits are `leased` and `abandoned`. It
+    /// could then never be closed, and its integration referenced a card whose
+    /// state had gone backwards past the acceptance that authorized it.
+    ///
+    /// Revising an approved card is deliberately still allowed: Section 15.2
+    /// makes a revision invalidate the approval, which is the mechanism working
+    /// rather than a hole. The line is drawn where an integration has pinned
+    /// the card's digest into a plan.
+    #[must_use]
+    pub const fn is_revisable(self) -> bool {
+        !matches!(
+            self,
+            Self::Integrating | Self::Accepted | Self::Landed | Self::Closed | Self::Abandoned
+        )
+    }
+
     /// True when the card's definition may still be edited.
     ///
     /// Only a draft. Section 7.3.3 makes activation the point of no return; a

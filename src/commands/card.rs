@@ -591,9 +591,12 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 reason: format!("card {card_id} is not activated; use `card activate`"),
                 code: ErrorCode::PreconditionNotFound,
             })?;
-            if state.state.is_terminal() {
+            if !state.state.is_revisable() {
                 return Err(HarnessError::Control {
-                    reason: format!("card {card_id} is `{}` and cannot be revised", state.state),
+                    reason: format!(
+                        "card {card_id} is `{}` and cannot be revised; a revision returns a card to `ready`, which from here would strand it",
+                        state.state
+                    ),
                     code: ErrorCode::PolicyInvalidTransition,
                 });
             }
