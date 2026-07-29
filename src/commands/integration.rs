@@ -14,6 +14,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{
         acceptance::acceptance_for,
         card::load_card,
@@ -83,7 +84,7 @@ pub enum IntegrationCommand {
 #[derive(Debug, Args)]
 pub struct MergeArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to combine.
     #[arg(long)]
@@ -107,7 +108,7 @@ pub struct MergeArgs {
 #[derive(Debug, Args)]
 pub struct ReadyArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The cycle to report on.
     #[arg(long)]
@@ -118,7 +119,7 @@ pub struct ReadyArgs {
 #[derive(Debug, Args)]
 pub struct PrepareArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The cycle to integrate.
     #[arg(long)]
@@ -159,7 +160,7 @@ impl From<ModeArg> for IntegrationMode {
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to report.
     #[arg(long)]
@@ -2046,7 +2047,7 @@ fn report_verification(
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to review.
     #[arg(long)]
@@ -2234,7 +2235,7 @@ fn run_integration_review(
 #[derive(Debug, Args)]
 pub struct PromoteArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to promote.
     #[arg(long)]
@@ -2743,7 +2744,7 @@ pub fn resume_promotion(
 #[derive(Debug, Args)]
 pub struct AbandonArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration to abandon.
     #[arg(long)]

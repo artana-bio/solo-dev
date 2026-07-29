@@ -80,6 +80,18 @@ Every command accepts `--output text|json`. JSON emits a stable envelope
 (`harness.command-result/v1` or `harness.command-error/v1`) with a machine
 -readable error code, which is the interface a coding agent should use.
 
+Every command that operates on an existing project takes `--control`. Export it
+once instead of repeating it:
+
+```bash
+export CHANGE_HARNESS_CONTROL=/path/to/control
+```
+
+The flag still wins where both are present. `project init` deliberately ignores
+the variable: that flag decides where a control repository is *created*, and
+defaulting it from something exported for another project is how a project gets
+initialized into the wrong place.
+
 ## Three repositories
 
 The harness separates three roles, and keeping them apart is what the safety
@@ -114,7 +126,7 @@ rather than declared inline, so a card cannot invent a check that nobody
 reviewed.
 
 ```bash
-change-harness gate register --control $CONTROL --definition gate.unit.yaml
+change-harness gate register --definition gate.unit.yaml
 ```
 
 **2. Open a cycle and freeze its baseline.** Activation pins one exact

@@ -272,3 +272,103 @@ fn unknown_subcommand_is_rejected() {
     let output = run(&["cycle", "create"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn the_control_path_may_come_from_the_environment() {
+    // Twenty-one commands require an absolute control path. Across eleven
+    // self-hosted releases it was typed several hundred times, and each
+    // repetition is a chance to point a command at the wrong project.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let control = temp.path().join("control");
+
+    let output = harness_command()
+        .env("CHANGE_HARNESS_CONTROL", &control)
+        .args(["project", "status", "--output", "json"])
+        .output()
+        .expect("the CLI should start");
+
+    // The path is wrong on purpose: what matters is that it was *used*, which
+    // a message naming it proves and a usage error would not.
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["schema"], "harness.command-error/v1");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&control.display().to_string()),
+        "the environment path must be the one it tried: {envelope}"
+    );
+}
+
+#[test]
+fn an_explicit_control_flag_overrides_the_environment() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let from_env = temp.path().join("from-env");
+    let from_flag = temp.path().join("from-flag");
+
+    let output = harness_command()
+        .env("CHANGE_HARNESS_CONTROL", &from_env)
+        .args(["project", "status", "--output", "json", "--control"])
+        .arg(&from_flag)
+        .output()
+        .expect("the CLI should start");
+
+    let message = stdout_json(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        message.contains(&from_flag.display().to_string()),
+        "the flag must win: {message}"
+    );
+    assert!(
+        !message.contains(&from_env.display().to_string()),
+        "the environment must not leak through: {message}"
+    );
+}
+
+#[test]
+fn neither_flag_nor_environment_is_a_usage_error() {
+    let output = harness_command()
+        .env_remove("CHANGE_HARNESS_CONTROL")
+        .args(["project", "status"])
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(2), "usage category is exit 2");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--control"),
+        "the missing argument must be named"
+    );
+}
+
+#[test]
+fn help_names_the_environment_variable_as_well_as_the_flag() {
+    // The terse missing-argument error names only the flag, because clap does
+    // not let a required argument's error be customised. `--help` is therefore
+    // where someone learns the other way, so it must actually say so.
+    let stdout = String::from_utf8(run(&["project", "status", "--help"]).stdout)
+        .expect("help should be UTF-8");
+    assert!(stdout.contains("--control"), "unexpected: {stdout}");
+    assert!(
+        stdout.contains("CHANGE_HARNESS_CONTROL"),
+        "help must name the environment variable: {stdout}"
+    );
+}
+
+#[test]
+fn project_init_deliberately_ignores_the_environment() {
+    // `init` decides where a control repository is *created*. Defaulting that
+    // from a variable exported for another project is how someone initializes
+    // into the wrong place, so this one flag stays required.
+    let output = harness_command()
+        .env("CHANGE_HARNESS_CONTROL", "/somewhere/else")
+        .args(["project", "init", "--help"])
+        .output()
+        .expect("the CLI should start");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("CHANGE_HARNESS_CONTROL"),
+        "init must not advertise an environment fallback: {stdout}"
+    );
+}

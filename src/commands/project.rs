@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{integration::ResumeOutcome, transaction::with_transaction},
     config::{
         DEFAULT_AUTHORITY_REMOTE, HostPolicy, PROJECT_SCHEMA, ProjectConfig,
@@ -82,7 +83,7 @@ pub struct ValidateArgs {
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
 }
 
@@ -90,7 +91,7 @@ pub struct StatusArgs {
 #[derive(Debug, Args)]
 pub struct RecoverArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
     /// Finish what can be finished instead of only reporting it.
     ///

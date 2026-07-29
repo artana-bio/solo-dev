@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
+    commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
         integration::{load_integration, load_verification},
@@ -40,7 +41,7 @@ pub enum AcceptanceCommand {
 #[derive(Debug, Args)]
 pub struct RecordArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration being decided.
     #[arg(long)]
@@ -69,7 +70,7 @@ pub struct RecordArgs {
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// Path to the control repository.
-    #[arg(long)]
+    #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
     /// The integration whose acceptance to report.
     #[arg(long)]
