@@ -83,6 +83,10 @@ pub enum ErrorCode {
     PolicyIntegrationOpen,
     /// The project uses a capability no shipped work package implements yet.
     PolicyUnsupportedUntilWp540,
+    /// A declared cycle invariant was neither confirmed nor refused.
+    PolicyInvariantUnaddressed,
+    /// One actor attempted two roles that must be held by different actors.
+    PolicySameActor,
     /// The named record does not exist.
     PreconditionNotFound,
     /// A card's declared base commit does not exist in the repository.
@@ -137,7 +141,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 59] = [
+    pub const ALL: [Self; 61] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -172,6 +176,8 @@ impl ErrorCode {
         Self::PolicyAtomicGroupSplit,
         Self::PolicyIntegrationOpen,
         Self::PolicyUnsupportedUntilWp540,
+        Self::PolicyInvariantUnaddressed,
+        Self::PolicySameActor,
         Self::PreconditionNotFound,
         Self::PreconditionBaseMissing,
         Self::PreconditionBranchExists,
@@ -238,6 +244,8 @@ impl ErrorCode {
             | Self::PolicyAtomicGroupSplit
             | Self::PolicyIntegrationOpen
             | Self::PolicyUnsupportedUntilWp540
+            | Self::PolicyInvariantUnaddressed
+            | Self::PolicySameActor
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
@@ -301,6 +309,8 @@ impl ErrorCode {
             Self::PolicyAtomicGroupSplit => "ATOMIC-GROUP-SPLIT",
             Self::PolicyIntegrationOpen => "INTEGRATION-OPEN",
             Self::PolicyUnsupportedUntilWp540 => "UNSUPPORTED-UNTIL-WP-540",
+            Self::PolicyInvariantUnaddressed => "INVARIANT-UNADDRESSED",
+            Self::PolicySameActor => "SAME-ACTOR",
             Self::PreconditionNotFound => "NOT-FOUND",
             Self::PreconditionBaseMissing => "BASE-MISSING",
             Self::PreconditionBranchExists => "BRANCH-EXISTS",
@@ -441,6 +451,12 @@ impl ErrorCode {
             }
             Self::PolicyUnsupportedUntilWp540 => {
                 "Remove the shared generated artifacts from the cards, or wait for WP-540."
+            }
+            Self::PolicyInvariantUnaddressed => {
+                "Confirm each declared cycle invariant with `--invariant-holds`, or block the integration."
+            }
+            Self::PolicySameActor => {
+                "Have a different actor perform this step; the two roles must be held separately."
             }
             Self::PolicyLeaseHeld => "Resume the existing lease, or release it explicitly.",
             Self::PolicyLocatorMismatch => {

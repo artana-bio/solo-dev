@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 21 |
+| Plan revision | 22 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `2e40bc7` (`feat(WP-420): merge preflight, conflict classification, disposable integration`) |
+| Previous plan commit | `7c0ae0e` (`feat(WP-430): landing commit construction`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-430` complete; 579 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
-| Next executable work package | `WP-440` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-440` complete; 595 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. |
+| Next executable work package | `WP-450` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -620,8 +620,9 @@ schema
 receipt_id
 project_id
 cycle_id
-card_id
-card_digest
+card_id            (optional; set for a card's gate run)
+card_digest        (optional; set with card_id)
+integration_id     (optional; set for a combined verification run)
 evaluated_sha
 gate_id
 gate_digest
@@ -640,6 +641,10 @@ attempt
 ```
 
 `termination` is one of `completed`, `timeout`, `signal`, or `runner_error`.
+
+Exactly one subject is always present: `card_id` with `card_digest` for a
+gate run against one card's candidate, or `integration_id` for a combined
+verification run against a landing commit. See D-046.
 
 ### 10.7 Handoff
 
@@ -2258,9 +2263,10 @@ artifacts.
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-420`, `WP-310` |
 | Target release | Single-repository MVP |
+| Evidence | `VerificationRecord` and `interactions` in `src/domain/integration.rs`, `integration verify` and `review` in `src/commands/integration.rs`, `tests/combined_verification.rs` (13 acceptance tests) |
 
 Deliverables:
 
@@ -2278,6 +2284,34 @@ Acceptance:
 - combined gate failure blocks acceptance;
 - dirty post-gate worktree fails;
 - integration review records residual risk.
+
+Delivered notes:
+
+- Verification reruns every gate any member names — feature, review, and
+  integration alike — against the landing commit in a fresh disposable
+  worktree. A feature gate that passed on an isolated candidate proves nothing
+  about the combined tree, which is the entire reason the rerun exists.
+- The receipt record gained an integration scope (D-046). A combined run
+  belongs to the integration, not to one card, and attributing it to a member
+  would be a false claim about what was checked. This amends Section 10.6:
+  `card_id` and `card_digest` become optional and `integration_id` is added;
+  exactly one of the two subjects is always present.
+- The worktree is checked for cleanliness *after* the gates as well as before.
+  A gate that writes into the tree it is checking invalidates its own result,
+  and the diagnosis says so rather than reporting a generic gate failure.
+- The combined interaction checklist is derived from the members' declared
+  contracts: ordered pairs where what one card changes is what another reads.
+  Directions are listed separately, because "A changes what B reads" is a
+  different thing to look at than the reverse.
+- Cycle release invariants are free text, so no gate can evaluate them. They
+  are carried into the verification record marked `machine_checked: false`,
+  and `integration review` refuses to record a decision that leaves one
+  unconfirmed (D-047). An invariant nobody is shown is an invariant nobody
+  checks.
+- A failed verification is recorded and committed before the command fails, so
+  a retry cannot present itself as the first attempt.
+- Section 15.1's independence rule extends to this stage: whoever ran the
+  gates cannot also be the actor who judges what they proved.
 
 ### WP-450 — Acceptance and promotion
 
@@ -2738,7 +2772,7 @@ All must be true:
 
 
 
-| Integration | `IN_PROGRESS` | Plan, preflight, and landing done; verification next | `WP-440` onward |
+| Integration | `IN_PROGRESS` | Through verification and review; acceptance next | `WP-450` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
@@ -2755,8 +2789,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-440` |
-| Next branch name | `wp/WP-440-combined-verification` |
+| Next work package | `WP-450` |
+| Next branch name | `wp/WP-450-acceptance-promotion` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2897,6 +2931,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-043 | Refuse a second `integration merge` on an already-merged plan | Accepted | Merging twice builds a different head from the same plan and overwrites the recorded one, leaving anything `WP-430` or `WP-440` had already done pointing at a commit the record no longer names. Rebuilding requires abandoning the integration and preparing again, which is visible in the record rather than silent. |
 | D-044 | Hold the landing commit with `refs/harness/landing/<INT-id>` | Accepted | Section 13.5 requires the landing commit to stay unreachable from the protected branch until accepted, which is not the same as unreachable outright. An object no ref points at can be garbage-collected, and losing the landing commit between construction and promotion would force a rebuild and a full re-verification. A harness ref keeps it alive without putting it anywhere a reader would mistake for promoted. |
 | D-045 | Add `integration ready`, `preflight`, `merge`, and `land` to the Section 12.3 command surface | Accepted | Section 12.3 lists `prepare`, `verify`, `inspect`, `review`, and `promote`. `ready` is required by `WP-410` for `SPIKE-001` finding F-3; `preflight`, `merge`, and `land` are the separately observable steps `WP-420` and `WP-430` deliver, and Section 13.5 requires the landing commit to exist before final verification, which is impossible if landing is folded into `verify` or `promote`. |
+| D-046 | Give receipts an integration scope, making `card_id` optional | Accepted, amends Section 10.6 | `WP-440` reruns gates against the landing commit, which belongs to every member card and to none of them individually. The original schema required `card_id`, leaving two options: attribute a combined run to an arbitrary member, or run each gate once per card. The first is a false claim about what was checked; the second multiplies a long test suite by the batch size while adding no information, since the gate does not know which card asked for it. Naming the real subject is the honest third option. |
+| D-047 | Refuse an integration review that leaves a declared cycle invariant unconfirmed | Accepted | Section 10.2 lets a cycle declare release invariants in free text, which no gate can evaluate. If the review can pass without addressing them, they are decorative. Requiring each to be named explicitly is the only mechanism available for a condition a machine cannot check. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 
 ## 23. Decisions required later

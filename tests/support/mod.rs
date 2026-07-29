@@ -86,13 +86,18 @@ impl Workspace {
 
     /// Registers a gate at revision 1 with the given argv.
     pub fn register_gate(&self, gate_id: &str, argv: &[&str]) {
+        self.register_gate_revision(gate_id, 1, argv);
+    }
+
+    /// Registers a specific revision of a gate, so a definition can change.
+    pub fn register_gate_revision(&self, gate_id: &str, revision: u32, argv: &[&str]) {
         let list = argv
             .iter()
             .map(|value| format!("\"{value}\""))
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
         );
         let path = self.root.join(format!("{gate_id}.yaml"));
         fs::write(&path, body).unwrap();
@@ -433,6 +438,34 @@ impl Workspace {
     /// Runs an `integration` subcommand and parses its JSON envelope.
     pub fn integration_json(&self, args: &[&str]) -> serde_json::Value {
         serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
+    }
+
+    /// Activates a card naming explicit feature and integration gate sets.
+    pub fn activate_card_with_gate_sets(
+        &self,
+        card_id: &str,
+        include: &[&str],
+        feature: &[&str],
+        integration: &[&str],
+    ) {
+        let list = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [{feat}]\n  review: []\n  integration: [{integ}]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = self.authority_head(),
+            inc = list(include),
+            feat = list(feature),
+            integ = list(integration),
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
     }
 
     /// Activates a card that declares dependencies on other cards.

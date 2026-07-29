@@ -16,7 +16,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::{
         card::load_card,
-        gate::{load_gate, receipts_for},
+        gate::{load_gate, next_receipt_id, receipts_for},
         handoff::latest_handoff,
         review::{current_approval, reviews_for},
         transaction::with_transaction,
@@ -31,7 +31,8 @@ use crate::{
         ids::{CardId, CycleId, IntegrationId},
         integration::{
             INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember, IntegrationMode,
-            IntegrationRecord, IntegrationStatus, topological_order,
+            IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck, VERIFICATION_SCHEMA,
+            VerificationRecord, interactions, topological_order,
         },
         review::ReviewRecord,
     },
@@ -42,7 +43,11 @@ use crate::{
         inspect, integration_worktree, landing,
         merge::{Conflict, ConflictClass, merge_tree},
     },
-    runner::{receipt::LOG_DIR, run_attempt},
+    runner::{
+        environment_fingerprint,
+        receipt::{LOG_DIR, RECEIPT_SCHEMA, Receipt},
+        run_attempt,
+    },
 };
 
 /// Subcommands under `integration`.
@@ -58,6 +63,10 @@ pub enum IntegrationCommand {
     Merge(MergeArgs),
     /// Build the landing commit without moving the protected branch.
     Land(MergeArgs),
+    /// Rerun every required gate against the landing commit.
+    Verify(MergeArgs),
+    /// Record an independent review of the verified integration.
+    Review(ReviewArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
 }
@@ -164,6 +173,8 @@ pub fn execute(
         IntegrationCommand::Preflight(args) => run_preflight(args),
         IntegrationCommand::Merge(args) => run_merge(args, clock),
         IntegrationCommand::Land(args) => run_land(args, clock),
+        IntegrationCommand::Verify(args) => run_verify(args, clock),
+        IntegrationCommand::Review(args) => run_integration_review(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
     }
 }
@@ -1615,6 +1626,509 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
                 &digest,
                 &config.project_id,
             ))
+        },
+    )
+}
+
+/// The distinct gates a landing must pass, with the cards that require them.
+///
+/// Every gate any member names — feature, review, and integration alike — is
+/// rerun against the landing commit. A feature gate that passed on an isolated
+/// candidate proves nothing about the combined tree, which is the whole reason
+/// this rerun exists.
+fn required_gates(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<String>, HarnessError> {
+    let mut gates: Vec<String> = Vec::new();
+    for member in &record.members {
+        let (card, _) = load_card(control, &member.card_id)?;
+        for gate_id in card
+            .named_gates
+            .feature
+            .iter()
+            .chain(&card.named_gates.review)
+            .chain(&card.named_gates.integration)
+        {
+            if !gates.contains(gate_id) {
+                gates.push(gate_id.clone());
+            }
+        }
+    }
+    // Sorted so the run order — and therefore the receipt order — is a
+    // function of the plan rather than of card iteration.
+    gates.sort();
+    Ok(gates)
+}
+
+/// Builds the interaction checklist from the members' declared contracts.
+fn member_interactions(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<Interaction>, HarnessError> {
+    let mut declared = Vec::new();
+    for member in &record.members {
+        let (card, _) = load_card(control, &member.card_id)?;
+        declared.push((
+            member.card_id.clone(),
+            card.contract_changes.clone(),
+            card.contract_reads.clone(),
+        ));
+    }
+    Ok(interactions(&declared))
+}
+
+/// Runs every required gate against the landing commit in a clean worktree.
+///
+/// The worktree is checked for cleanliness after the gates as well as before:
+/// a gate that writes into the tree it is checking invalidates its own result,
+/// and would leave the landing tree and the verified tree describing different
+/// things.
+fn verify_landing(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+    landing_sha: &str,
+    clock: &dyn Clock,
+) -> Result<(Vec<Receipt>, bool), HarnessError> {
+    let path =
+        integration_worktree::path_for(&config.worktree_root, record.integration_id.as_str());
+    integration_worktree::remove(&config.repository, &path)?;
+    integration_worktree::create(&config.repository, &path, landing_sha)?;
+
+    let outcome = (|| -> Result<(Vec<Receipt>, bool), HarnessError> {
+        let mut receipts = Vec::new();
+        for gate_id in required_gates(control, record)? {
+            let gate = load_gate(control, &gate_id)?;
+            let log_root = control.path(LOG_DIR).join(record.integration_id.as_str());
+            let started_at = clock.now();
+            let attempt = run_attempt(&gate, &path, &log_root, 1, clock)?;
+            let finished_at = clock.now();
+
+            receipts.push(Receipt {
+                schema: RECEIPT_SCHEMA.to_owned(),
+                receipt_id: "R-000000".parse()?,
+                project_id: config.project_id.clone(),
+                cycle_id: record.cycle_id.clone(),
+                card_id: None,
+                card_digest: None,
+                integration_id: Some(record.integration_id.clone()),
+                evaluated_sha: landing_sha.to_owned(),
+                gate_id: gate.gate_id.clone(),
+                gate_digest: gate.digest()?,
+                harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+                environment_fingerprint: environment_fingerprint(&gate),
+                started_at,
+                finished_at,
+                duration_ms: attempt.duration_ms,
+                exit_code: attempt.exit_code,
+                termination: attempt.termination,
+                stdout_digest: attempt.stdout_digest.clone(),
+                stderr_digest: attempt.stderr_digest.clone(),
+                artifact_digests: attempt.artifact_digests.clone(),
+                log_location: attempt.log_location.clone(),
+                attempt: 1,
+                passed: attempt.passed(),
+            });
+        }
+        let clean = integration_worktree::is_clean(&path)?;
+        Ok((receipts, clean))
+    })();
+
+    integration_worktree::remove(&config.repository, &path)?;
+    outcome
+}
+
+/// Allocates receipt identifiers, stores the receipts, and builds the record.
+///
+/// Identifiers are allocated only once the runs are done, so a verification
+/// that never completed does not consume a block of them and leave a gap that
+/// reads like deleted evidence.
+fn store_verification(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    cycle: &CycleRecord,
+    receipts: &mut [Receipt],
+    worktree_clean_after: bool,
+    actor_id: &str,
+    clock: &dyn Clock,
+) -> Result<VerificationRecord, HarnessError> {
+    let mut receipt_ids = Vec::new();
+    let mut failed_gates = Vec::new();
+    for receipt in receipts.iter_mut() {
+        receipt.receipt_id = next_receipt_id(control)?;
+        if !receipt.passed {
+            failed_gates.push(receipt.gate_id.clone());
+        }
+        control.write_atomic(
+            &Receipt::relative_path(&receipt.receipt_id),
+            &format!("{}\n", serde_json::to_string_pretty(receipt)?),
+        )?;
+        receipt_ids.push(receipt.receipt_id.to_string());
+    }
+
+    Ok(VerificationRecord {
+        schema: VERIFICATION_SCHEMA.to_owned(),
+        integration_id: record.integration_id.clone(),
+        cycle_id: record.cycle_id.clone(),
+        landing_sha: record.landing_sha.clone().unwrap_or_default(),
+        landing_tree: record.integration_tree.clone().unwrap_or_default(),
+        receipt_ids,
+        failed_gates,
+        invariants: cycle
+            .release_invariants
+            .iter()
+            .map(|invariant| InvariantCheck {
+                invariant: invariant.clone(),
+                machine_checked: false,
+            })
+            .collect(),
+        interactions: member_interactions(control, record)?,
+        worktree_clean_after,
+        verified_by: actor_id.to_owned(),
+        verified_at: clock.now(),
+        canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
+    })
+}
+
+fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    with_transaction(
+        &args.control,
+        "integration.verify",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            record
+                .status
+                .check_transition(IntegrationStatus::Verified)?;
+            let Some(landing_sha) = record.landing_sha.clone() else {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {integration_id} has no landing commit; run `integration land` first"
+                    ),
+                    code: ErrorCode::PreconditionNotFound,
+                });
+            };
+
+            let cycle = load_cycle(control, &record.cycle_id)?;
+            let (mut receipts, worktree_clean_after) =
+                verify_landing(control, &config, &record, &landing_sha, clock)?;
+
+            let verification = store_verification(
+                control,
+                &record,
+                &cycle,
+                &mut receipts,
+                worktree_clean_after,
+                &args.actor_id,
+                clock,
+            )?;
+            let receipt_ids = verification.receipt_ids.clone();
+            let failed_gates = verification.failed_gates.clone();
+            let passed = verification.passed();
+            let digest = verification.digest()?;
+
+            // Both outcomes are recorded. A failed verification that left no
+            // trace would let a retry present itself as the first attempt.
+            control.write_atomic(
+                &VerificationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&verification)?),
+            )?;
+            if passed {
+                record.status = IntegrationStatus::Verified;
+                control.write_atomic(
+                    &IntegrationRecord::relative_path(&integration_id),
+                    &format!("{}\n", serde_json::to_string_pretty(&record)?),
+                )?;
+            }
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.verified", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(landing_sha.clone())
+                    .transition(
+                        Some(IntegrationStatus::Prepared.name()),
+                        if passed {
+                            IntegrationStatus::Verified.name()
+                        } else {
+                            IntegrationStatus::Prepared.name()
+                        },
+                    )
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("verification_digest", serde_json::json!(digest.as_str()))
+                    .meta("passed", serde_json::json!(passed))
+                    .meta("receipt_ids", serde_json::json!(receipt_ids))
+                    .meta("failed_gates", serde_json::json!(failed_gates)),
+                clock,
+            )?;
+            control.commit(expected, &format!("integration: verify {integration_id}"))?;
+
+            if !passed {
+                return Err(HarnessError::Control {
+                    reason: if worktree_clean_after {
+                        format!(
+                            "combined verification of {integration_id} failed: {}",
+                            failed_gates.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "the integration worktree was dirty after verifying {integration_id}; a gate wrote into the tree it was checking"
+                        )
+                    },
+                    code: ErrorCode::GateFailed,
+                });
+            }
+
+            Ok(report_verification(
+                &verification,
+                &digest,
+                &config.project_id,
+            ))
+        },
+    )
+}
+
+/// Turns a verification into the command's outcome.
+fn report_verification(
+    verification: &VerificationRecord,
+    digest: &crate::domain::digest::Digest,
+    project_id: &crate::domain::ids::ProjectId,
+) -> CommandOutcome {
+    let mut text = format!(
+        "Verified integration {} against landing commit {}\ngates passed: {}\nworktree clean after gates: {}",
+        verification.integration_id,
+        verification.landing_sha,
+        verification.receipt_ids.len(),
+        verification.worktree_clean_after
+    );
+    if !verification.invariants.is_empty() {
+        text.push_str("\ncycle invariants a reviewer must still judge:");
+        for check in &verification.invariants {
+            let _ =
+                std::fmt::Write::write_fmt(&mut text, format_args!("\n  - {}", check.invariant));
+        }
+    }
+    if verification.interactions.is_empty() {
+        text.push_str("\nno declared contract interactions between members");
+    } else {
+        text.push_str("\ncombined interactions to review:");
+        for interaction in &verification.interactions {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!(
+                    "\n  - {} changes {}, which {} reads",
+                    interaction.changes,
+                    interaction.shared.join(", "),
+                    interaction.reads
+                ),
+            );
+        }
+    }
+
+    CommandOutcome::new(
+        "integration.verify",
+        text,
+        serde_json::json!({
+            "integration_id": verification.integration_id.to_string(),
+            "verification_digest": digest.as_str(),
+            "landing_sha": verification.landing_sha,
+            "receipt_ids": verification.receipt_ids,
+            "failed_gates": verification.failed_gates,
+            "invariants": verification.invariants,
+            "interactions": verification.interactions,
+            "worktree_clean_after": verification.worktree_clean_after,
+            "passed": verification.passed(),
+        }),
+    )
+    .with_project(project_id.clone())
+}
+
+/// Arguments accepted by `integration review`.
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    /// Path to the control repository.
+    #[arg(long)]
+    pub control: std::path::PathBuf,
+    /// The integration to review.
+    #[arg(long)]
+    pub integration_id: String,
+    /// Who is reviewing. Must differ from whoever verified it.
+    #[arg(long)]
+    pub reviewer_actor_id: String,
+    /// A risk accepted by approving this integration. Repeatable.
+    #[arg(long = "residual-risk")]
+    pub residual_risks: Vec<String>,
+    /// A cycle invariant the reviewer confirms holds. Repeatable.
+    #[arg(long = "invariant-holds")]
+    pub invariants_held: Vec<String>,
+    /// Report the decision without recording it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Reads an integration's verification record.
+fn load_verification(
+    control: &ControlRepository,
+    integration_id: &IntegrationId,
+) -> Result<VerificationRecord, HarnessError> {
+    let relative = VerificationRecord::relative_path(integration_id);
+    if !control.path(&relative).exists() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {integration_id} has not been verified; run `integration verify` first"
+            ),
+            code: ErrorCode::PreconditionNotFound,
+        });
+    }
+    serde_json::from_str(&control.read(&relative)?).map_err(|source| HarnessError::Control {
+        reason: format!("verification for {integration_id} is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+/// Refuses a review that leaves a declared cycle invariant unaddressed.
+///
+/// Free-text invariants are the reviewer's job precisely because no gate can
+/// evaluate them. Letting a review pass without naming each one would make the
+/// cycle's own release conditions decorative.
+fn require_invariants_addressed(
+    verification: &VerificationRecord,
+    held: &[String],
+) -> Result<(), HarnessError> {
+    let missing: Vec<&str> = verification
+        .invariants
+        .iter()
+        .map(|check| check.invariant.as_str())
+        .filter(|invariant| !held.iter().any(|value| value == invariant))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "the cycle declares invariants this review does not confirm: {}",
+            missing.join("; ")
+        ),
+        code: ErrorCode::PolicyInvariantUnaddressed,
+    })
+}
+
+fn run_integration_review(
+    args: &ReviewArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        let record = load_integration(&control, &integration_id)?;
+        record
+            .status
+            .check_transition(IntegrationStatus::Reviewed)?;
+        let verification = load_verification(&control, &integration_id)?;
+        require_invariants_addressed(&verification, &args.invariants_held)?;
+        return Ok(CommandOutcome::new(
+            "integration.review",
+            format!(
+                "Dry run: would record an integration review of {integration_id} by {}\nnothing was changed",
+                args.reviewer_actor_id
+            ),
+            serde_json::json!({
+                "dry_run": true,
+                "integration_id": integration_id.to_string(),
+                "reviewer_actor_id": args.reviewer_actor_id,
+            }),
+        )
+        .with_project(config.project_id));
+    }
+
+    with_transaction(
+        &args.control,
+        "integration.review",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let mut record = load_integration(control, &integration_id)?;
+            record
+                .status
+                .check_transition(IntegrationStatus::Reviewed)?;
+            let verification = load_verification(control, &integration_id)?;
+
+            // Section 15.1's independence rule applies here too: whoever ran
+            // the gates cannot be the one who judges what they proved.
+            if verification.verified_by == args.reviewer_actor_id {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "{} verified this integration and cannot also review it",
+                        args.reviewer_actor_id
+                    ),
+                    code: ErrorCode::PolicySameActor,
+                });
+            }
+            require_invariants_addressed(&verification, &args.invariants_held)?;
+
+            record.status = IntegrationStatus::Reviewed;
+            control.write_atomic(
+                &IntegrationRecord::relative_path(&integration_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+
+            let digest = verification.digest()?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("integration.reviewed", &args.reviewer_actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(verification.landing_sha.clone())
+                    .transition(
+                        Some(IntegrationStatus::Verified.name()),
+                        IntegrationStatus::Reviewed.name(),
+                    )
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("verification_digest", serde_json::json!(digest.as_str()))
+                    .meta("residual_risks", serde_json::json!(args.residual_risks))
+                    .meta("invariants_held", serde_json::json!(args.invariants_held))
+                    .meta("verified_by", serde_json::json!(verification.verified_by)),
+                clock,
+            )?;
+            control.commit(expected, &format!("integration: review {integration_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "integration.review",
+                format!(
+                    "Reviewed integration {integration_id} ({})\nreviewer: {}\nverified by: {}\nlanding commit: {}\nresidual risks: {}",
+                    IntegrationStatus::Reviewed.name(),
+                    args.reviewer_actor_id,
+                    verification.verified_by,
+                    verification.landing_sha,
+                    if args.residual_risks.is_empty() {
+                        "none declared".to_owned()
+                    } else {
+                        args.residual_risks.join("; ")
+                    }
+                ),
+                serde_json::json!({
+                    "integration_id": integration_id.to_string(),
+                    "status": IntegrationStatus::Reviewed.name(),
+                    "reviewer_actor_id": args.reviewer_actor_id,
+                    "verified_by": verification.verified_by,
+                    "verification_digest": digest.as_str(),
+                    "landing_sha": verification.landing_sha,
+                    "residual_risks": args.residual_risks,
+                    "invariants_held": args.invariants_held,
+                }),
+            )
+            .with_project(config.project_id.clone()))
         },
     )
 }

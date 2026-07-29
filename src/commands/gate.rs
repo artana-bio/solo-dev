@@ -402,7 +402,12 @@ fn run_show(args: &ShowArgs) -> Result<CommandOutcome, HarnessError> {
 }
 
 /// Allocates the next receipt identifier.
-fn next_receipt_id(control: &ControlRepository) -> Result<ReceiptId, HarnessError> {
+/// Allocates the next receipt identifier.
+///
+/// # Errors
+///
+/// Returns an error when the receipt directory cannot be read.
+pub fn next_receipt_id(control: &ControlRepository) -> Result<ReceiptId, HarnessError> {
     let directory = control.path(RECEIPT_DIR);
     let highest = if directory.exists() {
         fs::read_dir(&directory)
@@ -462,7 +467,7 @@ pub fn receipts_for(
                 reason: format!("receipt {name} is malformed: {source}"),
                 code: ErrorCode::InternalControlCorrupt,
             })?;
-        if receipt.card_id == *card_id {
+        if receipt.card_id.as_ref() == Some(card_id) {
             receipts.push(receipt);
         }
     }
@@ -552,8 +557,9 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
                 receipt_id: receipt_id.clone(),
                 project_id: config.project_id.clone(),
                 cycle_id: record.cycle_id.clone(),
-                card_id: card_id.clone(),
-                card_digest: state.current_digest.clone(),
+                card_id: Some(card_id.clone()),
+                card_digest: Some(state.current_digest.clone()),
+                integration_id: None,
                 evaluated_sha: evaluated_sha.clone(),
                 gate_id: gate.gate_id.clone(),
                 gate_digest: gate_digest.clone(),
@@ -624,9 +630,9 @@ fn report_run(
     if !receipt.passed {
         return Err(HarnessError::Control {
             reason: format!(
-                "gate `{}` did not pass for card {}: termination {}, exit {exit}",
+                "gate `{}` did not pass for {}: termination {}, exit {exit}",
                 receipt.gate_id,
-                receipt.card_id,
+                receipt.subject(),
                 receipt.termination.name()
             ),
             code: ErrorCode::GateFailed,
@@ -636,10 +642,10 @@ fn report_run(
     Ok(CommandOutcome::new(
         "gate.run",
         format!(
-            "Gate `{}` attempt {} for card {}\ncommit: {}\ntermination: {}\nexit code: {exit}\nverdict: PASS\nreceipt: {}\nlogs: {}",
+            "Gate `{}` attempt {} for {}\ncommit: {}\ntermination: {}\nexit code: {exit}\nverdict: PASS\nreceipt: {}\nlogs: {}",
             receipt.gate_id,
             receipt.attempt,
-            receipt.card_id,
+            receipt.subject(),
             receipt.evaluated_sha,
             receipt.termination.name(),
             receipt.receipt_id,

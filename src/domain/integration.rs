@@ -408,6 +408,50 @@ mod tests {
     }
 
     #[test]
+    fn interactions_are_found_in_both_directions_separately() {
+        let found = interactions(&[
+            (
+                card("F-001"),
+                vec!["api.orders".to_owned()],
+                vec!["api.users".to_owned()],
+            ),
+            (
+                card("F-002"),
+                vec!["api.users".to_owned()],
+                vec!["api.orders".to_owned()],
+            ),
+        ]);
+        assert_eq!(found.len(), 2, "each direction is its own thing to check");
+        assert_eq!(found[0].changes.as_str(), "F-001");
+        assert_eq!(found[0].reads.as_str(), "F-002");
+        assert_eq!(found[0].shared, ["api.orders"]);
+        assert_eq!(found[1].changes.as_str(), "F-002");
+        assert_eq!(found[1].reads.as_str(), "F-001");
+    }
+
+    #[test]
+    fn cards_with_disjoint_contracts_do_not_interact() {
+        let found = interactions(&[
+            (card("F-001"), vec!["api.orders".to_owned()], vec![]),
+            (card("F-002"), vec!["api.users".to_owned()], vec![]),
+        ]);
+        assert!(found.is_empty(), "unexpected: {found:?}");
+    }
+
+    #[test]
+    fn a_card_does_not_interact_with_itself() {
+        let found = interactions(&[(
+            card("F-001"),
+            vec!["api.orders".to_owned()],
+            vec!["api.orders".to_owned()],
+        )]);
+        assert!(
+            found.is_empty(),
+            "a card reading what it changes is ordinary, not an interaction"
+        );
+    }
+
+    #[test]
     fn only_terminal_states_release_the_cycle_lease() {
         assert!(IntegrationStatus::Prepared.holds_lease());
         assert!(IntegrationStatus::Blocked.holds_lease());
@@ -415,4 +459,127 @@ mod tests {
         assert!(!IntegrationStatus::Archived.holds_lease());
         assert!(!IntegrationStatus::Abandoned.holds_lease());
     }
+}
+
+/// Schema identifier for a combined-verification record.
+pub const VERIFICATION_SCHEMA: &str = "harness.integration-verification/v1";
+
+/// Directory holding verification records, relative to the control repository.
+pub const VERIFICATION_DIR: &str = "verifications";
+
+/// One pair of member cards whose declared contracts touch.
+///
+/// The combined interaction checklist. Two cards that each passed their own
+/// gates can still be wrong together, and the pairs worth looking at are not a
+/// matter of taste: they are the ones where what one card changes is what the
+/// other reads. Deriving the list means a reviewer is handed the interactions
+/// rather than asked to imagine them.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Interaction {
+    /// The card that changes a contract.
+    pub changes: CardId,
+    /// The card that reads it.
+    pub reads: CardId,
+    /// The contract domains they share.
+    pub shared: Vec<String>,
+}
+
+/// One cycle release invariant, carried into verification unanswered.
+///
+/// Section 10.2 lets a cycle declare invariants in free text, which no gate can
+/// evaluate. They are surfaced here rather than dropped: an invariant nobody is
+/// shown is an invariant nobody checks.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantCheck {
+    /// The invariant as the cycle stated it.
+    pub invariant: String,
+    /// Whether any gate could observe it. Always false for now; free-text
+    /// invariants are a reviewer's judgment, not a machine's.
+    pub machine_checked: bool,
+}
+
+/// The result of running every required gate against the landing commit.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationRecord {
+    /// Always [`VERIFICATION_SCHEMA`].
+    pub schema: String,
+    /// The integration verified.
+    pub integration_id: IntegrationId,
+    /// The cycle it belongs to.
+    pub cycle_id: CycleId,
+    /// The exact commit every gate ran against.
+    pub landing_sha: String,
+    /// The tree that commit carries.
+    pub landing_tree: String,
+    /// The receipts produced, one per gate.
+    pub receipt_ids: Vec<String>,
+    /// Gates that did not pass.
+    pub failed_gates: Vec<String>,
+    /// The cycle invariants a reviewer must still judge.
+    pub invariants: Vec<InvariantCheck>,
+    /// Member pairs whose contracts interact.
+    pub interactions: Vec<Interaction>,
+    /// True when the worktree was clean after every gate ran.
+    pub worktree_clean_after: bool,
+    /// Who ran it. Declared, not proven; see D-013.
+    pub verified_by: String,
+    /// When it completed.
+    pub verified_at: Timestamp,
+    /// The canonicalization algorithm its digest was computed under.
+    pub canonical_algorithm: String,
+}
+
+impl VerificationRecord {
+    /// Relative path of a verification inside the control repository.
+    #[must_use]
+    pub fn relative_path(integration_id: &IntegrationId) -> String {
+        format!("{VERIFICATION_DIR}/{integration_id}.json")
+    }
+
+    /// The verification's canonical digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be serialized.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+
+    /// True when every gate passed and the worktree stayed clean.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.failed_gates.is_empty() && self.worktree_clean_after
+    }
+}
+
+/// Derives the interaction checklist from the members' declared contracts.
+///
+/// Ordered pairs: "A changes what B reads" is a different thing to look at than
+/// the reverse, and collapsing them would hide one direction.
+#[must_use]
+pub fn interactions(members: &[(CardId, Vec<String>, Vec<String>)]) -> Vec<Interaction> {
+    let mut found = Vec::new();
+    for (changer, changes, _) in members {
+        for (reader, _, reads) in members {
+            if changer == reader {
+                continue;
+            }
+            let shared: Vec<String> = changes
+                .iter()
+                .filter(|domain| reads.contains(domain))
+                .cloned()
+                .collect();
+            if !shared.is_empty() {
+                found.push(Interaction {
+                    changes: changer.clone(),
+                    reads: reader.clone(),
+                    shared,
+                });
+            }
+        }
+    }
+    found
 }

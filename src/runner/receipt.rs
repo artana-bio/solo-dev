@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     clock::Timestamp,
     digest::Digest,
-    ids::{CardId, CycleId, ProjectId, ReceiptId},
+    ids::{CardId, CycleId, IntegrationId, ProjectId, ReceiptId},
 };
 
 /// Schema identifier for a receipt.
@@ -72,10 +72,20 @@ pub struct Receipt {
     pub project_id: ProjectId,
     /// The cycle it belongs to.
     pub cycle_id: CycleId,
-    /// The card whose gate ran.
-    pub card_id: CardId,
-    /// The card digest in force.
-    pub card_digest: Digest,
+    /// The card whose gate ran, when the run was for one card.
+    ///
+    /// Absent for a combined integration verification: that gate ran against
+    /// the landing tree, which belongs to every member card and to none of
+    /// them individually. Attributing it to one card would be a false claim
+    /// about what was checked. See D-046.
+    #[serde(default)]
+    pub card_id: Option<CardId>,
+    /// The card digest in force, when the run was for one card.
+    #[serde(default)]
+    pub card_digest: Option<Digest>,
+    /// The integration whose landing commit was verified, when it was one.
+    #[serde(default)]
+    pub integration_id: Option<IntegrationId>,
     /// The exact commit the gate ran against.
     pub evaluated_sha: String,
     /// The gate that ran.
@@ -111,6 +121,19 @@ pub struct Receipt {
 }
 
 impl Receipt {
+    /// What the run was for, as a short human label.
+    ///
+    /// Every receipt names a subject: a card for a feature gate, an
+    /// integration for a combined verification. One of the two is always set.
+    #[must_use]
+    pub fn subject(&self) -> String {
+        match (&self.card_id, &self.integration_id) {
+            (Some(card), _) => format!("card {card}"),
+            (None, Some(integration)) => format!("integration {integration}"),
+            (None, None) => "an unattributed run".to_owned(),
+        }
+    }
+
     /// Relative path of a receipt inside the control repository.
     #[must_use]
     pub fn relative_path(receipt_id: &ReceiptId) -> String {
@@ -185,8 +208,9 @@ mod tests {
             receipt_id: format!("R-{attempt:06}").parse().unwrap(),
             project_id: "example".parse().unwrap(),
             cycle_id: "C-001".parse().unwrap(),
-            card_id: "F-001".parse().unwrap(),
-            card_digest: Digest::of_bytes(b"card"),
+            card_id: Some("F-001".parse().unwrap()),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            integration_id: None,
             evaluated_sha: "a".repeat(40),
             gate_id: "gate.unit".to_owned(),
             gate_digest: Digest::of_bytes(b"gate"),
