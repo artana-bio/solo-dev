@@ -90,6 +90,63 @@ fn segment_matches(pattern: &str, name: &str) -> bool {
     true
 }
 
+/// True when some string is matched by both glob segments.
+///
+/// The two-directional `segment_matches(left, right) || segment_matches(right,
+/// left)` this replaces treated one side as a literal, so it missed every
+/// overlap where each pattern carries a wildcard the other must match through:
+/// `src/api_*.rs` and `src/*_handler.rs` were reported disjoint, and
+/// `src/api_handler.rs` matches both. Two cards could therefore be granted
+/// write scopes covering the same file, which is the one thing scope ownership
+/// exists to prevent.
+///
+/// This walks both globs together over the string they would have to share.
+/// Only `*` is a metacharacter, matching any run of characters within a
+/// segment, so a product walk over the two is exact rather than an
+/// approximation.
+fn segments_intersect(left: &str, right: &str) -> bool {
+    let a: Vec<char> = left.chars().collect();
+    let b: Vec<char> = right.chars().collect();
+    // `seen` keeps the walk linear in the product: without it, two globs of
+    // alternating stars and literals revisit the same pair exponentially.
+    let mut seen = vec![false; (a.len() + 1) * (b.len() + 1)];
+    let mut stack = vec![(0usize, 0usize)];
+
+    while let Some((i, j)) = stack.pop() {
+        let key = i * (b.len() + 1) + j;
+        if seen[key] {
+            continue;
+        }
+        seen[key] = true;
+
+        match (a.get(i), b.get(j)) {
+            (None, None) => return true,
+            // A trailing run of stars can match the empty string, so the other
+            // side being exhausted is not yet a failure.
+            (None, Some('*')) => stack.push((i, j + 1)),
+            (Some('*'), None) => stack.push((i + 1, j)),
+            (None, Some(_)) | (Some(_), None) => {}
+            (Some('*'), Some(_)) => {
+                // Match nothing, or absorb whatever the other side produces
+                // next. Both branches are needed: the star may have to swallow
+                // a literal the other glob emits, or step aside for it.
+                stack.push((i + 1, j));
+                stack.push((i, j + 1));
+            }
+            (Some(_), Some('*')) => {
+                stack.push((i, j + 1));
+                stack.push((i + 1, j));
+            }
+            (Some(left_char), Some(right_char)) => {
+                if left_char == right_char {
+                    stack.push((i + 1, j + 1));
+                }
+            }
+        }
+    }
+    false
+}
+
 /// True when a pattern matches a repository-relative path.
 #[must_use]
 pub fn matches(pattern: &str, path: &str, case: CaseSensitivity) -> bool {
@@ -130,8 +187,7 @@ fn match_segments(pattern: &[String], other: &[String], mode: MatchMode) -> bool
                     || match_segments(&pattern[1..], other, mode);
             }
             let heads_match = if mode == MatchMode::Pattern {
-                // Either side may hold a wildcard, so try both directions.
-                segment_matches(left, right) || segment_matches(right, left)
+                segments_intersect(left, right)
             } else {
                 segment_matches(left, right)
             };
@@ -315,6 +371,52 @@ mod tests {
         let exclude = vec![];
         let scope = Scope::with_case(&include, &exclude, SENSITIVE);
         assert!(!scope.allows("anything"));
+    }
+
+    #[test]
+    fn two_patterns_each_carrying_a_wildcard_intersect() {
+        // Tier 1, defect 4. The previous test asked whether either pattern
+        // matched the other as a literal, which is false here in both
+        // directions — and `src/api_handler.rs` matches both, so two cards
+        // could own the same file.
+        assert!(matches("src/api_*.rs", "src/api_handler.rs", SENSITIVE));
+        assert!(matches("src/*_handler.rs", "src/api_handler.rs", SENSITIVE));
+        assert!(
+            patterns_intersect("src/api_*.rs", "src/*_handler.rs", SENSITIVE),
+            "a file matching both patterns exists, so the scopes overlap"
+        );
+    }
+
+    #[test]
+    fn wildcards_that_cannot_meet_stay_disjoint() {
+        // The fix must not become "any two patterns with a star overlap",
+        // which would refuse every pair of cards touching one directory and
+        // make scope ownership useless. These share a directory and a
+        // wildcard, and no filename satisfies both.
+        assert!(!patterns_intersect("src/a_*.rs", "src/b_*.rs", SENSITIVE));
+        assert!(!patterns_intersect("src/*.rs", "src/*.txt", SENSITIVE));
+        assert!(!patterns_intersect(
+            "src/api_*.rs",
+            "src/*_handler.py",
+            SENSITIVE
+        ));
+    }
+
+    #[test]
+    fn overlapping_wildcards_may_share_one_character_run() {
+        // `*` matches an empty run, so the shared witness here is
+        // `src/handler.rs` — the same run satisfying both stars at once.
+        assert!(patterns_intersect(
+            "src/*handler.rs",
+            "src/handler*.rs",
+            SENSITIVE
+        ));
+        // And the walk must terminate on globs built to make it revisit pairs.
+        assert!(patterns_intersect(
+            "src/*a*a*a*a*a*a*a*a*.rs",
+            "src/*b*b*b*b*b*b*b*b*.rs",
+            SENSITIVE
+        ));
     }
 
     #[test]

@@ -155,6 +155,38 @@ fn overlapping_cards_cannot_both_activate() {
 }
 
 #[test]
+fn two_cards_whose_wildcards_meet_cannot_both_activate() {
+    // Tier 1, defect 4. Overlap detection asked whether either pattern matched
+    // the other as a literal, so two patterns that each carry a wildcard the
+    // other must match through were reported disjoint. `src/api_handler.rs`
+    // satisfies both, and both cards were granted write scope over it — the one
+    // outcome scope ownership exists to prevent, arrived at silently.
+    let workspace = with_active_cycle();
+    activate(&workspace, &Draft::new("F-001", &["src/api_*.rs"]));
+
+    let output = try_activate(&workspace, &Draft::new("F-002", &["src/*_handler.rs"]));
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-OWNERSHIP-OVERLAP");
+
+    let cycle = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(cycle["data"]["card_ids"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn two_cards_whose_wildcards_cannot_meet_both_activate() {
+    // The guard on the fix above. Refusing every pair of patterns that share a
+    // directory and a star would make the check useless in the ordinary case —
+    // two cards splitting a module by filename is exactly what write scopes are
+    // for, and no file satisfies both of these.
+    let workspace = with_active_cycle();
+    activate(&workspace, &Draft::new("F-001", &["src/api_*.rs"]));
+    activate(&workspace, &Draft::new("F-002", &["src/store_*.rs"]));
+
+    let cycle = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(cycle["data"]["card_ids"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn the_overlap_error_names_both_patterns_and_the_conflicting_card() {
     let workspace = with_active_cycle();
     activate(&workspace, &Draft::new("F-001", &["src/**"]));
