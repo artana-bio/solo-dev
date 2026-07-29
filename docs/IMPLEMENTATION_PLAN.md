@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 29 |
+| Plan revision | 30 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `30204fc` (`feat: recover an interrupted promotion, closing the last §19.3 code criterion`) |
+| Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
 | Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 649 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
-| Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
+| Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2751,6 +2751,13 @@ Requirement:
 
 #### Threshold C — Complete self-hosting
 
+Status: `DONE`. `SELFHOST-001` ran the full lifecycle against this repository on
+2026-07-28 and promoted `c51f2dc` to `main`. Two limitations are recorded rather
+than waived: the member-card review used a distinct declared actor but not a
+genuinely fresh context, and the three defects the run exposed were fixed by
+ordinary commits, since self-hosting becomes mandatory only after the run
+passes. Both are stated in `docs/SELFHOST-001.md`.
+
 Trigger: `WP-460` becomes `DONE`.
 
 Requirement:
@@ -2799,9 +2806,8 @@ prototype path.
 
 ### 19.3 Single-repository MVP gate
 
-Status: `IN_PROGRESS`. Every work-package criterion is met and four of the
-behavioural criteria are demonstrated by `tests/lifecycle.rs`; the remainder
-are listed below with what each still needs.
+Status: `IN_PROGRESS`. Eleven of the twelve criteria are met. Only the
+acceptance owner's signature on the release record remains.
 
 All must be true:
 
@@ -2835,8 +2841,8 @@ Progress against each criterion:
 | Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
 | No critical or high open defect | ✅ | No open defect is recorded; every defect found during implementation was fixed in the package that exposed it |
 | README documents installation and operator workflow | ✅ | `README.md`: installation, the three-repository model, the eleven-step operator workflow, recovery, and the exit-code table |
-| `SELFHOST-001` completes without manual Git mutation | ⏳ | Two attempts reached combined verification and were blocked by three real defects they exposed (D-052, D-053, D-054), all now fixed. The suite is verified green from a detached worktree, which is the condition that failed both times |
-| Acceptance owner signs the release record | ⏳ | Alvaro Alvarez, after the above |
+| `SELFHOST-001` completes without manual Git mutation | ✅ | Completed on the third attempt; landing commit `c51f2dc` on `main`, archive refs `refs/archive/cards/F-001` and `refs/archive/integrations/INT-001`, integration `archived`, card `closed`. The first two attempts exposed three real defects (D-052, D-053, D-054), which is recorded in `docs/SELFHOST-001.md` rather than smoothed over |
+| Acceptance owner signs the release record | ⏳ | Alvaro Alvarez. Every other criterion is now met |
 
 The recovery criterion was the one structural problem: Section 19.3 required a
 recovery that `WP-500` owned, and `WP-500` is scoped to the hardened release.
