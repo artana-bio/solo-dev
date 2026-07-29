@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 41 |
+| Plan revision | 42 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 729 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 732 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -3055,6 +3055,8 @@ and `WP-510`: check a claim before writing it down.
 | D-062 | Let `CHANGE_HARNESS_CONTROL` supply `--control`, except for `project init` | Accepted | Twenty-one commands require an absolute control path, and eleven self-hosted releases typed it several hundred times. Each repetition is an opportunity to point a command at the wrong project, which no amount of downstream checking catches — the command would be operating correctly on the wrong records. `project init` is excluded on purpose: that flag decides where a control repository is *created*, and inheriting it from a variable exported for a different project is how someone initializes into the wrong place. The missing-argument error names only the flag, because clap does not allow a required argument's error to be customised; `--help` names both, and the acceptance criterion was narrowed to match what is deliverable rather than left standing as unmet. |
 
 | D-063 | Test project neutrality directly rather than only through the ARTANA trial | Accepted | Every fixture, and the harness's own self-hosted development, is a Rust project checked by cargo. A language assumption baked into the engine would have passed all 726 tests and been discovered by the ARTANA trial — the most expensive place to find it. Driving a lifecycle against a Python project with `python3` and `make` gates costs three tests and catches it immediately. It found something on its first run: the compile gate writes `__pycache__` into the worktree, and an untracked file blocks handoff by design, so a project whose gates emit build output cannot complete a lifecycle unless it ignores that output. True of any project, invisible here because this repository ignores `target/` and nobody had to think about it. |
+
+| D-064 | Report a worktree locator that names a different control repository, and never refuse on it | Accepted | `CHANGE_HARNESS_CONTROL` (D-062) makes it possible to run a command for one project with a variable exported for another, and the command succeeds — correctly, against the wrong records. Nothing downstream can catch that, because nothing is wrong except the operator's intent. The worktree locator is the only artifact that knows which project a directory belongs to, so `project status` compares them. It reports and never refuses, because Section 9.3 makes the locator advisory: it lives in a tree the actor can edit, and a check that refused on it would be trusting exactly what the design says not to trust. |
 
 ### 19.5 Multi-repository gate
 

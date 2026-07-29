@@ -92,6 +92,12 @@ the variable: that flag decides where a control repository is *created*, and
 defaulting it from something exported for another project is how a project gets
 initialized into the wrong place.
 
+The same convenience has a hazard worth knowing: a variable exported for one
+project will happily drive a command meant for another, and the command will
+succeed — correctly, against the wrong records. `project status` reports when
+the worktree you are standing in belongs to a different control repository than
+the one in use, which is the case that catches most of it.
+
 ## Three repositories
 
 The harness separates three roles, and keeping them apart is what the safety
@@ -151,9 +157,17 @@ one actor and allocates a worktree and branch for it. Overlapping write scopes
 between active cards are refused here, not discovered at merge time.
 
 ```bash
-change-harness work start --control $CONTROL --card-id F-001
-change-harness gate run --control $CONTROL --card-id F-001 --gate-id gate.unit
+change-harness work start --card-id F-001
+change-harness gate run --card-id F-001 --gate-id gate.unit
 ```
+
+> **Your project must ignore whatever its gates write.** Gates run inside the
+> worktree, and an untracked file blocks handoff — deliberately, because an
+> untracked file can silently become part of a candidate. A test suite that
+> emits coverage data, a compiler that leaves a cache, a formatter that writes
+> a backup: any of these will stop a card handing off until the project's
+> `.gitignore` covers them. Most projects already do this and never notice;
+> the ones that do not will meet it at the first handoff.
 
 **5. Hand off an exact candidate.** The declaration names the SHA the actor
 believes they delivered, and the harness refuses if the branch says otherwise.
