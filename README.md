@@ -9,31 +9,48 @@ will not own the workflow engine.
 
 ## Status
 
+**Not released. Both release gates are `BLOCKED`, and the evidence this produces
+has not been independently re-assessed since it was repaired.**
+
 Every Single-repository MVP work package is implemented, along with all five
 hardening packages: failure injection at every journaled boundary, stale-lock
 diagnosis with explicit lease reclaim, verified backups, cycle auditing with
-evidence cross-checking, and generated-artifact classification.
+evidence cross-checking, and generated-artifact classification. 801 tests pass.
 
-**Eleven of the twelve Section 19.3 release criteria are met. The remaining one
-is the acceptance owner's signature on the release record.** Five of the seven
-Section 19.4 hardening criteria are met; the two outstanding both need
-something outside this repository — a soak run for "concurrency tests pass
-repeatedly", and an ARTANA checkout for the profile trial. The per-criterion
-status, with the test that demonstrates each, is in
-[the implementation plan](./docs/IMPLEMENTATION_PLAN.md).
+That was previously reported here as "eleven of the twelve Section 19.3 release
+criteria are met; the remaining one is the acceptance owner's signature". An
+eight-reviewer independent review disproved it. Every one of the eight found
+defects that invalidated a recorded claim; twenty-four are catalogued in
+[the defect register](./docs/DEFECT-REGISTER.md), five of which meant the
+evidence chain did not hold.
+
+**All twenty-four are now fixed**, each with a test that fails against the
+unfixed code and a mutation check confirming the test catches the enforcement
+rather than the recording. Several more defects were found while fixing them,
+including that failure injection could not observe the state it was built to
+test, and that five existing fixtures were asserting defects as correct
+behaviour.
+
+The gates stay blocked anyway, and the reason is the point. Fixing every
+catalogued defect is not the same as the criteria being met: the criteria were
+assessed by the author of the code, against tests the same author wrote, and
+that assessment is precisely what failed. Section 19.3 and 19.4 need
+re-assessing by someone else before either can move.
 
 The harness runs its own development. `SELFHOST-001` took a documentation-only
 card through every lifecycle stage against this repository and promoted the
 result; every package since has been built the same way. That run is recorded
 in [its report](./docs/SELFHOST-001.md), including the two attempts that failed
 first and the three defects they exposed — which is the reason Threshold C
-exists.
+exists. **Threshold C is currently suspended** (D-065): certifying the repair of
+an evidence chain using that same chain proves nothing about either, so repairs
+land as ordinary reviewed commits.
 
 One limitation is worth knowing before relying on the evidence: the reviews in
 these runs were recorded by distinct declared actors but not from genuinely
 fresh contexts. D-013 makes actor identity declared rather than proven, so the
-harness cannot detect this. It is recorded as an accepted-risk finding on each
-review rather than left for a reader to infer.
+harness cannot detect this. That gap is exactly the one the eight-reviewer
+exercise measured, and it measured badly.
 
 The `SPIKE-001` walking skeleton that preceded implementation is recorded in
 [its report](./docs/spikes/SPIKE-001-REPORT.md). No prototype code was merged;
