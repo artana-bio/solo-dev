@@ -9,6 +9,7 @@ pub mod domain;
 pub mod error;
 pub mod git;
 pub mod policy;
+pub mod runner;
 
 use cli::{
     Cli, Command, LEGACY_FORMAT_WARNING,

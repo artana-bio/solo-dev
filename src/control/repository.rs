@@ -36,7 +36,12 @@ pub const CONTROL_AUTHOR_EMAIL: &str = "change-harness@local.invalid";
 /// place non-authoritative state into authoritative history. Recovery reads the
 /// journal from the working tree precisely because a crashed process leaves it
 /// there uncommitted. See D-029.
-const CONTROL_IGNORE: &str = "harness.lock\njournal/\n";
+///
+/// Gate logs are excluded because Section 14.3 gives them retention windows
+/// rather than permanence, and a passing gate's output is large and
+/// uninteresting. Invariant 7.4.2 is satisfied by the receipt, which records
+/// each log's location and digest.
+const CONTROL_IGNORE: &str = "harness.lock\njournal/\nlogs/\n";
 
 /// A control repository on disk.
 #[derive(Clone, Debug)]

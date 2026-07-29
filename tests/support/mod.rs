@@ -297,6 +297,27 @@ impl Workspace {
         self.activate_card_with_base(card_id, include, &self.authority_head());
     }
 
+    /// Creates and activates a card naming explicit feature gates.
+    pub fn activate_card_with_gates(&self, card_id: &str, include: &[&str], gates: &[&str]) {
+        let list = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [{gates}]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = self.authority_head(),
+            inc = list(include),
+            gates = list(gates),
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
+    }
+
     /// Creates and activates a card with an explicit exclude list.
     pub fn activate_card_excluding(&self, card_id: &str, include: &[&str], exclude: &[&str]) {
         let list = |values: &[&str]| {

@@ -91,6 +91,12 @@ pub enum ErrorCode {
     PolicyLocatorMismatch,
     /// A candidate changed paths outside its card's declared scope.
     PolicyCandidateOutOfScope,
+    /// The gate runner could not execute or supervise a process.
+    GateRunnerError,
+    /// A named gate failed, timed out, or was signalled.
+    GateFailed,
+    /// Required gate evidence is missing or no longer applies.
+    GateEvidenceStale,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -107,7 +113,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 47] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -146,6 +152,9 @@ impl ErrorCode {
         Self::PolicyLeaseHeld,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
+        Self::GateRunnerError,
+        Self::GateFailed,
+        Self::GateEvidenceStale,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -191,6 +200,9 @@ impl ErrorCode {
             | Self::PolicyLeaseHeld
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope => ExitCategory::Policy,
+            Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
+                ExitCategory::Gate
+            }
             Self::PreconditionNotFound
             | Self::PreconditionBaseMissing
             | Self::PreconditionBranchExists
@@ -246,6 +258,9 @@ impl ErrorCode {
             Self::PolicyLeaseHeld => "LEASE-HELD",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
+            Self::GateRunnerError => "RUNNER-ERROR",
+            Self::GateFailed => "FAILED",
+            Self::GateEvidenceStale => "EVIDENCE-STALE",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -273,6 +288,7 @@ impl ErrorCode {
             ExitCategory::Configuration => self.config_recovery(),
             ExitCategory::Policy => self.policy_recovery(),
             ExitCategory::Precondition => self.precondition_recovery(),
+            ExitCategory::Gate => self.gate_recovery(),
             _ => self.other_recovery(),
         }
     }
@@ -387,6 +403,20 @@ impl ErrorCode {
                 "Land or archive the branch's commits before deleting it."
             }
             _ => "Satisfy the reported precondition, then retry.",
+        }
+    }
+
+    /// Guidance for gate failures.
+    const fn gate_recovery(self) -> &'static str {
+        match self {
+            Self::GateRunnerError => {
+                "Check the gate's executable exists and is runnable in the evaluation worktree."
+            }
+            Self::GateFailed => "Fix the failure the gate reported, then rerun it.",
+            Self::GateEvidenceStale => {
+                "Rerun the gate against the current candidate; the recorded run no longer applies."
+            }
+            _ => "Resolve the reported gate failure.",
         }
     }
 

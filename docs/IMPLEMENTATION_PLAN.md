@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 14 |
+| Plan revision | 15 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `f2066bd` (`feat(WP-240): authoritative candidate verification`) |
+| Previous plan commit | `d96c9eb` (`feat(WP-300): named gate registry`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240`, `WP-300` complete; 399 tests passing. Threshold A is live. |
-| Next executable work package | `WP-310` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-240`, `WP-300`, `WP-310` complete; 436 tests passing. Threshold A is live. |
+| Next executable work package | `WP-250` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1918,9 +1918,38 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-300` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 13 workspace tests plus 24 unit tests;
+- success, failure, timeout, signal, and runner error are separate terminations,
+  each asserted: a clean non-zero exit is `completed`, a deadline is `timeout`,
+  and a missing executable is a runner error rather than a gate failure;
+- every attempt is recorded and numbered, with logs written to per-attempt paths
+  so a retry cannot overwrite the evidence of the attempt before it;
+- the child starts from an empty environment and receives only what the gate
+  names, proven by a gate that cannot see `HOME` unless it is allowlisted;
+- gate output never reaches the JSON envelope: a gate that prints JSON to stdout
+  is captured to log files while the envelope stays one clean document;
+- a receipt goes stale when either the candidate or the gate definition moves,
+  and the staleness message names which binding broke;
+- a gate passing only beyond its declared attempts is not acceptable evidence.
+
+Two defects were found by tests rather than by inspection:
+
+- reading the child's pipes only after it exits deadlocks any gate that prints
+  more than the pipe buffer, roughly 64 KiB. The gate would then hang until its
+  own timeout. Fixed by draining both streams concurrently; the bounded-log test
+  went from 30 seconds to 1;
+- gate logs were being committed to control history. Section 14.3 gives logs
+  retention windows rather than permanence, so they are now excluded and the
+  receipt carries their location and digest, which is what invariant 7.4.2
+  actually requires.
 
 Deliverables:
 
@@ -2558,11 +2587,12 @@ All must be true:
 | Worktree allocation | `DONE` | `WP-230`, 35 tests | Preserve |
 | Candidate verification | `DONE` | `WP-240`, 32 tests | Preserve |
 | Gate registry | `DONE` | `WP-300`, 31 tests | Preserve |
-| Gate runner and receipts | `READY` | `WP-300` complete | `WP-310` |
+| Gate runner and receipts | `DONE` | `WP-310`, 37 tests | Preserve |
+| Handoff | `READY` | `WP-240` and `WP-310` complete | `WP-250` |
 
 
 
-| Handoff and review | `NOT_STARTED` | None | `WP-250`, `WP-320` |
+
 | Bare authority | `NOT_STARTED` | None | `WP-400` |
 | Integration | `NOT_STARTED` | None | `WP-410` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
@@ -2581,8 +2611,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-310` |
-| Next branch name | `wp/WP-310-gate-runner` |
+| Next work package | `WP-250` |
+| Next branch name | `wp/WP-250-handoff` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2708,6 +2738,8 @@ commands before commit even though Rust behavior is unchanged.
 | D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
 | D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
 | D-030 | Accept card drafts in YAML or JSON via `serde_yaml_ng` | Accepted | D-010 permits YAML drafts. `serde_yaml` is archived, so a maintained fork is used. JSON is accepted for free because it is a YAML subset, which suits machine authors without a second code path. |
+| D-035 | Terminate gate process groups by invoking `kill` rather than `libc::killpg` | Accepted | The crate sets `unsafe_code = "forbid"`, and `killpg` requires an unsafe block. Invoking `kill` with a negative process id is the same operation expressed through a process boundary, and keeps the crate free of unsafe code. |
+| D-036 | Exclude gate logs from control history | Accepted | Section 14.3 gives logs retention windows rather than permanence, and a passing gate's output is large and uninteresting. Invariant 7.4.2 is satisfied by the receipt, which records each log's location and SHA-256 digest. |
 | D-034 | Add `gate validate`, `register`, `list`, and `show` to the Section 12.3 command surface | Accepted | Section 12.3 lists only `gate run` and `gate status`, but gates must be registered before a card can name one, and D-008 makes registration a deliberate trusted act rather than a side effect of authoring a card. |
 | D-032 | Add `work verify` to the Section 12.3 command surface | Accepted | `WP-240` produces a structured verification report, and without a command it would only be observable through `handoff create` in `WP-250`. A separate read-only command lets an actor check scope before attempting handoff. |
 | D-033 | Treat a failed verification as a policy refusal rather than a successful report | Accepted | Returning exit 0 with `passed: false` would let a caller pipe the result onward and treat an out-of-scope candidate as ready. The verdict is the command's outcome, not its payload. |

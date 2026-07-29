@@ -194,7 +194,11 @@ fn leases_for(
 }
 
 /// The lease currently held for a card, if any.
-fn held_lease(
+///
+/// # Errors
+///
+/// Returns an error when the lease store cannot be read.
+pub fn held_lease(
     control: &ControlRepository,
     card_id: &CardId,
 ) -> Result<Option<LeaseRecord>, HarnessError> {
