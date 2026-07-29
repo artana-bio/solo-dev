@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_identifies_this_path_as_a_linked_worktree_or_the_main_one() {
+    fn probe_classifies_this_path_as_a_non_bare_repository() {
         let probe = GitClient::probe(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         let RepositoryClass::Repository {
             bare,
@@ -126,13 +126,14 @@ mod tests {
             panic!("expected a repository");
         };
         assert!(!bare, "the source checkout is not bare");
-        // Neither `linked_worktree` nor `detached_head` is pinned. This crate
-        // is developed from linked worktrees, and its own integration gates run
-        // in a *detached* worktree by design, so both values depend on where
-        // the suite happens to run. Asserting either would make the test a
-        // statement about the environment rather than about the code — which
-        // is exactly how it failed the first time the harness ran its own
-        // gates against itself.
+        // Non-bare is the whole claim, and the name says so. Neither
+        // `linked_worktree` nor `detached_head` is pinned: this crate is
+        // developed from linked worktrees and gated from a detached one, so
+        // both depend on where the suite happens to run. Asserting either
+        // would make the test a statement about the environment rather than
+        // the code — which is exactly how it failed the first time the harness
+        // ran its own gates against itself (D-052). The name was left claiming
+        // more than that until D-061.
         let _ = linked_worktree;
         let _ = detached_head;
     }
