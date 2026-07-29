@@ -460,3 +460,135 @@ fn the_transient_lock_never_enters_control_history() {
     assert!(!listing.contains(LOCK_FILE), "{listing}");
     assert!(listing.contains(PROJECT_FILE), "{listing}");
 }
+
+#[test]
+fn status_reports_a_worktree_belonging_to_a_different_project() {
+    // The hazard `CHANGE_HARNESS_CONTROL` introduces: a variable exported for
+    // one project drives a command meant for another, and the command succeeds
+    // correctly against the wrong records. The locator is the only thing that
+    // knows, so `project status` says so.
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+
+    // A locator naming some other project, in the directory the command runs
+    // from.
+    let elsewhere = fixture.root.join("another-control");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let stage = fixture.root.join("stage");
+    fs::create_dir_all(stage.join(".agent")).unwrap();
+    fs::write(
+        stage.join(".agent/project.json"),
+        serde_json::json!({
+            "schema": "harness.worktree-link/v1",
+            "project_id": "example",
+            "card_id": "F-042",
+            "card_revision": 1,
+            "control_repository": elsewhere,
+            "lease_id": "L-000001",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .current_dir(&stage)
+        .args([
+            "project",
+            "status",
+            "--output",
+            "json",
+            "--control",
+            &fixture.control.display().to_string(),
+        ])
+        .output()
+        .expect("the CLI should start");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(
+        output.status.success(),
+        "the locator is advisory, so this reports rather than refuses"
+    );
+    let warning = envelope["warnings"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(warning.contains("F-042"), "unexpected: {envelope}");
+    assert!(
+        envelope["data"]["locator_disagreement"].is_string(),
+        "the disagreement must be in the payload too: {envelope}"
+    );
+}
+
+#[test]
+fn status_says_nothing_about_the_locator_when_there_is_none() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+
+    let empty = fixture.root.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .current_dir(&empty)
+        .args([
+            "project",
+            "status",
+            "--output",
+            "json",
+            "--control",
+            &fixture.control.display().to_string(),
+        ])
+        .output()
+        .expect("the CLI should start");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(envelope["warnings"].as_array().unwrap().len(), 0);
+    assert!(envelope["data"]["locator_disagreement"].is_null());
+    // The rest of the report is unchanged.
+    assert_eq!(envelope["data"]["project_id"], "example");
+    assert!(envelope["data"]["lock"].is_object());
+}
+
+#[test]
+fn status_says_nothing_when_the_locator_agrees() {
+    // The half the "no locator" test does not reach: a locator that names the
+    // control repository actually in use must produce no warning. Without
+    // this, reporting a disagreement unconditionally would pass every test.
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+
+    let stage = fixture.root.join("agreeing");
+    fs::create_dir_all(stage.join(".agent")).unwrap();
+    fs::write(
+        stage.join(".agent/project.json"),
+        serde_json::json!({
+            "schema": "harness.worktree-link/v1",
+            "project_id": "example",
+            "card_id": "F-001",
+            "card_revision": 1,
+            "control_repository": &fixture.control,
+            "lease_id": "L-000001",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .current_dir(&stage)
+        .args([
+            "project",
+            "status",
+            "--output",
+            "json",
+            "--control",
+            &fixture.control.display().to_string(),
+        ])
+        .output()
+        .expect("the CLI should start");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(
+        envelope["warnings"].as_array().unwrap().len(),
+        0,
+        "an agreeing locator must be silent: {envelope}"
+    );
+    assert!(envelope["data"]["locator_disagreement"].is_null());
+}

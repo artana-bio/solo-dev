@@ -357,6 +357,43 @@ fn authority_health(config: &ProjectConfig) -> serde_json::Value {
     })
 }
 
+/// Reports a worktree locator that names a different control repository.
+///
+/// Section 9.3 keeps the locator advisory: it lives in a tree the actor can
+/// edit, so it is never authoritative and this never refuses. But it does know
+/// which project its worktree belongs to, and that is exactly the fact missing
+/// when `CHANGE_HARNESS_CONTROL` is exported for one project and a command is
+/// run for another — where the command succeeds, correctly, against the wrong
+/// records. Reporting the disagreement costs nothing and is the only signal
+/// available.
+fn locator_disagreement(control: &ControlRepository) -> Option<String> {
+    let mut directory = std::env::current_dir().ok()?;
+    loop {
+        let candidate = directory
+            .join(crate::git::worktree::AGENT_DIR)
+            .join("project.json");
+        if candidate.exists() {
+            let raw = fs::read_to_string(&candidate).ok()?;
+            let link: crate::domain::lease::WorktreeLink = serde_json::from_str(&raw).ok()?;
+            // Compared after canonicalization, so a symlinked or
+            // relatively-expressed path does not read as a different project.
+            let recorded = fs::canonicalize(&link.control_repository).ok()?;
+            let in_use = fs::canonicalize(control.root()).ok()?;
+            return (recorded != in_use).then(|| {
+                format!(
+                    "this worktree belongs to card {} of the project at {}, not the control repository in use at {}",
+                    link.card_id,
+                    recorded.display(),
+                    in_use.display()
+                )
+            });
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
 fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
@@ -380,6 +417,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         },
         unresolved.len()
     );
+    let disagreement = locator_disagreement(&control);
     let authority = authority_health(&config);
     let _ = write!(
         text,
@@ -411,7 +449,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         );
     }
 
-    Ok(CommandOutcome::new(
+    let mut outcome = CommandOutcome::new(
         "project.status",
         text,
         serde_json::json!({
@@ -432,9 +470,13 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             },
             "authority": authority,
             "unresolved_operations": unresolved,
+            "locator_disagreement": disagreement,
         }),
-    )
-    .with_project(config.project_id.clone()))
+    );
+    if let Some(warning) = disagreement {
+        outcome = outcome.with_warning(warning);
+    }
+    Ok(outcome.with_project(config.project_id.clone()))
 }
 
 /// Finishes what an interrupted operation left undone.
