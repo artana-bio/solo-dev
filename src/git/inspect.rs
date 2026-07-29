@@ -387,18 +387,61 @@ pub struct WorktreeState {
 pub fn worktree_state(scope: &GitScope) -> Result<WorktreeState, HarnessError> {
     let output = run_ok(
         scope,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
     )?;
-    let dirty_paths: Vec<String> = output
-        .stdout
-        .split('\0')
-        .filter(|record| !record.is_empty())
-        .map(|record| record.get(3..).unwrap_or(record).to_owned())
-        .collect();
+    let dirty_paths = parse_status_porcelain_z(&output.stdout)?;
     Ok(WorktreeState {
         clean: dirty_paths.is_empty(),
         dirty_paths,
     })
+}
+
+/// Parses `git status --porcelain=v1 -z` into the paths it names.
+///
+/// Every record is `XY <path>`, and byte 3 onwards is the path. A malformed
+/// record is refused rather than truncated: the previous
+/// `record.get(3..).unwrap_or(record)` handed back the untouched field when the
+/// strip failed, so a wrong answer was indistinguishable from a right one.
+///
+/// `--no-renames` at the call site is load-bearing, not tidiness. With rename
+/// detection on, a rename emits **two** NUL-separated fields — `R  <dest>\0
+/// <source>\0` — and the second is a bare path with no `XY ` prefix. Stripping
+/// three bytes from it turned `src/alpha.rs` into `/alpha.rs`: a dirty path
+/// that exists nowhere. With the flag, the same rename arrives as `D  <source>`
+/// and `A  <dest>`, one field per record, and both real paths are reported,
+/// which is what a cleanliness report wants. It also makes the answer
+/// independent of the repository's `status.renames` setting.
+///
+/// Do not remove the flag without also teaching this function to consume a
+/// second field. With the strict parse in place, dropping it makes
+/// `worktree_state` fail on every staged rename.
+///
+/// # Errors
+///
+/// Returns an external-tool error when a record does not have the shape the
+/// porcelain format guarantees.
+fn parse_status_porcelain_z(raw: &str) -> Result<Vec<String>, HarnessError> {
+    raw.split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let bytes = record.as_bytes();
+            // Length first: indexing byte 2 panics on a shorter record, and
+            // `"a"` is exactly the input a malformed-output check must survive.
+            // Byte 3 is always a char boundary because `XY ` is ASCII.
+            if bytes.len() < 4 || bytes[2] != b' ' {
+                return Err(HarnessError::GitCommand(format!(
+                    "malformed status record: {record:?}"
+                )));
+            }
+            Ok(record[3..].to_owned())
+        })
+        .collect()
 }
 
 /// A Git operation left half-finished in the worktree.
@@ -478,6 +521,43 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_status_record_without_the_two_letter_code_is_refused_not_truncated() {
+        // The strict half of the rename fix, and the only place it is
+        // observable: with `--no-renames` at the call site, real Git never
+        // emits a bare field, so no real-repository test can reach this. The
+        // previous parser used `get(3..).unwrap_or(record)`, which handed back
+        // the untouched field when the strip failed — a wrong answer that
+        // looked exactly like a right one.
+        for malformed in ["src/alpha.rs\0", "ab\0", "?? \0", "a\0"] {
+            assert!(
+                parse_status_porcelain_z(malformed).is_err(),
+                "{malformed:?} must be refused rather than truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn status_records_keep_the_whole_path_after_the_two_letter_code() {
+        // The guard against refusing too much. A parser that cannot answer
+        // blocks handoff, work resume, work verify, archive close and project
+        // init — every one of them asks whether a worktree is clean.
+        let raw = "?? a\0 M na me
+with
+newlines.txt\0D  一二三.md\0";
+        assert_eq!(
+            parse_status_porcelain_z(raw).unwrap(),
+            vec![
+                "a".to_owned(),
+                "na me
+with
+newlines.txt"
+                    .to_owned(),
+                "一二三.md".to_owned(),
+            ]
+        );
+    }
     use super::*;
 
     #[test]

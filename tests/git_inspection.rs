@@ -51,6 +51,14 @@ fn repo_with_commit() -> (TempDir, PathBuf) {
     (temp, path)
 }
 
+/// Creates an empty repository with a deterministic identity, no commits.
+fn init_repo(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-q", "-b", "main"]);
+    git(path, &["config", "user.email", "fixture@local.invalid"]);
+    git(path, &["config", "user.name", "Fixture"]);
+}
+
 fn scope(path: &Path) -> GitScope {
     GitScope::work_tree(path)
 }
@@ -477,4 +485,187 @@ fn successful_queries_expose_trimmed_stdout() {
     let output = run_ok(&scope(&path), ["rev-parse", "HEAD"]).unwrap();
     assert_eq!(output.trimmed_stdout().len(), 40);
     assert!(!output.trimmed_stdout().ends_with('\n'));
+}
+
+#[test]
+fn a_staged_rename_reports_both_real_paths() {
+    // Tier 4. `git status --porcelain=v1 -z` emits TWO fields for a rename —
+    // `R  <dest>\0<source>\0` — and the second is a bare path with no `XY `
+    // prefix. The parser stripped three bytes from every field, so
+    // `src/alpha.rs` was reported as `/alpha.rs`: a dirty path that exists
+    // nowhere, in a report an actor is meant to act on.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo");
+    init_repo(&path);
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/alpha.rs"), "fn alpha() {}\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "add alpha"]);
+    git(&path, &["mv", "src/alpha.rs", "src/beta.rs"]);
+
+    let state = worktree_state(&scope(&path)).expect("a status");
+    assert!(!state.clean);
+    assert!(
+        state.dirty_paths.contains(&"src/alpha.rs".to_owned()),
+        "the rename source must be reported as itself: {:?}",
+        state.dirty_paths
+    );
+    assert!(
+        state.dirty_paths.contains(&"src/beta.rs".to_owned()),
+        "and so must the destination: {:?}",
+        state.dirty_paths
+    );
+
+    // The guard against a fix that merely stops inventing paths: every path
+    // reported must be one that actually exists, on disk or in HEAD.
+    for reported in &state.dirty_paths {
+        let on_disk = path.join(reported).exists();
+        let in_head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["cat-file", "-t", &format!("HEAD:{reported}")])
+            .output()
+            .expect("git should run")
+            .status
+            .success();
+        assert!(on_disk || in_head, "{reported} exists nowhere");
+    }
+}
+
+#[test]
+fn a_rename_source_named_like_a_status_prefix_is_not_truncated() {
+    // The test that kills a heuristic fix. "Strip three bytes only when the
+    // field looks like it has an `XY ` prefix" passes every other test here and
+    // silently truncates this one, because the file is literally named
+    // `R  looks-like-status.txt`.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo");
+    init_repo(&path);
+    fs::write(path.join("R  looks-like-status.txt"), "content\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "add oddly named file"]);
+    git(&path, &["mv", "R  looks-like-status.txt", "renamed.txt"]);
+
+    let state = worktree_state(&scope(&path)).expect("a status");
+    assert!(
+        state
+            .dirty_paths
+            .contains(&"R  looks-like-status.txt".to_owned()),
+        "the source must be reported verbatim: {:?}",
+        state.dirty_paths
+    );
+}
+
+#[test]
+fn the_report_does_not_depend_on_status_renames_config() {
+    // `status.renames` is an operator setting. Whether a cleanliness report
+    // names both sides of a rename must not turn on it.
+    for setting in ["true", "false", "copies"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repo");
+        init_repo(&path);
+        git(&path, &["config", "status.renames", setting]);
+        fs::write(path.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        git(&path, &["add", "-A"]);
+        git(&path, &["commit", "-q", "-m", "add alpha"]);
+        git(&path, &["mv", "alpha.rs", "beta.rs"]);
+
+        let mut reported = worktree_state(&scope(&path)).expect("a status").dirty_paths;
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec!["alpha.rs".to_owned(), "beta.rs".to_owned()],
+            "status.renames={setting} changed the answer"
+        );
+    }
+}
+
+#[test]
+fn a_rename_does_not_swallow_the_next_dirty_path() {
+    // The guard against a lookahead fix. Consuming a second field on `R`/`C`
+    // works until the record after a rename is an ordinary one, which it then
+    // eats.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo");
+    init_repo(&path);
+    fs::write(path.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+    fs::write(path.join("README.md"), "hello\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "base"]);
+    git(&path, &["mv", "alpha.rs", "zeta.rs"]);
+    fs::write(path.join("README.md"), "changed\n").unwrap();
+    fs::write(path.join("untracked.txt"), "new\n").unwrap();
+
+    let mut reported = worktree_state(&scope(&path)).expect("a status").dirty_paths;
+    reported.sort();
+    assert_eq!(
+        reported,
+        vec![
+            "README.md".to_owned(),
+            "alpha.rs".to_owned(),
+            "untracked.txt".to_owned(),
+            "zeta.rs".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn an_untracked_file_inside_an_untracked_directory_is_named() {
+    // `--untracked-files=all` was entirely unguarded: deleting it left the full
+    // suite green, because every existing fixture writes its untracked file at
+    // the repository root, where Git's default `-unormal` names it anyway. One
+    // directory down the default collapses to `nested/` and the file is never
+    // named — and an untracked file that no report names is exactly what
+    // handoff refuses to let past.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo");
+    init_repo(&path);
+    fs::write(path.join("seed.txt"), "seed\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "seed"]);
+    fs::create_dir_all(path.join("nested")).unwrap();
+    fs::write(path.join("nested/hidden.txt"), "hidden\n").unwrap();
+
+    let state = worktree_state(&scope(&path)).expect("a status");
+    assert_eq!(
+        state.dirty_paths,
+        vec!["nested/hidden.txt".to_owned()],
+        "the file must be named, not collapsed to its directory"
+    );
+}
+
+#[test]
+fn a_conflicted_worktree_is_still_reportable() {
+    // The shape most likely to blindside a strict status parser here: `handoff`
+    // and `work verify` both run against a worktree that may be mid-merge, and
+    // `UU`/`AA`/`DU` are what Git emits there. A parser that cannot answer
+    // blocks the lifecycle.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo");
+    init_repo(&path);
+    fs::write(path.join("shared.txt"), "base\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "base"]);
+    git(&path, &["checkout", "-q", "-b", "other"]);
+    fs::write(path.join("shared.txt"), "other\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "other"]);
+    git(&path, &["checkout", "-q", "main"]);
+    fs::write(path.join("shared.txt"), "main\n").unwrap();
+    git(&path, &["add", "-A"]);
+    git(&path, &["commit", "-q", "-m", "main"]);
+    let merge = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["merge", "other"])
+        .output()
+        .expect("git should run");
+    assert!(
+        !merge.status.success(),
+        "the fixture must actually conflict"
+    );
+
+    let state = worktree_state(&scope(&path)).expect("a conflicted worktree must still answer");
+    assert!(!state.clean);
+    assert!(state.dirty_paths.contains(&"shared.txt".to_owned()));
 }

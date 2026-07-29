@@ -84,8 +84,14 @@ filesystem, a permissions mistake, a full disk are all the operator's to fix.
 Those kinds are now `CH-PRECONDITION-CONTROL-ACCESS`, exit 4. `NotFound` stays
 internal on purpose: a control file missing when the state says it exists is
 corruption, and nothing here can tell that from someone deleting the directory. The conflict-token table does not
-match git's real output and binary conflicts are double-counted. Rename records
-are mis-parsed into paths that do not exist. Dependency SHAs are never bound to
+match git's real output and binary conflicts are double-counted. ✅ **FIXED:** rename records were mis-parsed into paths that do not exist —
+specifically in the `status --porcelain=v1 -z` parser, **not** the `--raw -z`
+diff parser, which is correct and consumes its second field properly. A rename
+emits two NUL-separated fields and the second is a bare path with no `XY `
+prefix, so stripping three bytes turned `src/alpha.rs` into `/alpha.rs`.
+`--no-renames` plus a parser that refuses a malformed record rather than
+truncating it. Recording the disambiguation so the next reader does not
+re-audit `diff.rs`. Dependency SHAs are never bound to
 a review. Cycle status folds card events. Five cycle statuses and one card state
 are unreachable. Generated-artifact scope checks compare globs with `==`. Merge
 honours `commit.gpgsign` and repository hooks, contradicting "hooks are
