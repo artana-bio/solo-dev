@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 34 |
+| Plan revision | 35 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 690 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 699 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. Eleven of the twelve Section 19.3 criteria are met; only the acceptance owner's signature remains. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2636,9 +2636,10 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-460` |
 | Target release | Hardened single-repository release |
+| Evidence | `src/commands/audit.rs`, `tests/audit.rs` (9 acceptance tests) |
 
 Deliverables:
 
@@ -2654,6 +2655,29 @@ Acceptance:
 - secrets are excluded;
 - missing or mismatched evidence is explicit;
 - report identifies the exact protected-branch transition.
+
+Delivered notes:
+
+- The report's value is entirely in the discrepancies. A summary of records
+  that agree tells a reader nothing they could not get by listing files; what
+  they cannot get any other way is whether the evidence still describes the
+  objects it names. So a stale digest, a vanished commit, or a missing revision
+  is a *finding*, never a line quietly dropped because it could not be
+  resolved (D-058).
+- A report that found discrepancies exits non-zero. A caller piping the result
+  onward must not have to parse prose to learn the answer, which is the same
+  reasoning as D-033 for candidate verification.
+- Redaction is structural rather than filtered: gate logs live outside control
+  history by D-036, and the report names their location and never reads them.
+  Nothing needs a secret-scanning heuristic, because the captured third-party
+  text is never opened. The test proves the negative properly — it writes a
+  recognizable secret through a real gate, asserts it reached disk, then
+  asserts it is absent from the report.
+- Events are ordered by their monotonic identifiers rather than by timestamp,
+  because two events recorded in the same second would otherwise sort
+  arbitrarily and the timeline is the point.
+
+| D-058 | Report unresolvable evidence as a discrepancy rather than omitting it | Accepted | The tempting implementation skips what it cannot resolve, which produces a clean-looking report from a damaged record — the worst possible output, because it converts an unknown into a false assurance in exactly the situation an audit exists for. A missing revision, a stale digest, and a vanished commit are all reported with what the record claims and what was found, and the command exits non-zero so a caller does not have to read prose to learn there was a problem. |
 
 ### WP-540 — Generated-artifact governance
 
