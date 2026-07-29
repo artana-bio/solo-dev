@@ -355,7 +355,11 @@ fn cli_validate_reports_the_exact_invalid_field_in_json() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "harness.command-error/v1");
-    assert_eq!(envelope["command"], "project");
+    assert_eq!(
+        envelope["command"], "project.validate",
+        "the error envelope names the subcommand; this asserted the group, \
+         which was the defect"
+    );
     assert_eq!(envelope["error"]["code"], "CH-CONFIG-PROTECTED-BRANCH");
     assert_eq!(envelope["error"]["details"]["field"], "protected_branch");
 }

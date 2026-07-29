@@ -41,6 +41,22 @@ pub enum HandoffCommand {
     Revoke(RevokeArgs),
 }
 
+impl HandoffCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `handoff` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Create(..) => "handoff.create",
+            Self::Inspect(..) => "handoff.inspect",
+            Self::Revoke(..) => "handoff.revoke",
+        }
+    }
+}
+
 /// Arguments shared by handoff subcommands.
 #[derive(Debug, Args)]
 pub struct CommonArgs {

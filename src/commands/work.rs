@@ -50,6 +50,26 @@ pub enum WorkCommand {
     Reclaim(ReclaimArgs),
 }
 
+impl WorkCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `work` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Start(..) => "work.start",
+            Self::Status(..) => "work.status",
+            Self::Checkpoint(..) => "work.checkpoint",
+            Self::Resume(..) => "work.resume",
+            Self::Verify(..) => "work.verify",
+            Self::Block(..) => "work.block",
+            Self::Reclaim(..) => "work.reclaim",
+        }
+    }
+}
+
 /// Arguments shared by every work subcommand.
 #[derive(Debug, Args)]
 pub struct CommonArgs {

@@ -63,9 +63,17 @@ remains unenforced named at the check.
 
 ## Tier 4 — contract and correctness
 
-The error envelope reports a different `command` granularity than the success
-envelope. Argument-parsing failures escape the JSON contract entirely. Every I/O
-failure is classified as a harness defect. The conflict-token table does not
+✅ **FIXED:** the error envelope reported a different `command` granularity than
+the success envelope — the group `review` where a success carried
+`review.record` — so the field could not be used for the routing it exists to
+support. Each subcommand enum now carries its own dotted path. Found while
+fixing it: `acceptance inspect` succeeded while reporting
+`command: "acceptance.record"`, labelling a read as the write whose reporting
+function it reused. And `cli_validate_reports_the_exact_invalid_field_in_json`
+asserted the group, so it was holding the defect in place.
+
+**Still open:** argument-parsing failures escape the JSON contract entirely.
+Every I/O failure is classified as a harness defect. The conflict-token table does not
 match git's real output and binary conflicts are double-counted. Rename records
 are mis-parsed into paths that do not exist. Dependency SHAs are never bound to
 a review. Cycle status folds card events. Five cycle statuses and one card state

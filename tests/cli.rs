@@ -413,3 +413,87 @@ fn an_ambient_git_dir_does_not_redirect_the_harness() {
         "the workspace flag must win over an exported GIT_DIR"
     );
 }
+
+#[test]
+fn the_error_envelope_names_the_same_command_a_success_would() {
+    // Tier 4. The success envelope carries the full dotted path — `card.status`
+    // — and the error envelope carried only the group, `card`. A consumer
+    // matching on `command` therefore got a different granularity depending on
+    // whether the command worked, which makes the field unusable for the
+    // routing it exists to support.
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+
+    let output = harness_command()
+        .args(["card", "status", "--output", "json", "--card-id", "F-001"])
+        .arg("--control")
+        .arg(&missing)
+        .output()
+        .expect("the CLI should start");
+
+    assert!(!output.status.success());
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["schema"], "harness.command-error/v1");
+    assert_eq!(
+        envelope["command"], "card.status",
+        "the error envelope must name the subcommand, not just its group"
+    );
+}
+
+#[test]
+fn every_subcommand_group_reports_a_dotted_path_on_failure() {
+    // The same for one failing invocation per group, so a single fixed match
+    // arm does not look like a fixed contract.
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+    let control = missing.display().to_string();
+
+    for (args, expected) in [
+        (vec!["project", "status"], "project.status"),
+        (
+            vec!["cycle", "status", "--cycle-id", "C-001"],
+            "cycle.status",
+        ),
+        (vec!["card", "status", "--card-id", "F-001"], "card.status"),
+        (vec!["work", "status", "--card-id", "F-001"], "work.status"),
+        (vec!["gate", "list"], "gate.list"),
+        (
+            vec!["handoff", "inspect", "--card-id", "F-001"],
+            "handoff.inspect",
+        ),
+        (
+            vec!["review", "inspect", "--card-id", "F-001"],
+            "review.inspect",
+        ),
+        (
+            vec!["integration", "inspect", "--integration-id", "INT-001"],
+            "integration.inspect",
+        ),
+        (
+            vec!["acceptance", "inspect", "--integration-id", "INT-001"],
+            "acceptance.inspect",
+        ),
+        (vec!["audit", "cycle", "--cycle-id", "C-001"], "audit.cycle"),
+    ] {
+        let mut full: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        full.extend(["--output".to_owned(), "json".to_owned()]);
+        full.extend(["--control".to_owned(), control.clone()]);
+        let output = harness_command()
+            .args(&full)
+            .output()
+            .expect("the CLI should start");
+        assert!(
+            !output.status.success(),
+            "{expected}: the fixture must fail, or it proves nothing"
+        );
+        assert_eq!(
+            stdout_json(&output)["command"],
+            expected,
+            "wrong command path for {full:?}"
+        );
+    }
+}

@@ -44,6 +44,25 @@ pub enum GateCommand {
     Status(StatusArgs),
 }
 
+impl GateCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `gate` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Validate(..) => "gate.validate",
+            Self::Register(..) => "gate.register",
+            Self::List(..) => "gate.list",
+            Self::Show(..) => "gate.show",
+            Self::Run(..) => "gate.run",
+            Self::Status(..) => "gate.status",
+        }
+    }
+}
+
 /// Arguments accepted by `gate run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {

@@ -69,6 +69,24 @@ pub enum CardCommand {
     Status(StatusArgs),
 }
 
+impl CardCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `card` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Validate(..) => "card.validate",
+            Self::Create(..) => "card.create",
+            Self::Activate(..) => "card.activate",
+            Self::Revise(..) => "card.revise",
+            Self::Status(..) => "card.status",
+        }
+    }
+}
+
 /// Arguments shared by card subcommands that touch control state.
 #[derive(Debug, Args)]
 pub struct CommonArgs {

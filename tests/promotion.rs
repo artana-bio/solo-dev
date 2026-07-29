@@ -367,6 +367,29 @@ fn promotion_records_evidence_naming_the_acceptance_it_rested_on() {
 }
 
 #[test]
+fn a_read_command_is_not_labelled_as_the_write_it_reuses() {
+    // Tier 4. `acceptance inspect` reused `report_acceptance` and so emitted
+    // `command: "acceptance.record"` on success. A consumer routing on that
+    // field would treat a read as a write — and the field exists for routing.
+    let (workspace, id) = accepted(1);
+
+    let recorded = workspace.acceptance_json(&["inspect", "--integration-id", &id]);
+    assert_eq!(recorded["command"], "acceptance.inspect");
+    assert_eq!(recorded["status"], "success");
+
+    // And the write still says what it is, so this is not a blanket rename.
+    let (other, second) = reviewed(1);
+    let written = other.acceptance_json(&[
+        "record",
+        "--integration-id",
+        &second,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(written["command"], "acceptance.record");
+}
+
+#[test]
 fn acceptance_inspect_reports_the_decision_without_promoting() {
     let (workspace, id) = accepted(1);
     let authority_before = workspace.authority_head();

@@ -41,6 +41,22 @@ pub enum ReviewCommand {
     Inspect(CardArgs),
 }
 
+impl ReviewCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `review` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Begin(..) => "review.begin",
+            Self::Record(..) => "review.record",
+            Self::Inspect(..) => "review.inspect",
+        }
+    }
+}
+
 /// Arguments shared by review subcommands.
 #[derive(Debug, Args)]
 pub struct CommonArgs {

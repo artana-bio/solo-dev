@@ -80,6 +80,29 @@ pub enum IntegrationCommand {
     Inspect(InspectArgs),
 }
 
+impl IntegrationCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `integration` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Ready(..) => "integration.ready",
+            Self::Prepare(..) => "integration.prepare",
+            Self::Preflight(..) => "integration.preflight",
+            Self::Merge(..) => "integration.merge",
+            Self::Land(..) => "integration.land",
+            Self::Verify(..) => "integration.verify",
+            Self::Review(..) => "integration.review",
+            Self::Promote(..) => "integration.promote",
+            Self::Abandon(..) => "integration.abandon",
+            Self::Inspect(..) => "integration.inspect",
+        }
+    }
+}
+
 /// Arguments accepted by `integration merge`.
 #[derive(Debug, Args)]
 pub struct MergeArgs {

@@ -60,18 +60,18 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
 pub fn command_path(cli: &Cli) -> &'static str {
     match &cli.command {
         Command::Doctor(_) => "doctor",
-        Command::Project { .. } => "project",
-        Command::Cycle { .. } => "cycle",
-        Command::Card { .. } => "card",
-        Command::Work { .. } => "work",
-        Command::Gate { .. } => "gate",
-        Command::Handoff { .. } => "handoff",
-        Command::Review { .. } => "review",
-        Command::Integration { .. } => "integration",
-        Command::Acceptance { .. } => "acceptance",
-        Command::Archive { .. } => "archive",
-        Command::Backup { .. } => "backup",
-        Command::Audit { .. } => "audit",
+        Command::Project { command } => command.path(),
+        Command::Cycle { command } => command.path(),
+        Command::Card { command } => command.path(),
+        Command::Work { command } => command.path(),
+        Command::Gate { command } => command.path(),
+        Command::Handoff { command } => command.path(),
+        Command::Review { command } => command.path(),
+        Command::Integration { command } => command.path(),
+        Command::Acceptance { command } => command.path(),
+        Command::Archive { command } => command.path(),
+        Command::Backup { command } => command.path(),
+        Command::Audit { command } => command.path(),
     }
 }
 

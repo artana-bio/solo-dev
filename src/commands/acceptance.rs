@@ -37,6 +37,21 @@ pub enum AcceptanceCommand {
     Inspect(InspectArgs),
 }
 
+impl AcceptanceCommand {
+    /// Its dotted command path, as the result envelope reports it.
+    ///
+    /// The error envelope used to carry only the group — `acceptance` — while a
+    /// success carried the full path, so a consumer matching on `command` got a
+    /// different granularity depending on whether the command worked.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Record(..) => "acceptance.record",
+            Self::Inspect(..) => "acceptance.inspect",
+        }
+    }
+}
+
 /// Arguments accepted by `acceptance record`.
 #[derive(Debug, Args)]
 pub struct RecordArgs {
@@ -324,7 +339,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &format!("acceptance: {} {integration_id}", decision.name()),
             )?;
 
-            Ok(report_acceptance(&acceptance, &digest, &config.project_id))
+            Ok(report_acceptance(
+                "acceptance.record",
+                &acceptance,
+                &digest,
+                &config.project_id,
+            ))
         },
     )
 }
@@ -346,12 +366,13 @@ fn require_reviewed(record: &IntegrationRecord) -> Result<(), HarnessError> {
 
 /// Turns an acceptance into the command's outcome.
 fn report_acceptance(
+    command: &str,
     acceptance: &AcceptanceRecord,
     digest: &crate::domain::digest::Digest,
     project_id: &crate::domain::ids::ProjectId,
 ) -> CommandOutcome {
     CommandOutcome::new(
-        "acceptance.record",
+        command,
         format!(
             "Recorded acceptance {} (`{}`)\nintegration: {}\nlanding commit: {}\nowner: {}\nrollback: {}\nresidual risks: {}",
             acceptance.acceptance_id,
@@ -394,7 +415,12 @@ fn run_inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
         })?;
     let digest = acceptance.digest()?;
 
-    let mut outcome = report_acceptance(&acceptance, &digest, &config.project_id);
+    let mut outcome = report_acceptance(
+        "acceptance.inspect",
+        &acceptance,
+        &digest,
+        &config.project_id,
+    );
     outcome = outcome.with_warning(format!(
         "inspection only; promotion still requires `integration promote --integration-id {integration_id}`"
     ));
