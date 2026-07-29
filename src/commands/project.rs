@@ -434,7 +434,8 @@ fn run_resume(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, H
         &args.control,
         "project.recover",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             match crate::commands::integration::resume_promotion(
                 control,

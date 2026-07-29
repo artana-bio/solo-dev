@@ -13,7 +13,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::{
         card::{CardStateRecord, load_card, store_card_state},
-        transaction::with_transaction,
+        transaction::{Steps, with_transaction},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
@@ -248,9 +248,16 @@ fn allocate_worktree(
     base: &str,
     path: &std::path::Path,
     card_id: &CardId,
+    steps: &mut Steps<'_>,
 ) -> Result<(), HarnessError> {
+    // Named individually because the recoveries differ: a branch with no
+    // worktree is retryable once the branch is removed, while a worktree with
+    // no lock is already usable and must not be discarded.
+    steps.at("branch-created")?;
     worktree::create_branch(scope, branch, base)?;
+    steps.at("worktree-added")?;
     worktree::add_worktree(scope, path, branch)?;
+    steps.at("worktree-locked")?;
     worktree::lock_worktree(scope, path, &format!("allocated to card {card_id}"))?;
     worktree::install_agent_exclude(scope)?;
     Ok(())
@@ -417,7 +424,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         &args.common.control,
         "work.start",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             let (base, branch, path) =
@@ -427,7 +435,7 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             let lease_id = next_lease_id(control)?;
 
             // From here the operation mutates.
-            allocate_worktree(&scope, &branch, &base, &path, &card_id)?;
+            allocate_worktree(&scope, &branch, &base, &path, &card_id, steps)?;
             write_locator(
                 control,
                 &config,
@@ -575,7 +583,8 @@ fn run_checkpoint(
         &args.common.control,
         "work.checkpoint",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state, mut lease) = allocation(control, &card_id)?;
             // A checkpoint does not move the card, per Section 11.4, so only
@@ -725,7 +734,8 @@ fn resume_to_active(
         &args.common.control,
         "work.resume",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
             verify_locator(control, &lease, &config.project_id)?;
@@ -943,7 +953,8 @@ fn run_block(args: &BlockArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         &args.common.control,
         "work.block",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             state.state.check_transition(CardState::Blocked)?;

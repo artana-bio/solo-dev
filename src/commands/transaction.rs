@@ -11,7 +11,7 @@ use crate::{
     cli::{exit::ExitCategory, output::CommandOutcome},
     control::{
         event_store::EventStore,
-        journal::{Journal, OperationState},
+        journal::{Journal, OperationRecord, OperationState},
         lock::ProjectLock,
         repository::ControlRepository,
     },
@@ -19,11 +19,35 @@ use crate::{
     error::HarnessError,
 };
 
+/// Records named boundaries within one operation.
+///
+/// Handed to the transaction body so a command can say where it got to. Every
+/// step is written before the work it names, and any step can be made to fail
+/// deliberately through [`crate::control::journal::INJECT_FAILURE_VAR`], which
+/// is how `WP-500` reaches boundaries a natural interruption would rarely hit.
+pub struct Steps<'a> {
+    journal: &'a Journal<'a>,
+    record: &'a mut OperationRecord,
+}
+
+impl Steps<'_> {
+    /// Records that the operation reached a named boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal cannot be written, or when this step
+    /// was named for deliberate interruption.
+    pub fn at(&mut self, step: &str) -> Result<(), HarnessError> {
+        self.journal.step(self.record, step)
+    }
+}
+
 /// Runs a mutating command inside the lock and the journal.
 ///
-/// The closure receives the control repository, an event store, and the control
-/// head the operation started from, which it passes back to `commit` as the
-/// compare-and-swap expectation.
+/// The closure receives the control repository, an event store, the control
+/// head the operation started from — which it passes back to `commit` as the
+/// compare-and-swap expectation — and a [`Steps`] recorder for naming the
+/// boundaries it passes.
 ///
 /// # Errors
 ///
@@ -40,6 +64,7 @@ where
         &ControlRepository,
         &EventStore<'_>,
         Option<&str>,
+        &mut Steps<'_>,
     ) -> Result<CommandOutcome, HarnessError>,
 {
     let control = ControlRepository::open(control_path)?;
@@ -51,7 +76,15 @@ where
     let mut operation = journal.begin(command_name, expected_head.clone(), clock)?;
     let events = EventStore::new(&control);
 
-    match body(&control, &events, expected_head.as_deref()) {
+    let outcome = {
+        let mut steps = Steps {
+            journal: &journal,
+            record: &mut operation,
+        };
+        body(&control, &events, expected_head.as_deref(), &mut steps)
+    };
+
+    match outcome {
         Ok(outcome) => {
             journal.finish(&mut operation, OperationState::Completed, None, clock)?;
             Ok(outcome.with_operation(operation.operation_id.clone()))

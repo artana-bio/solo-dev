@@ -266,7 +266,8 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
         &args.common.control,
         "gate.register",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let previous = load_gate(control, &gate.gate_id).ok();
 
@@ -528,7 +529,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
         &args.common.control,
         "gate.run",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             let gate = load_gate(control, &args.gate_id)?;
@@ -548,6 +549,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let started_at = clock.now();
             let log_root = control.path(LOG_DIR).join(card_id.as_str());
+            steps.at("gate-attempt-started")?;
             let outcome = run_attempt(&gate, &lease.worktree_path, &log_root, attempt, clock)?;
             let finished_at = clock.now();
 

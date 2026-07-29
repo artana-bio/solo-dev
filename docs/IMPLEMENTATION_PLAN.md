@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 30 |
+| Plan revision | 31 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 649 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 657 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-500` onward |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2471,9 +2471,10 @@ boundary, and recovery for boundaries introduced after the MVP.
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
 | Dependencies | `WP-460` |
 | Target release | Hardened single-repository release |
+| Evidence | `INJECT_FAILURE_VAR` and `Journal::step` in `src/control/journal.rs`, `Steps` in `src/commands/transaction.rs`, named boundaries across all ten command modules, `tests/recovery.rs` (8 acceptance tests) |
 
 Deliverables:
 
@@ -2491,6 +2492,31 @@ Acceptance:
 - no interruption silently reports success;
 - recovery never deletes ambiguous work;
 - completed operations are idempotently recognized.
+
+Delivered notes:
+
+- Injection lives in `Journal::step`, so it reaches every boundary any command
+  names, present or future, from one insertion point. The step is written
+  before the work it names, which means an injected failure lands in the
+  hardest place for recovery: the boundary was recorded and its work did not
+  happen.
+- The affordance is compiled in rather than hidden behind a feature flag, so
+  the code under test is the code that ships (D-055). It can only make a
+  command fail at a boundary the harness already has to handle; it cannot
+  produce a silent success or a write recovery cannot see.
+- `with_transaction` now hands the body a `Steps` recorder. Every mutating
+  command names at least one boundary, and a test asserts that against the
+  source rather than trusting it — a command that names none has no boundary
+  to inject at, which would make the coverage claim false without failing
+  anything.
+- Allocation names three boundaries rather than one, because the recoveries
+  differ: a branch with no worktree is retryable once the branch is removed,
+  while a worktree with no lock is already usable and must not be discarded.
+- The interrupted-allocation test asserts recovery leaves the half-created
+  branch alone. Deleting it would be tidier and wrong: its disposition is
+  ambiguous, and cleanup that guesses is indistinguishable from data loss.
+
+| D-055 | Compile failure injection in rather than gate it behind a feature flag | Accepted | A `#[cfg(feature)]` affordance means the binary under test is not the binary that ships, which is precisely the gap this package exists to close. Leaving it compiled in is safe because it can only cause a command to fail at a boundary the harness already journals and already has to handle — never a silent success, and never a write recovery cannot see. It is driven by an environment variable that names one step, so it cannot be triggered by accident in a way that does anything the harness is not already required to survive. |
 
 ### WP-510 — Concurrency and lease hardening
 

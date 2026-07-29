@@ -345,7 +345,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.common.control,
         "handoff.create",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             state.state.check_transition(CardState::HandedOff)?;
@@ -518,7 +519,8 @@ fn run_revoke(args: &RevokeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         &args.common.control,
         "handoff.revoke",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             let mut handoff =

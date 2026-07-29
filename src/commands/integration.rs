@@ -667,7 +667,8 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         &args.control,
         "integration.prepare",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let cycle = load_cycle(control, &cycle_id)?;
             let plan = build_plan(control, &cycle, &requested, args)?;
@@ -1272,7 +1273,7 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         &args.control,
         "integration.merge",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             if record.status != IntegrationStatus::Prepared {
@@ -1314,6 +1315,7 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                 });
             }
 
+            steps.at("integration-worktree-built")?;
             let (head, tree) =
                 build_integration(control, &config, &record, &args.smoke_gates, clock)?;
             record.integration_head = Some(head.clone());
@@ -1588,7 +1590,7 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
         &args.control,
         "integration.land",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             if let Some(existing) = &record.landing_sha {
@@ -1609,6 +1611,7 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
                 &landing_subject(&record),
                 &landing_trailers(control, &record, &planned_digest)?,
             );
+            steps.at("landing-commit-created")?;
             let landing_sha = landing::create(
                 &config.repository,
                 &tree,
@@ -1619,6 +1622,7 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
             // Held by a harness ref so collection cannot take it before
             // promotion; the protected branch is untouched.
             landing::retain(&config.repository, integration_id.as_str(), &landing_sha)?;
+            steps.at("landing-ref-retained")?;
 
             record.landing_sha = Some(landing_sha.clone());
             record.landed_at = Some(clock.now());
@@ -1874,7 +1878,8 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
         &args.control,
         "integration.verify",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             record
@@ -2134,7 +2139,8 @@ fn run_integration_review(
         &args.control,
         "integration.review",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             record
@@ -2595,18 +2601,22 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         &args.control,
         "integration.promote",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             let checks = check_promotion(control, &config, &record)?;
 
-            // Steps 7, 9, and 10.
+            // Steps 7, 9, and 10. Named on both sides of the authority
+            // update, because "we were about to publish" and "we published and
+            // had not finished recording it" need different recoveries.
+            steps.at("authority-publish-attempted")?;
             publish(
                 &config,
                 &integration_id,
                 &checks.landing_sha,
                 &record.expected_main_sha,
             )?;
+            steps.at("authority-published")?;
 
             // Past this point the authority has moved. Section 13.6 is
             // explicit that a local synchronization failure must NOT roll it
@@ -2774,7 +2784,8 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         &args.control,
         "integration.abandon",
         clock,
-        |control, events, expected| {
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             let previous = record.status;
