@@ -36,7 +36,7 @@ proposition.
 | 8 | ✅ **FIXED.** **`recover --resume` marks failed operations complete without recovering them**, destroying the only record that a partial mutation occurred. Found independently by three reviewers. **[V]** Fixed: `--resume` refuses when any unresolved entry is not `integration.promote`, which is the only operation it can actually finish, and names them. Their disposition stays an operator decision, which is what `recover` without `--resume` is for. |
 | 9 | ✅ **FIXED.** **`git add -A` sweeps a crashed operation's residue into authoritative history**, including the lock's own scratch file, which the ignore list does not cover. **[R]** Fixed: staging names the paths the harness owns rather than sweeping the directory, so inclusion is deliberate the way everything else here is deny-by-default. The trade runs the other way — a record type omitted from the list would never be committed — so `control_history_holds_everything_a_lifecycle_writes` runs a full lifecycle and refuses to leave anything untracked. |
 | 10 | **Archive refs are in no backup.** Those refs are the sole justification for `archive close` deleting branches and worktrees; they live in the candidate repository, and backups cover only authority and control. **[R]** |
-| 11 | **A failed `work start` strands a card permanently and journals that nothing happened.** The branch, worktree, lock and locator are created before the lease is written; the partial/clean decision inspects only the control repository, which is genuinely clean. `recover` then reports nothing is wrong. **[R]** |
+| 11 | ✅ **FIXED.** **A failed `work start` strands a card permanently and journals that nothing happened.** The branch, worktree, lock and locator are created before the lease is written; the partial/clean decision inspects only the control repository, which is genuinely clean. `recover` then reports nothing is wrong. **[R]** Fixed: `Steps::outside_control` marks the boundaries whose mutation lands outside control — a branch, a worktree, a moved authority — and reaching one makes the operation partial whatever control looks like. The decision is extracted as `terminal_state` and unit-tested, because it could not be reached through failure injection: see the note below. |
 
 ## Tier 3 — wedges, false reports, wrong targets
 
@@ -67,6 +67,21 @@ a review. Cycle status folds card events. Five cycle statuses and one card state
 are unreachable. Generated-artifact scope checks compare globs with `==`. Merge
 honours `commit.gpgsign` and repository hooks, contradicting "hooks are
 advisory".
+
+## Why failure injection did not catch defect 11
+
+`CHANGE_HARNESS_FAIL_AT` raises `RecoveryIncomplete`, whose category is
+`RecoveryRequired`, and the clean/partial decision takes that arm before
+consulting anything else. So **every failure-injection test in the suite records
+`FailedPartial` regardless**, and none of them can observe whether the rest of
+the decision is correct. `WP-500`'s "failure injection at every journaled
+boundary" is real coverage of the journal and no coverage at all of the state it
+writes.
+
+Found while confirming defect 11: a test asserting `recovery_required == true`
+at the exact boundary in question passed against the unfixed code. The decision
+is now a separate function with its own tests, one of which states this
+limitation so the next person reaching for injection sees why it will not work.
 
 ## The test suite
 

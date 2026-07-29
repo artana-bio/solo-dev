@@ -1623,7 +1623,7 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
                 &landing_subject(&record),
                 &landing_trailers(control, &record, &planned_digest)?,
             );
-            steps.at("landing-commit-created")?;
+            steps.outside_control("landing-commit-created")?;
             let landing_sha = landing::create(
                 &config.repository,
                 &tree,
@@ -1634,7 +1634,7 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
             // Held by a harness ref so collection cannot take it before
             // promotion; the protected branch is untouched.
             landing::retain(&config.repository, integration_id.as_str(), &landing_sha)?;
-            steps.at("landing-ref-retained")?;
+            steps.outside_control("landing-ref-retained")?;
 
             record.landing_sha = Some(landing_sha.clone());
             record.landed_at = Some(clock.now());
@@ -2642,14 +2642,14 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             // Steps 7, 9, and 10. Named on both sides of the authority
             // update, because "we were about to publish" and "we published and
             // had not finished recording it" need different recoveries.
-            steps.at("authority-publish-attempted")?;
+            steps.outside_control("authority-publish-attempted")?;
             publish(
                 &config,
                 &integration_id,
                 &checks.landing_sha,
                 &record.expected_main_sha,
             )?;
-            steps.at("authority-published")?;
+            steps.outside_control("authority-published")?;
 
             // Past this point the authority has moved. Section 13.6 is
             // explicit that a local synchronization failure must NOT roll it

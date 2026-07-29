@@ -463,3 +463,58 @@ fn resume_does_not_mark_an_operation_it_cannot_resume_as_complete() {
         "and the half-made allocation must still be there to recover"
     );
 }
+
+#[test]
+fn an_allocation_that_created_a_worktree_is_reported_as_needing_recovery() {
+    // Tier 2, defect 11. The partial/clean decision inspects `control.is_clean()`
+    // and nothing else. `work start` creates a branch, a worktree, a worktree
+    // lock, and a locator before it writes the lease into control — so a failure
+    // anywhere in that stretch leaves the control repository genuinely clean,
+    // the operation journalled `FailedClean`, and `recover` reporting that
+    // nothing is wrong. The card holds a branch and a worktree it has no lease
+    // for, and the branch name is taken, so `work start` cannot be retried.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    let args: Vec<String> = vec![
+        "work".into(),
+        "start".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--card-id".into(),
+        "F-001".into(),
+    ];
+    assert!(!run_failing_at("worktree-locked", &args).status.success());
+
+    // The fixture must have left real artifacts outside control, or there is
+    // nothing for the decision to get wrong.
+    assert!(
+        workspace.candidate_branch_exists("card/F-001"),
+        "the branch must exist for this to be a partial allocation"
+    );
+    assert!(
+        workspace.worktrees.join("F-001").exists(),
+        "and so must the worktree"
+    );
+
+    let report = Workspace::run_json(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(
+        report["data"]["recovery_required"], true,
+        "a half-made allocation is not a clean failure: {report}"
+    );
+}

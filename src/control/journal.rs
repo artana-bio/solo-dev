@@ -105,6 +105,20 @@ pub struct OperationRecord {
     pub finished_at: Option<Timestamp>,
     /// Why it failed, when it did.
     pub failure: Option<String>,
+    /// Whether a boundary outside the control repository was reached.
+    ///
+    /// The clean/partial decision used to rest entirely on whether the control
+    /// repository was dirty, which cannot see a branch, a worktree, or the
+    /// authority. `work start` creates all of the first two before it writes
+    /// the lease, so a failure in that stretch left control genuinely clean,
+    /// journalled `FailedClean`, and `recover` reporting nothing was wrong —
+    /// over a card holding a branch and a worktree it has no lease for, whose
+    /// branch name is now taken so the command cannot be retried.
+    ///
+    /// Recorded here rather than derived, so recovery reads the same fact the
+    /// decision was made on.
+    #[serde(default)]
+    pub touched_outside_control: bool,
 }
 
 impl OperationRecord {
@@ -179,6 +193,7 @@ impl<'a> Journal<'a> {
             state: OperationState::Started,
             steps: Vec::new(),
             expected_control_head,
+            touched_outside_control: false,
             started_at: clock.now(),
             finished_at: None,
             failure: None,

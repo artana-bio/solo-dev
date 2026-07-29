@@ -257,11 +257,11 @@ fn allocate_worktree(
     // Named individually because the recoveries differ: a branch with no
     // worktree is retryable once the branch is removed, while a worktree with
     // no lock is already usable and must not be discarded.
-    steps.at("branch-created")?;
+    steps.outside_control("branch-created")?;
     worktree::create_branch(scope, branch, base)?;
-    steps.at("worktree-added")?;
+    steps.outside_control("worktree-added")?;
     worktree::add_worktree(scope, path, branch)?;
-    steps.at("worktree-locked")?;
+    steps.outside_control("worktree-locked")?;
     worktree::lock_worktree(scope, path, &format!("allocated to card {card_id}"))?;
     worktree::install_agent_exclude(scope)?;
     Ok(())

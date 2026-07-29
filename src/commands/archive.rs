@@ -519,7 +519,7 @@ fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                 }
             }
 
-            steps.at("cleanup-started")?;
+            steps.outside_control("cleanup-started")?;
             let mut removed = Vec::new();
             for member in &record.members {
                 removed.extend(clean_up_card(control, &config, &member.card_id)?);
