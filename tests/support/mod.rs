@@ -758,6 +758,26 @@ impl Workspace {
     }
 }
 
+/// Concatenates every gate log stdout under a control repository.
+pub fn capture_stdout_of_logs(control: &Path) -> String {
+    fn walk(path: &Path, into: &mut String) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, into);
+            } else if let Ok(text) = fs::read_to_string(&path) {
+                into.push_str(&text);
+            }
+        }
+    }
+    let mut collected = String::new();
+    walk(&control.join("logs"), &mut collected);
+    collected
+}
+
 /// Runs Git in a fixture, asserting success.
 pub fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
