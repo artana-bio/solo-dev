@@ -120,6 +120,23 @@ verify-side rule. A third,
 strings were identical, so it certified `==` rather than ownership and could not
 tell the implementations apart.
 
+## Found later, by the test audit
+
+**The audit trail's timeline carries no timestamps.** `src/commands/audit.rs`
+builds each timeline entry's `at` from `event["recorded_at"]`, and the event
+schema's field is `occurred_at`, so every `at` is `null` — in both the timeline
+and the protected-branch transition record. The audit report's whole purpose is
+reconstructing when things happened.
+
+Not looked for. It surfaced because
+`the_timeline_reconstructs_the_cycle_in_order` asserts only the relative order
+of three `type` strings and never reads a timestamp, so deleting the line
+entirely leaves all twelve audit tests green. The defect and the test that
+should have caught it are the same finding twice.
+
+Open. Not yet numbered into a tier, because it was found after the tiers were
+drawn and inventing a slot for it would misrepresent when it was known.
+
 ## Why failure injection did not catch defect 11
 
 `CHANGE_HARNESS_FAIL_AT` raises `RecoveryIncomplete`, whose category is
