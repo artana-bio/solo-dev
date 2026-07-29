@@ -294,13 +294,18 @@ fn findings_remain_visible_after_a_later_approval() {
     ]);
     workspace.review(&["begin", "--card-id", "F-001"]);
 
-    // Second round: a different reviewer approves.
+    // Second round: a different reviewer approves, and must account for the
+    // finding the first round left open. This test previously used a blanket
+    // approval carrying `findings: []`, which the harness accepted — so it was
+    // asserting that a critical open finding can be approved away, under a name
+    // claiming the opposite. See `an_approval_may_not_drop_a_prior_open_finding`.
+    let resolution = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
         "F-001",
         "--verdict",
-        &verdict(&workspace, &approval("reviewer-session-b")),
+        &verdict(&workspace, resolution),
     ]);
 
     let envelope = workspace.review_json(&["inspect", "--card-id", "F-001"]);
@@ -322,6 +327,146 @@ fn findings_remain_visible_after_a_later_approval() {
         "SPIKE-001 H-04: approval came from a different session"
     );
     assert_eq!(envelope["data"]["has_current_approval"], true);
+    assert_eq!(
+        reviews[1]["findings"][0]["disposition"], "resolved",
+        "the approval had to say what became of the earlier finding"
+    );
+}
+
+#[test]
+fn an_approval_may_not_drop_a_prior_open_finding() {
+    // Tier 1, defect 2. `WP-320` required this and it was never implemented.
+    // A re-review carrying `findings: []` approved away a prior critical open
+    // finding: the earlier record stayed on disk, stayed open, and nothing
+    // consulted it again. Supersession without this check is only filing.
+    let (workspace, _) = handed_off();
+
+    let rejection = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, rejection),
+    ]);
+    workspace.work(&["resume", "--card-id", "F-001"]);
+
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(worktree.join("src/a.rs"), "fn main() { /* guarded */ }\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "fix: add guard"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration2.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a guard\nimplementation_decisions: [mirrored the sibling]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // The fixture has to be able to succeed, or a refusal below proves nothing
+    // about the finding: the same approval with the finding dispositioned is
+    // accepted, and only the silent one is refused.
+    let silent = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, &approval("reviewer-session-b")),
+    ]);
+    assert!(
+        !silent.status.success(),
+        "an approval carrying no findings must not clear a prior critical one"
+    );
+    assert_eq!(error_code(&silent), "CH-POLICY-OPEN-FINDINGS");
+    let envelope: Value = serde_json::from_slice(&silent.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("src/a.rs") && message.contains("critical"),
+        "the refusal must name the finding it is protecting: {message}"
+    );
+
+    let dispositioned = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, dispositioned),
+    ]);
+    assert_eq!(
+        workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
+        true,
+        "dispositioning it is the way through, and it must work"
+    );
+}
+
+#[test]
+fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
+    // The check applies to every re-review, not only approvals. A
+    // `changes_requested` that omits the earlier finding leaves the next
+    // reviewer looking at a clean predecessor, which is the same defect one
+    // step removed: review 1 opens it, review 2 drops it, review 3 approves
+    // over a prior review that no longer shows anything open.
+    let (workspace, _) = handed_off();
+
+    let first = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, first),
+    ]);
+    workspace.work(&["resume", "--card-id", "F-001"]);
+
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(worktree.join("src/a.rs"), "fn main() { /* partial */ }\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "wip: partial"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration2.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: partial\nimplementation_decisions: [wip]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // A second round about a different problem entirely, silent on the first.
+    let second = "reviewer_actor_id: reviewer-session-b\ndecision: changes_requested\nfindings:\n  - severity: medium\n    location: src/b.rs\n    detail: naming\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, second),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a re-review about something else must still account for what is open"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-OPEN-FINDINGS");
 }
 
 #[test]

@@ -423,11 +423,14 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 findings: verdict.findings.clone(),
                 gate_adequacy: verdict.gate_adequacy.clone(),
                 residual_risks: verdict.residual_risks.clone(),
-                supersedes: previous.map(|review| review.review_id),
+                supersedes: previous.as_ref().map(|review| review.review_id.clone()),
                 reviewed_at: clock.now(),
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
             review.validate()?;
+            if let Some(superseded) = previous.as_ref() {
+                review.check_supersedes(superseded)?;
+            }
             let digest = review.digest()?;
 
             control.write_atomic(

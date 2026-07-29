@@ -69,6 +69,19 @@ pub enum FindingSeverity {
     Low,
 }
 
+impl FindingSeverity {
+    /// Its stable serialized name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
 /// What happened to a finding.
 ///
 /// `SPIKE-001` finding F-4: a review that can only approve or reject cannot
@@ -269,6 +282,57 @@ impl ReviewRecord {
         }
 
         Ok(())
+    }
+
+    /// Refuses a re-review that drops a prior open finding instead of
+    /// dispositioning it.
+    ///
+    /// `WP-320` required this and it was never implemented. Without it a
+    /// re-review carrying `findings: []` approves away a prior critical finding
+    /// silently: the earlier record stays on disk and stays open, and nothing
+    /// consults it again. Supersession is what makes a finding survive a
+    /// re-review, and supersession without this check is only filing.
+    ///
+    /// A finding is accounted for when the new review names the same
+    /// `location` with a disposition that no longer blocks. Silence is not
+    /// resolution. Two distinct findings sharing one location collapse into a
+    /// single obligation, which is a real weakness of using `location` as the
+    /// identity — but the reviewer must still have looked at that location and
+    /// asserted something about it, and it is the eliminating of silence that
+    /// this check is for.
+    ///
+    /// This applies to every re-review, not only approvals. A
+    /// `changes_requested` that drops a prior finding would leave the next
+    /// reviewer looking at a clean predecessor, which is the same defect one
+    /// step removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy error naming each unaccounted-for finding.
+    pub fn check_supersedes(&self, superseded: &Self) -> Result<(), HarnessError> {
+        let dropped: Vec<String> = superseded
+            .open_findings()
+            .iter()
+            .filter(|prior| {
+                !self.findings.iter().any(|current| {
+                    current.location == prior.location && !current.disposition.blocks_approval()
+                })
+            })
+            .map(|finding| format!("{} ({})", finding.location, finding.severity.name()))
+            .collect();
+
+        if dropped.is_empty() {
+            return Ok(());
+        }
+
+        Err(HarnessError::Control {
+            reason: format!(
+                "review {} left findings open at {}; this review must disposition each as resolved, accepted risk, or out of scope rather than omit them",
+                superseded.review_id,
+                dropped.join(", ")
+            ),
+            code: ErrorCode::PolicyOpenFindings,
+        })
     }
 }
 
