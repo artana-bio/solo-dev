@@ -19,6 +19,15 @@ fn error_code(output: &std::process::Output) -> String {
 }
 
 /// Writes a lock file naming a chosen holder.
+/// A process id that is in range and reliably absent.
+///
+/// Not an enormous one. `ps` answers "process id too large" on stderr for those
+/// — a refusal to answer, not a report of death — and the fixtures here used
+/// `4_294_967_294` precisely because the old code treated that refusal as proof
+/// the holder was gone. That was defect 13, so these fixtures were asserting
+/// the bug.
+const ABSENT_PID: u32 = 99_999;
+
 fn plant_lock(workspace: &Workspace, pid: u32, process_start: Option<&str>) {
     let holder = serde_json::json!({
         "pid": pid,
@@ -49,7 +58,7 @@ fn lock_state(workspace: &Workspace) -> serde_json::Value {
 #[test]
 fn a_lock_left_by_a_dead_process_is_reported_stale() {
     let workspace = Workspace::initialized();
-    plant_lock(&workspace, 4_294_967_294, Some("whenever"));
+    plant_lock(&workspace, ABSENT_PID, Some("whenever"));
 
     let lock = lock_state(&workspace);
     assert_eq!(lock["state"], "stale");
@@ -65,7 +74,7 @@ fn a_lock_left_by_a_dead_process_is_reported_stale() {
 #[test]
 fn a_stale_lock_names_itself_rather_than_blocking_silently() {
     let workspace = Workspace::initialized();
-    plant_lock(&workspace, 4_294_967_294, Some("whenever"));
+    plant_lock(&workspace, ABSENT_PID, Some("whenever"));
 
     let output = workspace.cycle_raw(&[
         "create",
@@ -89,7 +98,7 @@ fn a_stale_lock_names_itself_rather_than_blocking_silently() {
 #[test]
 fn recovery_clears_a_provably_stale_lock() {
     let workspace = Workspace::initialized();
-    plant_lock(&workspace, 4_294_967_294, Some("whenever"));
+    plant_lock(&workspace, ABSENT_PID, Some("whenever"));
 
     Workspace::run_json(&[
         "project".into(),

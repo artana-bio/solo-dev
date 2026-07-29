@@ -95,16 +95,68 @@ pub enum LockDiagnosis {
 /// precisely the interleaving D-056 exists to prevent.
 #[must_use]
 pub fn process_start_time(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .env("LC_ALL", "C")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    match process_liveness(pid) {
+        Liveness::Running(start) => Some(start),
+        Liveness::Gone | Liveness::Unknown(_) => None,
+    }
+}
+
+/// What could be established about a process.
+///
+/// Three outcomes, and collapsing them was defect 13. `ps` failing to run at
+/// all — not installed, not on `PATH`, a slim container, a restricted
+/// environment — produced the same `None` as `ps` reporting the process gone,
+/// and `diagnose` read that as proof of death. So on any host without `ps`,
+/// every lock read as stale and `recover` deleted one whose holder was still
+/// writing: exactly the interleaving D-056 exists to prevent, reached by the
+/// mechanism built to prevent it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Liveness {
+    /// The process exists, and this is when it started.
+    Running(String),
+    /// `ps` was consulted and reported no such process.
+    Gone,
+    /// `ps` could not be consulted, so nothing was established.
+    Unknown(String),
+}
+
+/// Classifies what running `ps` produced.
+///
+/// Separate from the invocation so it can be tested: making `ps` unavailable
+/// inside a test process means changing `PATH` globally, which is unsound with
+/// tests running in parallel and would break every other command besides.
+fn classify(outcome: std::io::Result<std::process::Output>) -> Liveness {
+    let output = match outcome {
+        Ok(output) => output,
+        Err(error) => return Liveness::Unknown(format!("`ps` could not be run: {error}")),
+    };
     if !output.status.success() {
-        return None;
+        // `ps -p` exits non-zero for a pid that does not exist, which is the
+        // answer we want, and also for a usage error, which is not. The two are
+        // distinguishable only by stderr: a working `ps` says nothing there.
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        let complaint = complaint.trim();
+        if complaint.is_empty() {
+            return Liveness::Gone;
+        }
+        return Liveness::Unknown(format!("`ps` did not answer: {complaint}"));
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!value.is_empty()).then_some(value)
+    if value.is_empty() {
+        return Liveness::Gone;
+    }
+    Liveness::Running(value)
+}
+
+/// Asks the system whether a process is alive, and when it started.
+#[must_use]
+pub fn process_liveness(pid: u32) -> Liveness {
+    classify(
+        std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output(),
+    )
 }
 
 /// Distinguishes one acquisition attempt's scratch file from another's.
@@ -251,13 +303,24 @@ impl ProjectLock {
             };
         };
 
-        match process_start_time(holder.pid) {
+        match process_liveness(holder.pid) {
             // No such process: whoever held it is gone.
-            None => LockDiagnosis::Stale {
+            Liveness::Gone => LockDiagnosis::Stale {
                 reason: format!("process {} is no longer running", holder.pid),
                 holder,
             },
-            Some(current) => match &holder.process_start {
+            // Nothing was established, so nothing may be concluded. Clearing a
+            // lock whose holder might still be writing is the failure this
+            // whole module exists to prevent, and "the tool was missing" is not
+            // evidence of death.
+            Liveness::Unknown(reason) => LockDiagnosis::Ambiguous {
+                reason: format!(
+                    "process {} could not be checked: {reason}. Confirm by hand whether it is still running",
+                    holder.pid
+                ),
+                holder: Some(holder),
+            },
+            Liveness::Running(current) => match &holder.process_start {
                 // Same PID, same start instant: it is the same process.
                 Some(recorded) if *recorded == current => LockDiagnosis::Held(holder),
                 // Same PID, different start instant: the number was recycled
@@ -320,6 +383,56 @@ impl Drop for ProjectLock {
 
 #[cfg(test)]
 mod tests {
+
+    use std::os::unix::process::ExitStatusExt as _;
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn ps_being_unavailable_is_not_evidence_of_death() {
+        // Tier 3, defect 13. `ps` failing to run produced the same `None` as
+        // `ps` reporting the process gone, and `diagnose` read that as proof of
+        // death — so on any host without `ps`, every lock read as stale and
+        // recovery deleted one whose holder was still writing.
+        let missing = classify(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory",
+        )));
+        assert!(
+            matches!(missing, Liveness::Unknown(_)),
+            "a missing tool establishes nothing: {missing:?}"
+        );
+
+        let complained = classify(Ok(output(1, "", "usage: ps [-AaCcEefhjlMmrSTvwXx]")));
+        assert!(
+            matches!(complained, Liveness::Unknown(_)),
+            "a usage error is not an answer either: {complained:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_non_zero_ps_means_the_process_is_gone() {
+        // The guard. `ps -p <pid>` exits non-zero and says nothing on stderr
+        // for a pid that does not exist, which is the answer stale-lock
+        // clearing depends on. Treating every non-zero exit as unknown would
+        // make a stale lock permanent.
+        assert_eq!(classify(Ok(output(1, "", ""))), Liveness::Gone);
+        assert_eq!(classify(Ok(output(0, "", ""))), Liveness::Gone);
+    }
+
+    #[test]
+    fn a_running_process_reports_its_start_instant() {
+        assert_eq!(
+            classify(Ok(output(0, "Tue Jul 28 09:12:03 2026\n", ""))),
+            Liveness::Running("Tue Jul 28 09:12:03 2026".to_owned())
+        );
+    }
     use super::*;
     use crate::domain::clock::FixedClock;
 
@@ -396,9 +509,13 @@ mod tests {
     #[test]
     fn a_lock_left_by_a_dead_process_is_stale() {
         let temp = tempfile::tempdir().unwrap();
-        // PID 1 exists; a very high PID reliably does not.
+        // A pid that is in range and absent. Not an enormous one: `ps` answers
+        // "process id too large" on stderr for those, which is a refusal to
+        // answer rather than a report of death — and treating it as death was
+        // defect 13. This fixture asserted the bug's behaviour, so it had to
+        // change with the fix.
         let holder = LockHolder {
-            pid: 4_294_967_294,
+            pid: 99_999,
             acquired_at: clock().now(),
             operation: "abandoned".to_owned(),
             process_start: Some("whenever".to_owned()),

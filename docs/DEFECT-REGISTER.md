@@ -45,7 +45,7 @@ proposition.
 | # | Defect |
 | --- | --- |
 | 12 | An interrupted `project init` wedges the project: `init` says run recover, recover says run init. **[R]** |
-| 13 | A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** |
+| 13 | ✅ **FIXED.** A live lock is deleted wherever `ps` is unavailable — any slim container or restricted `PATH`. **[R]** Fixed: liveness is three-valued. `ps` failing to run, or refusing to answer, is `Unknown` and routes to the `Ambiguous` diagnosis that already existed for exactly this doctrine. Four fixtures used a pid so large `ps` rejects it as out of range — they were asserting the bug, and now use an absent pid that `ps` genuinely answers about. |
 | 14 | ✅ **FIXED.** Promotion fast-forwards whatever branch HEAD is on, not the protected one, and reports success. **[R]** Fixed: the preconditions now check which branch is checked out before checking where it points, so the refusal lands before the authority moves. Every other local check described the protected branch only if HEAD happened to be it. |
 | 15 | A post-publish failure is unrecoverable, and recover falsely reports that no promotion reached the authority. **[R]** |
 | 16 | ✅ **FIXED.** Ambient `GIT_DIR`/`GIT_WORK_TREE` override every git call. The gate runner clears its environment; the git layer does not. **[V]** Reproduced: `doctor --workspace <repo>` reported a decoy directory. Fixed: the Git helper removes what redirects — repository, objects, index, config — and also the author/committer identity variables, which outrank repository config and so quietly undid the fixed control identity Section 9.2 requires. |
