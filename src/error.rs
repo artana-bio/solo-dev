@@ -101,6 +101,14 @@ pub enum ErrorCode {
     PolicyIncompleteHandoff,
     /// The branch was rewritten between delivery and handoff creation.
     PolicyDeliveredShaMismatch,
+    /// The reviewer is the feature actor.
+    PolicySelfReview,
+    /// A review approved while findings remain open.
+    PolicyOpenFindings,
+    /// A review is missing a required field.
+    PolicyIncompleteReview,
+    /// The handoff under review no longer describes the branch.
+    PolicyStaleHandoff,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -117,7 +125,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 53] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -161,6 +169,10 @@ impl ErrorCode {
         Self::GateEvidenceStale,
         Self::PolicyIncompleteHandoff,
         Self::PolicyDeliveredShaMismatch,
+        Self::PolicySelfReview,
+        Self::PolicyOpenFindings,
+        Self::PolicyIncompleteReview,
+        Self::PolicyStaleHandoff,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -207,7 +219,11 @@ impl ErrorCode {
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyIncompleteHandoff
-            | Self::PolicyDeliveredShaMismatch => ExitCategory::Policy,
+            | Self::PolicyDeliveredShaMismatch
+            | Self::PolicySelfReview
+            | Self::PolicyOpenFindings
+            | Self::PolicyIncompleteReview
+            | Self::PolicyStaleHandoff => ExitCategory::Policy,
             Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
                 ExitCategory::Gate
             }
@@ -271,6 +287,10 @@ impl ErrorCode {
             Self::GateEvidenceStale => "EVIDENCE-STALE",
             Self::PolicyIncompleteHandoff => "INCOMPLETE-HANDOFF",
             Self::PolicyDeliveredShaMismatch => "DELIVERED-SHA-MISMATCH",
+            Self::PolicySelfReview => "SELF-REVIEW",
+            Self::PolicyOpenFindings => "OPEN-FINDINGS",
+            Self::PolicyIncompleteReview => "INCOMPLETE-REVIEW",
+            Self::PolicyStaleHandoff => "STALE-HANDOFF",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -392,6 +412,18 @@ impl ErrorCode {
             }
             Self::PolicyDeliveredShaMismatch => {
                 "The branch moved after delivery. Re-verify the candidate and hand off the commit that is actually there."
+            }
+            Self::PolicySelfReview => {
+                "Have a different actor review this candidate in a fresh context."
+            }
+            Self::PolicyOpenFindings => {
+                "Disposition each finding as resolved, accepted risk, or out of scope before approving."
+            }
+            Self::PolicyIncompleteReview => {
+                "Supply the missing review field; a review that omits it cannot be acted on."
+            }
+            Self::PolicyStaleHandoff => {
+                "Create a fresh handoff for the current candidate before reviewing it."
             }
             _ => "Resolve the reported policy violation.",
         }

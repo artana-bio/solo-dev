@@ -386,6 +386,37 @@ impl Workspace {
         serde_json::from_slice(&self.handoff(args).stdout).expect("the JSON envelope")
     }
 
+    /// Runs a `review` subcommand in JSON mode without asserting success.
+    pub fn review_raw(&self, args: &[&str]) -> Output {
+        let mut full = vec![
+            "review".to_owned(),
+            args[0].to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            self.control.display().to_string(),
+        ];
+        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        Self::run(&full)
+    }
+
+    /// Runs a `review` subcommand, asserting success.
+    pub fn review(&self, args: &[&str]) -> Output {
+        let output = self.review_raw(args);
+        assert!(
+            output.status.success(),
+            "review {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a `review` subcommand and parses its JSON envelope.
+    pub fn review_json(&self, args: &[&str]) -> serde_json::Value {
+        serde_json::from_slice(&self.review(args).stdout).expect("the JSON envelope")
+    }
+
     /// Revises a card, moving its digest.
     pub fn revise_card(&self, card_id: &str, include: &[&str], reason: &str) {
         let list = include

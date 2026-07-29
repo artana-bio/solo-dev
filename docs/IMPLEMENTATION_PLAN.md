@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 16 |
+| Plan revision | 17 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `a5b5704` (`feat(WP-310): gate runner and receipts`) |
+| Previous plan commit | `0c27d43` (`feat(WP-250): exact-SHA handoff, closing SPIKE-001 finding F-1`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`, `WP-310` complete; 460 tests passing. Threshold A is live. `SPIKE-001` finding F-1 is closed. |
-| Next executable work package | `WP-320` |
+| Current implementation status | `WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320` complete; 487 tests passing. Thresholds A and B are live. `SPIKE-001` findings F-1, F-4, and F-5 are closed. |
+| Next executable work package | `WP-400` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -1995,9 +1995,37 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `DONE` |
+| Owner | Claude |
+| Completed | 2026-07-28 |
 | Dependencies | `WP-250`, `WP-310` |
 | Target release | Single-repository MVP |
+
+Evidence:
+
+- 14 workspace tests plus 13 unit tests;
+- self-review is refused, and the message says the check is procedural rather
+  than claiming an identity proof it does not have;
+- **`SPIKE-001` finding F-4 is closed.** Findings carry a disposition, so a
+  reviewer can approve while recording that a real problem is accepted or
+  unfixable within the card's write scope. Approving over an *open* finding is
+  refused;
+- **`SPIKE-001` finding F-5 is closed.** Every review states whether the gates
+  can observe the acceptance behaviors and how that was established. A review
+  reporting inadequate gates still approves, and the shortfall is surfaced as a
+  warning rather than buried;
+- a candidate change or a card revision invalidates an approval;
+- reviewing a superseded handoff is refused, which is `SPIKE-001` F-1's failure
+  one stage later;
+- a re-review supersedes rather than erases: the earlier finding survives in its
+  own record, the later review names what it supersedes, and the test asserts
+  the approval came from a different reviewer than the one who raised the
+  finding, reproducing spike hypothesis `H-04`.
+
+Gap found and closed while building this: Section 11.2 permits
+`changes_requested -> active`, but no command performed it, so a card that
+received review feedback could never be handed off again. `work resume` now
+performs it. See D-037.
 
 Deliverables:
 
@@ -2480,7 +2508,7 @@ Requirement:
 
 #### Threshold B — Cards, handoffs, and reviews
 
-Trigger: `WP-320` becomes `DONE`.
+Trigger: `WP-320` becomes `DONE`. **Reached 2026-07-28.**
 
 Requirement:
 
@@ -2611,12 +2639,13 @@ All must be true:
 | Gate registry | `DONE` | `WP-300`, 31 tests | Preserve |
 | Gate runner and receipts | `DONE` | `WP-310`, 37 tests | Preserve |
 | Handoff | `DONE` | `WP-250`, 24 tests | Preserve |
-| Independent review | `READY` | `WP-250` and `WP-310` complete | `WP-320` |
+| Independent review | `DONE` | `WP-320`, 27 tests | Preserve |
+| Bare authority | `READY` | `WP-120` and `WP-130` complete | `WP-400` |
 
 
 
 
-| Bare authority | `NOT_STARTED` | None | `WP-400` |
+
 | Integration | `NOT_STARTED` | None | `WP-410` onward |
 | Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
@@ -2634,8 +2663,8 @@ All must be true:
 | Active implementation worktree | None |
 | Active owner | None |
 | Active blocker | None |
-| Next work package | `WP-320` |
-| Next branch name | `wp/WP-320-independent-review` |
+| Next work package | `WP-400` |
+| Next branch name | `wp/WP-400-bare-authority` |
 | Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
 
 The spike-derived corrections are assigned to their owning packages and are not
@@ -2761,6 +2790,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-027 | Keep `doctor --format json` on its pre-envelope payload rather than making it a strict alias for `--output json` | Accepted | Section 12.1 calls `--format` an alias while `WP-100` acceptance requires existing `doctor` behavior to remain compatible. Emitting the envelope under the old option would move every field under `data` and break existing callers, so the explicit compatibility requirement wins and the option is documented as a shim. Combining both options is a usage error rather than a silent precedence rule. |
 | D-028 | Reserve exit code 1 rather than assigning it a category | Accepted | Section 12.2 assigns 0 and 2 through 10. Leaving 1 unused keeps an uncategorized process failure, such as a panic, distinguishable from every classified outcome. |
 | D-030 | Accept card drafts in YAML or JSON via `serde_yaml_ng` | Accepted | D-010 permits YAML drafts. `serde_yaml` is archived, so a maintained fork is used. JSON is accepted for free because it is a YAML subset, which suits machine authors without a second code path. |
+| D-037 | Make `work resume` perform the `changes_requested`/`blocked` to `active` transition | Accepted | Section 11.2 permits both transitions but Section 11.4 assigned neither to a command, so a card that received review feedback could never be handed off again. Resuming is the actor's own signal that they have picked the work back up, which makes it the honest trigger. `work resume` gains `--dry-run` accordingly. |
 | D-035 | Terminate gate process groups by invoking `kill` rather than `libc::killpg` | Accepted | The crate sets `unsafe_code = "forbid"`, and `killpg` requires an unsafe block. Invoking `kill` with a negative process id is the same operation expressed through a process boundary, and keeps the crate free of unsafe code. |
 | D-036 | Exclude gate logs from control history | Accepted | Section 14.3 gives logs retention windows rather than permanence, and a passing gate's output is large and uninteresting. Invariant 7.4.2 is satisfied by the receipt, which records each log's location and SHA-256 digest. |
 | D-034 | Add `gate validate`, `register`, `list`, and `show` to the Section 12.3 command surface | Accepted | Section 12.3 lists only `gate run` and `gate status`, but gates must be registered before a card can name one, and D-008 makes registration a deliberate trusted act rather than a side effect of authoring a card. |

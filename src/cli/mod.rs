@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs, gate::GateCommand,
-        handoff::HandoffCommand, project::ProjectCommand, work::WorkCommand,
+        handoff::HandoffCommand, project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -75,6 +75,12 @@ pub enum Command {
     Handoff {
         #[command(subcommand)]
         command: HandoffCommand,
+    },
+
+    /// Record independent review of a candidate.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
     },
 }
 

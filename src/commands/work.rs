@@ -39,8 +39,8 @@ pub enum WorkCommand {
     Status(CardArgs),
     /// Record a progress note against the current lease.
     Checkpoint(CheckpointArgs),
-    /// Verify a worktree still matches authoritative control state.
-    Resume(CardArgs),
+    /// Verify a worktree matches control state and take the card back up.
+    Resume(ResumeArgs),
     /// Verify the candidate stays inside its card.
     Verify(CardArgs),
     /// Mark work halted pending a decision.
@@ -97,6 +97,19 @@ pub struct CheckpointArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `work resume`.
+#[derive(Debug, Args)]
+pub struct ResumeArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card to take back up.
+    #[arg(long)]
+    pub card_id: String,
+    /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments accepted by `work block`.
 #[derive(Debug, Args)]
 pub struct BlockArgs {
@@ -123,7 +136,7 @@ pub fn execute(command: &WorkCommand, clock: &dyn Clock) -> Result<CommandOutcom
         WorkCommand::Start(args) => run_start(args, clock),
         WorkCommand::Status(args) => run_status(args),
         WorkCommand::Checkpoint(args) => run_checkpoint(args, clock),
-        WorkCommand::Resume(args) => run_resume(args),
+        WorkCommand::Resume(args) => run_resume(args, clock),
         WorkCommand::Verify(args) => run_verify(args),
         WorkCommand::Block(args) => run_block(args, clock),
     }
@@ -621,11 +634,145 @@ fn run_checkpoint(
     )
 }
 
-fn run_resume(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
+/// Reads a worktree locator and confirms it agrees with control state.
+///
+/// The locator is never trusted, only checked. Section 9.3 is explicit that it
+/// is a locator, not a source of truth: it lives inside a tree the actor can
+/// edit.
+fn verify_locator(
+    control: &ControlRepository,
+    lease: &LeaseRecord,
+    project_id: &crate::domain::ids::ProjectId,
+) -> Result<(), HarnessError> {
+    let _ = control;
+    let link_path = WorktreeLink::path_in(&lease.worktree_path);
+    let raw = fs::read_to_string(&link_path).map_err(|source| HarnessError::ControlIo {
+        path: link_path.clone(),
+        source,
+    })?;
+    let link: WorktreeLink =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!(
+                "worktree locator at {} is malformed: {source}",
+                link_path.display()
+            ),
+            code: ErrorCode::PolicyLocatorMismatch,
+        })?;
+
+    if let Some(disagreement) = link.disagreement(lease, project_id) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "worktree locator at {} disagrees with control state: {disagreement}",
+                link_path.display()
+            ),
+            code: ErrorCode::PolicyLocatorMismatch,
+        });
+    }
+    Ok(())
+}
+
+/// Takes a card back up after review requested changes or work was blocked.
+///
+/// Section 11.2 permits `changes_requested -> active` and `blocked -> active`,
+/// but nothing performed either transition, so a card that received review
+/// feedback could never be handed off again. Resuming is the actor's own signal
+/// that they have picked the work back up, which makes it the honest trigger.
+/// See D-037.
+fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.common.control)?;
+        let (_record, state, lease) = allocation(&control, &card_id)?;
+        let config = control.project()?;
+        verify_locator(&control, &lease, &config.project_id)?;
+        return Ok(CommandOutcome::new(
+            "work.resume",
+            format!(
+                "Dry run: locator matches; card {card_id} is `{}`{}",
+                state.state,
+                if resumes_to_active(state.state) {
+                    " and would move to active"
+                } else {
+                    " and would stay as it is"
+                }
+            ),
+            serde_json::json!({ "dry_run": true, "card_id": card_id.to_string() }),
+        ));
+    }
+
+    let control = ControlRepository::open(&args.common.control)?;
+    let (_record, state, _lease) = allocation(&control, &card_id)?;
+
+    if resumes_to_active(state.state) {
+        return resume_to_active(args, &card_id, clock);
+    }
+    report_resume(args, &card_id)
+}
+
+/// True when resuming should move the card back to active work.
+const fn resumes_to_active(state: CardState) -> bool {
+    matches!(state, CardState::ChangesRequested | CardState::Blocked)
+}
+
+/// Performs the `changes_requested`/`blocked` to `active` transition.
+fn resume_to_active(
+    args: &ResumeArgs,
+    card_id: &CardId,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    with_transaction(
+        &args.common.control,
+        "work.resume",
+        clock,
+        |control, events, expected| {
+            let config = control.project()?;
+            let (record, state, lease) = allocation(control, card_id)?;
+            verify_locator(control, &lease, &config.project_id)?;
+            state.state.check_transition(CardState::Active)?;
+            store_card_state(control, &record, &state, CardState::Active)?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("work.resumed", &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .transition(Some(state.state.name()), CardState::Active.name())
+                    .meta("lease_id", serde_json::json!(lease.lease_id.to_string())),
+                clock,
+            )?;
+            control.commit(expected, &format!("work: resume {card_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "work.resume",
+                format!(
+                    "Resumed card {card_id}
+moved from `{}` to `active`
+worktree: {}",
+                    state.state,
+                    lease.worktree_path.display()
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Active.name(),
+                    "previous_state": state.state.name(),
+                    "locator_matches": true,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+fn report_resume(args: &ResumeArgs, card_id: &CardId) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
-    let (record, state, lease) = allocation(&control, &card_id)?;
+    let (record, state, lease) = allocation(&control, card_id)?;
+    let card_id = card_id.clone();
 
     // The locator is read only to be checked against control state. Section 9.3
     // is explicit that it is a locator, not a source of truth: it lives inside a
