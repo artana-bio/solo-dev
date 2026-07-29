@@ -9,27 +9,26 @@ will not own the workflow engine.
 
 ## Status
 
-Foundation complete; workflow implementation has not started.
+Every Single-repository MVP work package is implemented. A change travels the
+full path — card, work, gates, handoff, independent review, integration,
+merge preflight, landing commit, combined verification, integration review,
+acceptance, promotion, archive, close — using only harness commands.
 
-The timeboxed `SPIKE-001` walking skeleton ran the complete card-to-authority
-workflow on a disposable toy repository using fresh agent contexts. All seven
-hypotheses passed and the report was accepted on 2026-07-28. Its findings are
-recorded in [the spike report](./docs/spikes/SPIKE-001-REPORT.md) and folded
-into plan revision 4.
+The Section 19.3 release gate is not yet met. Three criteria remain: the forty
+mandatory scenarios have not been enumerated and traced one by one,
+`SELFHOST-001` has not been run against this repository, and the acceptance
+owner has not signed the release record. One further criterion is structurally
+blocked and flagged in the plan rather than skipped. See
+[the implementation plan](./docs/IMPLEMENTATION_PLAN.md) for the per-criterion
+status.
 
-No prototype code was merged; the prototype is preserved only under
-`refs/archive/spikes/SPIKE-001`.
-
-Production implementation is now unblocked. The next work package is `WP-100`,
-core contracts and stable command output.
-
-The current CLI provides a read-only `doctor` command that validates the host
-Git installation and reports whether a path belongs to a Git repository. It
-does not yet create worktrees, integrate branches, or update protected refs.
+The `SPIKE-001` walking skeleton that preceded implementation is recorded in
+[its report](./docs/spikes/SPIKE-001-REPORT.md). No prototype code was merged;
+the prototype survives only under `refs/archive/spikes/SPIKE-001`.
 
 ## Product boundary
 
-Change Harness will automate mechanical controls:
+Change Harness automates mechanical controls:
 
 - exact commit and branch checks;
 - worktree allocation;
@@ -39,28 +38,221 @@ Change Harness will automate mechanical controls:
 - clean integration and safe promotion;
 - archival, recovery, and cleanup.
 
-It will not decide whether a requirement is correct, whether an architecture is
-appropriate, whether tests prove the intended behavior, or whether residual
-risk is acceptable.
+It does not decide whether a requirement is correct, whether an architecture is
+appropriate, whether tests prove the intended behavior, or whether residual risk
+is acceptable. Those judgments stay with people, and the harness's job is to
+make sure the artifacts they judge are the exact ones that will land.
 
 Local hooks are convenience guardrails, not a security boundary. Strong
 authorization requires a separate identity or operating-system boundary.
 
-## Development
+## Installation
 
-The repository pins the same Rust toolchain family currently used by ARTANA,
-but the resulting binary is independent of the target repository's programming
-language.
+Requires Rust 1.95 or newer and Git 2.50 or newer. The Git floor is not
+arbitrary: `git merge-tree --write-tree` is what makes a non-destructive merge
+preflight possible, and project validation refuses an older Git rather than
+silently falling back to a different algorithm.
 
 ```bash
-cargo run -- doctor --workspace .
+cargo install --path .
+```
+
+Check the host before configuring a project:
+
+```bash
+change-harness doctor --workspace .
+```
+
+Every command accepts `--output text|json`. JSON emits a stable envelope
+(`harness.command-result/v1` or `harness.command-error/v1`) with a machine
+-readable error code, which is the interface a coding agent should use.
+
+## Three repositories
+
+The harness separates three roles, and keeping them apart is what the safety
+properties rest on:
+
+| Role | What it holds |
+| --- | --- |
+| Candidate | Ordinary repository where feature and integration work happens |
+| Control | Separate Git repository holding cards, events, reviews, receipts, and integration records |
+| Authority | Bare repository owning the protected branch, updated only by promotion |
+
+`project init` creates the control and authority repositories and registers the
+authority as a remote of the candidate. It never overwrites an existing remote
+and never adopts a directory whose contents nobody checked.
+
+```bash
+change-harness project init \
+  --project-id example \
+  --repository /path/to/repo \
+  --control /path/to/control \
+  --authority /path/to/authority.git \
+  --worktree-root /path/to/worktrees
+```
+
+## Operator workflow
+
+The sequence below is the whole lifecycle. `tests/lifecycle.rs` runs exactly
+this, twice, against a temporary project.
+
+**1. Register the gates cards may name.** Gates are registered deliberately
+rather than declared inline, so a card cannot invent a check that nobody
+reviewed.
+
+```bash
+change-harness gate register --control $CONTROL --definition gate.unit.yaml
+```
+
+**2. Open a cycle and freeze its baseline.** Activation pins one exact
+authority commit; every independent card in the cycle starts from it.
+
+```bash
+change-harness cycle create --control $CONTROL --cycle-id C-001 --objective "First slice"
+change-harness cycle activate --control $CONTROL --cycle-id C-001
+```
+
+**3. Author and activate a card.** A card declares its write scope, the
+contracts it reads and changes, the gates it must pass, and what acceptance
+looks like. Activation freezes it into an immutable, digested revision.
+
+```bash
+change-harness card create --control $CONTROL --draft F-001.yaml
+change-harness card activate --control $CONTROL --card-id F-001
+```
+
+**4. Do the work in an allocated worktree.** `work start` leases the card to
+one actor and allocates a worktree and branch for it. Overlapping write scopes
+between active cards are refused here, not discovered at merge time.
+
+```bash
+change-harness work start --control $CONTROL --card-id F-001
+change-harness gate run --control $CONTROL --card-id F-001 --gate-id gate.unit
+```
+
+**5. Hand off an exact candidate.** The declaration names the SHA the actor
+believes they delivered, and the harness refuses if the branch says otherwise.
+This is the check `SPIKE-001` found missing: a branch rewritten between
+delivery and review produced an internally consistent handoff describing code
+nobody wrote.
+
+```bash
+change-harness handoff create --control $CONTROL --card-id F-001 --declaration decl.yaml
+```
+
+**6. Review independently.** A different actor, a fresh context, and the
+review packet only. The verdict records per-finding disposition and whether the
+gates could actually observe the acceptance behaviors — both because spike
+reviewers needed to say things a binary verdict cannot express.
+
+```bash
+change-harness review begin  --control $CONTROL --card-id F-001
+change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml
+```
+
+**7. See what is waiting.** `integration ready` answers "what is approved and
+integrable" from control state, and says why each card that is not ready is
+not. An actor arriving with no context does not have to remember.
+
+```bash
+change-harness integration ready --control $CONTROL --cycle-id C-001
+```
+
+**8. Plan, preflight, and combine.** `prepare` pins each candidate and orders
+them topologically. `preflight` simulates the whole merge sequence without
+touching a ref, index, or worktree. `merge` combines them in a disposable
+worktree that is removed on every path.
+
+```bash
+change-harness integration prepare   --control $CONTROL --cycle-id C-001 --actor-id coordinator
+change-harness integration preflight --control $CONTROL --integration-id INT-001
+change-harness integration merge     --control $CONTROL --integration-id INT-001 --actor-id coordinator
+```
+
+**9. Build the landing commit, then verify it.** The landing commit has the
+authority baseline as first parent and the integration head as second, carries
+the exact verified tree, and moves no branch. Verification then reruns every
+gate any member named *against the landing commit* — a gate that passed on an
+isolated candidate proves nothing about the combined tree.
+
+```bash
+change-harness integration land   --control $CONTROL --integration-id INT-001 --actor-id coordinator
+change-harness integration verify --control $CONTROL --integration-id INT-001 --actor-id verifier
+change-harness integration review --control $CONTROL --integration-id INT-001 \
+  --reviewer-actor-id integration-reviewer
+```
+
+**10. Accept, then promote.** Acceptance is the only thing that authorizes
+moving the protected branch, and it binds one exact landing commit. Promotion
+checks every precondition first, moves the authority with a compare-and-swap,
+and fast-forwards the local protected worktree.
+
+```bash
+change-harness acceptance record   --control $CONTROL --integration-id INT-001 --acceptance-owner owner
+change-harness integration promote --control $CONTROL --integration-id INT-001 --actor-id promoter
+```
+
+**11. Archive, then clean up.** Archive refs keep the landing commit and every
+candidate reachable after the branches are gone. `close` refuses to remove
+anything holding commits reachable from nowhere else, so cleanup cannot become
+data loss.
+
+```bash
+change-harness archive create --control $CONTROL --integration-id INT-001
+change-harness archive verify --control $CONTROL --integration-id INT-001
+change-harness archive close  --control $CONTROL --integration-id INT-001
+```
+
+Every mutating command accepts `--dry-run`, which validates against real state
+and reports what would change without changing it.
+
+## Recovering from an interruption
+
+Mutating commands journal each step before performing it, so an interrupted
+operation is attributable to a boundary rather than guessed at.
+
+```bash
+change-harness project status  --control $CONTROL
+change-harness project recover --control $CONTROL
+```
+
+One case is deliberate: if promotion moves the authority and the local
+fast-forward then fails, the command exits 9 and records
+`authority_promoted_local_sync_pending`. The authority is **not** rolled back.
+Rewinding a published branch is worse than leaving a recoverable gap, so
+resolving it is an operator decision.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 2 | Usage error |
+| 3 | Configuration error |
+| 4 | Precondition not met |
+| 5 | Policy refusal |
+| 6 | Conflict with concurrent state |
+| 7 | A gate failed |
+| 8 | External tool failure |
+| 9 | Recovery required |
+| 10 | Internal error |
+
+Exit 1 is deliberately unassigned, so an uncategorized process failure such as a
+panic stays distinguishable from every classified outcome.
+
+## Development
+
+```bash
 cargo test
+cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+All three must pass. The crate sets `unsafe_code = "forbid"`.
 
 See:
 
 - [Implementation Plan and Status Ledger](./docs/IMPLEMENTATION_PLAN.md) for
-  authoritative requirements, work packages, acceptance gates, and current
-  status.
+  authoritative requirements, work packages, acceptance gates, decision and
+  risk registers, and current status.
 - [Architecture](./docs/ARCHITECTURE.md) for the shorter design summary.

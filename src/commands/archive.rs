@@ -40,7 +40,7 @@ pub enum ArchiveCommand {
     /// Create archive refs for a promoted integration and its cards.
     Create(CommonArgs),
     /// Check that every archived ref still resolves to its recorded commit.
-    Verify(CommonArgs),
+    Verify(VerifyArgs),
     /// Remove worktrees and branches, closing the integration and its cards.
     Close(CloseArgs),
 }
@@ -60,6 +60,21 @@ pub struct CommonArgs {
     /// Report without changing anything.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments accepted by `archive verify`.
+///
+/// No `--dry-run`: verification reads and reports, so a dry run of it would be
+/// the same command. Advertising the flag would imply the plain form changes
+/// something.
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    /// Path to the control repository.
+    #[arg(long)]
+    pub control: std::path::PathBuf,
+    /// The integration to check.
+    #[arg(long)]
+    pub integration_id: String,
 }
 
 /// Arguments accepted by `archive close`.
@@ -241,7 +256,7 @@ fn load_archive(
     })
 }
 
-fn run_verify(args: &CommonArgs) -> Result<CommandOutcome, HarnessError> {
+fn run_verify(args: &VerifyArgs) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;

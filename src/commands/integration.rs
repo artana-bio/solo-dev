@@ -1817,8 +1817,55 @@ fn store_verification(
     })
 }
 
+/// Reports what verification would run, running no gate.
+///
+/// A dry run that started the gates would be a real verification wearing the
+/// wrong name: the gates have side effects by construction, and one of them
+/// transitions the integration.
+fn preview_verify(
+    args: &MergeArgs,
+    integration_id: &IntegrationId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, integration_id)?;
+    record
+        .status
+        .check_transition(IntegrationStatus::Verified)?;
+    let Some(landing_sha) = record.landing_sha.clone() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {integration_id} has no landing commit; run `integration land` first"
+            ),
+            code: ErrorCode::PreconditionNotFound,
+        });
+    };
+    let gates = required_gates(&control, &record)?;
+
+    Ok(CommandOutcome::new(
+        "integration.verify",
+        format!(
+            "Dry run: would run {} gate(s) against landing commit {landing_sha}\n  {}\nnothing was changed",
+            gates.len(),
+            gates.join("\n  ")
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "integration_id": integration_id.to_string(),
+            "landing_sha": landing_sha,
+            "gates": gates,
+            "interactions": member_interactions(&control, &record)?,
+        }),
+    )
+    .with_project(config.project_id))
+}
+
 fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
+
+    if args.dry_run {
+        return preview_verify(args, &integration_id);
+    }
 
     with_transaction(
         &args.control,

@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 25 |
+| Plan revision | 26 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `5551887` (`feat(WP-460): archive refs, reachability verification, and safe cleanup`) |
+| Previous plan commit | `7be867d` (`test: demonstrate the full lifecycle twice, and trace the §19.3 gate`) |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 637 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
+| Current implementation status | Every Single-repository MVP work package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) is complete; 638 tests passing. A change travels end to end from card to promoted, archived, closed. The whole Section 12.3 command surface exists. Thresholds A and B are live. `SPIKE-001` findings F-1, F-3, F-4, and F-5 are closed. Threshold C and the Section 19.3 MVP gate are the remaining work. |
 | Next executable work package | `SELFHOST-001` (Threshold C), then the Section 19.3 MVP gate |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2777,7 +2777,7 @@ Progress against each criterion:
 | Recovery-required promotion state demonstrated and recovered | ⚠️ | `a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind` demonstrates the state and proves the authority is not rewound. *Recovering* from it is `WP-500`, which is not an MVP package — the gate as written depends on a hardened-release package |
 | Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
 | No critical or high open defect | ✅ | No open defect is recorded; every defect found during implementation was fixed in the package that exposed it |
-| README documents installation and operator workflow | ⏳ | Not written |
+| README documents installation and operator workflow | ✅ | `README.md`: installation, the three-repository model, the eleven-step operator workflow, recovery, and the exit-code table |
 | `SELFHOST-001` completes without manual Git mutation | ⏳ | Not run. `tests/lifecycle.rs` proves the machinery works on a temporary project; `SELFHOST-001` is the same claim against this repository |
 | Acceptance owner signs the release record | ⏳ | Alvaro Alvarez, after the above |
 

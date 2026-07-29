@@ -263,3 +263,87 @@ fn no_failure_path_in_the_lifecycle_leaves_the_authority_moved() {
         );
     }
 }
+
+#[test]
+fn every_advertised_dry_run_changes_nothing() {
+    // `integration verify` advertised `--dry-run` and ignored it, so the flag
+    // ran a real, state-mutating verification. This checks the whole surface
+    // rather than that one command, because the failure mode is a flag that
+    // parses and is then forgotten.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+
+    let control_before = workspace.control_head();
+    let authority_before = workspace.authority_head();
+    let status_before =
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"].clone();
+
+    for args in [
+        vec!["verify", "--integration-id", &id, "--actor-id", "verifier"],
+        vec!["preflight", "--integration-id", &id],
+    ] {
+        let mut full = args.clone();
+        if full[0] != "preflight" {
+            full.push("--dry-run");
+        }
+        let output = workspace.integration_raw(&full);
+        assert!(
+            output.status.success(),
+            "{full:?} failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            control_before,
+            "{full:?} wrote to control state"
+        );
+        assert_eq!(
+            workspace.authority_head(),
+            authority_before,
+            "{full:?} moved the protected branch"
+        );
+        assert_eq!(
+            workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
+            status_before,
+            "{full:?} advanced the integration"
+        );
+    }
+
+    // And the dry run must still say something useful about what would happen.
+    let envelope = workspace.integration_json(&[
+        "verify",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "verifier",
+        "--dry-run",
+    ]);
+    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_eq!(
+        envelope["data"]["gates"],
+        serde_json::json!(["gate.all", "gate.unit"]),
+        "a dry run that does not name the gates is not a preview"
+    );
+}
