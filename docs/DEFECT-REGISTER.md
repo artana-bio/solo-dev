@@ -138,9 +138,32 @@ Deliberately **not** fixed, and named at the check:
 - **Section 10.2's dependency-base precondition is unenforced here.** A card's
   `base_sha` is checked only as 40 hexadecimal characters; nothing verifies that
   it is the dependency's exact accepted SHA.
-- **Cycle status folds card events.** This remains an open Tier 4 defect.
-- **Five cycle statuses and one card state are unreachable.** This remains an
-  open Tier 4 defect.
+
+✅ **FIXED:** cycle status now folds only cycle lifecycle events — `card_id`
+unset *and* `event_type` starting with `cycle.` — while `EventStore::for_cycle`
+still returns the complete cycle subtree for the audit trail and the status
+command's per-event history. Both conditions are load-bearing, and neither
+alone is sufficient: `card_id.is_none()` alone still admits `card.created`,
+which fires before a card is activated and therefore carries no `card_id` —
+and whose `next_state` is `draft`, colliding with `CycleStatus::Draft`. Without
+the `event_type` check, creating a single card in an active cycle silently
+folds the reported status back to `draft`, undoing `cycle activate` in the
+report though not in the stored record. Confirmed by mutation:
+`creating_a_card_does_not_reset_an_active_cycle_to_draft` fails at exactly that
+assertion (`left: "draft", right: "active"`) with the `event_type` clause
+removed. Two further regressions cover the originally-suspected case — one
+card's `active → blocked → closed` events inside an active cycle, and a
+completed integration — both of which also fail under an unfiltered fold.
+
+**DELIBERATE GAP:** `CycleStatus::Integrating`, `Accepted`, `Landed`,
+`Closed`, and `Blocked` remain named but unset by any command. F-019 documents
+that automatic cycle-status advancement is future design work because it
+crosses integration and acceptance policy; it is not silently introduced here.
+
+✅ **FIXED:** `CardState::Abandoned` is now reachable through `card abandon
+--card-id <id> --reason <reason> [--dry-run]`. The command records a
+card-attributed `card.abandoned` event, and a real promoted-card test confirms
+that `landed → abandoned` is refused with `CH-POLICY-INVALID-TRANSITION`.
 
 ✅ **FIXED:** authoritative integration merges no longer inherit
 `commit.gpgsign` or commit-stage hooks. The merge stops before committing; the

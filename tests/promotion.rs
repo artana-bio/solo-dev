@@ -813,3 +813,38 @@ fn a_landed_card_cannot_be_revised() {
         "closed"
     );
 }
+
+#[test]
+fn a_landed_card_cannot_be_abandoned() {
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "the fixture must reach the state Section 11.2 protects"
+    );
+
+    let output = workspace.card_raw(&["abandon", "--card-id", "F-001", "--reason", "too late"]);
+    assert!(
+        !output.status.success(),
+        "landed cards must not be abandoned"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "the refusal must leave the card able to close"
+    );
+}
+
+#[test]
+fn a_completed_integration_does_not_advance_the_cycle_status() {
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    workspace.archive(&["create", "--integration-id", &id]);
+    workspace.archive(&["close", "--integration-id", &id]);
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(status["data"]["status"], "active");
+    assert_eq!(status["data"]["status_matches_history"], true);
+}
