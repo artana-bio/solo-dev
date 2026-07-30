@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 49 |
+| Plan revision | 50 |
 | Plan date | 2026-07-30 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `claude/project-status-review-543d65` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 732 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects, 5 of which mean the evidence chain does not hold. The previous claim that eleven of twelve criteria were met was the author assessing their own work against their own tests, and it was wrong. See `docs/DEFECT-REGISTER.md`. |
-| Next executable work package | Acceptance owner signs the Section 19.3 release record; then `WP-530` and `WP-540` |
+| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 858 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects; every one is now fixed with a mutation proof or explicitly, deliberately left open with a named reason, per `docs/DEFECT-REGISTER.md`. Criterion 9 (no critical or high open defect) now reads `MET` — see Section 19.3. What remains open is criterion 2 (an honest, unresolved bound on scenario-coverage soundness, not a pass or a fail) and the acceptance owner's own signature. |
+| Next executable work package | Acceptance owner resolves Section 19.3 criterion 2 (a larger mutation-audit effort, or a named acceptance of residual risk) and signs the release record; then `WP-530` and `WP-540` |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2963,12 +2963,29 @@ prototype path.
 
 ### 19.3 Single-repository MVP gate
 
-Status: `BLOCKED`. This section previously read "eleven of the twelve criteria
-are met; only the acceptance owner's signature remains." That was wrong, and the
-way it was wrong matters more than the count: the criteria were assessed by the
-author of the code against tests written by that same author. An independent
-review (Section 19.6) disproved it. Three criteria now fail, and one of them —
-"no critical or high open defect" — fails with twenty-four findings behind it.
+Status: `BLOCKED`. Ten of twelve criteria are met. This section previously read
+"eleven of the twelve criteria are met; only the acceptance owner's signature
+remains." That was wrong, and the way it was wrong matters more than the count:
+the criteria were assessed by the author of the code against tests written by
+that same author. An independent, eight-reviewer review (Section 19.6)
+disproved it, finding defects across every tier of `docs/DEFECT-REGISTER.md`.
+
+Every entry in that register is now either fixed with a mutation proof or
+explicitly, deliberately left open with a named reason — reconfirmed end to end
+by a certification review with no role in authoring any of the code. The most
+recent repair, `F-021`, closed the two findings that had failed criterion 9
+("no critical or high open defect"): `handoff create` never enforced write
+scope, confirmed exploited on `F-019` itself, and a coverage gap on the
+`IntegrationStatus::Draft → Promoted` transition that no live path could
+actually reach. Criterion 9 now reads `MET`, confirmed independently twice
+since the fix landed — once by `RV-000025`'s review, and once more by this
+certification's own spot check (below).
+
+What remains open is genuinely open, not glossed over. Criterion 2 ("all 40
+mandatory scenarios pass") is an honest, unresolved bound on test soundness
+rather than a demonstrated pass — closing it is the acceptance owner's call to
+make, not this review's. Criterion 12 is the acceptance owner's own signature,
+untouched here.
 
 All must be true:
 
@@ -2993,14 +3010,14 @@ Progress against each criterion:
 | Criterion | Status | Evidence or what remains |
 | --- | --- | --- |
 | All twenty work packages `DONE` | ✅ | This document's per-package entries |
-| All 40 mandatory scenarios pass | ❌ | The trace in Section 16.2 is sound in structure, but the test audit found ~45 tests that assert less than their names claim, and four mutations that survive the whole suite. A scenario traced to an over-claiming test is not demonstrated. Re-assessment requires the Tier-1 repairs and a guard on each cited test proving its fixture is not vacuous |
+| All 40 mandatory scenarios pass | ⏳ | Genuinely unresolved — an honest open bound, not a pass or a fail. The Section 16.2 trace maps all 41 scenarios (the original 40 plus the dependency-SHA scenario `F-016` added) to specific tests and is sound in structure. But `docs/reviews/over-claiming-tests.md` names 18 tests that assert less than their names claim; only 2 of those 18 intersect the scenario trace, and both have been individually checked — one repaired and now holding under mutation, one carrying an incidental backstop that catches what its own assertion misses. The other roughly 48 of the ~50 tests the trace cites have never been mutation-tested by anyone. Closing this needs either a larger mutation-audit effort across the untested remainder, or the acceptance owner's explicit, named acceptance of the residual risk — not something this review resolves unilaterally |
 | No unclassified failure path mutates authority | ✅ | `no_failure_path_in_the_lifecycle_leaves_the_authority_moved`, which also asserts exit 1 is never produced |
 | Exact-SHA review and acceptance invalidation demonstrated | ✅ | `an_invalidated_approval_is_reported_as_stale_rather_than_absent`, `an_acceptance_binds_the_exact_landing_commit_and_its_evidence` |
 | One temporary project completes the full lifecycle twice | ✅ | `one_project_completes_the_full_lifecycle_twice` |
 | Second lifecycle proves stale-main rejection | ✅ | `the_second_cycle_rejects_a_plan_built_against_a_stale_main` |
 | Recovery-required promotion state demonstrated and recovered | ✅ | `a_local_sync_failure_after_promotion_requires_recovery_and_does_not_rewind` reaches the state; `a_recovery_required_promotion_can_be_resumed_to_completion` recovers it via `project recover --resume`. Scope decision recorded as D-051 |
 | Audit evidence identifies the exact authority transition | ✅ | `audit_evidence_identifies_the_exact_authority_transition` |
-| No critical or high open defect | ❌ | 24 open defects, `docs/DEFECT-REGISTER.md`. Five are critical: a gate passes on uncommitted content while the receipt binds the pass to HEAD; a re-review approves away a prior critical finding; acceptance never checks its recorded digest; two cards can own the same file; a gate's timeout does not bound the gate. The previous entry — "no open defect is recorded" — was true and meaningless, because the only party looking was the author |
+| No critical or high open defect | ✅ | `docs/DEFECT-REGISTER.md`: every entry is fixed with a mutation proof or explicitly, deliberately left open with a named reason (reconfirmed end to end for this certification; the one loose thread found — an unlabeled, redundant restatement of the already-closed `Draft → Promoted` item under "The test suite" — was already caught and dispositioned `accepted_risk` by `RV-000025` as zero functional impact, since the authoritative entry for the same defect earlier in the same file is unambiguous). The two findings that had failed this criterion are both closed by `F-021`: (1) `handoff create` never enforced write scope — confirmed exploited via `H-000025`/`H-000026` on `F-019` — fixed and mutation-proved (`an_out_of_scope_candidate_refuses_handoff_with_the_path` fails without the fix, passes with it); independently reviewed and approved in `RV-000025`, which built its own binary from source and adversarially tested eight cases, including both directions of a rename across the scope boundary and a path sharing a string prefix but not a full path segment; independently reproduced a third time for this certification (below). (2) The `IntegrationStatus::Draft → Promoted` coverage gap — closed with a direct transition-table regression test; `RV-000025` additionally confirmed `Draft` is never constructed anywhere in the codebase, so the gap was never reachable through any real command. One pre-existing, lower-severity item remains explicitly named and non-blocking: defect 22 (risk policy) is "partly fixed" — a `high`/`critical` card now requires a declared human reviewer, but Section 15.3's further requirements for `critical` (a rollback exercise, and a second human approval beyond D-068's policy decision) remain unenforced in code, recorded as unenforced rather than implied. Spot-checked directly for this certification: built `change-harness` from `main` at `e70b1a2` (`cargo build --release`), drove it against a fresh scratch project (`project init`, then `cycle`/`card`/`work start`), committed a candidate touching one in-scope file and one file outside the card's declared write scope, and confirmed both `handoff create --dry-run` and the real `handoff create` refuse with `CH-POLICY-CANDIDATE-OUT-OF-SCOPE` naming the exact path, exit 5, writing no handoff record; the identical lease handed off normally once the out-of-scope file was removed |
 | README documents installation and operator workflow | ✅ | `README.md`: installation, the three-repository model, the eleven-step operator workflow, recovery, and the exit-code table |
 | `SELFHOST-001` completes without manual Git mutation | ✅ | Completed on the third attempt; landing commit `c51f2dc` on `main`, archive refs `refs/archive/cards/F-001` and `refs/archive/integrations/INT-001`, integration `archived`, card `closed`. The first two attempts exposed three real defects (D-052, D-053, D-054), which is recorded in `docs/SELFHOST-001.md` rather than smoothed over |
 | Acceptance owner signs the release record | ⛔ | Alvaro Alvarez. **Must not be signed.** Signing certifies criteria that are now known to fail |
@@ -3091,6 +3108,7 @@ and `WP-510`: check a claim before writing it down.
 | D-075 | Release when no known defect can produce wrong evidence or lose data, every Section 19.3 criterion has a mutation-checked test, and an independent reviewer certifies both; everything else ships as a public register | Accepted | The count of known defects was not converging — each round of looking harder found more — while their severity was. A rule of “zero known defects” would never terminate. These three conditions are finite and checkable, and the first is already met. |
 | D-076 | Implementation of the remaining repair goes to a different tool than the one that wrote the original code, with the harness's own review binding the result | Accepted | Measured on this project, agents reviewing the original author's work found real defects every round, the author reviewing their own found none, and a finding the author got wrong twice was fixed by a different implementer on its first attempt. |
 | D-077 | Leave automatic cycle-status advancement undesigned | Accepted | The commands emit cycle lifecycle events only for create, activate, and abandon. `Integrating`, `Accepted`, `Landed`, `Closed`, and `Blocked` therefore remain named `CycleStatus` variants that no command ever sets. Wiring them to the integration or acceptance flow would change cross-cutting lifecycle policy — whether a cycle should auto-advance at all is a design question, not a bug fix — and needs its own decision rather than being inferred while correcting the event-derivation defect that let them appear by accident. |
+| D-078 | Certify criterion 9 `MET` and bring the Section 19.3 record current | Accepted | A fresh-context reviewer (Claude Sonnet 5; no role in authoring any Section 19.3 code, `F-021`, or its review) re-read `docs/DEFECT-REGISTER.md` end to end and confirmed every entry is either fixed with a mutation proof or explicitly, deliberately left open with a named reason. One recurring low-severity item: an unlabeled bullet under "The test suite" restates the already-closed `Draft → Promoted` coverage gap without its own resolution marker; already found and dispositioned `accepted_risk` by `RV-000025` as zero functional impact, since the authoritative Tier-4 entry for the same defect, earlier in the same file, is unambiguous — not a new finding, and not critical or high severity. Independently spot-checked the higher-severity fix rather than resting on the two prior reports alone: built `change-harness` from `main` at `e70b1a2`, drove it directly against a fresh scratch project, and confirmed both `handoff create --dry-run` and the real command refuse a candidate touching one out-of-scope file with `CH-POLICY-CANDIDATE-OUT-OF-SCOPE`, exit 5, naming the exact path and writing no record, while the identical lease handed off normally once the file was in scope. Criterion 9 now reads `MET`. Criterion 2 remains a genuinely open bound rather than a pass, left for the acceptance owner to close with either a larger mutation-audit effort or a named acceptance of residual risk. The acceptance-signature line (criterion 12) is untouched — that decision belongs to the acceptance owner alone. |
 
 ### 19.5 Multi-repository gate
 
