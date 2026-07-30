@@ -1058,19 +1058,49 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_setting_a_commit_encoding_still_integrates() {
+        let (temp, repo, base, candidate) = repository_with_candidate();
+        // The guard on `verify_authored`'s encoding refusal, and the reason that
+        // refusal cannot ship without `i18n.commitEncoding` in
+        // `authoring_overrides`. Without the override this fails 100% of the
+        // time on any host where the setting exists — reported as
+        // `InternalControlCorrupt`, which tells the operator the harness is
+        // broken and points them at the wrong repository. A reviewer reproduced
+        // it three ways: repository config, `~/.gitconfig`, and an `includeIf`
+        // with no repository configuration at all.
+        //
+        // This is the fifth time in this project a fix would have refused every
+        // valid case, and the second on this defect alone.
+        crate::git::command::run_ok(
+            &GitScope::work_tree(&repo),
+            ["config", "i18n.commitEncoding", "ISO-8859-1"],
+        )
+        .expect("config");
+        let worktree = path_for(&temp.path().join("worktrees"), "INT-001");
+        create(&repo, &worktree, &base).expect("a worktree");
+        merge(&worktree, &candidate, "integrate F-001 into INT-001")
+            .expect("a repository setting i18n.commitEncoding must still integrate");
+    }
+
+    #[test]
     fn post_merge_hook_children_do_not_delay_an_integration() {
         let (temp, repo, base, candidate) = repository_with_candidate();
         // `output()` holds capture pipes open until this child exits; `status()`
         // with null streams returns when the hook shell exits, as Git does.
-        hook(&repo, "post-merge", "sleep 2 &");
+        // The child sleeps far longer than any plausible merge so the margin is
+        // wide. At `sleep 2` this test asserted 1s wall-clock and failed 1 run
+        // in 7 on an unloaded host — a flaky assertion in this card's own
+        // integration gate.
+        hook(&repo, "post-merge", "sleep 30 &");
         let worktree = path_for(&temp.path().join("worktrees"), "INT-001");
         create(&repo, &worktree, &base).expect("a worktree");
 
         let started = std::time::Instant::now();
         merge(&worktree, &candidate, "integrate F-001 into INT-001").expect("a merge");
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "a post-merge hook child must not delay the integration"
+            elapsed < std::time::Duration::from_secs(10),
+            "a post-merge hook child must not delay the integration: took {elapsed:?}"
         );
     }
 

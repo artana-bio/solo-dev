@@ -150,6 +150,15 @@ const AMBIENT_OVERRIDES: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_COUNT",
+    // Stripped for the same reason as `GIT_CONFIG_COUNT`, and previously absent
+    // by oversight: `GIT_CONFIG_PARAMETERS` injects arbitrary config into every
+    // invocation including `commit-tree`, verified to reach
+    // `i18n.commitEncoding`. `GIT_TEMPLATE_DIR` outranks `-c init.templateDir=`,
+    // so without it a template hook really is written into the control
+    // repository — inert, because hooks are neutralised per invocation, but the
+    // claim that nothing is written there was false.
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_TEMPLATE_DIR",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_AUTHOR_DATE",
@@ -196,7 +205,21 @@ const AMBIENT_OVERRIDES: &[&str] = &[
 pub fn authoring_overrides(hook_sink: &Path) -> Vec<OsString> {
     let mut hooks_path = OsString::from("core.hooksPath=");
     hooks_path.push(hook_sink.as_os_str());
-    vec![hooks_path, OsString::from("merge.verifySignatures=false")]
+    vec![
+        hooks_path,
+        OsString::from("merge.verifySignatures=false"),
+        // `commit-tree` honours `i18n.commitEncoding`, and `verify_authored`
+        // refuses a commit carrying an `encoding` header it did not ask for.
+        // Adding that refusal without this key made every integration fail on
+        // any host where the setting exists — reported as an internal harness
+        // defect, pointing the operator at the wrong repository. Reproduced via
+        // repository config, `~/.gitconfig`, and an `includeIf` with no
+        // repository configuration at all.
+        //
+        // Pinned to UTF-8 rather than emptied: an empty value makes Git write a
+        // literal empty `encoding ` header, which the refusal then catches.
+        OsString::from("i18n.commitEncoding=UTF-8"),
+    ]
 }
 
 /// Removes the environment variables that would redirect or re-identify Git.

@@ -141,6 +141,7 @@ Deliberately **not** fixed, and named at the check:
 - **Cycle status folds card events.** This remains an open Tier 4 defect.
 - **Five cycle statuses and one card state are unreachable.** This remains an
   open Tier 4 defect.
+
 ✅ **FIXED:** authoritative integration merges no longer inherit
 `commit.gpgsign` or commit-stage hooks. The merge stops before committing; the
 harness writes and verifies the exact two-parent object, then runs only the
