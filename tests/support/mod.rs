@@ -574,6 +574,91 @@ impl Workspace {
         self.card(&["activate", "--card-id", card_id]);
     }
 
+    /// Activates a dependent card branched at an exact commit.
+    ///
+    /// Section 10.2: a dependent uses the accepted dependency SHA. The default
+    /// `activate_card_depending_on` branches from the cycle baseline instead,
+    /// which is a declared dependency the candidate does not incorporate — a
+    /// different case, and both are exercised.
+    pub fn activate_card_depending_on_at(
+        &self,
+        card_id: &str,
+        include: &[&str],
+        depends_on: &[&str],
+        base: &str,
+    ) {
+        let list = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| format!("\"{value}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\ndepends_on: [{deps}]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            inc = list(include),
+            deps = list(depends_on),
+        );
+        let path = self.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        self.card(&["create", "--draft", &path.display().to_string()]);
+        self.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Re-works an approved card and approves it again at a new commit.
+    ///
+    /// `rewrite` chooses how: `true` amends the tip, so the previous candidate
+    /// is no longer in the branch's history; `false` commits on top, so it
+    /// still is. The distinction is the whole subject of the dependency
+    /// binding check, so it is a parameter rather than two near-identical
+    /// helpers.
+    pub fn rework_and_reapprove(&self, card_id: &str, file: &str, rewrite: bool) -> String {
+        self.handoff(&["revoke", "--card-id", card_id, "--reason", "rework"]);
+        let worktree = self.worktrees.join(card_id);
+        let path = worktree.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "// reworked\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        if rewrite {
+            git(&worktree, &["commit", "-q", "--amend", "-m", "rework"]);
+        } else {
+            git(&worktree, &["commit", "-q", "-m", "rework"]);
+        }
+        self.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = self.root.join(format!("{card_id}-rework.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: reworked\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        self.handoff(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration.display().to_string(),
+        ]);
+        self.review(&["begin", "--card-id", card_id]);
+        let verdict = self.root.join(format!("{card_id}-rework-verdict.yaml"));
+        fs::write(
+            &verdict,
+            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n",
+        )
+        .unwrap();
+        self.review(&[
+            "record",
+            "--card-id",
+            card_id,
+            "--verdict",
+            &verdict.display().to_string(),
+        ]);
+        head
+    }
+
     /// Carries an activated card all the way to `approved`.
     ///
     /// Work, gate, handoff, and an approval by a reviewer distinct from the

@@ -103,10 +103,46 @@ emits two NUL-separated fields and the second is a bare path with no `XY `
 prefix, so stripping three bytes turned `src/alpha.rs` into `/alpha.rs`.
 `--no-renames` plus a parser that refuses a malformed record rather than
 truncating it. Recording the disambiguation so the next reader does not
-re-audit `diff.rs`. Dependency SHAs are never bound to
-a review. Cycle status folds card events. Five cycle statuses and one card state
-are unreachable. Merge honours `commit.gpgsign` and repository hooks,
-contradicting "hooks are advisory".
+re-audit `diff.rs`. ✅ **FIXED:** dependency SHAs were never bound to a review. Neither
+`HandoffRecord` nor `ReviewRecord` carried one, so Section 10.7's required
+field did not exist and invariant 7.3.6's invalidation trigger was
+unimplemented: an approval survived its dependency being re-reviewed at a
+different commit.
+
+The binding is constrained by what the candidate incorporates, rather than what
+the dependency's current approval names. A handoff records, per declared
+dependency, the newest commit that dependency ever handed off which is an
+ancestor of this candidate.
+The binding goes stale only when the dependency's standing approval no longer
+*contains* that commit — containment, not equality, because a dependency that
+gained review-requested fixes on top has not moved out from under anyone, while
+a rewrite that discards the bound commit has.
+
+That resolution rule is what avoids re-serializing the cycle. An earlier design
+compared against the dependency's current approval, which would have invalidated
+a dependent every time its dependency was re-reviewed and forced dependencies to
+be approved in order. The proof it is gone: `tests/integration_plan.rs` still
+approves `F-002` before `F-001` and needed no repair.
+
+Deliberately **not** fixed, and named at the check:
+
+- The four other Section 15.2 invalidation triggers this does not reach.
+- **A candidate can incorporate dependency work through a commit the dependency
+  never handed off without the binding showing that gap.** The resolution asks
+  which of the dependency's *handed-off* commits is an ancestor. When unhanded
+  work sits on an earlier handed-off ancestor, it records that older commit;
+  a later approval that still contains the older commit passes containment with
+  no warning. It records `null` only when no handed-off ancestor exists. Closing
+  the gap means binding against the dependency's branch rather than its
+  handoffs, which is a wider change than this card owns.
+- **Section 10.2's dependency-base precondition is unenforced here.** A card's
+  `base_sha` is checked only as 40 hexadecimal characters; nothing verifies that
+  it is the dependency's exact accepted SHA.
+- **Cycle status folds card events.** This remains an open Tier 4 defect.
+- **Five cycle statuses and one card state are unreachable.** This remains an
+  open Tier 4 defect.
+- **Merge honours `commit.gpgsign` and repository hooks, contradicting "hooks
+  are advisory".** This remains an open Tier 4 defect.
 
 ✅ **FIXED:** generated-artifact scope checks compared globs with `==`. Both
 directions were wrong and in opposite ways: a shared artifact covered by a glob

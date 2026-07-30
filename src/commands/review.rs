@@ -10,7 +10,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
-        handoff::latest_handoff,
+        handoff::{ancestry, latest_handoff},
         transaction::with_transaction,
         work::held_lease,
     },
@@ -19,7 +19,7 @@ use crate::{
         card::CardState,
         clock::Clock,
         digest::CANONICAL_ALGORITHM,
-        handoff::HandoffStatus,
+        handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
         review::{
             Decision, Finding, GateAdequacy, REVIEW_DIR, REVIEW_SCHEMA, ReviewRecord,
@@ -221,18 +221,95 @@ pub fn reviews_for(
 
 /// The most recent approval that still describes the current candidate.
 ///
+/// Each candidate approval is judged against its own dependency bindings, so
+/// the standings are resolved per review rather than once for the card.
+///
 /// # Errors
 ///
 /// Returns an error when the store cannot be read.
 pub fn current_approval(
     control: &ControlRepository,
+    scope: &GitScope,
     card_id: &CardId,
     candidate_sha: &str,
     card_digest: &crate::domain::digest::Digest,
+    depends_on: &[CardId],
 ) -> Result<Option<ReviewRecord>, HarnessError> {
-    Ok(reviews_for(control, card_id)?.into_iter().rfind(|review| {
-        review.decision == Decision::Approved && review.is_current_for(candidate_sha, card_digest)
-    }))
+    for review in reviews_for(control, card_id)?.into_iter().rev() {
+        if review.decision != Decision::Approved {
+            continue;
+        }
+        let standings =
+            dependency_standings(control, scope, depends_on, &review.dependency_bindings)?;
+        if review.is_current_for(candidate_sha, card_digest, &standings) {
+            return Ok(Some(review));
+        }
+    }
+    Ok(None)
+}
+
+/// The card's standing verdict, read from the store.
+///
+/// The rule lives on [`ReviewRecord::standing_approval`], which is where its
+/// unit test can reach it. It deliberately does not ask whether the approval
+/// still describes the card's current candidate: it answers "which commit of
+/// this dependency was blessed", and an approval whose own candidate has since
+/// moved still answers that correctly. The dependency's own staleness is what
+/// stops it being integrated, and applying it here would refuse a dependent for
+/// a fact about a card it is claiming nothing about.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be read.
+pub fn standing_approval(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<Option<ReviewRecord>, HarnessError> {
+    Ok(ReviewRecord::standing_approval(&reviews_for(control, card_id)?).cloned())
+}
+
+/// Where each declared dependency stands against one record's bindings.
+///
+/// The containment question — does the dependency's standing approval contain
+/// the commit this record bound — is asked of Git here, because a record cannot
+/// carry an ancestry fact about a commit that did not exist when it was
+/// written.
+///
+/// An object Git does not have is reported as *contained*. A dependency's
+/// candidate can become unreachable once its branch is deleted and its objects
+/// collected, and voiding a dependent's approval because an unrelated card's
+/// history aged out would refuse for a reason that is not about supersession.
+/// The direction of that choice is deliberate: this check exists to catch a
+/// rewrite it can see, not to demand proof of innocence.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be read or Git cannot be run.
+pub fn dependency_standings(
+    control: &ControlRepository,
+    scope: &GitScope,
+    depends_on: &[CardId],
+    bindings: &[DependencyBinding],
+) -> Result<Vec<DependencyStanding>, HarnessError> {
+    let mut standings = Vec::with_capacity(depends_on.len());
+    for card_id in depends_on {
+        let approved_candidate_sha =
+            standing_approval(control, card_id)?.map(|review| review.candidate_sha);
+        let bound = bindings
+            .iter()
+            .find(|binding| binding.card_id == *card_id)
+            .and_then(|binding| binding.incorporated_sha.as_deref());
+        let approval_contains_binding = match (bound, approved_candidate_sha.as_deref()) {
+            (Some(bound), Some(approved)) => ancestry(scope, bound, approved)?.unwrap_or(true),
+            _ => true,
+        };
+        standings.push(DependencyStanding {
+            card_id: card_id.clone(),
+            approved_candidate_sha,
+            approval_contains_binding,
+        });
+    }
+    Ok(standings)
 }
 
 fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
@@ -382,6 +459,14 @@ const fn state_for(decision: Decision) -> CardState {
 ///
 /// A review recorded against a superseded handoff would approve code nobody
 /// looked at, which is the same failure `SPIKE-001` F-1 found one stage earlier.
+///
+/// Dependency bindings are deliberately excluded here — the one site that
+/// passes [`DEPENDENCIES_NOT_CHECKED`]. A dependency moving does not change the
+/// candidate the reviewer is holding, and refusing to file their verdict would
+/// leave a card whose only exit is abandonment. That is defect 21 exactly: a
+/// verdict the schema offers, discarded because a transition refused it. The
+/// dependency question is asked where it decides something — of the review, at
+/// integration.
 fn require_current_handoff(
     control: &ControlRepository,
     card_id: &CardId,
@@ -392,7 +477,7 @@ fn require_current_handoff(
         return Ok(());
     };
     let head = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
-    if let Some(reason) = handoff.staleness(&head, card_digest) {
+    if let Some(reason) = handoff.staleness(&head, card_digest, DEPENDENCIES_NOT_CHECKED) {
         return Err(HarnessError::Control {
             reason: format!("cannot review a superseded handoff: {reason}"),
             code: ErrorCode::PolicyStaleHandoff,
@@ -439,6 +524,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 cycle_id: record.cycle_id.clone(),
                 baseline_sha: handoff.baseline_sha.clone(),
                 candidate_sha: handoff.candidate_sha.clone(),
+                dependency_bindings: handoff.dependency_bindings.clone(),
                 handoff_id: handoff.handoff_id.clone(),
                 handoff_digest: handoff.digest()?,
                 reviewer_actor_id: verdict.reviewer_actor_id.clone(),
@@ -546,16 +632,24 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
-    let (_record, state) = load_card(&control, &card_id)?;
+    let (record, state) = load_card(&control, &card_id)?;
     let reviews = reviews_for(&control, &card_id)?;
+    let scope = GitScope::work_tree(&config.repository);
 
     let candidate = held_lease(&control, &card_id)?.and_then(|lease| {
         inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD").ok()
     });
     let approval = candidate.as_ref().and_then(|sha| {
-        current_approval(&control, &card_id, sha, &state.current_digest)
-            .ok()
-            .flatten()
+        current_approval(
+            &control,
+            &scope,
+            &card_id,
+            sha,
+            &state.current_digest,
+            &record.depends_on,
+        )
+        .ok()
+        .flatten()
     });
 
     let mut text = format!(
@@ -566,10 +660,19 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
             .as_ref()
             .map_or_else(|| "none".to_owned(), |review| review.review_id.to_string())
     );
+    let mut latest_stale_reason = None;
+    let mut standings = Vec::new();
     for review in &reviews {
+        standings = dependency_standings(
+            &control,
+            &scope,
+            &record.depends_on,
+            &review.dependency_bindings,
+        )?;
         let no_longer_applies = candidate
             .as_ref()
-            .and_then(|sha| review.staleness(sha, &state.current_digest));
+            .and_then(|sha| review.staleness(sha, &state.current_digest, &standings));
+        latest_stale_reason.clone_from(&no_longer_applies);
         let _ = write!(
             text,
             "\n  {} {} by {} ({} finding(s)){}",
@@ -590,6 +693,11 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
             "reviews": reviews,
             "current_approval": approval,
             "has_current_approval": approval.is_some(),
+            // Why the card's own latest verdict no longer applies. Reported so
+            // a caller can act on the reason without re-deriving it, which is
+            // the whole point of recording the binding.
+            "latest_stale_reason": latest_stale_reason,
+            "dependency_standings": standings,
         }),
     )
     .with_project(config.project_id.clone()))
