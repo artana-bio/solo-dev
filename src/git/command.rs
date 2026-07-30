@@ -158,6 +158,59 @@ const AMBIENT_OVERRIDES: &[&str] = &[
     "GIT_COMMITTER_DATE",
 ];
 
+/// The `-c` overrides for a sequence in which the harness authors the object.
+///
+/// Read this together with the porcelain/plumbing split at
+/// [`crate::git::integration_worktree::merge`]. That split is what does the
+/// work: the commit object is written by `commit-tree`, which composes no
+/// message and runs no hook, so `commit.gpgsign`, `gpg.*`, `merge.log`,
+/// `commit.template`, `prepare-commit-msg`, `commit-msg`, `pre-merge-commit`
+/// and `post-commit` are all out of the picture by construction rather than by
+/// being listed. Enumerating configuration keys is how the previous attempt at
+/// this failed — the list had two entries and there were four.
+///
+/// Two things survive that split, and only these two are listed:
+///
+/// - `core.hooksPath`, pointed at a directory holding no hooks. The one hook
+///   still reachable in the sequence is `reference-transaction`, which fires on
+///   every ref the sequence writes — `MERGE_HEAD` as well as the `update-ref`
+///   that moves the integration head — and can abort any of them (verified:
+///   exit 128, "ref updates aborted by hook"). Writing those refs is
+///   bookkeeping the harness owns outright, so nothing is lost by suppressing
+///   hooks across the whole sequence — and a Git that grows a new commit-stage
+///   hook is covered in advance.
+/// - `merge.verifySignatures=false`. This one is genuinely a configuration key
+///   and genuinely has to be named, because it stops `git merge` *before* any
+///   content is combined (verified: exit 128, no `MERGE_HEAD`). The harness
+///   decides what may be integrated from the plan and the review record; it
+///   does not delegate that to whether a developer happened to sign a candidate
+///   commit. D-006 and D-013 already put candidate provenance outside this
+///   tool's trust model.
+///
+/// `hook_sink` must be absolute: a relative `core.hooksPath` resolves against
+/// the top of the working tree, which is the candidate repository. It should
+/// also be a directory the harness created rather than a path under the
+/// project's `.git`, so that "the project cannot alter what the harness
+/// authors" is true of the mechanism and not only of its intent.
+#[must_use]
+pub fn authoring_overrides(hook_sink: &Path) -> Vec<OsString> {
+    let mut hooks_path = OsString::from("core.hooksPath=");
+    hooks_path.push(hook_sink.as_os_str());
+    vec![hooks_path, OsString::from("merge.verifySignatures=false")]
+}
+
+/// Removes the environment variables that would redirect or re-identify Git.
+///
+/// Exposed so a process the harness spawns *instead of* Git — a repository hook
+/// the harness runs deliberately — starts from the same sanitised environment
+/// every Git invocation gets. Setting a variable back afterwards is the
+/// caller's business; this only takes away.
+pub fn strip_ambient_overrides(command: &mut Command) {
+    for name in AMBIENT_OVERRIDES {
+        command.env_remove(name);
+    }
+}
+
 /// Runs Git and captures its result without interpreting the exit status.
 ///
 /// A non-zero exit is a normal answer for many queries, so classification is
@@ -172,17 +225,44 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_with_config(scope, &[], args)
+}
+
+/// Runs Git with explicit `-c` overrides ahead of the subcommand.
+///
+/// The overrides sit between the scope prefix and the subcommand, which is
+/// where Git accepts them, and they outrank `.git/config` and the operator's
+/// `~/.gitconfig` without writing anything to either. Writing is the
+/// alternative and it is much worse: turning off signing or hooks in a
+/// developer's own repository to suit the harness would change what *their*
+/// commits do.
+///
+/// # Errors
+///
+/// Returns [`HarnessError::GitUnavailable`] when the process could not be
+/// spawned at all.
+pub fn run_with_config<I, S>(
+    scope: &GitScope,
+    overrides: &[OsString],
+    args: I,
+) -> Result<GitOutput, HarnessError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new("git");
     command.args(scope.prefix());
+    for value in overrides {
+        command.arg("-c");
+        command.arg(value);
+    }
     command.args(args);
     // Git may otherwise open a pager, an editor, or a credential prompt and
     // block a non-interactive command forever.
     command.env("GIT_PAGER", "cat");
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_OPTIONAL_LOCKS", "0");
-    for name in AMBIENT_OVERRIDES {
-        command.env_remove(name);
-    }
+    strip_ambient_overrides(&mut command);
 
     let output = command.output().map_err(HarnessError::GitUnavailable)?;
     Ok(GitOutput {
@@ -190,6 +270,23 @@ where
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// Runs Git with `-c` overrides and requires a zero exit.
+///
+/// # Errors
+///
+/// Returns an error when the process could not be spawned or exited non-zero.
+pub fn run_with_config_ok<I, S>(
+    scope: &GitScope,
+    overrides: &[OsString],
+    args: I,
+) -> Result<GitOutput, HarnessError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_config(scope, overrides, args)?.require_success()
 }
 
 /// Runs Git and requires a zero exit.

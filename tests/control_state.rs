@@ -647,3 +647,150 @@ fn an_environment_io_failure_is_not_reported_as_a_harness_defect() {
     );
     assert_eq!(error.code().as_string(), "CH-PRECONDITION-CONTROL-ACCESS");
 }
+
+/// A `HOME` carrying the Git configuration an ordinary developer is told to
+/// set, plus the global hook and template routes that reach a fresh repository.
+///
+/// Delivered as `HOME` and `XDG_CONFIG_HOME` deliberately. `GIT_CONFIG_GLOBAL`
+/// looks equivalent and is not: the Git layer strips it from every child
+/// environment, so a fixture built that way passes against unfixed code while
+/// proving nothing. `~/.gitconfig` has no such shield.
+fn operator_home(root: &Path) -> PathBuf {
+    let home = root.join("operator-home");
+    for relative in ["template/hooks", "global-hooks", ".config"] {
+        fs::create_dir_all(home.join(relative)).unwrap();
+    }
+    for relative in ["template/hooks/pre-commit", "global-hooks/pre-commit"] {
+        let path = home.join(relative);
+        fs::write(&path, "#!/bin/sh\necho refused >&2\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    fs::write(
+        home.join(".gitconfig"),
+        format!(
+            "[init]\n\ttemplateDir = {template}\n[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n[core]\n\thooksPath = {hooks}\n",
+            template = home.join("template").display(),
+            hooks = home.join("global-hooks").display(),
+        ),
+    )
+    .unwrap();
+    home
+}
+
+#[test]
+fn the_control_repository_commits_under_an_operators_signing_and_hook_configuration() {
+    // Tier 4. The harness's own audit trail was subject to whatever the
+    // operator's `~/.gitconfig` said, so `commit.gpgsign = true` — which
+    // GitHub's own documentation tells developers to set — made `project init`
+    // fail outright with CH-EXTERNAL-GIT-COMMAND and left control history
+    // unborn. A global template or `core.hooksPath` carrying a `pre-commit` did
+    // the same. The control repository is created and written only by the
+    // harness, so it now says so in its own local configuration.
+    let fixture = Fixture::new();
+    let home = operator_home(&fixture.root);
+
+    // The fixture must actually be hostile. Without this, a host where the
+    // configuration silently did nothing would make the assertions below hold
+    // against the unfixed code too.
+    let scratch = fixture.root.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "s@local.invalid"],
+        vec!["config", "user.name", "S"],
+    ] {
+        Command::new("git")
+            .arg("-C")
+            .arg(&scratch)
+            .args(&args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .output()
+            .unwrap();
+    }
+    let refused = Command::new("git")
+        .arg("-C")
+        .arg(&scratch)
+        .args(["commit", "-q", "--allow-empty", "-m", "probe"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "the fixture must break an ordinary commit, or it proves nothing"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args(fixture.init_args())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("the CLI should start");
+    assert!(
+        output.status.success(),
+        "project init must not depend on the operator's Git configuration: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    assert_eq!(
+        control.commit_count().unwrap(),
+        1,
+        "the audit trail must actually have a commit in it"
+    );
+    let raw = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.control)
+        .args(["cat-file", "commit", "HEAD"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let raw = String::from_utf8_lossy(&raw.stdout);
+    let headers = raw
+        .split_once("\n\n")
+        .map_or(raw.as_ref(), |(head, _)| head);
+    assert!(
+        !headers.lines().any(|line| line.starts_with("gpgsig")),
+        "a control commit must not carry the operator's signature: {headers}"
+    );
+    assert!(
+        !fixture.control.join(".git/hooks/pre-commit").exists(),
+        "the operator's template must not install scripts into the audit trail"
+    );
+
+    // An already-initialized control repository is the case local settings
+    // alone cannot repair: `project init` exits before `initialize_git`.
+    // Strip them to model an external edit, then make a real control write
+    // under the same hostile HOME. The invocation-level overrides above must
+    // carry this commit; without them the global pre-commit/signing setup wins.
+    git(&fixture.control, &["config", "--unset", "commit.gpgsign"]);
+    git(&fixture.control, &["config", "--unset", "core.hooksPath"]);
+    let control_write = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "cycle",
+            "create",
+            "--control",
+            &fixture.control.display().to_string(),
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "control write under hostile configuration",
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("the CLI should start");
+    assert!(
+        control_write.status.success(),
+        "an existing control repository must commit despite hostile Git configuration: {}",
+        String::from_utf8_lossy(&control_write.stderr)
+    );
+    assert_eq!(
+        control.commit_count().unwrap(),
+        2,
+        "the real control write must create its audit commit"
+    );
+}

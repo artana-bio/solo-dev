@@ -141,8 +141,18 @@ Deliberately **not** fixed, and named at the check:
 - **Cycle status folds card events.** This remains an open Tier 4 defect.
 - **Five cycle statuses and one card state are unreachable.** This remains an
   open Tier 4 defect.
-- **Merge honours `commit.gpgsign` and repository hooks, contradicting "hooks
-  are advisory".** This remains an open Tier 4 defect.
+✅ **FIXED:** authoritative integration merges no longer inherit
+`commit.gpgsign` or commit-stage hooks. The merge stops before committing; the
+harness writes and verifies the exact two-parent object, then runs only the
+project's best-effort `post-merge` checkout hook. Control commits are likewise
+neutralised both in their local configuration and per invocation, including
+already-existing control repositories whose local settings were removed.
+
+**Still unenforced:** a refusing `reference-transaction` hook can prevent
+integration-worktree creation, because that operation must retain the
+project's `post-checkout` hook that materialises the tree smoke gates judge.
+`post-merge` itself may also hang; its detached children do not delay the
+integration, but the hook process retains Git's normal unbounded behaviour.
 
 ✅ **FIXED:** generated-artifact scope checks compared globs with `==`. Both
 directions were wrong and in opposite ways: a shared artifact covered by a glob
