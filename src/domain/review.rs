@@ -21,6 +21,7 @@ use crate::{
         card::Risk,
         clock::Timestamp,
         digest::{CANONICAL_ALGORITHM, Digest},
+        handoff::{DependencyBinding, DependencyStanding, dependency_staleness},
         ids::{CardId, CycleId, ReviewId},
     },
     error::{ErrorCode, HarnessError},
@@ -161,6 +162,13 @@ pub struct ReviewRecord {
     pub baseline_sha: String,
     /// The exact candidate reviewed.
     pub candidate_sha: String,
+    /// Which commit of each declared dependency the reviewed candidate holds.
+    ///
+    /// Copied from the handoff, exactly as `baseline_sha` and `candidate_sha`
+    /// are, so a review can be judged without re-reading its handoff. Defaulted
+    /// for the same reason the handoff's copy is; see that field.
+    #[serde(default)]
+    pub dependency_bindings: Vec<DependencyBinding>,
     /// The handoff the reviewer received.
     pub handoff_id: String,
     /// Digest of that handoff, so the packet is pinned too.
@@ -212,17 +220,34 @@ impl ReviewRecord {
 
     /// True when this review still describes the given candidate and card.
     ///
-    /// Section 15.2: approval becomes invalid when the candidate SHA or the
-    /// card digest changes. Both are checked, because either alone would let a
-    /// stale approval through.
+    /// Section 15.2: approval becomes invalid when the candidate SHA, the card
+    /// digest, or a required dependency SHA changes. All three are checked,
+    /// because any one alone would let a stale approval through.
     #[must_use]
-    pub fn is_current_for(&self, candidate_sha: &str, card_digest: &Digest) -> bool {
-        self.candidate_sha == candidate_sha && self.card_digest == *card_digest
+    pub fn is_current_for(
+        &self,
+        candidate_sha: &str,
+        card_digest: &Digest,
+        dependencies: &[DependencyStanding],
+    ) -> bool {
+        self.staleness(candidate_sha, card_digest, dependencies)
+            .is_none()
     }
 
     /// Explains why this review no longer applies, if it does not.
+    ///
+    /// Three of Section 15.2's seven triggers are checked. The four that are
+    /// not — cycle invariant, required gate definition, reviewer-required
+    /// receipt, declared contract change — are named here rather than left to
+    /// be inferred from the code, because the docstring that used to sit here
+    /// described the specification as being the subset that was implemented.
     #[must_use]
-    pub fn staleness(&self, candidate_sha: &str, card_digest: &Digest) -> Option<String> {
+    pub fn staleness(
+        &self,
+        candidate_sha: &str,
+        card_digest: &Digest,
+        dependencies: &[DependencyStanding],
+    ) -> Option<String> {
         if self.candidate_sha != candidate_sha {
             return Some(format!(
                 "review approved candidate {} but the branch is now {candidate_sha}",
@@ -235,7 +260,24 @@ impl ReviewRecord {
                 self.card_digest
             ));
         }
-        None
+        dependency_staleness("review", &self.dependency_bindings, dependencies)
+    }
+
+    /// The card's standing verdict, when the reviewers left it approved.
+    ///
+    /// Not "the latest review that approved". Reviews on a card form a chain,
+    /// each superseding the one before it, so an approval followed by a
+    /// `changes_requested` no longer stands, and a search that skipped
+    /// backwards past the later verdict would report a decision the reviewer
+    /// has since withdrawn.
+    ///
+    /// `reviews` must be oldest first, as [`crate::commands::review::reviews_for`]
+    /// returns them.
+    #[must_use]
+    pub fn standing_approval(reviews: &[Self]) -> Option<&Self> {
+        reviews
+            .last()
+            .filter(|review| review.decision == Decision::Approved)
     }
 
     /// Findings that still demand action.
@@ -406,7 +448,10 @@ pub fn check_independence(reviewer: &str, feature_actor: &str) -> Result<(), Har
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::clock::{Clock as _, FixedClock};
+    use crate::domain::{
+        clock::{Clock as _, FixedClock},
+        handoff::DEPENDENCIES_NOT_CHECKED,
+    };
 
     fn adequacy() -> GateAdequacy {
         GateAdequacy {
@@ -426,6 +471,7 @@ mod tests {
             cycle_id: "C-001".parse().unwrap(),
             baseline_sha: "b".repeat(40),
             candidate_sha: "a".repeat(40),
+            dependency_bindings: vec![],
             handoff_id: "F-001-r1-aaaaaaaaaaaa".to_owned(),
             handoff_digest: Digest::of_bytes(b"handoff"),
             reviewer_actor_id: "reviewer-session-a".to_owned(),
@@ -579,28 +625,66 @@ mod tests {
     fn a_review_applies_only_to_its_exact_candidate_and_card() {
         let record = review(Decision::Approved, vec![]);
         let card = Digest::of_bytes(b"card");
-        assert!(record.is_current_for(&"a".repeat(40), &card));
-        assert!(!record.is_current_for(&"c".repeat(40), &card));
-        assert!(!record.is_current_for(&"a".repeat(40), &Digest::of_bytes(b"revised")));
+        assert!(record.is_current_for(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED));
+        assert!(!record.is_current_for(&"c".repeat(40), &card, DEPENDENCIES_NOT_CHECKED));
+        assert!(!record.is_current_for(
+            &"a".repeat(40),
+            &Digest::of_bytes(b"revised"),
+            DEPENDENCIES_NOT_CHECKED
+        ));
     }
 
     #[test]
     fn staleness_explains_which_binding_broke() {
         let record = review(Decision::Approved, vec![]);
         let card = Digest::of_bytes(b"card");
-        assert!(record.staleness(&"a".repeat(40), &card).is_none());
         assert!(
             record
-                .staleness(&"c".repeat(40), &card)
+                .staleness(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED)
+                .is_none()
+        );
+        assert!(
+            record
+                .staleness(&"c".repeat(40), &card, DEPENDENCIES_NOT_CHECKED)
                 .unwrap()
                 .contains("branch is now")
         );
         assert!(
             record
-                .staleness(&"a".repeat(40), &Digest::of_bytes(b"revised"))
+                .staleness(
+                    &"a".repeat(40),
+                    &Digest::of_bytes(b"revised"),
+                    DEPENDENCIES_NOT_CHECKED
+                )
                 .unwrap()
                 .contains("card is now")
         );
+    }
+
+    #[test]
+    fn a_later_verdict_supersedes_an_earlier_approval() {
+        // The hole a `rfind(approved)` search leaves: it walks backwards past
+        // the standing verdict and reports a decision the reviewer withdrew.
+        // Everything that asks "which commit of this dependency was blessed"
+        // reads this.
+        let approved = review(Decision::Approved, vec![]);
+        let rejected = review(Decision::ChangesRequested, vec![finding(Disposition::Open)]);
+
+        assert_eq!(
+            ReviewRecord::standing_approval(std::slice::from_ref(&approved)),
+            Some(&approved)
+        );
+        assert_eq!(
+            ReviewRecord::standing_approval(&[approved.clone(), rejected.clone()]),
+            None,
+            "an approval followed by a request for changes no longer stands"
+        );
+        assert_eq!(
+            ReviewRecord::standing_approval(&[rejected, approved.clone()]),
+            Some(&approved),
+            "and the approval that came after it does"
+        );
+        assert_eq!(ReviewRecord::standing_approval(&[]), None);
     }
 
     #[test]

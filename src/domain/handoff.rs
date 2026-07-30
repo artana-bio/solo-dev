@@ -103,6 +103,143 @@ impl ActorDeclaration {
     }
 }
 
+/// Which commit of a declared dependency a candidate's history contains.
+///
+/// Section 10.7 requires a handoff to carry dependency SHAs, and invariant
+/// 7.3.6 makes a *relevant* dependency SHA change invalidate dependent
+/// evidence. This record is what makes "relevant" decidable.
+///
+/// The binding is the dependency commit the candidate **incorporates**, not the
+/// commit the dependency happens to stand approved at. Those are different
+/// questions and only the first one is about what the reviewer saw. A card that
+/// branched from the cycle baseline and never merged its dependency has
+/// `incorporated_sha: None`: the dependency can be re-reviewed all day without
+/// changing a line of what was reviewed here, and refusing on that would
+/// serialize exactly the parallel work this harness exists to coordinate.
+///
+/// Section 10.2 says a dependent uses the exact accepted dependency SHA
+/// *declared in the card*. Asking Git which dependency commit is actually in
+/// the candidate answers the same question without trusting the declaration,
+/// and Section 10.7 requires this field to be machine-computed. A card whose
+/// `base_sha` names the dependency's accepted commit binds that commit, because
+/// it is an ancestor.
+///
+/// The value is resolved by asking Git whether any commit the dependency has
+/// ever handed off is an ancestor of this candidate, newest first. This is not
+/// a binding to the dependency branch: when a candidate incorporates an
+/// unhanded commit on top of an earlier handed-off commit, it binds that earlier
+/// commit instead. If the dependency later stands approved at a rewrite that
+/// still contains the earlier commit, containment passes and records no sign of
+/// the unhanded work. `None` occurs only when no handed-off ancestor exists.
+/// Closing that gap means binding against the dependency branch, which this
+/// record does not do.
+///
+/// Section 10.2's precondition that a dependent's `base_sha` is the exact
+/// accepted dependency SHA is also unenforced here: card validation checks only
+/// that `base_sha` is 40 hexadecimal characters. This resolution cannot infer
+/// a declaration the card record never proved.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyBinding {
+    /// The declared dependency.
+    pub card_id: CardId,
+    /// The dependency commit this candidate's history contains, if any.
+    pub incorporated_sha: Option<String>,
+}
+
+/// Where a dependency stands relative to one record's binding.
+///
+/// The input side of the dependency check. Resolved live at check time rather
+/// than recorded, because the whole question is whether the world moved since
+/// the binding was written.
+///
+/// `approval_contains_binding` is an ancestry fact about two commits, so it
+/// cannot be answered here — the caller asks Git. It is carried on this struct
+/// rather than left to the comparison below because containment, not equality,
+/// is what distinguishes a dependency that moved *forward* from one that was
+/// rewritten. See [`dependency_staleness`].
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct DependencyStanding {
+    /// The dependency card.
+    pub card_id: CardId,
+    /// The candidate its standing approval names, if it has one.
+    pub approved_candidate_sha: Option<String>,
+    /// True when that approved candidate's history contains the bound commit.
+    ///
+    /// Meaningless, and set true, when either side is absent.
+    pub approval_contains_binding: bool,
+}
+
+/// Passed where dependency bindings are deliberately not part of the question.
+///
+/// There is exactly one such site — `review record`'s handoff check — and it is
+/// deliberate: a reviewer must always be able to file a verdict about the
+/// candidate in front of them. Refusing there would leave a card with no exit,
+/// which is defect 20 in the register.
+pub const DEPENDENCIES_NOT_CHECKED: &[DependencyStanding] = &[];
+
+/// Explains which dependency binding broke, if one did.
+///
+/// `dependencies` must be the card's *declared* dependencies resolved against
+/// this record's own bindings; an empty slice asks no dependency question at
+/// all. A declared dependency with no recorded binding is treated as stale,
+/// because a record written before this field existed cannot be distinguished
+/// from one whose candidate genuinely incorporates nothing — and the remedy,
+/// re-creating the handoff, adds a record rather than rewriting one.
+///
+/// Two things are deliberately **not** stale, and both are the difference
+/// between a check and a blockade:
+///
+/// - A dependency approved at a commit that *contains* the bound one. The
+///   dependency gained review-requested fixes on top; what this candidate holds
+///   is a prefix of what will land, so nothing is superseded and nothing lands
+///   twice. A rewrite can leave the bound commit outside the approval, but so
+///   can evidence that binds a newer dependency commit than the one standing
+///   approved. The latter carries no rewrite and does not by itself make a merge
+///   carry both versions.
+/// - A dependency standing approved at nothing, because its own review is
+///   pending or asked for changes. The dependent may still be reviewed on its
+///   merits; it cannot be *integrated*, because `check_dependencies` already
+///   refuses a selection whose dependency is neither included nor landed, and a
+///   dependency with no standing approval can be neither. Refusing here as well
+///   would void a dependent's evidence for the whole time its dependency is
+///   under review, which is the parallelism this harness exists to coordinate.
+pub(crate) fn dependency_staleness(
+    subject: &str,
+    bindings: &[DependencyBinding],
+    dependencies: &[DependencyStanding],
+) -> Option<String> {
+    for dependency in dependencies {
+        let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.card_id == dependency.card_id)
+        else {
+            return Some(format!(
+                "this {subject} records no dependency binding for {}, which the card declares; re-create the handoff so the dependency SHA is bound",
+                dependency.card_id
+            ));
+        };
+        let Some(incorporated) = &binding.incorporated_sha else {
+            continue;
+        };
+        let Some(approved) = &dependency.approved_candidate_sha else {
+            continue;
+        };
+        if !dependency.approval_contains_binding {
+            // Deliberately does not say "rewritten". Containment fails for a
+            // rewrite, and also when this evidence binds a *newer* dependency
+            // commit than the one standing approved — no rewrite anywhere. A
+            // reviewer reproduced the second case, and a diagnostic that names
+            // the wrong cause sends an operator looking in the wrong place.
+            return Some(format!(
+                "this {subject} incorporates {} at {incorporated}, but {} now stands approved at {approved}, which does not contain it",
+                dependency.card_id, dependency.card_id
+            ));
+        }
+    }
+    None
+}
+
 /// A gate receipt as summarized inside a handoff.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +280,14 @@ pub struct HandoffRecord {
     pub candidate_sha: String,
     /// Commits the candidate introduces, oldest first.
     pub commits: Vec<String>,
+    /// Which commit of each declared dependency this candidate incorporates.
+    ///
+    /// `#[serde(default)]` follows the `human_reviewer` precedent: a record
+    /// written before this field existed still deserializes, so no evidence on
+    /// disk has to be rewritten. It is not a silent pass — `staleness` refuses a
+    /// record that declares a dependency and binds nothing.
+    #[serde(default)]
+    pub dependency_bindings: Vec<DependencyBinding>,
     /// Every path the candidate changed, including rename sources.
     pub changed_paths: Vec<ChangedPath>,
     /// Gate evidence in force at handoff time.
@@ -188,15 +333,34 @@ impl HandoffRecord {
 
     /// True when this handoff still describes the given candidate.
     #[must_use]
-    pub fn is_current_for(&self, candidate_sha: &str, card_digest: &Digest) -> bool {
-        self.status == HandoffStatus::Active
-            && self.candidate_sha == candidate_sha
-            && self.card_digest == *card_digest
+    pub fn is_current_for(
+        &self,
+        candidate_sha: &str,
+        card_digest: &Digest,
+        dependencies: &[DependencyStanding],
+    ) -> bool {
+        self.staleness(candidate_sha, card_digest, dependencies)
+            .is_none()
     }
 
     /// Explains why this handoff no longer applies, if it does not.
+    ///
+    /// Section 15.2 lists seven invalidation triggers. Three are checked here:
+    /// the candidate SHA, the card digest, and the required dependency SHA. The
+    /// remaining four — cycle invariant, gate definition, reviewer-required
+    /// receipt, declared contract change — are still not checked anywhere, and
+    /// saying so here is cheaper than the docstring that used to narrow the
+    /// specification to what happened to be implemented.
+    ///
+    /// `dependencies` is the card's declared dependencies with their current
+    /// approvals. [`DEPENDENCIES_NOT_CHECKED`] asks no dependency question.
     #[must_use]
-    pub fn staleness(&self, candidate_sha: &str, card_digest: &Digest) -> Option<String> {
+    pub fn staleness(
+        &self,
+        candidate_sha: &str,
+        card_digest: &Digest,
+        dependencies: &[DependencyStanding],
+    ) -> Option<String> {
         if self.status == HandoffStatus::Revoked {
             return Some("the handoff was revoked".to_owned());
         }
@@ -212,7 +376,7 @@ impl HandoffRecord {
                 self.card_digest
             ));
         }
-        None
+        dependency_staleness("handoff", &self.dependency_bindings, dependencies)
     }
 }
 
@@ -266,6 +430,7 @@ mod tests {
             branch: "card/F-001".to_owned(),
             candidate_sha: "a".repeat(40),
             commits: vec!["a".repeat(40)],
+            dependency_bindings: vec![],
             changed_paths: vec![],
             receipts: vec![],
             worktree_clean: true,
@@ -335,22 +500,36 @@ mod tests {
     fn a_handoff_applies_only_to_its_exact_candidate_and_card() {
         let record = handoff();
         let card = Digest::of_bytes(b"card");
-        assert!(record.is_current_for(&"a".repeat(40), &card));
-        assert!(!record.is_current_for(&"b".repeat(40), &card));
-        assert!(!record.is_current_for(&"a".repeat(40), &Digest::of_bytes(b"revised card")));
+        assert!(record.is_current_for(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED));
+        assert!(!record.is_current_for(&"b".repeat(40), &card, DEPENDENCIES_NOT_CHECKED));
+        assert!(!record.is_current_for(
+            &"a".repeat(40),
+            &Digest::of_bytes(b"revised card"),
+            DEPENDENCIES_NOT_CHECKED
+        ));
     }
 
     #[test]
     fn staleness_explains_which_binding_broke() {
         let record = handoff();
         let card = Digest::of_bytes(b"card");
-        assert!(record.staleness(&"a".repeat(40), &card).is_none());
+        assert!(
+            record
+                .staleness(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED)
+                .is_none()
+        );
 
-        let moved = record.staleness(&"c".repeat(40), &card).unwrap();
+        let moved = record
+            .staleness(&"c".repeat(40), &card, DEPENDENCIES_NOT_CHECKED)
+            .unwrap();
         assert!(moved.contains("branch is now"), "{moved}");
 
         let revised = record
-            .staleness(&"a".repeat(40), &Digest::of_bytes(b"revised"))
+            .staleness(
+                &"a".repeat(40),
+                &Digest::of_bytes(b"revised"),
+                DEPENDENCIES_NOT_CHECKED,
+            )
             .unwrap();
         assert!(revised.contains("card is now"), "{revised}");
     }
@@ -362,11 +541,128 @@ mod tests {
             ..handoff()
         };
         let card = Digest::of_bytes(b"card");
-        assert!(!revoked.is_current_for(&"a".repeat(40), &card));
+        assert!(!revoked.is_current_for(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED));
         assert_eq!(
-            revoked.staleness(&"a".repeat(40), &card).as_deref(),
+            revoked
+                .staleness(&"a".repeat(40), &card, DEPENDENCIES_NOT_CHECKED)
+                .as_deref(),
             Some("the handoff was revoked")
         );
+    }
+
+    fn binding(incorporated: Option<&str>) -> Vec<DependencyBinding> {
+        vec![DependencyBinding {
+            card_id: "F-000".parse().unwrap(),
+            incorporated_sha: incorporated.map(ToOwned::to_owned),
+        }]
+    }
+
+    fn standing(approved: Option<&str>, contains: bool) -> Vec<DependencyStanding> {
+        vec![DependencyStanding {
+            card_id: "F-000".parse().unwrap(),
+            approved_candidate_sha: approved.map(ToOwned::to_owned),
+            approval_contains_binding: contains,
+        }]
+    }
+
+    #[test]
+    fn the_handoff_record_reports_a_stale_dependency_through_staleness() {
+        // Finding 3 from the F-016 review. `dependency_staleness` was tested
+        // directly, but `HandoffRecord::staleness`'s call to it was not: a
+        // reviewer replaced that whole arm with `None` and the entire suite —
+        // 840 tests across 35 binaries, including their own nine probes —
+        // stayed green. A guarded helper reached through an unguarded call site
+        // is the same vacuity as an untested mechanism, one level up.
+        let record = HandoffRecord {
+            dependency_bindings: binding(Some(&"d".repeat(40))),
+            ..handoff()
+        };
+        let reason = record
+            .staleness(
+                &record.candidate_sha.clone(),
+                &record.card_digest.clone(),
+                &standing(Some(&"e".repeat(40)), false),
+            )
+            .expect("the record must surface what dependency_staleness found");
+        assert!(reason.contains("F-000"), "{reason}");
+
+        // And the same record with a containing approval is current, so the arm
+        // is not simply returning Some unconditionally.
+        assert!(
+            record
+                .staleness(
+                    &record.candidate_sha.clone(),
+                    &record.card_digest.clone(),
+                    &standing(Some(&"e".repeat(40)), true),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_dependency_rewritten_past_the_bound_commit_is_stale() {
+        let reason = dependency_staleness(
+            "handoff",
+            &binding(Some(&"d".repeat(40))),
+            &standing(Some(&"e".repeat(40)), false),
+        )
+        .expect("a rewritten dependency invalidates what was built on it");
+        assert!(reason.contains("F-000"), "{reason}");
+        assert!(reason.contains(&"d".repeat(40)), "{reason}");
+        assert!(reason.contains(&"e".repeat(40)), "{reason}");
+    }
+
+    #[test]
+    fn a_dependency_that_still_contains_the_bound_commit_is_current() {
+        // The overcorrection guard, at the unit where the comparison lives: a
+        // dependency that gained commits on top has moved, and must not
+        // invalidate anything.
+        assert!(
+            dependency_staleness(
+                "handoff",
+                &binding(Some(&"d".repeat(40))),
+                &standing(Some(&"e".repeat(40)), true),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn incorporating_nothing_asks_nothing_of_the_dependency() {
+        for approved in [None, Some(&"e".repeat(40) as &str)] {
+            assert!(
+                dependency_staleness("handoff", &binding(None), &standing(approved, false))
+                    .is_none(),
+                "a candidate that holds no commit of its dependency cannot be superseded by one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_with_no_standing_approval_does_not_invalidate() {
+        // Deliberate, and the trade is named at `dependency_staleness`:
+        // integration refuses such a selection anyway, and refusing here would
+        // void a dependent's evidence for as long as its dependency is under
+        // review.
+        assert!(
+            dependency_staleness(
+                "handoff",
+                &binding(Some(&"d".repeat(40))),
+                &standing(None, false),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_declared_dependency_with_no_binding_is_stale() {
+        // A record written before this field existed is indistinguishable from
+        // one whose candidate genuinely incorporates nothing, so it is refused
+        // rather than read as a pass.
+        let reason = dependency_staleness("review", &[], &standing(Some(&"e".repeat(40)), true))
+            .expect("an unbound declared dependency cannot be judged");
+        assert!(reason.contains("F-000"), "{reason}");
+        assert!(reason.contains("re-create the handoff"), "{reason}");
     }
 
     #[test]

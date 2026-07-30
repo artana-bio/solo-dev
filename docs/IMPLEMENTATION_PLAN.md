@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 45 |
+| Plan revision | 46 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -1215,7 +1215,17 @@ Before Single-repository MVP acceptance, tests MUST cover:
 37. cleanup rejection for unarchived commits;
 38. successful cleanup after archival;
 39. JSON success envelope;
-40. JSON error envelope and stable exit code.
+40. JSON error envelope and stable exit code;
+41. dependency-SHA binding and its invalidation: a dependent that incorporates
+    a dependency commit goes stale when the dependency's standing approval no
+    longer contains it, and a dependent that incorporates nothing from its
+    dependency never does.
+
+Scenario 41 was added with `F-016`. It is listed separately from the original
+forty because those were fixed before Single-repository MVP acceptance and this
+one was not: invariant 7.3.6 was unimplemented and unlisted, so the list
+described the tests that existed rather than the coverage the gate requires.
+A reviewer identified the omission.
 
 
 Coverage trace. Every scenario is mapped to the test that exercises it, so a
@@ -1263,6 +1273,7 @@ claim of coverage can be checked rather than taken on faith.
 | 38 | successful cleanup after archival | `closing_removes_the_worktrees_and_branches` |
 | 39 | JSON success envelope | `output_option_emits_the_stable_result_envelope` |
 | 40 | JSON error envelope and stable exit code | `json_mode_renders_failures_as_the_error_envelope` |
+| 41 | Dependency-SHA binding and invalidation | `tests/dependency_binding.rs`, and `the_handoff_record_reports_a_stale_dependency_through_staleness` for the record's own call site |
 
 Tracing the list found four genuine gaps rather than confirming what was
 already there: scenarios 4 and 5 had no enforcement at all — Section 9.1
@@ -3072,6 +3083,9 @@ and `WP-510`: check a claim before writing it down.
 | D-069 | Multi-repository work stays deferred, formally rather than by omission | Accepted | `WP-600` and `WP-610` and the whole of Section 19.5 were `DEFERRED` in status but never decided, which is how deferred scope reappears late as a surprise. The acceptance owner has deferred it explicitly. Nothing in the single-repository release depends on it, and Section 19.5's own first criterion is that the hardened single-repository release be accepted, so the ordering was already fixed. |
 | D-070 | Section 19.4's ARTANA profile trial is the one criterion knowingly left outstanding | Accepted | Section 19.4 requires one ARTANA profile trial completing without changing the generic engine, and that needs a repository this project does not have. The acceptance owner has directed that ARTANA begins only once this CLI is finished, which fixes the order: 19.4 cannot close before then, whatever else is true. Recording it as a known scheduling fact rather than discovering it at signing. D-063 already reduced the exposure by testing project neutrality directly against a Python project, so the trial confirms neutrality rather than establishing it for the first time. |
 | D-071 | Fast-forward the authority once to close out the D-065 suspension | Accepted | D-065 suspended Threshold C, so thirty-seven commits of defect repair landed directly on `main` while the authority stayed at `77dfbaa`. Resuming self-hosting under D-067 needed the authority to hold current `main` first, or every new card would be built from a baseline thirty-seven commits stale. The reconciliation is a fast-forward: `main` is a descendant of the authority's commit, so no history is rewritten and invariant 7.2's prohibitions on force-push, `reset --hard`, and force-remove are all untouched — verified with `merge-base --is-ancestor` before the push. This is the last manual authority mutation; `F-015` onward goes through the harness. Recorded because suspending Threshold C had a cost that was not stated when the suspension was proposed, and this was the cost. |
+| D-072 | Bind the dependency commit the candidate incorporates, not the one the dependency's approval names | Accepted | Invariant 7.3.6 requires a review to bind the relevant dependency SHAs, and the word that does the work is *relevant*. Binding the dependency's currently-approved commit sounds stricter and is wrong: it invalidates a dependent every time its dependency is re-reviewed, even when the dependent incorporates none of the change, and it forces dependencies to be approved before their dependents — a serialization Section 13 deliberately avoids. What the candidate actually contains is discoverable by asking Git whether any commit the dependency has handed off is an ancestor of this candidate, newest first. Staleness is then containment: the dependency's standing approval must still contain the bound commit. Fixes on top do not move it out; a rewrite does. |
+| D-073 | A dependency with no standing approval does not invalidate its dependent | Accepted | The alternative is that a dependent dies the instant its dependency is first handed off and before anyone has reviewed it, which would make declaring a dependency actively harmful. A dependency that has never been approved has nothing for the binding to have fallen out of, so there is nothing to report. The dependent is still blocked from integrating by the ordinary rule that every member needs an approval, so nothing lands early on the strength of this. |
+| D-074 | `integration prepare` reports the cards it left out | Accepted | Selecting only what is ready is correct — refusing whenever a cycle holds unfinished work would make the ordinary case an error. But dropping a card silently means a coordinator reads a plan and cannot tell whether a card is absent because it is not ready or because they mistyped its identifier. The plan now carries what it dropped and why, as warnings on both the real command and the dry run. The reviewer of the earlier design named this as the one hazard nothing in the proposal touched. |
 
 ### 19.5 Multi-repository gate
 
