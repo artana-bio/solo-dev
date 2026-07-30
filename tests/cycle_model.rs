@@ -2,6 +2,17 @@
 
 mod support;
 
+use change_harness::{
+    control::{
+        event_store::{EventDraft, EventStore},
+        repository::ControlRepository,
+    },
+    domain::{
+        clock::FixedClock,
+        digest::Digest,
+        ids::{CardId, CycleId},
+    },
+};
 use serde_json::Value;
 use support::Workspace;
 
@@ -196,6 +207,92 @@ fn status_is_derived_from_authoritative_events() {
     assert_eq!(status["data"]["status"], "active");
     assert_eq!(status["data"]["event_count"], 2, "created then activated");
     assert_eq!(status["data"]["status_matches_history"], true);
+}
+
+#[test]
+fn card_transitions_do_not_change_the_cycles_own_status() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    // `for_cycle` deliberately returns these card transitions as part of the
+    // cycle's audit history. They must not be folded as cycle transitions just
+    // because the state names overlap.
+    let control = ControlRepository::open(&workspace.control).unwrap();
+    let project = control.project().unwrap();
+    let events = EventStore::new(&control);
+    let cycle_id: CycleId = "C-001".parse().unwrap();
+    let card_id: CardId = "F-001".parse().unwrap();
+    let digest = Digest::of_bytes(b"F-001 revision 1");
+    let clock = FixedClock::at_unix_seconds(1_785_196_800).unwrap();
+    for (previous, next) in [
+        ("ready", "active"),
+        ("active", "blocked"),
+        ("blocked", "closed"),
+    ] {
+        events
+            .append(
+                &project.project_id,
+                EventDraft::new("card.transitioned", "operator")
+                    .cycle(cycle_id.clone())
+                    .card(card_id.clone(), 1, digest.clone())
+                    .transition(Some(previous), next),
+                &clock,
+            )
+            .unwrap();
+    }
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(status["data"]["status"], "active");
+    assert_eq!(
+        status["data"]["event_count"], 7,
+        "the per-event history keeps card transitions for the audit trail"
+    );
+    assert_eq!(status["data"]["status_matches_history"], true);
+}
+
+#[test]
+fn creating_a_card_does_not_reset_an_active_cycle_to_draft() {
+    // The specific, non-obvious collision `derived_status`'s filter exists to
+    // catch. `card create` fires `card.created` before the card is activated,
+    // so that event carries no `card_id` — the same absence a genuine cycle
+    // transition has. Its `next_state` is `draft`, which is also
+    // `CycleStatus::Draft`'s name. Filtering on `card_id.is_none()` alone
+    // would let it through and fold the cycle back to `draft` the instant any
+    // card in it is created, silently undoing `cycle activate`.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+
+    let before = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(before["data"]["status"], "active");
+
+    let base = workspace.authority_head();
+    let body = format!(
+        "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [\"src/F-001/**\"]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+    );
+    let path = workspace.root.join("F-001.yaml");
+    std::fs::write(&path, body).unwrap();
+    workspace.card(&["create", "--draft", &path.display().to_string()]);
+
+    let after = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        after["data"]["status"], "active",
+        "a card being created must not fold the cycle back to draft"
+    );
 }
 
 #[test]

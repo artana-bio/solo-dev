@@ -813,3 +813,65 @@ fn a_landed_card_cannot_be_revised() {
         "closed"
     );
 }
+
+#[test]
+fn a_landed_card_cannot_be_abandoned() {
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "the fixture must reach the state Section 11.2 protects"
+    );
+
+    let output = workspace.card_raw(&["abandon", "--card-id", "F-001", "--reason", "too late"]);
+    assert!(
+        !output.status.success(),
+        "landed cards must not be abandoned"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "landed",
+        "the refusal must leave the card able to close"
+    );
+}
+
+#[test]
+fn a_completed_integration_does_not_advance_the_cycle_status() {
+    let (workspace, id) = accepted(1);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    workspace.archive(&["create", "--integration-id", &id]);
+    workspace.archive(&["close", "--integration-id", &id]);
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(status["data"]["status"], "active");
+    assert_eq!(status["data"]["status_matches_history"], true);
+}
+
+#[test]
+fn abandoning_an_integration_does_not_abandon_its_cycle() {
+    // `integration.abandoned`'s `next_state` is `IntegrationStatus::Abandoned`,
+    // which serializes to the same string as `CycleStatus::Abandoned`. Nothing
+    // in this file exercised `cycle status` after an integration abandon before
+    // this test — the collision was real but had zero coverage, incidental or
+    // otherwise, until an independent review of F-019 found it by enumerating
+    // every `.cycle(...)` call site rather than trusting the fix's own tests.
+    let (workspace, id) = reviewed(1);
+    workspace.integration(&[
+        "abandon",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+        "--reason",
+        "the combination cannot be made to work in this cycle",
+    ]);
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        status["data"]["status"], "active",
+        "abandoning one integration must not fold the cycle to abandoned"
+    );
+    assert_eq!(status["data"]["status_matches_history"], true);
+}

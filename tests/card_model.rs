@@ -107,6 +107,94 @@ fn activation_produces_an_immutable_revision_with_a_digest() {
 }
 
 #[test]
+fn an_activated_card_can_be_abandoned_with_a_reason() {
+    let workspace = with_active_cycle();
+    let path = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs"),
+    );
+    workspace.card(&["create", "--draft", &path]);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+
+    let envelope =
+        workspace.card_json(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
+    assert_eq!(envelope["data"]["state"], "abandoned");
+    assert_eq!(envelope["data"]["reason"], "superseded");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "abandoned"
+    );
+
+    let event = workspace
+        .events()
+        .into_iter()
+        .find(|event| event["event_type"] == "card.abandoned")
+        .expect("abandonment must be recorded");
+    assert_eq!(event["card_id"], "F-001");
+    assert_eq!(event["previous_state"], "ready");
+    assert_eq!(event["next_state"], "abandoned");
+    assert_eq!(event["metadata"]["reason"], "superseded");
+}
+
+#[test]
+fn a_card_being_worked_can_also_be_abandoned() {
+    // The committed suite otherwise proves abandonment only from `ready`
+    // (immediately after activation). Section 11.2 permits it from every
+    // non-terminal state except `landed`; `active` is the state most cards
+    // actually spend their time in, and it was unproven.
+    let workspace = with_active_cycle();
+    let path = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs"),
+    );
+    workspace.card(&["create", "--draft", &path]);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active",
+        "fixture: the card must reach the state this test is meant to abandon from"
+    );
+
+    let envelope = workspace.card_json(&["abandon", "--card-id", "F-001", "--reason", "descoped"]);
+    assert_eq!(envelope["data"]["state"], "abandoned");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "abandoned"
+    );
+}
+
+#[test]
+fn abandoning_a_card_dry_run_changes_nothing() {
+    let workspace = with_active_cycle();
+    let path = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs"),
+    );
+    workspace.card(&["create", "--draft", &path]);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+    let before = workspace.control_head();
+
+    let envelope = workspace.card_json(&[
+        "abandon",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "superseded",
+        "--dry-run",
+    ]);
+    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_eq!(workspace.control_head(), before);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "ready"
+    );
+}
+
+#[test]
 fn a_reordered_json_draft_parses_identically_to_its_yaml_form() {
     // Order-independence of the digest itself is proven at unit level with a
     // fixed clock. Here the point is narrower: the two authoring formats must

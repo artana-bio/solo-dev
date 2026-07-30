@@ -65,6 +65,8 @@ pub enum CardCommand {
     Activate(ActivateArgs),
     /// Supersede the current revision with a new one.
     Revise(ReviseArgs),
+    /// Abandon a card that will not be landed.
+    Abandon(AbandonArgs),
     /// Report a card's state, revision, and digest.
     Status(StatusArgs),
 }
@@ -82,6 +84,7 @@ impl CardCommand {
             Self::Create(..) => "card.create",
             Self::Activate(..) => "card.activate",
             Self::Revise(..) => "card.revise",
+            Self::Abandon(..) => "card.abandon",
             Self::Status(..) => "card.status",
         }
     }
@@ -151,6 +154,22 @@ pub struct ReviseArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `card abandon`.
+#[derive(Debug, Args)]
+pub struct AbandonArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card to abandon.
+    #[arg(long)]
+    pub card_id: String,
+    /// Why it is being abandoned.
+    #[arg(long)]
+    pub reason: String,
+    /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments accepted by `card status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -172,6 +191,7 @@ pub fn execute(command: &CardCommand, clock: &dyn Clock) -> Result<CommandOutcom
         CardCommand::Create(args) => run_create(args, clock),
         CardCommand::Activate(args) => run_activate(args, clock),
         CardCommand::Revise(args) => run_revise(args, clock),
+        CardCommand::Abandon(args) => run_abandon(args, clock),
         CardCommand::Status(args) => run_status(args),
     }
 }
@@ -708,6 +728,61 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     "superseded_revision": state.current_revision,
                     "superseded_digest": state.current_digest.as_str(),
                     "state": CardState::Ready.name(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.common.control)?;
+        let (_, state) = load_card(&control, &card_id)?;
+        state.state.check_transition(CardState::Abandoned)?;
+        return Ok(CommandOutcome::new(
+            "card.abandon",
+            format!("Dry run: would abandon card {card_id}; nothing was changed"),
+            serde_json::json!({ "dry_run": true, "card_id": card_id.to_string() }),
+        ));
+    }
+
+    with_transaction(
+        &args.common.control,
+        "card.abandon",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let previous = state.state;
+            previous.check_transition(CardState::Abandoned)?;
+
+            let config = control.project()?;
+            store_card_state(control, &record, &state, CardState::Abandoned)?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("card.abandoned", &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .transition(Some(previous.name()), CardState::Abandoned.name())
+                    .meta("reason", serde_json::json!(args.reason)),
+                clock,
+            )?;
+            control.commit(expected, &format!("card: abandon {card_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "card.abandon",
+                format!("Abandoned card {card_id}\nreason: {}", args.reason),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Abandoned.name(),
+                    "reason": args.reason,
                 }),
             )
             .with_project(config.project_id.clone()))
