@@ -138,6 +138,26 @@ Deliberately **not** fixed, and named at the check:
 - **Section 10.2's dependency-base precondition is unenforced here.** A card's
   `base_sha` is checked only as 40 hexadecimal characters; nothing verifies that
   it is the dependency's exact accepted SHA.
+- **`handoff create` never enforces write scope.** `policy::verification::verify`
+  exists and is exactly what `work verify` runs, but `work verify` is the only
+  caller in the codebase — `gate.rs` and `handoff.rs` never invoke it. A
+  candidate whose changed paths fall outside its card's declared `write_scope`
+  hands off successfully and carries no record that it should not have. This is
+  the mechanical control the "path and shared-resource ownership" line in the
+  README's product boundary names, and it is not enforced at the one point
+  meant to be the last chance to catch it before a reviewer sees the candidate.
+  Confirmed exploited, not merely theoretical: `H-000025` and `H-000026`, two
+  real handoffs on `F-019` itself, both carried three test files outside that
+  card's then-declared write scope in `changed_paths`, and both succeeded.
+  Found and named three times before it was written down here: first in
+  `docs/reviews/tier4-redesign.json` (recommended filing it separately; it was
+  not), then independently by F-019's round-two reviewer, then again by its
+  round-three reviewer, who found the first mention and confirmed nothing had
+  come of it. Concrete remedy already scoped: `handoff::run_create` already
+  computes the changed-path diff via `derive_facts`, so wiring `verify` in
+  costs no new Git operation. Left unfixed here because `handoff.rs` and
+  `gate.rs` are outside every currently-open card's declared write scope, and
+  fixing it inside one would repeat the exact defect it fixes.
 
 ✅ **FIXED:** cycle status now folds only cycle lifecycle events — `card_id`
 unset *and* `event_type` starting with `cycle.` — while `EventStore::for_cycle`
