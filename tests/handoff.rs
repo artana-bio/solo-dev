@@ -44,6 +44,19 @@ fn declaration(workspace: &Workspace, delivered_sha: &str) -> String {
     path.display().to_string()
 }
 
+/// Extends the otherwise valid candidate with a file the card does not own.
+fn out_of_scope_candidate(workspace: &Workspace) -> (String, String) {
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(worktree.join("outside.rs"), "fn outside_scope() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: add outside file"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = declaration(workspace, &head);
+    (head, declaration)
+}
+
 fn error_code(output: &std::process::Output) -> String {
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("an error envelope");
     envelope["error"]["code"].as_str().unwrap().to_owned()
@@ -148,6 +161,41 @@ fn a_dirty_worktree_refuses_handoff() {
     let output = workspace.handoff_raw(&["create", "--card-id", "F-001", "--declaration", &path]);
     assert_eq!(output.status.code(), Some(4));
     assert_eq!(error_code(&output), "CH-PRECONDITION-WORKTREE-DIRTY");
+}
+
+#[test]
+fn an_out_of_scope_candidate_refuses_handoff_with_the_path() {
+    let (workspace, _) = ready_to_hand_off();
+    let (_head, path) = out_of_scope_candidate(&workspace);
+
+    let output = workspace.handoff_raw(&["create", "--card-id", "F-001", "--declaration", &path]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-CANDIDATE-OUT-OF-SCOPE");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("outside.rs"),
+        "the refusal must name the path outside the card's write scope"
+    );
+}
+
+#[test]
+fn a_dry_run_refuses_an_out_of_scope_candidate_with_the_path() {
+    let (workspace, _) = ready_to_hand_off();
+    let (_head, path) = out_of_scope_candidate(&workspace);
+
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &path,
+        "--dry-run",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-CANDIDATE-OUT-OF-SCOPE");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("outside.rs"),
+        "the preview refusal must name the path outside the card's write scope"
+    );
 }
 
 #[test]
