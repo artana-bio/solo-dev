@@ -30,13 +30,14 @@ will not own the workflow engine.
 
 ## Status
 
-**Not released. Both release gates are `BLOCKED` pending independent
-certification.**
+**The Single-repository MVP release is accepted and signed (2026-07-30).**
+Section 19.4 (hardening) remains `BLOCKED` — it needs an ARTANA checkout that
+does not exist yet, tracked by D-070.
 
 Every Single-repository MVP work package is implemented, along with all five
 hardening packages: failure injection at every journaled boundary, stale-lock
 diagnosis with explicit lease reclaim, verified backups, cycle auditing with
-evidence cross-checking, and generated-artifact classification. 848 tests pass.
+evidence cross-checking, and generated-artifact classification. 858 tests pass.
 
 That was previously reported here as "eleven of the twelve Section 19.3 release
 criteria are met; the remaining one is the acceptance owner's signature". An
@@ -58,16 +59,28 @@ carries a test that fails against the unfixed code and a mutation check
 confirming the test catches the real enforcement, not just its own recording of
 what happened.
 
-The gates stay blocked anyway, and the reason is the point. Fixing every
-catalogued defect is not the same as the release criteria being *proven* met:
-the original criteria were assessed by the author of the code, against tests
-the same author wrote, and that self-assessment is precisely what failed. The
-release rule now in force (D-075) settles each criterion by experiment rather
+Fixing every catalogued defect was never going to be the same thing as the
+release criteria being *proven* met: the original criteria were assessed by
+the author of the code, against tests the same author wrote, and that
+self-assessment is precisely what failed the first time. The release rule that
+governed everything since (D-075) settles each criterion by experiment rather
 than by written opinion: break the mechanism a criterion depends on, and
 confirm the test that is supposed to catch it actually fails. A reviewer who
-did not write the code runs that experiment for all twelve Section 19.3
-criteria and reports which hold. That certification is the last remaining
-step.
+did not write the code ran that experiment for all twelve Section 19.3
+criteria.
+
+**Eleven of twelve came back `MET`** this way — nine by mutation, two (work
+packages done, README accurate) by direct record inspection where mutation
+doesn't apply. **The twelfth is not `MET`, and the record says so rather than
+rounding up.** Only 2 of 18 known-weak tests touch the mandatory-scenario
+trace; the other ~48 have never been mutation-tested by anyone. The acceptance
+owner reviewed that exact bound and chose to accept it as disclosed residual
+risk (D-079) rather than commission an audit of unknown size — the pattern all
+week was that looking harder kept finding more, while what it found kept
+getting less severe. Signing (D-080) certifies that distinction, not that it
+disappeared: eleven criteria demonstrated, one knowingly carried in the open.
+[The plan's Section 19.3](./docs/IMPLEMENTATION_PLAN.md) has the full
+per-criterion evidence.
 
 The harness runs its own development. `SELFHOST-001` took a documentation-only
 card through every lifecycle stage against this repository and promoted the
