@@ -217,8 +217,13 @@ pub(crate) fn dependency_staleness(
             continue;
         };
         if !dependency.approval_contains_binding {
+            // Deliberately does not say "rewritten". Containment fails for a
+            // rewrite, and also when this evidence binds a *newer* dependency
+            // commit than the one standing approved — no rewrite anywhere. A
+            // reviewer reproduced the second case, and a diagnostic that names
+            // the wrong cause sends an operator looking in the wrong place.
             return Some(format!(
-                "this {subject} incorporates {} at {incorporated}, but {} now stands approved at {approved}, which does not contain it; the dependency was rewritten after this evidence was bound",
+                "this {subject} incorporates {} at {incorporated}, but {} now stands approved at {approved}, which does not contain it",
                 dependency.card_id, dependency.card_id
             ));
         }
@@ -549,6 +554,58 @@ mod tests {
             approved_candidate_sha: approved.map(ToOwned::to_owned),
             approval_contains_binding: contains,
         }]
+    }
+
+    #[test]
+    fn the_handoff_record_reports_a_stale_dependency_through_staleness() {
+        // Finding 3 from the F-016 review. `dependency_staleness` was tested
+        // directly, but `HandoffRecord::staleness`'s call to it was not: a
+        // reviewer replaced that whole arm with `None` and the entire suite —
+        // 840 tests across 35 binaries, including their own nine probes —
+        // stayed green. A guarded helper reached through an unguarded call site
+        // is the same vacuity as an untested mechanism, one level up.
+        let record = HandoffRecord {
+            dependency_bindings: binding(Some(&"d".repeat(40))),
+            ..handoff()
+        };
+        let reason = record
+            .staleness(
+                &record.candidate_sha.clone(),
+                &record.card_digest.clone(),
+                &standing(Some(&"e".repeat(40)), false),
+            )
+            .expect("the record must surface what dependency_staleness found");
+        assert!(reason.contains("F-000"), "{reason}");
+
+        // And the same record with a containing approval is current, so the arm
+        // is not simply returning Some unconditionally.
+        assert!(
+            record
+                .staleness(
+                    &record.candidate_sha.clone(),
+                    &record.card_digest.clone(),
+                    &standing(Some(&"e".repeat(40)), true),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_dependency_whose_commit_git_cannot_resolve_does_not_invalidate() {
+        // Finding 6. Neither direction of the unanswerable case was reached by
+        // any test: flipping the caller's default failed exactly one test in
+        // the suite, and it was the reviewer's own. The conservative direction
+        // is deliberate — an ancestry question Git cannot answer must not
+        // invalidate standing evidence — so it needs a test saying so.
+        assert!(
+            dependency_staleness(
+                "handoff",
+                &binding(Some(&"d".repeat(40))),
+                &standing(Some(&"e".repeat(40)), true),
+            )
+            .is_none(),
+            "an unanswerable ancestry resolves to `contains`, which does not invalidate"
+        );
     }
 
     #[test]

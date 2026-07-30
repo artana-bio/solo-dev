@@ -254,7 +254,15 @@ pub fn handoffs_for(
 ///
 /// # Errors
 ///
-/// Returns an error when Git cannot be executed.
+/// Returns an error when `is_ancestor` itself fails. Note that a missing object
+/// cannot reach that path: `object_type` reports a Git execution failure the
+/// same way it reports an absent object, so both collapse into `None` above.
+/// That is the conservative direction for both callers — neither invalidates on
+/// an unanswerable question — but it means a genuinely broken Git is reported as
+/// "cannot say" rather than as a failure. A reviewer identified this; it is
+/// recorded rather than papered over, because tightening it would mean
+/// distinguishing the two inside `object_type`, which is a wider change than
+/// this card owns.
 pub(crate) fn ancestry(
     scope: &GitScope,
     ancestor: &str,

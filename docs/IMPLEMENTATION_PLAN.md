@@ -1215,7 +1215,17 @@ Before Single-repository MVP acceptance, tests MUST cover:
 37. cleanup rejection for unarchived commits;
 38. successful cleanup after archival;
 39. JSON success envelope;
-40. JSON error envelope and stable exit code.
+40. JSON error envelope and stable exit code;
+41. dependency-SHA binding and its invalidation: a dependent that incorporates
+    a dependency commit goes stale when the dependency's standing approval no
+    longer contains it, and a dependent that incorporates nothing from its
+    dependency never does.
+
+Scenario 41 was added with `F-016`. It is listed separately from the original
+forty because those were fixed before Single-repository MVP acceptance and this
+one was not: invariant 7.3.6 was unimplemented and unlisted, so the list
+described the tests that existed rather than the coverage the gate requires.
+A reviewer identified the omission.
 
 
 Coverage trace. Every scenario is mapped to the test that exercises it, so a
@@ -1263,6 +1273,7 @@ claim of coverage can be checked rather than taken on faith.
 | 38 | successful cleanup after archival | `closing_removes_the_worktrees_and_branches` |
 | 39 | JSON success envelope | `output_option_emits_the_stable_result_envelope` |
 | 40 | JSON error envelope and stable exit code | `json_mode_renders_failures_as_the_error_envelope` |
+| 41 | Dependency-SHA binding and invalidation | `tests/dependency_binding.rs`, and `the_handoff_record_reports_a_stale_dependency_through_staleness` for the record's own call site |
 
 Tracing the list found four genuine gaps rather than confirming what was
 already there: scenarios 4 and 5 had no enforcement at all — Section 9.1

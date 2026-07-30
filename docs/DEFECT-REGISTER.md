@@ -123,8 +123,19 @@ a dependent every time its dependency was re-reviewed and forced dependencies to
 be approved in order. The proof it is gone: `tests/integration_plan.rs` still
 approves `F-002` before `F-001` and needed no repair.
 
-Deliberately **not** fixed, and named at the check: the four other Section 15.2
-invalidation triggers this does not reach. Cycle status folds card events. Five cycle statuses and one card state
+Deliberately **not** fixed, and named at the check:
+
+- The four other Section 15.2 invalidation triggers this does not reach.
+- **A candidate can incorporate dependency work through a commit the dependency
+  never handed off, and the binding records nothing.** The resolution asks which
+  of the dependency's *handed-off* commits is an ancestor, so work committed on a
+  dependency's branch and merged in before that dependency handed off resolves to
+  no binding at all — and the dependent then cannot be invalidated by a later
+  rewrite of it. A reviewer built this with ordinary commands and got two
+  versions of the dependency's file into a prepared integration; only the merge
+  stopped it, and a non-conflicting rewrite would have landed. Closing it means
+  binding against the dependency's branch rather than its handoffs, which is a
+  wider change than this card owns. Cycle status folds card events. Five cycle statuses and one card state
 are unreachable. Merge honours `commit.gpgsign` and repository hooks,
 contradicting "hooks are advisory".
 
