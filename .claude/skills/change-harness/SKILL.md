@@ -81,8 +81,9 @@ recorded inconsistency — documented here as it is, not as it should be:
 | `integration review` | `--reviewer-actor-id` |
 | `acceptance record` | `--acceptance-owner` |
 
-`integration preflight`, `work verify`, and the read-only commands take no
-actor at all.
+`integration preflight` takes no actor at all. `work verify` and the
+read-only status commands (`cycle status`, `card status`, `gate list`) accept
+an optional `--actor` that defaults to `operator` — you may omit it.
 
 ## Exit codes
 
@@ -102,9 +103,10 @@ actor at all.
 Exit 1 is deliberately unassigned so an uncategorized panic stays
 distinguishable from every classified outcome.
 
-Every mutating command accepts `--dry-run`, which runs the real checks against
-real state and changes nothing. A dry run that would refuse tells you so with
-the same error the real command would give.
+Every mutating command accepts `--dry-run` (the one exception:
+`project recover --resume` has no dry-run form). It runs the real checks
+against real state and changes nothing. A dry run that would refuse tells you
+so with the same error the real command would give.
 
 ## The lifecycle
 
@@ -357,6 +359,7 @@ worktrees; `close` refuses to delete anything that would become unreachable.
 | `CH-POLICY-CANDIDATE-OUT-OF-SCOPE` (exit 5) | The candidate touches a path outside `write_scope`; the path is named | Drop the change, or `card revise` with the corrected scope, `work resume`, re-gate, re-handoff |
 | `CH-POLICY-INVALID-TRANSITION` (exit 5) | The command is not legal from the current state; permitted states are listed | `card status` to see where you are; after `changes_requested`, `work resume` first |
 | `CH-POLICY-NOT-INTEGRABLE` (exit 5) | A named card is not approved-and-current | `integration ready` explains exactly why |
+| `CH-POLICY-OWNERSHIP-OVERLAP` (exit 5) | The card's write scope overlaps another active card's | Narrow one scope (`card revise`), or wait for the other card to land — overlap is refused at activation, not discovered at merge |
 | Handoff refuses a dirty worktree | Uncommitted or untracked files | Commit them, or add gate outputs to the project's `.gitignore` |
 | Handoff refuses the SHA | Branch head ≠ `delivered_sha` | Re-read HEAD, fix the declaration |
 | An approval is reported stale | Candidate or card changed after the review | New handoff, fresh review — the old approval is not deleted, it just no longer applies |

@@ -201,7 +201,7 @@ this, twice, against a temporary project.
 
 > **Driving this CLI as an agent?** The operating guide — lifecycle in order,
 > the exact YAML shapes the deserializers accept, the actor-flag split, and
-> every refusal code with its remedy — is maintained as a skill at
+> the common refusal codes with their remedies — is maintained as a skill at
 > [`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md).
 > Copy that directory into any governed project so agents discover it there.
 
