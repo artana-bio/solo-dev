@@ -427,6 +427,10 @@ mod tests {
 
         // Skipping verification would let an unverified tree reach promotion.
         assert!(Prepared.check_transition(Accepted).is_err());
+        // A draft integration must be prepared, verified, reviewed, and
+        // accepted before promotion; command-level checks independently guard
+        // promotion today, but this protects the transition table itself.
+        assert!(Draft.check_transition(Promoted).is_err());
         // Promotion cannot be undone by abandoning it.
         assert!(Promoted.check_transition(Abandoned).is_err());
         assert!(Archived.check_transition(Prepared).is_err());
