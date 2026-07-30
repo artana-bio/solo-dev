@@ -1,7 +1,28 @@
 # Change Harness
 
-Change Harness is a project-neutral CLI for coordinating bounded changes made
-by humans and coding agents across local Git worktrees.
+Change Harness is a project-neutral CLI that governs how a change — written by
+a human or a coding agent — gets from a worktree onto a protected branch,
+without ever letting an unreviewed or unverified change slip through.
+
+## Why this exists
+
+The moment an agent (or a person moving fast) can push a change, three
+questions become hard to answer with certainty: did the exact code that was
+reviewed reach the protected branch, unchanged? Did the tests that ran belong
+to that same commit, or to something adjacent? And if two changes land
+together, was the *combination* ever actually checked — or only each piece in
+isolation?
+
+Change Harness exists to make those three questions structurally unavoidable
+rather than a matter of trust. It binds every review, every test receipt, and
+every promotion to an exact Git commit SHA — not a branch name, not "whatever
+is checked out right now." A card cannot be approved and then quietly changed
+before it lands. A gate cannot pass on uncommitted content and be presented as
+evidence about a commit. Two changes cannot land together without the combined
+result being verified as its own thing, separately from either change alone.
+It is a mechanical control, not a judgment call: the harness does not decide
+whether code is *good*, only that the thing being promoted is provably the
+thing that was reviewed.
 
 The repository is intentionally independent from ARTANA. ARTANA will eventually
 consume the CLI through project configuration and named gate definitions; it
@@ -9,48 +30,69 @@ will not own the workflow engine.
 
 ## Status
 
-**Not released. Both release gates are `BLOCKED`, and the evidence this produces
-has not been independently re-assessed since it was repaired.**
+**Not released. Both release gates are `BLOCKED` pending independent
+certification.**
 
 Every Single-repository MVP work package is implemented, along with all five
 hardening packages: failure injection at every journaled boundary, stale-lock
 diagnosis with explicit lease reclaim, verified backups, cycle auditing with
-evidence cross-checking, and generated-artifact classification. 801 tests pass.
+evidence cross-checking, and generated-artifact classification. 848 tests pass.
 
 That was previously reported here as "eleven of the twelve Section 19.3 release
 criteria are met; the remaining one is the acceptance owner's signature". An
 eight-reviewer independent review disproved it. Every one of the eight found
 defects that invalidated a recorded claim; twenty-four are catalogued in
 [the defect register](./docs/DEFECT-REGISTER.md), five of which meant the
-evidence chain did not hold.
+evidence chain did not hold — for example, a gate could pass on uncommitted
+content while the receipt bound that pass to a commit, or a re-review could
+approve away a prior critical finding.
 
-**All twenty-four are now fixed**, each with a test that fails against the
-unfixed code and a mutation check confirming the test catches the enforcement
-rather than the recording. Several more defects were found while fixing them,
-including that failure injection could not observe the state it was built to
-test, and that five existing fixtures were asserting defects as correct
-behaviour.
+**All twenty-four are fixed**, plus nine more found while fixing them or while
+auditing the test suite for tests that pass without actually checking what
+their name claims — including that failure injection could not observe the
+state it was built to test, that six severe tests could not fail under the
+exact conditions they existed to catch, and that an integration merge could
+silently inherit the operator's own Git configuration (a signing setting, a
+repository hook) and let it alter or block an authoritative commit. Each fix
+carries a test that fails against the unfixed code and a mutation check
+confirming the test catches the real enforcement, not just its own recording of
+what happened.
 
 The gates stay blocked anyway, and the reason is the point. Fixing every
-catalogued defect is not the same as the criteria being met: the criteria were
-assessed by the author of the code, against tests the same author wrote, and
-that assessment is precisely what failed. Section 19.3 and 19.4 need
-re-assessing by someone else before either can move.
+catalogued defect is not the same as the release criteria being *proven* met:
+the original criteria were assessed by the author of the code, against tests
+the same author wrote, and that self-assessment is precisely what failed. The
+release rule now in force (D-075) settles each criterion by experiment rather
+than by written opinion: break the mechanism a criterion depends on, and
+confirm the test that is supposed to catch it actually fails. A reviewer who
+did not write the code runs that experiment for all twelve Section 19.3
+criteria and reports which hold. That certification is the last remaining
+step.
 
 The harness runs its own development. `SELFHOST-001` took a documentation-only
 card through every lifecycle stage against this repository and promoted the
 result; every package since has been built the same way. That run is recorded
 in [its report](./docs/SELFHOST-001.md), including the two attempts that failed
 first and the three defects they exposed — which is the reason Threshold C
-exists. **Threshold C is currently suspended** (D-065): certifying the repair of
-an evidence chain using that same chain proves nothing about either, so repairs
-land as ordinary reviewed commits.
+exists. Threshold C was briefly suspended while the evidence chain itself was
+under repair (D-065), then resumed once that repair was independently verified
+(D-067): the remaining defect fixes landed through the harness's own lifecycle,
+each authored by a different tool than the one that wrote the original code
+(D-076), gated, handed off at an exact SHA, and independently reviewed before
+promotion.
 
-One limitation is worth knowing before relying on the evidence: the reviews in
-these runs were recorded by distinct declared actors but not from genuinely
-fresh contexts. D-013 makes actor identity declared rather than proven, so the
-harness cannot detect this. That gap is exactly the one the eight-reviewer
-exercise measured, and it measured badly.
+One limitation is worth knowing before relying on any of this evidence: D-013
+makes actor identity a declared claim rather than a proven one, so the harness
+itself cannot tell a genuinely independent reviewer from the same author typing
+a different name. The reviews recorded during the original build-out used
+distinct declared actors but not genuinely fresh contexts — that gap is exactly
+what the eight-reviewer exercise measured, and it measured badly. The repair
+that followed changed the practice, not the mechanism: each fix was reviewed by
+an agent given only the code and the specification, with no memory of writing
+it, and often by an implementing tool (Codex) entirely separate from the
+reviewing one (Claude). That discipline is why the repair caught real defects
+on nearly every round — including the repair *of* the repair, twice — but it is
+still a practice the team follows, not a guarantee the tool enforces.
 
 The `SPIKE-001` walking skeleton that preceded implementation is recorded in
 [its report](./docs/spikes/SPIKE-001-REPORT.md). No prototype code was merged;
