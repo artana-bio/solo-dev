@@ -238,16 +238,28 @@ fn a_held_lock_makes_a_second_mutation_fail_as_policy() {
     // Hold the lock as another process would.
     let _held = ProjectLock::acquire(&fixture.control, "other-command", &clock()).unwrap();
 
-    let output = Fixture::run(&fixture.init_args());
-    // The repeat path is reached only after the lock, so an identical config
-    // still has to contend for it when the control repository is fresh.
-    // Here the project already exists, so assert the lock file is intact and
-    // the command did not corrupt state.
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "must contend for the lock".into(),
+    ]);
+    // Unlike idempotent project initialization, this command would write a
+    // cycle record. Its only admissible outcome while the lock is held is the
+    // policy refusal from acquisition.
     assert!(fixture.control.join(LOCK_FILE).exists());
     assert!(
-        output.status.success() || output.status.code() == Some(5),
-        "unexpected status {:?}",
-        output.status.code()
+        !output.status.success(),
+        "a held lock must refuse the mutation"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "contention is a policy refusal"
     );
 }
 
