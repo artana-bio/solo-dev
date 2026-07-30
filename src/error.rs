@@ -113,6 +113,15 @@ pub enum ErrorCode {
     PreconditionUnmergedWork,
     /// The local protected worktree is not at the commit promotion expects.
     PreconditionLocalMainStale,
+    /// Git refused to begin a merge, so no content was ever combined.
+    ///
+    /// Distinct from [`Self::ConflictMergeFailed`] on purpose. A conflict means
+    /// two changes disagree and the answer is a fix card; this means Git never
+    /// got as far as comparing them, and the answer is somewhere in the
+    /// worktree or the repository's configuration. Reporting the second as the
+    /// first sent operators to `integration preflight`, which reports clean
+    /// because in-memory merging is unaffected by whatever stopped this one.
+    PreconditionMergeRefused,
     /// A path initialization would adopt already holds content nobody checked.
     PreconditionOccupiedPath,
     /// The control repository could not be read or written by this process.
@@ -196,7 +205,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 79] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -246,6 +255,7 @@ impl ErrorCode {
         Self::PreconditionWorktreeDirty,
         Self::PreconditionUnmergedWork,
         Self::PreconditionLocalMainStale,
+        Self::PreconditionMergeRefused,
         Self::PreconditionOccupiedPath,
         Self::PreconditionControlAccess,
         Self::PolicyRiskReview,
@@ -352,7 +362,8 @@ impl ErrorCode {
             | Self::PreconditionControlAccess
             | Self::PreconditionWorktreeDirty
             | Self::PreconditionUnmergedWork
-            | Self::PreconditionLocalMainStale => ExitCategory::Precondition,
+            | Self::PreconditionLocalMainStale
+            | Self::PreconditionMergeRefused => ExitCategory::Precondition,
             Self::RecoveryIncomplete => ExitCategory::RecoveryRequired,
             Self::ConflictControlHeadMoved | Self::ConflictMergeFailed => ExitCategory::Conflict,
             Self::ExternalGitUnavailable | Self::ExternalGitCommand => ExitCategory::ExternalTool,
@@ -415,6 +426,7 @@ impl ErrorCode {
             Self::PreconditionWorktreeDirty => "WORKTREE-DIRTY",
             Self::PreconditionUnmergedWork => "UNMERGED-WORK",
             Self::PreconditionLocalMainStale => "LOCAL-MAIN-STALE",
+            Self::PreconditionMergeRefused => "MERGE-REFUSED",
             Self::PolicyLeaseHeld => "LEASE-HELD",
             Self::PolicyStaleLock => "STALE-LOCK",
             Self::PolicyLockAmbiguous => "LOCK-AMBIGUOUS",
@@ -664,6 +676,16 @@ impl ErrorCode {
             }
             Self::PreconditionWorktreeDirty => {
                 "Commit or discard the uncommitted work, then retry."
+            }
+            // Deliberately points at Git's own words rather than naming a
+            // cause. The set of things that stop a merge before it starts is
+            // open — untracked files a gate left behind, unrelated histories,
+            // a merge driver that will not run — and a remediation that names
+            // one of them sends the operator to the wrong place for the rest.
+            // Naming `integration preflight` would be worse still: it merges
+            // in memory and reports clean while this fails.
+            Self::PreconditionMergeRefused => {
+                "Read the Git diagnostic in this error: the merge was refused before any content was combined, so this is the integration worktree's state or the repository's configuration, not a conflict."
             }
             Self::PreconditionUnmergedWork => {
                 "Land or archive the branch's commits before deleting it."

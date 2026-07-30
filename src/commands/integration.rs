@@ -2584,6 +2584,17 @@ fn require_local_main_ready(
 /// Section 13.6 step 11. `--ff-only` is the point: if this cannot be a
 /// fast-forward, something changed the worktree between the precondition check
 /// and now, and merging instead would invent a commit nobody accepted.
+///
+/// This one keeps the project's hooks, unlike `integration_worktree::merge`,
+/// and the difference is deliberate. A fast-forward writes no commit, so
+/// nothing here is a harness-authored object that signing or a
+/// `prepare-commit-msg` hook could alter — the landing commit was authored
+/// earlier by plumbing and is already published. What a fast-forward does run
+/// is `post-merge`, and this is the developer's own protected worktree being
+/// brought up to date; that hook is the project's way of finishing the job, and
+/// suppressing it here would leave a checkout the project considers unfinished
+/// in the one place a human will actually work next. Verified that it cannot
+/// block: a `post-merge` exiting 1 still leaves `git merge --ff-only` at exit 0.
 fn synchronize_local_main(
     config: &crate::config::ProjectConfig,
     landing_sha: &str,

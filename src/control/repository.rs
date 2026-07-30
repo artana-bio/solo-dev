@@ -14,7 +14,7 @@ use crate::{
     config::ProjectConfig,
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
-    git::command::{GitScope, run, run_ok},
+    git::command::{GitScope, run, run_ok, run_with_config_ok},
 };
 
 /// Path of the project document inside the control repository.
@@ -165,7 +165,17 @@ impl ControlRepository {
             source,
         })?;
         if !self.root.join(".git").exists() {
-            run_ok(&self.scope(), ["init", "-q", "-b", "main"])?;
+            // `init.templateDir=` (empty) copies no template. A global template
+            // is an ordinary thing for an operator to have, and one carrying a
+            // `pre-commit` gets it installed into the control repository, where
+            // it refuses the very first commit and `project init` fails
+            // outright — verified on git 2.50.1. `core.hooksPath` below already
+            // makes such a hook inert; this stops it being written at all,
+            // because the audit trail should not contain someone else's scripts.
+            run_ok(
+                &self.scope(),
+                ["-c", "init.templateDir=", "init", "-q", "-b", "main"],
+            )?;
         }
         // Identity is configured on the repository, not read from the operator's
         // global config, so control history is byte-identical regardless of who
@@ -174,6 +184,34 @@ impl ControlRepository {
         run_ok(
             &self.scope(),
             ["config", "user.email", CONTROL_AUTHOR_EMAIL],
+        )?;
+        // The same reasoning one layer down. Control history is the audit
+        // trail: the harness writes every commit in it and nobody edits them by
+        // hand. Local configuration outranks `~/.gitconfig`, so this is where a
+        // repository the harness owns outright records that no hook and no
+        // signing key applies to it — while touching no configuration belonging
+        // to the operator or to the candidate repository.
+        //
+        // Written into this repository rather than passed as `-c` on every
+        // invocation precisely because this repository is the harness's. The
+        // candidate repository is the developer's and gets the opposite
+        // treatment: see `git::command::authoring_overrides`.
+        //
+        // Verified: without these, a `~/.gitconfig` carrying
+        // `commit.gpgsign = true` with an unusable signer, or a global
+        // `core.hooksPath` whose `pre-commit` refuses, makes `project init`
+        // fail with CH-EXTERNAL-GIT-COMMAND and leaves control history unborn.
+        // A hooks directory that does not exist is how Git is told there are no
+        // hooks; it is not created, so nothing can later appear in it.
+        run_ok(&self.scope(), ["config", "commit.gpgsign", "false"])?;
+        let hook_sink = self.root.join(".git").join("change-harness-no-hooks");
+        run_ok(
+            &self.scope(),
+            [
+                "config".as_ref(),
+                "core.hooksPath".as_ref(),
+                hook_sink.as_os_str(),
+            ],
         )?;
         self.write_atomic(".gitignore", CONTROL_IGNORE)?;
         Ok(())
@@ -305,7 +343,17 @@ impl ControlRepository {
         if run(&self.scope(), ["diff", "--cached", "--quiet"])?.success() {
             return Ok(None);
         }
-        run_ok(&self.scope(), ["commit", "-q", "-m", message])?;
+        // This remains an invocation-level defence as well as the local
+        // configuration set during initialization. An existing control
+        // repository can have those local settings removed, and `project init`
+        // intentionally short-circuits before `initialize_git` in that case.
+        // The audit write must still be independent of an operator's global
+        // hooks and signing configuration.
+        let hook_sink = self.root.join(".git").join("change-harness-no-hooks");
+        let mut hooks_path = std::ffi::OsString::from("core.hooksPath=");
+        hooks_path.push(hook_sink.as_os_str());
+        let overrides = vec![hooks_path, std::ffi::OsString::from("commit.gpgsign=false")];
+        run_with_config_ok(&self.scope(), &overrides, ["commit", "-q", "-m", message])?;
         self.head()
     }
 
