@@ -103,6 +103,7 @@ fn the_timeline_reconstructs_the_cycle_in_order() {
     let workspace = completed();
     let envelope = audit_json(&workspace, "C-001");
     let timeline = envelope["data"]["timeline"].as_array().unwrap();
+    let events = workspace.events();
 
     let types: Vec<&str> = timeline
         .iter()
@@ -115,12 +116,23 @@ fn the_timeline_reconstructs_the_cycle_in_order() {
     let promoted = types.iter().position(|t| *t == "integration.promoted");
     assert!(handoff < review, "review must follow handoff: {types:?}");
     assert!(review < promoted, "promotion must follow review: {types:?}");
+    for entry in timeline {
+        let event = events
+            .iter()
+            .find(|event| event["event_id"] == entry["event_id"])
+            .expect("every timeline entry must name an event");
+        assert_eq!(
+            entry["at"], event["occurred_at"],
+            "timeline timestamp must reproduce its source event: {entry}"
+        );
+    }
 }
 
 #[test]
 fn the_report_names_the_exact_protected_branch_transition() {
     let workspace = completed();
     let envelope = audit_json(&workspace, "C-001");
+    let events = workspace.events();
     let transitions = envelope["data"]["protected_branch_transitions"]
         .as_array()
         .unwrap();
@@ -138,6 +150,15 @@ fn the_report_names_the_exact_protected_branch_transition() {
             .unwrap()
             .starts_with("ACC-"),
         "the authorizing decision must be named: {}",
+        transitions[0]
+    );
+    let promotion = events
+        .iter()
+        .find(|event| event["event_type"] == "integration.promoted")
+        .expect("the promoted integration must have an event");
+    assert_eq!(
+        transitions[0]["at"], promotion["occurred_at"],
+        "protected-branch transition timestamp must reproduce its source event: {}",
         transitions[0]
     );
 }
