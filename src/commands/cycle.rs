@@ -195,6 +195,17 @@ fn derived_status(
     let records = events.for_cycle(cycle_id)?;
     let transitions: Vec<&str> = records
         .iter()
+        // `for_cycle` intentionally includes the full cycle subtree for audit
+        // output, so this must filter, not switch source. `card_id.is_none()`
+        // alone is not enough: `card.created` deliberately omits `card_id`
+        // (the card is not yet activated when it fires) and its `next_state`
+        // is `draft`, which collides with `CycleStatus::Draft` — folding it
+        // in would reset an active cycle to `draft` the moment any card in it
+        // is created. `event_type` starting with `cycle.` is what actually
+        // distinguishes a cycle's own transition from every other subject
+        // that happens to share its cycle_id and, for some state name, its
+        // vocabulary — card, integration, and acceptance events among them.
+        .filter(|event| event.card_id.is_none() && event.event_type.starts_with("cycle."))
         .filter_map(|event| event.next_state.as_deref())
         .collect();
     Ok(status_from_events(transitions))

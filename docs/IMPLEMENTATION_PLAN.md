@@ -5,8 +5,8 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 47 |
-| Plan date | 2026-07-28 |
+| Plan revision | 48 |
+| Plan date | 2026-07-30 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
@@ -778,6 +778,7 @@ any pre-promoted state → abandoned
 | Command | Required state | Resulting state |
 | --- | --- | --- |
 | `card activate` | Card `draft`; cycle `active` | Card `ready` |
+| `card abandon` | Any card state except `landed` or terminal states | Card `abandoned` |
 | `work start` | Card `ready` | Card `active` through `leased` |
 | `work checkpoint` | Card `active` or `blocked` | State unchanged |
 | `handoff create` | Card `active` | Card `handed_off` |
@@ -859,6 +860,7 @@ change-harness card create
 change-harness card validate
 change-harness card activate
 change-harness card revise
+change-harness card abandon
 change-harness card status
 
 change-harness work start
@@ -3088,6 +3090,7 @@ and `WP-510`: check a claim before writing it down.
 | D-074 | `integration prepare` reports the cards it left out | Accepted | Selecting only what is ready is correct — refusing whenever a cycle holds unfinished work would make the ordinary case an error. But dropping a card silently means a coordinator reads a plan and cannot tell whether a card is absent because it is not ready or because they mistyped its identifier. The plan now carries what it dropped and why, as warnings on both the real command and the dry run. The reviewer of the earlier design named this as the one hazard nothing in the proposal touched. |
 | D-075 | Release when no known defect can produce wrong evidence or lose data, every Section 19.3 criterion has a mutation-checked test, and an independent reviewer certifies both; everything else ships as a public register | Accepted | The count of known defects was not converging — each round of looking harder found more — while their severity was. A rule of “zero known defects” would never terminate. These three conditions are finite and checkable, and the first is already met. |
 | D-076 | Implementation of the remaining repair goes to a different tool than the one that wrote the original code, with the harness's own review binding the result | Accepted | Measured on this project, agents reviewing the original author's work found real defects every round, the author reviewing their own found none, and a finding the author got wrong twice was fixed by a different implementer on its first attempt. |
+| D-077 | Leave automatic cycle-status advancement undesigned | Accepted | The commands emit cycle lifecycle events only for create, activate, and abandon. `Integrating`, `Accepted`, `Landed`, `Closed`, and `Blocked` therefore remain named `CycleStatus` variants that no command ever sets. Wiring them to the integration or acceptance flow would change cross-cutting lifecycle policy — whether a cycle should auto-advance at all is a design question, not a bug fix — and needs its own decision rather than being inferred while correcting the event-derivation defect that let them appear by accident. |
 
 ### 19.5 Multi-repository gate
 
