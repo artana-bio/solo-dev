@@ -13,7 +13,10 @@
 
 mod support;
 
-use std::process::Output;
+use std::{
+    fs,
+    process::{Command, Output},
+};
 
 use serde_json::Value;
 use support::Workspace;
@@ -41,6 +44,39 @@ fn contains(workspace: &Workspace, ancestor: &str, descendant: &str) -> bool {
 
 fn head_of(workspace: &Workspace, card_id: &str) -> String {
     support::capture(&workspace.worktrees.join(card_id), &["rev-parse", "HEAD"])
+}
+
+/// Whether Git can resolve the object, rather than merely parse its SHA.
+fn object_exists(workspace: &Workspace, sha: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(&workspace.repository)
+        .args(["cat-file", "-e", sha])
+        .status()
+        .expect("Git should run")
+        .success()
+}
+
+/// Removes one loose object from the temporary candidate repository.
+///
+/// The test needs Git's real missing-object path. A made-up 40-character SHA
+/// would only prove a malformed record reaches the check; this starts with an
+/// object Git created and makes that exact object unavailable.
+fn remove_loose_object(workspace: &Workspace, sha: &str) {
+    let object_path = workspace
+        .repository
+        .join(".git/objects")
+        .join(&sha[..2])
+        .join(&sha[2..]);
+    assert!(
+        object_path.is_file(),
+        "fixture: {sha} must be a loose object before it is made unavailable"
+    );
+    fs::remove_file(&object_path).expect("remove the fixture's unreachable object");
+    assert!(
+        !object_exists(workspace, sha),
+        "fixture: Git must be unable to resolve {sha}"
+    );
 }
 
 /// F-001 approved, and F-002 declaring it and branched from its candidate.
@@ -215,6 +251,65 @@ fn a_dependency_rewrite_does_not_invalidate_a_dependent_that_does_not_incorporat
         "F-002",
     ]);
     assert_eq!(prepared["data"]["members"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_missing_handed_off_dependency_commit_is_not_bound() {
+    // `resolve_dependency_bindings` treats an ancestry question Git cannot
+    // answer as "not incorporated". The earlier handoff is deliberately
+    // revoked and made unreachable, so it is still in control history but no
+    // longer available to Git when F-002's handoff walks it.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let unavailable = head_of(&workspace, "F-001");
+
+    let replacement = workspace.rework_and_reapprove("F-001", "src/F-001/a.rs", true);
+    assert!(
+        !contains(&workspace, &unavailable, &replacement),
+        "fixture: the replacement must leave the first handoff unreachable"
+    );
+    remove_loose_object(&workspace, &unavailable);
+
+    workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
+    workspace.approve_card("F-002", "src/F-002/b.rs");
+
+    let handoff = workspace.handoff_json(&["inspect", "--card-id", "F-002"]);
+    let binding = &handoff["data"]["handoff"]["dependency_bindings"][0];
+    assert_eq!(binding["card_id"], "F-001");
+    assert_eq!(
+        binding["incorporated_sha"],
+        Value::Null,
+        "a missing object is not evidence that F-002 incorporated it"
+    );
+}
+
+#[test]
+fn a_missing_bound_dependency_commit_does_not_invalidate_the_review() {
+    // F-002 genuinely bound F-001 before its parent object disappeared. The
+    // missing object then makes `ancestry` return `None` through the live
+    // review-inspection path, where the conservative default is "contained".
+    let (workspace, bound) = dependent_built_on_its_dependency();
+    let recorded = workspace.review_json(&["inspect", "--card-id", "F-002"]);
+    assert_eq!(
+        recorded["data"]["reviews"][0]["dependency_bindings"][0]["incorporated_sha"],
+        bound.as_str(),
+        "fixture: F-002 must have bound the object before it disappears"
+    );
+    remove_loose_object(&workspace, &bound);
+
+    let inspect = workspace.review_json(&["inspect", "--card-id", "F-002"]);
+    assert_eq!(
+        inspect["data"]["has_current_approval"], true,
+        "an unanswerable containment question must not invalidate the approval"
+    );
+    assert_eq!(
+        inspect["data"]["latest_stale_reason"],
+        Value::Null,
+        "the review remains current rather than receiving a fabricated stale reason"
+    );
 }
 
 #[test]

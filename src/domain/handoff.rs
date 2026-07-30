@@ -125,11 +125,19 @@ impl ActorDeclaration {
 /// it is an ancestor.
 ///
 /// The value is resolved by asking Git whether any commit the dependency has
-/// ever handed off is an ancestor of this candidate, newest first. **A
-/// dependency commit that was never handed off cannot be bound**, because
-/// nothing recorded it: a dependent branched from a mid-branch commit of its
-/// dependency binds `None` and this check says nothing about it. Stated here
-/// rather than implied.
+/// ever handed off is an ancestor of this candidate, newest first. This is not
+/// a binding to the dependency branch: when a candidate incorporates an
+/// unhanded commit on top of an earlier handed-off commit, it binds that earlier
+/// commit instead. If the dependency later stands approved at a rewrite that
+/// still contains the earlier commit, containment passes and records no sign of
+/// the unhanded work. `None` occurs only when no handed-off ancestor exists.
+/// Closing that gap means binding against the dependency branch, which this
+/// record does not do.
+///
+/// Section 10.2's precondition that a dependent's `base_sha` is the exact
+/// accepted dependency SHA is also unenforced here: card validation checks only
+/// that `base_sha` is 40 hexadecimal characters. This resolution cannot infer
+/// a declaration the card record never proved.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyBinding {
@@ -185,9 +193,10 @@ pub const DEPENDENCIES_NOT_CHECKED: &[DependencyStanding] = &[];
 /// - A dependency approved at a commit that *contains* the bound one. The
 ///   dependency gained review-requested fixes on top; what this candidate holds
 ///   is a prefix of what will land, so nothing is superseded and nothing lands
-///   twice. Only a rewrite — a rebase, an amend, a different line of history —
-///   leaves the bound commit outside the approval, and that is exactly the case
-///   where the merge would carry both versions.
+///   twice. A rewrite can leave the bound commit outside the approval, but so
+///   can evidence that binds a newer dependency commit than the one standing
+///   approved. The latter carries no rewrite and does not by itself make a merge
+///   carry both versions.
 /// - A dependency standing approved at nothing, because its own review is
 ///   pending or asked for changes. The dependent may still be reviewed on its
 ///   merits; it cannot be *integrated*, because `check_dependencies` already
@@ -587,24 +596,6 @@ mod tests {
                     &standing(Some(&"e".repeat(40)), true),
                 )
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn a_dependency_whose_commit_git_cannot_resolve_does_not_invalidate() {
-        // Finding 6. Neither direction of the unanswerable case was reached by
-        // any test: flipping the caller's default failed exactly one test in
-        // the suite, and it was the reviewer's own. The conservative direction
-        // is deliberate — an ancestry question Git cannot answer must not
-        // invalidate standing evidence — so it needs a test saying so.
-        assert!(
-            dependency_staleness(
-                "handoff",
-                &binding(Some(&"d".repeat(40))),
-                &standing(Some(&"e".repeat(40)), true),
-            )
-            .is_none(),
-            "an unanswerable ancestry resolves to `contains`, which does not invalidate"
         );
     }
 

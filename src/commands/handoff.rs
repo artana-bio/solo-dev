@@ -276,19 +276,25 @@ pub(crate) fn ancestry(
     inspect::is_ancestor(scope, ancestor, descendant).map(Some)
 }
 
-/// Binds each declared dependency to the commit of it this candidate holds.
+/// Binds each declared dependency to the newest handed-off commit its candidate
+/// history contains.
 ///
-/// Section 10.7's `dependency SHAs`. The question asked is deliberately "which
-/// commit of the dependency is inside this candidate", not "which commit is the
-/// dependency approved at". A dependent branched from the cycle baseline
-/// incorporates nothing and binds `None`, and stays valid however often its
-/// dependency is re-reviewed; a dependent branched from — or merged with — the
-/// dependency's candidate binds that exact commit, and goes stale when the
+/// Section 10.7's `dependency SHAs`. The question is deliberately about an
+/// ancestor in this candidate, not the dependency's current approval. A
+/// dependent branched from the cycle baseline incorporates no handed-off
+/// dependency commit and binds `None`, and stays valid however often its
+/// dependency is re-reviewed; a dependent branched from — or merged with — a
+/// handed-off dependency candidate binds that commit, and goes stale when the
 /// dependency is re-approved somewhere else, because the candidate then carries
 /// a superseded version of code that is about to land twice.
 ///
-/// Handoffs are searched newest first so the binding is the most recent version
-/// of the dependency the candidate actually has.
+/// Handoffs are searched newest first, so the binding is the most recent
+/// *handed-off* dependency commit the candidate has. That is not necessarily
+/// the dependency commit the candidate actually contains: unhanded work on top
+/// of an older handoff binds the older commit, and an approval that still
+/// contains it passes containment with no sign of the gap. `base_sha` does not
+/// close it: the Section 10.2 precondition that it names an accepted dependency
+/// SHA is not enforced beyond validating 40 hexadecimal characters.
 fn resolve_dependency_bindings(
     control: &ControlRepository,
     scope: &GitScope,
