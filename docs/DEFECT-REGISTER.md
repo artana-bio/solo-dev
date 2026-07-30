@@ -176,9 +176,10 @@ tell the implementations apart.
 `at` was `null` — in both the timeline and the protected-branch transition
 record. The audit report's whole purpose is reconstructing when things happened.
 Fixed: both report projections now use `occurred_at`; the timeline test requires
-every entry to have a timestamp and the protected-branch test requires one on
-the transition. Deleting either projection's `at` field now fails its named
-test.
+each entry's timestamp to equal its source event's `occurred_at`, and the
+protected-branch test makes the same exact comparison for the promotion event.
+Deleting either projection's `at` field or substituting a constant now fails its
+named test.
 
 Not looked for. It surfaced because
 `the_timeline_reconstructs_the_cycle_in_order` asserts only the relative order

@@ -265,12 +265,22 @@ fn no_failure_path_in_the_lifecycle_leaves_the_authority_moved() {
 }
 
 #[test]
-fn every_advertised_dry_run_changes_nothing() {
+fn stateful_dry_runs_do_not_change_state() {
     // A dry-run flag that parses and is then forgotten performs the real
-    // mutation. Exercise every mutating lifecycle command that advertises it
-    // at a state where its real form would succeed, rather than treating a
-    // precondition refusal as evidence that no mutation occurred.
+    // mutation. Exercise the stateful lifecycle previews that need this
+    // fixture at a state where their real form would succeed, rather than
+    // treating a precondition refusal as evidence that no mutation occurred.
     let work = Workspace::initialized();
+    assert_dry_run_unchanged(&work, "cycle create", || {
+        work.cycle_raw(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "Dry-run work commands",
+            "--dry-run",
+        ])
+    });
     work.cycle(&[
         "create",
         "--cycle-id",
@@ -315,6 +325,116 @@ fn every_advertised_dry_run_changes_nothing() {
         work.work_raw(&["resume", "--card-id", "F-001", "--dry-run"])
     });
     work.work(&["resume", "--card-id", "F-001"]);
+    work.activate_card("F-002", &["src/F-002/**"]);
+    assert_dry_run_unchanged(&work, "cycle declare-group", || {
+        work.cycle_raw(&[
+            "declare-group",
+            "--cycle-id",
+            "C-001",
+            "--name",
+            "pair",
+            "--card-id",
+            "F-001",
+            "--card-id",
+            "F-002",
+            "--dry-run",
+        ])
+    });
+    work.cycle(&[
+        "declare-group",
+        "--cycle-id",
+        "C-001",
+        "--name",
+        "pair",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+    ]);
+
+    let abandoned_cycle = Workspace::initialized();
+    abandoned_cycle.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Abandon a plan",
+    ]);
+    assert_dry_run_unchanged(&abandoned_cycle, "cycle abandon", || {
+        abandoned_cycle.cycle_raw(&[
+            "abandon",
+            "--cycle-id",
+            "C-001",
+            "--reason",
+            "not needed",
+            "--dry-run",
+        ])
+    });
+    abandoned_cycle.cycle(&["abandon", "--cycle-id", "C-001", "--reason", "not needed"]);
+
+    let drafts = Workspace::initialized();
+    drafts.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Draft and revise",
+    ]);
+    drafts.cycle(&["activate", "--cycle-id", "C-001"]);
+    let initial_draft = write_draft(&drafts, "F-001", "Deliver F-001");
+    assert_dry_run_unchanged(&drafts, "card create", || {
+        drafts.card_raw(&[
+            "create",
+            "--draft",
+            &initial_draft.display().to_string(),
+            "--dry-run",
+        ])
+    });
+    drafts.card(&["create", "--draft", &initial_draft.display().to_string()]);
+    drafts.card(&["activate", "--card-id", "F-001"]);
+    let revised_draft = write_draft(&drafts, "F-001", "Deliver F-001 differently");
+    assert_dry_run_unchanged(&drafts, "card revise", || {
+        drafts.card_raw(&[
+            "revise",
+            "--card-id",
+            "F-001",
+            "--draft",
+            &revised_draft.display().to_string(),
+            "--reason",
+            "changed scope",
+            "--dry-run",
+        ])
+    });
+    drafts.card(&[
+        "revise",
+        "--card-id",
+        "F-001",
+        "--draft",
+        &revised_draft.display().to_string(),
+        "--reason",
+        "changed scope",
+    ]);
+
+    let revocation = Workspace::initialized();
+    prepare_handoff(&revocation, "F-001", "src/F-001/a.rs");
+    assert_dry_run_unchanged(&revocation, "handoff revoke", || {
+        revocation.handoff_raw(&[
+            "revoke",
+            "--card-id",
+            "F-001",
+            "--reason",
+            "rework",
+            "--dry-run",
+        ])
+    });
+    revocation.handoff(&["revoke", "--card-id", "F-001", "--reason", "rework"]);
+
+    let reviewing = Workspace::initialized();
+    prepare_handoff(&reviewing, "F-001", "src/F-001/a.rs");
+    assert_dry_run_unchanged(&reviewing, "review begin", || {
+        reviewing.review_raw(&["begin", "--card-id", "F-001", "--dry-run"])
+    });
+    reviewing.review(&["begin", "--card-id", "F-001"]);
 
     let workspace = Workspace::initialized();
     workspace.cycle(&[
@@ -377,7 +497,7 @@ fn every_advertised_dry_run_changes_nothing() {
         ])
     });
     workspace.integration(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
-    assert_dry_run_unchanged(&workspace, "integration verify", || {
+    let verification_preview = assert_dry_run_unchanged(&workspace, "integration verify", || {
         workspace.integration_raw(&[
             "verify",
             "--integration-id",
@@ -387,6 +507,11 @@ fn every_advertised_dry_run_changes_nothing() {
             "--dry-run",
         ])
     });
+    assert_eq!(
+        verification_preview["data"]["gates"],
+        serde_json::json!(["gate.all", "gate.unit"]),
+        "a dry run that does not name the gates is not a preview"
+    );
     workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
     assert_dry_run_unchanged(&workspace, "integration review", || {
         workspace.integration_raw(&[
@@ -476,11 +601,65 @@ fn every_advertised_dry_run_changes_nothing() {
     });
 }
 
+fn write_draft(workspace: &Workspace, card_id: &str, goal: &str) -> std::path::PathBuf {
+    let draft = workspace.root.join(format!("{card_id}-{goal}.yaml"));
+    fs::write(
+        &draft,
+        format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: {goal}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [\"src/{card_id}/**\"]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            base = workspace.authority_head(),
+        ),
+    )
+    .unwrap();
+    draft
+}
+
+fn prepare_handoff(workspace: &Workspace, card_id: &str, file: &str) {
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Prepare a handoff",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card(card_id, &[&format!("src/{card_id}/**")]);
+    workspace.work(&["start", "--card-id", card_id]);
+
+    let worktree = workspace.worktrees.join(card_id);
+    let path = worktree.join(file);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("// {card_id}\n")).unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(
+        &worktree,
+        &["commit", "-q", "-m", &format!("feat: {card_id}")],
+    );
+    workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+    let delivered = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {delivered}\nbehavior_delivered: adds {file}\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        card_id,
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+}
+
 fn assert_dry_run_unchanged(
     workspace: &Workspace,
     command: &str,
     run: impl FnOnce() -> std::process::Output,
-) {
+) -> serde_json::Value {
     let control_before = workspace.control_head();
     let authority_before = workspace.authority_head();
     let output = run();
@@ -504,6 +683,7 @@ fn assert_dry_run_unchanged(
         envelope["data"]["dry_run"], true,
         "{command} must identify its preview"
     );
+    envelope
 }
 
 fn assert_preflight_unchanged(workspace: &Workspace, integration_id: &str) {
