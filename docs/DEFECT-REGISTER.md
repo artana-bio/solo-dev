@@ -138,7 +138,7 @@ Deliberately **not** fixed, and named at the check:
 - **Section 10.2's dependency-base precondition is unenforced here.** A card's
   `base_sha` is checked only as 40 hexadecimal characters; nothing verifies that
   it is the dependency's exact accepted SHA.
-- **`handoff create` never enforces write scope.** `policy::verification::verify`
+- ✅ **FIXED (F-021): `handoff create` never enforced write scope.** `policy::verification::verify`
   exists and is exactly what `work verify` runs, but `work verify` is the only
   caller in the codebase — `gate.rs` and `handoff.rs` never invoke it. A
   candidate whose changed paths fall outside its card's declared `write_scope`
@@ -155,9 +155,28 @@ Deliberately **not** fixed, and named at the check:
   round-three reviewer, who found the first mention and confirmed nothing had
   come of it. Concrete remedy already scoped: `handoff::run_create` already
   computes the changed-path diff via `derive_facts`, so wiring `verify` in
-  costs no new Git operation. Left unfixed here because `handoff.rs` and
-  `gate.rs` are outside every currently-open card's declared write scope, and
-  fixing it inside one would repeat the exact defect it fixes.
+  costs no new Git operation. F-021 now retains that `DiffSummary`, builds the
+  equivalent `CandidateFacts`, and refuses before recording a handoff when the
+  report does not pass. `handoff create --dry-run` runs the same check. The
+  refusal is `CH-POLICY-CANDIDATE-OUT-OF-SCOPE` and includes every blocking
+  finding, including the out-of-scope path. Mutation proof: removing the
+  `run_create` verification call makes
+  `an_out_of_scope_candidate_refuses_handoff_with_the_path` fail at its exit
+  assertion (`left: Some(0)`, `right: Some(5)`); restoring it passes. The
+  dry-run sibling was first run against the unfixed behavior and failed at the
+  same assertion.
+
+✅ **COVERAGE GAP CLOSED (not a live exploit): `IntegrationStatus::Draft →
+Promoted`.** `Draft.successors()` already correctly excludes `Promoted`, and
+the real promotion command is independently protected: `check_promotion`
+requires `Accepted`, while `settle_promotion` writes `Promoted` directly.
+`acceptance::run_create` likewise independently gates the `Accepted` write.
+The transition table remains load-bearing for verify, review, abandon, and
+archive close, but this pair was not a reachable promotion path. F-021 adds
+the direct table regression guard
+`Draft.check_transition(Promoted).is_err()`. Mutation proof: temporarily
+adding `Promoted` to `Draft`'s successors makes the test fail at that assertion;
+the correct table passes.
 
 ✅ **FIXED:** cycle status now folds only cycle lifecycle events — `card_id`
 unset *and* `event_type` starting with `cycle.` — while `EventStore::for_cycle`

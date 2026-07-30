@@ -27,7 +27,8 @@ use crate::{
         ids::CardId,
     },
     error::{ErrorCode, HarnessError},
-    git::{command::GitScope, inspect},
+    git::{command::GitScope, diff::DiffSummary, inspect},
+    policy::verification::{CandidateFacts, VerificationReport, verify},
     runner::receipt::evidence_is_acceptable,
 };
 
@@ -391,12 +392,18 @@ fn preview_create(
     declaration: &ActorDeclaration,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
-    let lease = held_lease(&control, card_id)?.ok_or_else(|| HarnessError::Control {
-        reason: format!("card {card_id} holds no lease"),
-        code: ErrorCode::PreconditionNotFound,
-    })?;
-    let head = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
-    check_delivered_sha(&declaration.delivered_sha, &head)?;
+    let (record, state) = load_card(&control, card_id)?;
+    state.state.check_transition(CardState::HandedOff)?;
+    let (_lease, scope, head) = candidate_of(&control, card_id, &declaration.delivered_sha)?;
+    let (baseline, _commits, diff) = derive_facts(&scope, &record.base_sha, &head)?;
+    verify_handoff_candidate(
+        &record,
+        state.current_digest.as_str(),
+        &scope,
+        &baseline,
+        &head,
+        diff,
+    )?;
     Ok(CommandOutcome::new(
         "handoff.create",
         format!("Dry run: would hand off card {card_id} at {head}; nothing was changed"),
@@ -417,7 +424,7 @@ fn derive_facts(
     scope: &GitScope,
     base_sha: &str,
     candidate_sha: &str,
-) -> Result<(String, Vec<String>, Vec<crate::git::diff::ChangedPath>), HarnessError> {
+) -> Result<(String, Vec<String>, DiffSummary), HarnessError> {
     let baseline = inspect::resolve_commit(scope, base_sha)?;
     let diff = crate::git::diff::diff_commits(scope, &baseline, candidate_sha)?;
     let commits: Vec<String> = inspect::raw(
@@ -433,7 +440,84 @@ fn derive_facts(
     .lines()
     .map(ToOwned::to_owned)
     .collect();
-    Ok((baseline, commits, diff.paths))
+    Ok((baseline, commits, diff))
+}
+
+/// Builds and enforces the verification report that a handoff is bound to.
+///
+/// `work verify` remains the separately observable verification command. A
+/// handoff repeats its policy evaluation because it is the final control point
+/// before an out-of-scope candidate becomes reviewable evidence.
+fn verify_handoff_candidate(
+    record: &crate::domain::card::CardRecord,
+    card_digest: &str,
+    scope: &GitScope,
+    declared_base: &str,
+    candidate_sha: &str,
+    diff: DiffSummary,
+) -> Result<(), HarnessError> {
+    let actual_base = inspect::merge_base(scope, declared_base, candidate_sha)?;
+    let subjects = inspect::raw(
+        scope,
+        [
+            "log",
+            "--format=%s",
+            &format!("{declared_base}..{candidate_sha}"),
+        ],
+    )?;
+    let commit_subjects = subjects
+        .trimmed_stdout()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    let facts = CandidateFacts {
+        declared_base: declared_base.to_owned(),
+        actual_base,
+        candidate_sha: candidate_sha.to_owned(),
+        diff,
+        commit_subjects,
+        // `candidate_of` has already refused a dirty worktree. Keeping this
+        // fact explicit makes the handoff's policy input complete without a
+        // second inspection of the worktree.
+        worktree_clean: true,
+        dirty_paths: Vec::new(),
+    };
+    let report = verify(record, card_digest, &facts);
+    if report.passed {
+        Ok(())
+    } else {
+        Err(verification_refusal(&report, &record.card_id))
+    }
+}
+
+/// Turns a failed verification report into the policy refusal a handoff needs.
+fn verification_refusal(report: &VerificationReport, card_id: &CardId) -> HarnessError {
+    HarnessError::Control {
+        reason: format!(
+            "candidate {} is outside card {card_id}: {}",
+            report.candidate_sha,
+            report
+                .blocking()
+                .iter()
+                .map(|finding| finding.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        code: ErrorCode::PolicyCandidateOutOfScope,
+    }
+}
+
+/// Loads the cycle whose baseline the handoff must record.
+fn load_handoff_cycle(
+    control: &ControlRepository,
+    record: &crate::domain::card::CardRecord,
+) -> Result<CycleRecord, HarnessError> {
+    serde_json::from_str(&control.read(&CycleRecord::relative_path(&record.cycle_id))?).map_err(
+        |source| HarnessError::Control {
+            reason: format!("cycle {} is malformed: {source}", record.cycle_id),
+            code: ErrorCode::InternalControlCorrupt,
+        },
+    )
 }
 
 /// Resolves the candidate a handoff would describe, refusing if it cannot stand.
@@ -493,15 +577,17 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let (lease, scope, candidate_sha) =
                 candidate_of(control, &card_id, &declaration.delivered_sha)?;
 
-            let cycle: CycleRecord =
-                serde_json::from_str(&control.read(&CycleRecord::relative_path(&record.cycle_id))?)
-                    .map_err(|source| HarnessError::Control {
-                        reason: format!("cycle {} is malformed: {source}", record.cycle_id),
-                        code: ErrorCode::InternalControlCorrupt,
-                    })?;
+            let cycle = load_handoff_cycle(control, &record)?;
 
-            let (baseline, commits, changed_paths) =
-                derive_facts(&scope, &record.base_sha, &candidate_sha)?;
+            let (baseline, commits, diff) = derive_facts(&scope, &record.base_sha, &candidate_sha)?;
+            verify_handoff_candidate(
+                &record,
+                state.current_digest.as_str(),
+                &scope,
+                &baseline,
+                &candidate_sha,
+                diff.clone(),
+            )?;
 
             let receipts = collect_evidence(
                 control,
@@ -525,7 +611,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 candidate_sha: candidate_sha.clone(),
                 commits,
                 dependency_bindings,
-                changed_paths,
+                changed_paths: diff.paths,
                 receipts,
                 worktree_clean: true,
                 declaration: declaration.clone(),
