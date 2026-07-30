@@ -170,11 +170,15 @@ tell the implementations apart.
 
 ## Found later, by the test audit
 
-**The audit trail's timeline carries no timestamps.** `src/commands/audit.rs`
-builds each timeline entry's `at` from `event["recorded_at"]`, and the event
-schema's field is `occurred_at`, so every `at` is `null` — in both the timeline
-and the protected-branch transition record. The audit report's whole purpose is
-reconstructing when things happened.
+**25. ✅ FIXED. The audit trail's timeline carried no timestamps.**
+`src/commands/audit.rs` built each timeline entry's `at` from
+`event["recorded_at"]`, and the event schema's field is `occurred_at`, so every
+`at` was `null` — in both the timeline and the protected-branch transition
+record. The audit report's whole purpose is reconstructing when things happened.
+Fixed: both report projections now use `occurred_at`; the timeline test requires
+every entry to have a timestamp and the protected-branch test requires one on
+the transition. Deleting either projection's `at` field now fails its named
+test.
 
 Not looked for. It surfaced because
 `the_timeline_reconstructs_the_cycle_in_order` asserts only the relative order
@@ -182,8 +186,8 @@ of three `type` strings and never reads a timestamp, so deleting the line
 entirely leaves all twelve audit tests green. The defect and the test that
 should have caught it are the same finding twice.
 
-Open. Not yet numbered into a tier, because it was found after the tiers were
-drawn and inventing a slot for it would misrepresent when it was known.
+Recorded after the original tiers were drawn; it remains in this section so the
+time it was found is not obscured.
 
 ## Why failure injection did not catch defect 11
 

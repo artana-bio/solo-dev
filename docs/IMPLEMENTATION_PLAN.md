@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 46 |
+| Plan revision | 47 |
 | Plan date | 2026-07-28 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -3086,6 +3086,8 @@ and `WP-510`: check a claim before writing it down.
 | D-072 | Bind the dependency commit the candidate incorporates, not the one the dependency's approval names | Accepted | Invariant 7.3.6 requires a review to bind the relevant dependency SHAs, and the word that does the work is *relevant*. Binding the dependency's currently-approved commit sounds stricter and is wrong: it invalidates a dependent every time its dependency is re-reviewed, even when the dependent incorporates none of the change, and it forces dependencies to be approved before their dependents — a serialization Section 13 deliberately avoids. What the candidate actually contains is discoverable by asking Git whether any commit the dependency has handed off is an ancestor of this candidate, newest first. Staleness is then containment: the dependency's standing approval must still contain the bound commit. Fixes on top do not move it out; a rewrite does. |
 | D-073 | A dependency with no standing approval does not invalidate its dependent | Accepted | The alternative is that a dependent dies the instant its dependency is first handed off and before anyone has reviewed it, which would make declaring a dependency actively harmful. A dependency that has never been approved has nothing for the binding to have fallen out of, so there is nothing to report. The dependent is still blocked from integrating by the ordinary rule that every member needs an approval, so nothing lands early on the strength of this. |
 | D-074 | `integration prepare` reports the cards it left out | Accepted | Selecting only what is ready is correct — refusing whenever a cycle holds unfinished work would make the ordinary case an error. But dropping a card silently means a coordinator reads a plan and cannot tell whether a card is absent because it is not ready or because they mistyped its identifier. The plan now carries what it dropped and why, as warnings on both the real command and the dry run. The reviewer of the earlier design named this as the one hazard nothing in the proposal touched. |
+| D-075 | Release when no known defect can produce wrong evidence or lose data, every Section 19.3 criterion has a mutation-checked test, and an independent reviewer certifies both; everything else ships as a public register | Accepted | The count of known defects was not converging — each round of looking harder found more — while their severity was. A rule of “zero known defects” would never terminate. These three conditions are finite and checkable, and the first is already met. |
+| D-076 | Implementation of the remaining repair goes to a different tool than the one that wrote the original code, with the harness's own review binding the result | Accepted | Measured on this project, agents reviewing the original author's work found real defects every round, the author reviewing their own found none, and a finding the author got wrong twice was fixed by a different implementer on its first attempt. |
 
 ### 19.5 Multi-repository gate
 

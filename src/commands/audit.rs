@@ -173,7 +173,7 @@ fn promotions(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .filter(|event| event["event_type"] == "integration.promoted")
         .map(|event| {
             serde_json::json!({
-                "at": event["recorded_at"],
+                "at": event["occurred_at"],
                 "actor_id": event["actor_id"],
                 "from": event["metadata"]["previous_main_sha"],
                 "to": event["metadata"]["landing_sha"],
@@ -244,7 +244,7 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         "events": events.len(),
         "timeline": events.iter().map(|event| serde_json::json!({
             "event_id": event["event_id"],
-            "at": event["recorded_at"],
+            "at": event["occurred_at"],
             "type": event["event_type"],
             "actor_id": event["actor_id"],
             "card_id": event["card_id"],

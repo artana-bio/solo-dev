@@ -266,10 +266,56 @@ fn no_failure_path_in_the_lifecycle_leaves_the_authority_moved() {
 
 #[test]
 fn every_advertised_dry_run_changes_nothing() {
-    // `integration verify` advertised `--dry-run` and ignored it, so the flag
-    // ran a real, state-mutating verification. This checks the whole surface
-    // rather than that one command, because the failure mode is a flag that
-    // parses and is then forgotten.
+    // A dry-run flag that parses and is then forgotten performs the real
+    // mutation. Exercise every mutating lifecycle command that advertises it
+    // at a state where its real form would succeed, rather than treating a
+    // precondition refusal as evidence that no mutation occurred.
+    let work = Workspace::initialized();
+    work.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Dry-run work commands",
+    ]);
+    work.cycle(&["activate", "--cycle-id", "C-001"]);
+    work.activate_card("F-001", &["src/F-001/**"]);
+
+    assert_dry_run_unchanged(&work, "work start", || {
+        work.work_raw(&["start", "--card-id", "F-001", "--dry-run"])
+    });
+    assert!(
+        !work.worktrees.join("F-001").exists(),
+        "work start --dry-run must not allocate a worktree"
+    );
+    work.work(&["start", "--card-id", "F-001"]);
+    assert_dry_run_unchanged(&work, "work checkpoint", || {
+        work.work_raw(&[
+            "checkpoint",
+            "--card-id",
+            "F-001",
+            "--note",
+            "progress",
+            "--dry-run",
+        ])
+    });
+    work.work(&["checkpoint", "--card-id", "F-001", "--note", "progress"]);
+    assert_dry_run_unchanged(&work, "work block", || {
+        work.work_raw(&[
+            "block",
+            "--card-id",
+            "F-001",
+            "--reason",
+            "waiting",
+            "--dry-run",
+        ])
+    });
+    work.work(&["block", "--card-id", "F-001", "--reason", "waiting"]);
+    assert_dry_run_unchanged(&work, "work resume", || {
+        work.work_raw(&["resume", "--card-id", "F-001", "--dry-run"])
+    });
+    work.work(&["resume", "--card-id", "F-001"]);
+
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -281,6 +327,17 @@ fn every_advertised_dry_run_changes_nothing() {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
+
+    assert_dry_run_unchanged(&workspace, "integration prepare", || {
+        workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--dry-run",
+        ])
+    });
     let id = workspace.integration_json(&[
         "prepare",
         "--cycle-id",
@@ -291,59 +348,181 @@ fn every_advertised_dry_run_changes_nothing() {
         .as_str()
         .unwrap()
         .to_owned();
-    for step in ["merge", "land"] {
-        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
-    }
-
-    let control_before = workspace.control_head();
-    let authority_before = workspace.authority_head();
-    let status_before =
-        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"].clone();
-
-    for args in [
-        vec!["verify", "--integration-id", &id, "--actor-id", "verifier"],
-        vec!["preflight", "--integration-id", &id],
-    ] {
-        let mut full = args.clone();
-        if full[0] != "preflight" {
-            full.push("--dry-run");
-        }
-        let output = workspace.integration_raw(&full);
-        assert!(
-            output.status.success(),
-            "{full:?} failed: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert_eq!(
-            workspace.control_head(),
-            control_before,
-            "{full:?} wrote to control state"
-        );
-        assert_eq!(
-            workspace.authority_head(),
-            authority_before,
-            "{full:?} moved the protected branch"
-        );
-        assert_eq!(
-            workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["status"],
-            status_before,
-            "{full:?} advanced the integration"
-        );
-    }
-
-    // And the dry run must still say something useful about what would happen.
-    let envelope = workspace.integration_json(&[
-        "verify",
+    assert_preflight_unchanged(&workspace, &id);
+    assert_dry_run_unchanged(&workspace, "integration merge", || {
+        workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--dry-run",
+        ])
+    });
+    workspace.integration(&[
+        "merge",
         "--integration-id",
         &id,
         "--actor-id",
-        "verifier",
-        "--dry-run",
+        "coordinator",
     ]);
-    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_dry_run_unchanged(&workspace, "integration land", || {
+        workspace.integration_raw(&[
+            "land",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--dry-run",
+        ])
+    });
+    workspace.integration(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+    assert_dry_run_unchanged(&workspace, "integration verify", || {
+        workspace.integration_raw(&[
+            "verify",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "verifier",
+            "--dry-run",
+        ])
+    });
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    assert_dry_run_unchanged(&workspace, "integration review", || {
+        workspace.integration_raw(&[
+            "review",
+            "--integration-id",
+            &id,
+            "--reviewer-actor-id",
+            "reviewer",
+            "--dry-run",
+        ])
+    });
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    assert_dry_run_unchanged(&workspace, "acceptance record", || {
+        workspace.acceptance_raw(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--acceptance-owner",
+            "owner",
+            "--dry-run",
+        ])
+    });
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_dry_run_unchanged(&workspace, "integration promote", || {
+        workspace.integration_raw(&[
+            "promote",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "promoter",
+            "--dry-run",
+        ])
+    });
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_dry_run_unchanged(&workspace, "archive create", || {
+        workspace.archive_raw(&["create", "--integration-id", &id, "--dry-run"])
+    });
+    workspace.archive(&["create", "--integration-id", &id]);
+    assert_dry_run_unchanged(&workspace, "archive close", || {
+        workspace.archive_raw(&["close", "--integration-id", &id, "--dry-run"])
+    });
+
+    let abandoned = Workspace::initialized();
+    abandoned.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Abandon a plan",
+    ]);
+    abandoned.cycle(&["activate", "--cycle-id", "C-001"]);
+    abandoned.activate_card("F-001", &["src/F-001/**"]);
+    abandoned.approve_card("F-001", "src/F-001/a.rs");
+    let abandoned_id = abandoned.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_dry_run_unchanged(&abandoned, "integration abandon", || {
+        abandoned.integration_raw(&[
+            "abandon",
+            "--integration-id",
+            &abandoned_id,
+            "--actor-id",
+            "coordinator",
+            "--reason",
+            "not needed",
+            "--dry-run",
+        ])
+    });
+}
+
+fn assert_dry_run_unchanged(
+    workspace: &Workspace,
+    command: &str,
+    run: impl FnOnce() -> std::process::Output,
+) {
+    let control_before = workspace.control_head();
+    let authority_before = workspace.authority_head();
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{command} --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        envelope["data"]["gates"],
-        serde_json::json!(["gate.all", "gate.unit"]),
-        "a dry run that does not name the gates is not a preview"
+        workspace.control_head(),
+        control_before,
+        "{command} wrote to control state"
+    );
+    assert_eq!(
+        workspace.authority_head(),
+        authority_before,
+        "{command} moved the protected branch"
+    );
+    assert_eq!(
+        envelope["data"]["dry_run"], true,
+        "{command} must identify its preview"
+    );
+}
+
+fn assert_preflight_unchanged(workspace: &Workspace, integration_id: &str) {
+    let control_before = workspace.control_head();
+    let authority_before = workspace.authority_head();
+    let output = workspace.integration_raw(&["preflight", "--integration-id", integration_id]);
+    assert!(
+        output.status.success(),
+        "preflight failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        control_before,
+        "preflight wrote to control state"
+    );
+    assert_eq!(
+        workspace.authority_head(),
+        authority_before,
+        "preflight moved the protected branch"
     );
 }

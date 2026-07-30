@@ -76,6 +76,18 @@ fn error_code(output: &std::process::Output) -> String {
 fn archiving_creates_a_ref_for_the_landing_and_every_candidate() {
     let (workspace, id) = promoted(2);
     let landing = workspace.authority_head();
+    let candidates: std::collections::BTreeMap<String, String> =
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| {
+                (
+                    member["card_id"].as_str().unwrap().to_owned(),
+                    member["candidate_sha"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
 
     let envelope = workspace.archive_json(&["create", "--integration-id", &id]);
     let refs = envelope["data"]["refs"].as_array().unwrap();
@@ -93,7 +105,10 @@ fn archiving_creates_a_ref_for_the_landing_and_every_candidate() {
             &workspace.repository,
             &["rev-parse", &format!("refs/archive/cards/{card}")],
         );
-        assert_eq!(archived.len(), 40, "card {card} must be archived");
+        assert_eq!(
+            archived, candidates[card],
+            "card {card}'s archive ref must name its candidate, not merely a commit"
+        );
     }
 }
 
@@ -237,6 +252,37 @@ fn landed_commits_remain_reachable_after_cleanup() {
         .collect();
 
     workspace.archive(&["close", "--integration-id", &id]);
+    // Remove every other ref that could retain a candidate. This makes the
+    // fixture discriminate: each candidate must now be retained by its own
+    // card archive ref, not incidentally by the landing merge or main branch.
+    let refs = support::capture(
+        &workspace.repository,
+        &["for-each-ref", "--format=%(refname)"],
+    );
+    for reference in refs
+        .lines()
+        .filter(|reference| !reference.starts_with("refs/archive/cards/"))
+    {
+        support::git(&workspace.repository, &["update-ref", "-d", reference]);
+    }
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let card = format!("F-{:03}", index + 1);
+        let containing = support::capture(
+            &workspace.repository,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                candidate,
+            ],
+        );
+        assert_eq!(
+            containing.lines().collect::<Vec<_>>(),
+            vec![format!("refs/archive/cards/{card}")],
+            "candidate {candidate} must be retained solely by its own card archive ref"
+        );
+    }
     // The branches are gone; collection must not be able to take the commits.
     support::git(&workspace.repository, &["gc", "--prune=now", "--quiet"]);
 
@@ -249,13 +295,6 @@ fn landed_commits_remain_reachable_after_cleanup() {
             "an archived candidate must survive cleanup and collection"
         );
     }
-    assert_eq!(
-        support::capture(
-            &workspace.repository,
-            &["rev-parse", &format!("refs/archive/integrations/{id}")]
-        ),
-        workspace.authority_head()
-    );
 }
 
 #[test]

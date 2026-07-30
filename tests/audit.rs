@@ -115,6 +115,12 @@ fn the_timeline_reconstructs_the_cycle_in_order() {
     let promoted = types.iter().position(|t| *t == "integration.promoted");
     assert!(handoff < review, "review must follow handoff: {types:?}");
     assert!(review < promoted, "promotion must follow review: {types:?}");
+    for entry in timeline {
+        assert!(
+            entry["at"].as_str().is_some(),
+            "every reconstructed event needs its occurrence time: {entry}"
+        );
+    }
 }
 
 #[test]
@@ -138,6 +144,11 @@ fn the_report_names_the_exact_protected_branch_transition() {
             .unwrap()
             .starts_with("ACC-"),
         "the authorizing decision must be named: {}",
+        transitions[0]
+    );
+    assert!(
+        transitions[0]["at"].as_str().is_some(),
+        "the protected-branch transition needs its occurrence time: {}",
         transitions[0]
     );
 }

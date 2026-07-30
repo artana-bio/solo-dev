@@ -4,31 +4,37 @@
 - CLAIMS: An archive ref is created for the landing commit AND for every card's candidate commit — the refs that are the sole justification for `archive close` deleting branches and worktrees.
 - ASSERTS: That `refs/archive/integrations/<id>` equals the authority head, and that `git rev-parse refs/archive/cards/<card>` returns a string 40 characters long. It never compares a card's archive ref to that card's candidate SHA.
 - SURVIVING MUTATION: In `src/commands/archive.rs::refs_for`, change the member loop to `sha: landing_sha.clone()` (clone `landing_sha` into the first `ArchivedRef` so it stays available). Every card archive ref then points at the landing commit and no candidate commit is archived at all. Verified: all 17 tests in tests/archive_cleanup.rs and all 11 in tests/backup.rs pass.
+- REPAIRED: The test reads each integration member's exact `candidate_sha` and requires the corresponding card archive ref to equal it. The recorded `landing_sha.clone()` mutation now fails on that identity assertion.
 
 ## [high] tests/archive_cleanup.rs :: landed_commits_remain_reachable_after_cleanup
 - CLAIMS: After `archive close` deletes the branches and `gc --prune=now` runs, every landed candidate commit is still in the object database — i.e. the archive refs did their job.
 - ASSERTS: That each candidate SHA still passes `cat-file -e`. It happens to hold for a reason unrelated to card archive refs: every candidate is a second-parent ancestor of the landing commit, which the integration archive ref keeps alive.
 - SURVIVING MUTATION: The same `refs_for` mutation (all card archive refs point at `landing_sha`). No card candidate is archived, yet the test stays green because reachability comes through the landing merge. Verified.
+- REPAIRED: After cleanup the test deletes every non-card-archive ref and proves each candidate is retained solely by its own card archive ref before collection. The recorded `landing_sha.clone()` mutation now fails that discriminator assertion.
 
 ## [high] tests/lifecycle.rs :: every_advertised_dry_run_changes_nothing
 - CLAIMS: The whole `--dry-run` surface is checked, explicitly "because the failure mode is a flag that parses and is then forgotten" (Tier 2 defect 7).
 - ASSERTS: Two invocations: `integration verify --dry-run` and `integration preflight`. Eleven other commands advertise `--dry-run` and are not touched here.
 - SURVIVING MUTATION: In `src/commands/work.rs::run_checkpoint`, change `if args.dry_run {` to `if false {` so `work checkpoint --dry-run` performs the real mutation. Verified: the entire suite — 801 tests — passes. No test anywhere passes `--dry-run` to `work checkpoint`, `work block`, or `work resume`.
+- REPAIRED: The lifecycle test now runs every advertised mutating lifecycle preview at a state where its real form would succeed, including `work checkpoint`, `work block`, and `work resume`, and snapshots control and authority before each. The recorded `if false` mutation now fails because `work checkpoint --dry-run` changes the control head.
 
 ## [high] tests/control_state.rs :: a_held_lock_makes_a_second_mutation_fail_as_policy
 - CLAIMS: With the project lock held, a second mutating command fails, and fails in the policy category.
 - ASSERTS: That the lock file still exists, and `output.status.success() || output.status.code() == Some(5)` — a disjunction that admits complete success. Nothing about the second command's outcome can make this test fail.
 - SURVIVING MUTATION: In `src/control/lock.rs::acquire`, change the arm `Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists =>` to `... && false =>` so acquisition never reports contention. Verified: this test passes; only `a_second_acquisition_loses_while_the_first_is_held` (honestly named) fails.
+- REPAIRED: The test now issues a real `cycle create` mutation under the held lock and requires an unsuccessful exit with policy code 5. The recorded `&& false` mutation now fails that outcome assertion.
 
 ## [high] tests/audit.rs :: the_timeline_reconstructs_the_cycle_in_order
 - CLAIMS: The audit timeline reconstructs what happened in a cycle, in order — the reconstruction an auditor reads.
 - ASSERTS: Only the relative index of three `type` strings within the array. The `at` timestamp on every timeline entry is never read. It is in fact always `null`: `src/commands/audit.rs` builds it from `event["recorded_at"]`, and `Event` has no such field — the timestamp is `occurred_at`. The audit trail's timeline carries no times today and no test notices.
 - SURVIVING MUTATION: Delete the line `"at": event["recorded_at"],` from both `serde_json::json!` blocks in `src/commands/audit.rs` (the timeline map and `promotions`). Verified: all 12 tests in tests/audit.rs pass.
+- REPAIRED: `audit.rs` now reads `occurred_at`, and this test requires a string timestamp on every timeline entry. Deleting the timeline `at` line now fails the timestamp assertion.
 
 ## [high] tests/audit.rs :: the_report_names_the_exact_protected_branch_transition
 - CLAIMS: The report names the exact protected-branch transition — when it happened, from what, to what, under whose acceptance.
 - ASSERTS: `from`, `to` and `acceptance_id`. The `at` field is never asserted and is always `null` for the same `recorded_at`/`occurred_at` reason, so the recorded transition has no time attached.
 - SURVIVING MUTATION: Same deletion of `"at": event["recorded_at"],` from `promotions()` in `src/commands/audit.rs`. Verified green.
+- REPAIRED: The test requires a string timestamp on the protected-branch transition. Deleting the `promotions()` `at` line now fails that assertion.
 
 ## [medium] tests/ownership.rs :: an_exclude_lets_two_cards_share_a_directory
 - CLAIMS: An exclude releases part of one card's scope so a second card can claim it — the mechanism that lets two cards share a directory.
