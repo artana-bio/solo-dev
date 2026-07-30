@@ -155,6 +155,17 @@ removed. Two further regressions cover the originally-suspected case — one
 card's `active → blocked → closed` events inside an active cycle, and a
 completed integration — both of which also fail under an unfiltered fold.
 
+A third and fourth instance of the same collision were found by an independent
+reviewer enumerating every `.cycle(...)` call site rather than trusting the
+fix's own tests: `acceptance.recorded`'s `next_state` becomes `"accepted"`
+(colliding with `CycleStatus::Accepted`), and `integration.abandoned`'s becomes
+`"abandoned"` (colliding with `CycleStatus::Abandoned`). Both were already
+closed by the shipped `event_type.starts_with("cycle.")` condition, but neither
+had a dedicated test — the first was caught only incidentally by the
+already-committed regression above, and the second had no coverage at all.
+`abandoning_an_integration_does_not_abandon_its_cycle` now covers it and fails
+without the fix (`left: "abandoned", right: "active"`).
+
 **DELIBERATE GAP:** `CycleStatus::Integrating`, `Accepted`, `Landed`,
 `Closed`, and `Blocked` remain named but unset by any command. F-019 documents
 that automatic cycle-status advancement is future design work because it

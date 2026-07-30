@@ -138,6 +138,35 @@ fn an_activated_card_can_be_abandoned_with_a_reason() {
 }
 
 #[test]
+fn a_card_being_worked_can_also_be_abandoned() {
+    // The committed suite otherwise proves abandonment only from `ready`
+    // (immediately after activation). Section 11.2 permits it from every
+    // non-terminal state except `landed`; `active` is the state most cards
+    // actually spend their time in, and it was unproven.
+    let workspace = with_active_cycle();
+    let path = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs"),
+    );
+    workspace.card(&["create", "--draft", &path]);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active",
+        "fixture: the card must reach the state this test is meant to abandon from"
+    );
+
+    let envelope = workspace.card_json(&["abandon", "--card-id", "F-001", "--reason", "descoped"]);
+    assert_eq!(envelope["data"]["state"], "abandoned");
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "abandoned"
+    );
+}
+
+#[test]
 fn abandoning_a_card_dry_run_changes_nothing() {
     let workspace = with_active_cycle();
     let path = write_draft(

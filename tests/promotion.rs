@@ -848,3 +848,30 @@ fn a_completed_integration_does_not_advance_the_cycle_status() {
     assert_eq!(status["data"]["status"], "active");
     assert_eq!(status["data"]["status_matches_history"], true);
 }
+
+#[test]
+fn abandoning_an_integration_does_not_abandon_its_cycle() {
+    // `integration.abandoned`'s `next_state` is `IntegrationStatus::Abandoned`,
+    // which serializes to the same string as `CycleStatus::Abandoned`. Nothing
+    // in this file exercised `cycle status` after an integration abandon before
+    // this test — the collision was real but had zero coverage, incidental or
+    // otherwise, until an independent review of F-019 found it by enumerating
+    // every `.cycle(...)` call site rather than trusting the fix's own tests.
+    let (workspace, id) = reviewed(1);
+    workspace.integration(&[
+        "abandon",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+        "--reason",
+        "the combination cannot be made to work in this cycle",
+    ]);
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        status["data"]["status"], "active",
+        "abandoning one integration must not fold the cycle to abandoned"
+    );
+    assert_eq!(status["data"]["status_matches_history"], true);
+}
