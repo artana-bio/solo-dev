@@ -131,19 +131,42 @@ mkdir -p "$install_dir" || fail "could not create installation directory '$insta
 # the symlink entry itself -- which is what makes a single mv into a shared,
 # attacker-writable directory safe where multiple by-path operations were not.
 chmod 755 "$extracted_binary" || fail "could not make the $PROGRAM_NAME binary executable"
-# mv replaces a destination that is a plain file or a symlink to one, but a
-# symlink to a directory makes it move the source INSIDE that directory
-# instead -- ordinary mv semantics, not a bug in mv, but wrong here: a
-# pre-existing symlink at $install_path pointing at a directory (planted
-# before this script ever ran, zero timing required) makes the install
-# silently land somewhere else entirely while this script still reports
-# success. Stripping any pre-existing symlink at the exact destination path
-# first removes the ambiguity outright: mv into a path that does not exist
-# can only ever create a plain file there, never move into anything.
-if [ -L "$install_path" ]; then
-    rm -f "$install_path" || fail "could not remove the existing symlink at '$install_path'"
+# Plain mv treats a destination that is, or resolves through a symlink to, a
+# directory as "move the source inside it" rather than "replace it" -- so a
+# directory or a symlink-to-directory pre-staged at $install_path before this
+# script ever runs (zero timing required either way) makes the install
+# silently land somewhere else while the script still reports success.
+#
+# A prior version of this fix used a separate rm -f before the mv. That
+# reintroduced exactly the shape of bug this project has already had to fix
+# once: two operations on shared state instead of one, leaving a live window
+# a background watcher can win. It also missed the plain-directory case
+# entirely, since it only ever checked for a symlink. Both are closed here by
+# using mv itself to refuse the directory cases in a single call, rather than
+# adding a check in front of it -- no new operation, no new window.
+#
+# GNU mv's -T treats the destination strictly as a file: it replaces a
+# symlink-to-directory atomically and, on a plain pre-existing directory,
+# fails cleanly instead of moving into it. Every Linux target this project
+# ships for gets this for free, since GNU coreutils is the platform mv.
+#
+# BSD mv, which ships on every Mac, has no equivalent -T. Its -h flag
+# atomically replaces a symlink-to-directory destination -- verified directly
+# before relying on it -- but a PLAIN pre-existing directory still silently
+# absorbs the source even with -h. Closing that specific residual on macOS
+# needs an explicit refusal in front of the mv, which is a real, disclosed,
+# narrow check-then-act window -- but the outcome it bounds was already
+# reduced to "moves inside a directory instead of installing," with no path
+# to content corruption or code execution, so a small residual here does not
+# reopen anything this file's history has already closed.
+if [ "$os_value" = "Linux" ]; then
+    mv -f -T "$extracted_binary" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
+else
+    if [ -d "$install_path" ] && [ ! -L "$install_path" ]; then
+        fail "a directory already exists at '$install_path'; remove it and re-run this installer"
+    fi
+    mv -f -h "$extracted_binary" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
 fi
-mv -f "$extracted_binary" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
 
 printf 'Installed %s to %s\n' "$installed_version" "$install_path"
 
