@@ -131,6 +131,18 @@ mkdir -p "$install_dir" || fail "could not create installation directory '$insta
 # the symlink entry itself -- which is what makes a single mv into a shared,
 # attacker-writable directory safe where multiple by-path operations were not.
 chmod 755 "$extracted_binary" || fail "could not make the $PROGRAM_NAME binary executable"
+# mv replaces a destination that is a plain file or a symlink to one, but a
+# symlink to a directory makes it move the source INSIDE that directory
+# instead -- ordinary mv semantics, not a bug in mv, but wrong here: a
+# pre-existing symlink at $install_path pointing at a directory (planted
+# before this script ever ran, zero timing required) makes the install
+# silently land somewhere else entirely while this script still reports
+# success. Stripping any pre-existing symlink at the exact destination path
+# first removes the ambiguity outright: mv into a path that does not exist
+# can only ever create a plain file there, never move into anything.
+if [ -L "$install_path" ]; then
+    rm -f "$install_path" || fail "could not remove the existing symlink at '$install_path'"
+fi
 mv -f "$extracted_binary" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
 
 printf 'Installed %s to %s\n' "$installed_version" "$install_path"
