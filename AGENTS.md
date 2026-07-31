@@ -1,5 +1,16 @@
 # Change Harness Agent Instructions
 
+**This file is for agents *building* Change Harness.** If you are instead
+*using* the CLI to drive a change through some project it governs, you want
+the operating guide at
+[`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md) —
+the lifecycle in order, the exact YAML the commands accept, the refusal codes
+and their remedies. Read that instead of this; nothing below applies to you.
+
+That guide is a portable skill: copy the `.claude/skills/change-harness/`
+directory into any repository this harness governs and agents working there
+will find it.
+
 `docs/IMPLEMENTATION_PLAN.md` is authoritative for work-package scope,
 dependencies, acceptance gates, and status, but feature agents MUST NOT load
 the entire plan by default.
