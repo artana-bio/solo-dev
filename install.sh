@@ -121,7 +121,11 @@ if [ -e "$install_path" ]; then
 fi
 
 mkdir -p "$install_dir" || fail "could not create installation directory '$install_dir'"
-install_temp="$install_dir/.$PROGRAM_NAME.install.$$"
+# mktemp creates the file itself with O_CREAT|O_EXCL, so there is no window in
+# which a predictable name could be pre-staged as a symlink by another local
+# user of a shared $INSTALL_DIR -- unlike a PID-suffixed name, which names a
+# path before anything exists there and lets an attacker win the race for it.
+install_temp=$(mktemp "$install_dir/.$PROGRAM_NAME.install.XXXXXX") || fail "could not stage $PROGRAM_NAME in '$install_dir'"
 cp "$extracted_binary" "$install_temp" || fail "could not stage $PROGRAM_NAME in '$install_dir'"
 chmod 755 "$install_temp" || fail "could not make the staged $PROGRAM_NAME binary executable"
 mv -f "$install_temp" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
