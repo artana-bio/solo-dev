@@ -28,6 +28,26 @@ The repository is intentionally independent from ARTANA. ARTANA will eventually
 consume the CLI through project configuration and named gate definitions; it
 will not own the workflow engine.
 
+## For coding agents
+
+The operating guide is
+[`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md):
+the lifecycle in order, the exact YAML each command accepts, the actor-flag
+split, and every common refusal with its remedy. It is written to be followed
+without reading anything else. An independent reviewer drove a complete
+lifecycle from `project init` through promotion and archive using the file
+alone — and then failed it, on three sentences that were word-for-word wrong
+about the CLI. Those were corrected and re-verified against the binary before
+a second reviewer accepted it.
+
+It is a portable skill. Copy the `.claude/skills/change-harness/` directory
+into any repository this harness governs, and agents working there will find
+it.
+
+Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
+instead, which carries the reading contract and engineering rules for building
+the tool rather than driving it.
+
 ## Status
 
 **The Single-repository MVP release is accepted and signed (2026-07-30).**
@@ -130,24 +150,6 @@ make sure the artifacts they judge are the exact ones that will land.
 
 Local hooks are convenience guardrails, not a security boundary. Strong
 authorization requires a separate identity or operating-system boundary.
-
-## For coding agents
-
-The operating guide is
-[`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md):
-the lifecycle in order, the exact YAML each command accepts, the actor-flag
-split, and every common refusal with its remedy. It is written to be followed
-without reading anything else — an independent reviewer drove a complete
-lifecycle from `project init` through promotion and archive using that file
-alone, which is how it was accepted.
-
-It is a portable skill. Copy the `.claude/skills/change-harness/` directory
-into any repository this harness governs, and agents working there will find
-it.
-
-Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
-instead, which carries the reading contract and engineering rules for building
-the tool rather than driving it.
 
 ## Installation
 
