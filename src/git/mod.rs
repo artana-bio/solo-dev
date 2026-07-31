@@ -90,6 +90,9 @@ impl GitClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    const UNSUPPORTED_GIT_CHILD: &str = "CHANGE_HARNESS_UNSUPPORTED_GIT_CHILD";
 
     #[test]
     fn probing_this_repository_reports_a_repository_and_a_root() {
@@ -104,23 +107,62 @@ mod tests {
 
     #[test]
     fn probe_reports_minimum_version_compliance_and_worktree_support() {
-        // This asserted `meets_minimum_version == (parsed_version >= MINIMUM)`,
-        // which restates the implementation rather than checking it: replacing
-        // the field with a hardcoded `true` left it passing, because on any
-        // supported host the right-hand side is also true. It now asserts the
-        // value itself, which is at least a claim about the world.
-        //
-        // What a hardcoded `true` would still slip past here is unavoidable
-        // without an old Git to test against. The check that has teeth is
-        // `check_git_version`, which refuses a project whose configured minimum
-        // exceeds the installed version, and
-        // `an_unsatisfiable_minimum_git_version_fails_explicitly` exercises it
-        // in both directions. This field only feeds `doctor`'s report.
+        if std::env::var_os(UNSUPPORTED_GIT_CHILD).is_some() {
+            let probe = GitClient::probe(Path::new(".")).unwrap();
+            assert!(
+                probe.parsed_version < MINIMUM_GIT_VERSION,
+                "the fake old Git must exercise the non-compliant side"
+            );
+            assert!(
+                !probe.supports_worktrees,
+                "a Git that rejects the worktree subcommand must not report worktree support"
+            );
+            return;
+        }
+
+        // The host assertions exercise the supported side. The child process
+        // below gives the probe an old Git that rejects `worktree`, without
+        // changing process-global PATH while sibling tests are running.
         let probe = GitClient::probe(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         assert_eq!(probe.minimum_version, MINIMUM_GIT_VERSION);
         assert!(probe.meets_minimum_version);
         assert!(probe.parsed_version >= MINIMUM_GIT_VERSION);
         assert!(probe.supports_worktrees);
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = temp.path().join("git");
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '%s\\n' 'git version 2.4.0'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"-C\" ]; then\n\
+               printf '%s\\n' 'fatal: not a git repository' >&2\n\
+               exit 128\n\
+             fi\n\
+             printf '%s\\n' \"git: 'worktree' is not a git command. See 'git --help'.\" >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("git::tests::probe_reports_minimum_version_compliance_and_worktree_support")
+            .arg("--nocapture")
+            .env(UNSUPPORTED_GIT_CHILD, "1")
+            .env("PATH", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the unsupported-Git discriminator failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

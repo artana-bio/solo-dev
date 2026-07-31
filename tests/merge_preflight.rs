@@ -209,6 +209,20 @@ fn a_clean_merge_records_the_integration_head_and_tree() {
     let workspace = integrable(2);
     let id = prepare(&workspace);
     let authority_before = workspace.authority_head();
+    let authority_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{authority_before}^{{tree}}")],
+    );
+    let preflight = workspace.integration_json(&["preflight", "--integration-id", &id]);
+    assert_eq!(
+        preflight["data"]["clean"], true,
+        "the fixture must produce a clean combined tree"
+    );
+    let expected_tree = preflight["data"]["resulting_tree"].as_str().unwrap();
+    assert_ne!(
+        expected_tree, authority_tree,
+        "the fixture must make its candidate content distinguish the integration tree from the authority baseline"
+    );
 
     let envelope = workspace.integration_json(&[
         "merge",
@@ -222,6 +236,18 @@ fn a_clean_merge_records_the_integration_head_and_tree() {
     assert_eq!(head.len(), 40);
     assert_eq!(tree.len(), 40);
     assert_ne!(head, authority_before, "the merge must build something new");
+    let head_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{head}^{{tree}}")],
+    );
+    assert_eq!(
+        tree, head_tree,
+        "the recorded tree must be the tree carried by the recorded integration head"
+    );
+    assert_eq!(
+        tree, expected_tree,
+        "the integration tree must contain the candidate combination proven clean by preflight"
+    );
 
     assert_eq!(
         workspace.authority_head(),
@@ -232,6 +258,8 @@ fn a_clean_merge_records_the_integration_head_and_tree() {
     // The record carries the result forward for WP-430 and WP-440.
     let inspected = workspace.integration_json(&["inspect", "--integration-id", &id]);
     assert_eq!(inspected["data"]["members"], envelope["data"]["members"]);
+    assert_eq!(inspected["data"]["integration_head"], head);
+    assert_eq!(inspected["data"]["integration_tree"], tree);
 
     let merged = workspace
         .events()
@@ -239,6 +267,7 @@ fn a_clean_merge_records_the_integration_head_and_tree() {
         .find(|event| event["event_type"] == "integration.merged")
         .expect("the merge must be recorded");
     assert_eq!(merged["head_sha"], head);
+    assert_eq!(merged["metadata"]["integration_tree"], tree);
 }
 
 #[test]
@@ -411,7 +440,25 @@ fn untracked_feature_state_cannot_enter_the_integration() {
     fs::write(worktree.join("scratch.txt"), "not committed\n").unwrap();
 
     let id = prepare(&workspace);
-    workspace.integration(&[
+    let planned = workspace.integration_json(&["inspect", "--integration-id", &id]);
+    let candidate = planned["data"]["members"][0]["candidate_sha"]
+        .as_str()
+        .unwrap();
+    let candidate_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{candidate}^{{tree}}")],
+    );
+    let authority = workspace.authority_head();
+    let authority_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{authority}^{{tree}}")],
+    );
+    assert_ne!(
+        candidate_tree, authority_tree,
+        "the fixture must make the committed candidate content distinguishable from the authority baseline"
+    );
+
+    let envelope = workspace.integration_json(&[
         "merge",
         "--integration-id",
         &id,
@@ -421,11 +468,23 @@ fn untracked_feature_state_cannot_enter_the_integration() {
 
     // Integration merges the pinned commit, so nothing uncommitted can ride
     // along. Reading the merged tree is the only honest way to check.
-    let head = workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["members"]
-        [0]["candidate_sha"]
+    let head = envelope["data"]["integration_head"]
         .as_str()
         .unwrap()
         .to_owned();
+    let recorded_tree = envelope["data"]["integration_tree"].as_str().unwrap();
+    let head_tree = support::capture(
+        &workspace.repository,
+        &["rev-parse", &format!("{head}^{{tree}}")],
+    );
+    assert_eq!(
+        recorded_tree, head_tree,
+        "the recorded integration tree must identify the merged head's contents"
+    );
+    assert_eq!(
+        head_tree, candidate_tree,
+        "a one-member integration must contain exactly the pinned candidate tree, excluding untracked worktree state"
+    );
     let listing = support::capture(
         &workspace.repository,
         &["ls-tree", "-r", "--name-only", &head],

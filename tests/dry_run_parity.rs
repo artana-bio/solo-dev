@@ -62,7 +62,7 @@ fn active_cycle() -> Workspace {
 }
 
 #[test]
-fn work_start_previews_an_overlapping_scope_refusal() {
+fn work_start_previews_a_held_lease_refusal() {
     let workspace = active_cycle();
     workspace.activate_card("F-001", &["src/**"]);
     workspace.work(&["start", "--card-id", "F-001"]);
@@ -72,6 +72,25 @@ fn work_start_previews_an_overlapping_scope_refusal() {
         "work start",
         &workspace.work_raw(&["start", "--card-id", "F-001"]),
         &workspace.work_raw(&["start", "--card-id", "F-001", "--dry-run"]),
+    );
+}
+
+#[test]
+fn work_start_previews_an_existing_branch_refusal() {
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    support::git(&workspace.repository, &["branch", "card/F-001"]);
+
+    let real = workspace.work_raw(&["start", "--card-id", "F-001"]);
+    assert_parity(
+        "work start",
+        &real,
+        &workspace.work_raw(&["start", "--card-id", "F-001", "--dry-run"]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-PRECONDITION-BRANCH-EXISTS",
+        "the fixture must exercise the existing-branch refusal"
     );
 }
 
