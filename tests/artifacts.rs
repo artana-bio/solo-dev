@@ -7,6 +7,7 @@
 
 mod support;
 
+use change_harness::policy::paths::{CaseSensitivity, Scope, matches};
 use std::fs;
 
 use support::Workspace;
@@ -75,12 +76,20 @@ fn one_path_declared_under_two_classes_is_refused() {
 
 #[test]
 fn a_per_card_artifact_generated_from_sources_outside_the_scope_is_refused() {
+    let include = ["src/a/**".to_owned()];
+    let scope = Scope::new(&include, &[]);
+    assert!(scope.allows("src/a/owned.rs"));
+    assert!(
+        !scope.allows("src/b/unowned.rs"),
+        "the fixture's source region must contain an actually unowned path"
+    );
+
     let workspace = active_cycle();
     let path = draft(
         &workspace,
         "F-001",
-        "\"src/**\"",
-        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"schema/**\"]\n",
+        "\"src/a/**\"",
+        "  - path: src/a/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/b/**\"]\n",
     );
     let output = workspace.card_raw(&["validate", "--draft", &path]);
     assert!(!output.status.success());
@@ -113,12 +122,19 @@ fn a_per_card_artifact_generated_from_owned_sources_is_accepted() {
 
 #[test]
 fn a_card_claiming_a_shared_artifact_in_its_own_scope_is_refused() {
+    let case = CaseSensitivity::host();
+    assert!(
+        matches("dist/*.js", "dist/bundle.js", case)
+            && matches("dist/bundle.*", "dist/bundle.js", case),
+        "dist/bundle.js must witness real overlap between the two fixture globs"
+    );
+
     let workspace = active_cycle();
     let path = draft(
         &workspace,
         "F-001",
-        "\"src/**\", \"dist/bundle.js\"",
-        "  - path: dist/bundle.js\n    class: shared\n    generator: gate.all\n",
+        "\"src/**\", \"dist/*.js\"",
+        "  - path: dist/bundle.*\n    class: shared\n    generator: gate.all\n",
     );
     let output = workspace.card_raw(&["validate", "--draft", &path]);
     assert!(!output.status.success());
@@ -348,6 +364,48 @@ fn a_shared_artifact_excluded_from_the_scope_is_accepted() {
 }
 
 #[test]
+fn a_shared_artifact_glob_only_partly_excluded_from_the_scope_is_refused() {
+    let include = ["src/**".to_owned()];
+    let exclude = ["src/*".to_owned()];
+    let scope = Scope::new(&include, &exclude);
+    assert!(!scope.allows("src/one.rs"));
+    assert!(
+        scope.allows("src/deep/file.rs")
+            && matches("src/**", "src/deep/file.rs", CaseSensitivity::host()),
+        "src/deep/file.rs must witness shared ownership left behind by the partial exclude"
+    );
+
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"src/*\"",
+        "  - path: src/**\n    class: shared\n    generator: gate.all\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "a partial exclude must not hide the remaining two-owner region: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-ARTIFACT");
+}
+
+#[test]
+fn a_shared_artifact_glob_fully_excluded_from_the_scope_is_accepted() {
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"src/generated/**\"",
+        "  - path: src/generated/**\n    class: shared\n    generator: gate.all\n",
+    );
+    workspace.card(&["validate", "--draft", &path]);
+}
+
+#[test]
 fn a_shared_artifact_outside_the_scope_is_accepted() {
     let workspace = active_cycle();
     let path = draft(
@@ -400,5 +458,163 @@ fn a_per_card_source_excluded_from_the_scope_is_refused() {
         !output.status.success(),
         "an excluded source is not owned: {}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_per_card_source_glob_broader_than_a_single_segment_scope_is_refused() {
+    let include = ["src/*".to_owned()];
+    let scope = Scope::new(&include, &[]);
+    assert!(scope.allows("src/one.rs"));
+    assert!(
+        !scope.allows("src/nested/two.rs"),
+        "the source glob must contain a concrete path beyond the card's scope"
+    );
+
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/*\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/**\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "src/** includes nested paths that src/* does not own: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-ARTIFACT");
+}
+
+#[test]
+fn a_per_card_source_glob_intersecting_an_exclude_is_refused() {
+    let include = ["src/**".to_owned()];
+    let exclude = ["src/b/private/**".to_owned()];
+    let scope = Scope::new(&include, &exclude);
+    assert!(scope.allows("src/b/public.rs"));
+    assert!(
+        !scope.allows("src/b/private/secret.rs"),
+        "the source glob must contain a concrete path removed by the exclude"
+    );
+
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"src/b/private/**\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/b/**\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "the source glob includes paths the card explicitly excludes: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-ARTIFACT");
+}
+
+#[test]
+fn a_nested_per_card_source_glob_with_a_disjoint_exclude_is_accepted() {
+    let workspace = active_cycle();
+    let path = draft_excluding(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "\"docs/**\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/b/**\"]\n",
+    );
+    workspace.card(&["validate", "--draft", &path]);
+}
+
+#[test]
+fn a_generated_source_pattern_cannot_traverse_outside_the_repository() {
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "  - path: src/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/../secret/**\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "generated-source patterns must not escape their apparent scope: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not traverse upward"),
+        "the path validator must own the refusal: {envelope}"
+    );
+}
+
+#[test]
+fn a_generated_artifact_path_cannot_traverse_outside_the_repository() {
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"src/**\"",
+        "  - path: src/../generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/schema.toml\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"].as_str().unwrap().contains(
+            "generated artifact path pattern `src/../generated.rs` must not traverse upward"
+        ),
+        "the artifact path must use the same repository-boundary validator: {envelope}"
+    );
+}
+
+#[test]
+fn a_generated_source_pattern_cannot_name_git_internals_through_dot_segments() {
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"**\"",
+        "  - path: generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"./.git/**\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(
+        !output.status.success(),
+        "normalized generated-source patterns must not name Git internals: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not name Git internals"),
+        "the repository-path validator must own the refusal: {envelope}"
+    );
+}
+
+#[test]
+fn a_generated_artifact_path_cannot_name_case_varied_git_internals() {
+    let workspace = active_cycle();
+    let path = draft(
+        &workspace,
+        "F-001",
+        "\"**\"",
+        "  - path: ./.GIT/generated.rs\n    class: per_card\n    generator: gate.all\n    sources: [\"src/schema.toml\"]\n",
+    );
+    let output = workspace.card_raw(&["validate", "--draft", &path]);
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not name Git internals"),
+        "Git-internal rejection must be deterministic across host case rules: {envelope}"
     );
 }

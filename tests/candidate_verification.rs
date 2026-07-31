@@ -40,6 +40,68 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+/// Replaces the leased linked worktree with an independent clean clone at the
+/// exact same branch and commit, then makes the source repository unavailable.
+fn replace_with_independent_clone(workspace: &Workspace) {
+    let original = worktree(workspace);
+    let candidate = support::capture(&original, &["rev-parse", "HEAD"]);
+    let candidate_branch = support::capture(&original, &["branch", "--show-current"]);
+    let second_clone = workspace.root.join("second-clean-clone");
+    let source = workspace.repository.display().to_string();
+    let destination = second_clone.display().to_string();
+    support::git(
+        &workspace.root,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            "--branch",
+            &candidate_branch,
+            &source,
+            &destination,
+        ],
+    );
+    assert_eq!(
+        support::capture(&second_clone, &["rev-parse", "HEAD"]),
+        candidate,
+        "the clone must contain the exact candidate"
+    );
+    assert_eq!(
+        support::capture(&second_clone, &["branch", "--show-current"]),
+        candidate_branch,
+        "the clone must check out the leased candidate branch"
+    );
+    assert!(
+        support::capture(
+            &second_clone,
+            &["status", "--porcelain", "--untracked-files=all"]
+        )
+        .is_empty(),
+        "the second clone must be Git-clean"
+    );
+    assert!(
+        !second_clone.join(".agent/card.json").exists(),
+        "worktree-local state must not be copied into the clone"
+    );
+
+    let original_arg = original.display().to_string();
+    support::git(
+        &workspace.repository,
+        &["worktree", "unlock", &original_arg],
+    );
+    support::git(
+        &workspace.repository,
+        &["worktree", "remove", &original_arg],
+    );
+    fs::rename(&second_clone, &original).unwrap();
+    let unavailable_source = workspace.root.join("source-repository-unavailable");
+    fs::rename(&workspace.repository, &unavailable_source).unwrap();
+    assert!(
+        !workspace.repository.exists(),
+        "the original repository must be unavailable to the second verification"
+    );
+}
+
 #[test]
 fn an_in_scope_candidate_verifies() {
     let workspace = allocated(&["src/**"]);
@@ -211,19 +273,71 @@ fn a_cached_card_in_the_worktree_cannot_alter_verification() {
 }
 
 #[test]
-fn verification_is_identical_from_a_second_clean_clone() {
+fn successful_verification_data_is_identical_from_a_second_clean_clone() {
     let workspace = allocated(&["src/**"]);
-    let path = worktree(&workspace);
-    fs::create_dir_all(path.join("src")).unwrap();
-    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    let original = worktree(&workspace);
+    fs::create_dir_all(original.join("src")).unwrap();
+    fs::write(original.join("src/a.rs"), "fn main() {}\n").unwrap();
     commit(&workspace, "feat: add a.rs");
 
     let first = workspace.work_json(&["verify", "--card-id", "F-001"]);
+    assert_eq!(first["data"]["passed"], true);
+    replace_with_independent_clone(&workspace);
     let second = workspace.work_json(&["verify", "--card-id", "F-001"]);
+
     assert_eq!(
         first["data"], second["data"],
         "verification must be a pure function of committed objects"
     );
+}
+
+#[test]
+fn verification_is_identical_from_a_second_clean_clone() {
+    let workspace = allocated(&["src/**"]);
+    let original = worktree(&workspace);
+    fs::write(original.join("README.md"), "edited outside scope\n").unwrap();
+    commit(&workspace, "docs: edit readme");
+
+    // A permissive worktree-local card would admit the change if verification
+    // consulted it instead of authoritative control state. The allocation's
+    // local exclude rule keeps this deliberate discriminator Git-clean.
+    fs::write(
+        original.join(".agent/card.json"),
+        r#"{"write_scope":{"include":["**"],"exclude":[]}}"#,
+    )
+    .unwrap();
+    assert!(
+        support::capture(
+            &original,
+            &["status", "--porcelain", "--untracked-files=all"]
+        )
+        .is_empty(),
+        "the original fixture must be Git-clean despite its ignored local card"
+    );
+
+    let first = workspace.work_raw(&["verify", "--card-id", "F-001"]);
+    replace_with_independent_clone(&workspace);
+
+    let second = workspace.work_raw(&["verify", "--card-id", "F-001"]);
+    let first_envelope: Value = serde_json::from_slice(&first.stdout).expect("first JSON refusal");
+    let second_envelope: Value =
+        serde_json::from_slice(&second.stdout).expect("second JSON refusal");
+    assert_eq!(
+        first_envelope, second_envelope,
+        "verification must be identical from the independent clean clone"
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(5),
+        "the same out-of-scope change must be refused from the clone"
+    );
+    assert_eq!(
+        first.status.code(),
+        Some(5),
+        "the authoritative card must refuse the out-of-scope change"
+    );
+    assert_eq!(error_code(&first), "CH-POLICY-CANDIDATE-OUT-OF-SCOPE");
+    assert_eq!(error_code(&second), "CH-POLICY-CANDIDATE-OUT-OF-SCOPE");
 }
 
 #[test]
