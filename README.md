@@ -153,6 +153,19 @@ authorization requires a separate identity or operating-system boundary.
 
 ## Installation
 
+### Quick install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/artana-bio/solo-dev/main/install.sh | sh
+```
+
+This downloads a pre-built binary for macOS (arm64 or x86_64) or Linux (x86_64
+or aarch64), verifies its checksum, and installs it without requiring a Rust
+toolchain. Change Harness is distributed under the
+[ARTANA proprietary, all-rights-reserved license](./LICENSE).
+
+### From source
+
 Requires Rust 1.95 or newer and Git 2.50 or newer. The Git floor is not
 arbitrary: `git merge-tree --write-tree` is what makes a non-destructive merge
 preflight possible, and project validation refuses an older Git rather than
