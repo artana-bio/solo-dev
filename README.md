@@ -131,6 +131,24 @@ make sure the artifacts they judge are the exact ones that will land.
 Local hooks are convenience guardrails, not a security boundary. Strong
 authorization requires a separate identity or operating-system boundary.
 
+## For coding agents
+
+The operating guide is
+[`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md):
+the lifecycle in order, the exact YAML each command accepts, the actor-flag
+split, and every common refusal with its remedy. It is written to be followed
+without reading anything else — an independent reviewer drove a complete
+lifecycle from `project init` through promotion and archive using that file
+alone, which is how it was accepted.
+
+It is a portable skill. Copy the `.claude/skills/change-harness/` directory
+into any repository this harness governs, and agents working there will find
+it.
+
+Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
+instead, which carries the reading contract and engineering rules for building
+the tool rather than driving it.
+
 ## Installation
 
 Requires Rust 1.95 or newer and Git 2.50 or newer. The Git floor is not
