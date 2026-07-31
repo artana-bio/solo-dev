@@ -199,6 +199,12 @@ change-harness project init \
 The sequence below is the whole lifecycle. `tests/lifecycle.rs` runs exactly
 this, twice, against a temporary project.
 
+> **Driving this CLI as an agent?** The operating guide — lifecycle in order,
+> the exact YAML shapes the deserializers accept, the actor-flag split, and
+> the common refusal codes with their remedies — is maintained as a skill at
+> [`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md).
+> Copy that directory into any governed project so agents discover it there.
+
 **1. Register the gates cards may name.** Gates are registered deliberately
 rather than declared inline, so a card cannot invent a check that nobody
 reviewed.
