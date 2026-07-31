@@ -4,8 +4,9 @@
 *using* the CLI to drive a change through some project it governs, you want
 the operating guide at
 [`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md) —
-the lifecycle in order, the exact YAML the commands accept, the refusal codes
-and their remedies. Read that instead of this; nothing below applies to you.
+the lifecycle in order, the exact YAML the commands accept, and the common
+refusal codes with their remedies. Read that instead of this; nothing below
+applies to you.
 
 That guide is a portable skill: copy the `.claude/skills/change-harness/`
 directory into any repository this harness governs and agents working there
