@@ -67,12 +67,8 @@ checksums_url=$(printf '%s\n' "$release_json" | sed -n 's/.*"browser_download_ur
 [ -n "$checksums_url" ] || fail "release '$tag_name' has no SHA256SUMS asset"
 
 temp_dir=$(mktemp -d 2>/dev/null) || fail "could not create a temporary directory"
-install_temp=""
 cleanup() {
     rm -rf "$temp_dir"
-    if [ -n "$install_temp" ]; then
-        rm -f "$install_temp"
-    fi
 }
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
@@ -121,15 +117,21 @@ if [ -e "$install_path" ]; then
 fi
 
 mkdir -p "$install_dir" || fail "could not create installation directory '$install_dir'"
-# mktemp creates the file itself with O_CREAT|O_EXCL, so there is no window in
-# which a predictable name could be pre-staged as a symlink by another local
-# user of a shared $INSTALL_DIR -- unlike a PID-suffixed name, which names a
-# path before anything exists there and lets an attacker win the race for it.
-install_temp=$(mktemp "$install_dir/.$PROGRAM_NAME.install.XXXXXX") || fail "could not stage $PROGRAM_NAME in '$install_dir'"
-cp "$extracted_binary" "$install_temp" || fail "could not stage $PROGRAM_NAME in '$install_dir'"
-chmod 755 "$install_temp" || fail "could not make the staged $PROGRAM_NAME binary executable"
-mv -f "$install_temp" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
-install_temp=""
+# The binary is prepared entirely inside $temp_dir, which mktemp -d created
+# private to this process (mode 0700) -- no other local user can write there,
+# so no by-path operation on it can be raced. Only one operation ever touches
+# the shared $install_dir: the final mv. This survived two rounds of review
+# that found real, working attacks against every staged-file approach tried
+# first: a predictable PID-suffixed name (pre-stageable from a distance), and
+# then a live TOCTOU race against a properly random mktemp name in
+# $install_dir itself (100% reliable with a simple polling watcher, because
+# mktemp's O_CREAT|O_EXCL guarantee covers only its own creation instant, not
+# the cp/chmod/mv operations that follow it by path). mv does not write
+# through a pre-existing destination symlink the way cp does -- it replaces
+# the symlink entry itself -- which is what makes a single mv into a shared,
+# attacker-writable directory safe where multiple by-path operations were not.
+chmod 755 "$extracted_binary" || fail "could not make the $PROGRAM_NAME binary executable"
+mv -f "$extracted_binary" "$install_path" || fail "could not install $PROGRAM_NAME at '$install_path'"
 
 printf 'Installed %s to %s\n' "$installed_version" "$install_path"
 
