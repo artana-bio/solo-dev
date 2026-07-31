@@ -324,7 +324,7 @@ mod tests {
         let (_temp, control) = control();
         let store = EventStore::new(&control);
         assert_eq!(store.next_id().unwrap().as_str(), "E-000001");
-        store
+        let first = store
             .append(
                 &project(),
                 EventDraft::new("cycle.created", "alvaro"),
@@ -332,6 +332,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.next_id().unwrap().as_str(), "E-000002");
+
+        let second = store
+            .append(
+                &project(),
+                EventDraft::new("cycle.activated", "alvaro"),
+                &clock(),
+            )
+            .unwrap();
+        let third = store
+            .append(
+                &project(),
+                EventDraft::new("cycle.abandoned", "alvaro"),
+                &clock(),
+            )
+            .unwrap();
+        assert_eq!(
+            [
+                first.event_id.as_str(),
+                second.event_id.as_str(),
+                third.event_id.as_str(),
+            ],
+            ["E-000001", "E-000002", "E-000003"],
+            "ordinary allocation must be dense"
+        );
+
+        let second_path = control.path(&Event::relative_path(&second.event_id));
+        let third_path = Event::relative_path(&third.event_id);
+        let third_before = control.read(&third_path).unwrap();
+        std::fs::remove_file(&second_path).unwrap();
+        assert!(
+            !second_path.exists() && control.path(&third_path).exists(),
+            "the fixture must contain a real gap below the highest event identifier"
+        );
+
+        assert_eq!(
+            store.next_id().unwrap().as_str(),
+            "E-000004",
+            "the next identifier must advance beyond every existing event"
+        );
+        let fourth = store
+            .append(
+                &project(),
+                EventDraft::new("cycle.closed", "alvaro"),
+                &clock(),
+            )
+            .unwrap();
+        assert_eq!(fourth.event_id.as_str(), "E-000004");
+        assert_eq!(
+            control.read(&third_path).unwrap(),
+            third_before,
+            "allocating after a gap must not overwrite the highest existing event"
+        );
     }
 
     #[test]

@@ -303,14 +303,47 @@ fn a_dependency_cycle_is_refused_with_an_explanatory_path() {
 
 #[test]
 fn an_exclude_lets_two_cards_share_a_directory() {
+    // Prove the fixture actually contends without the exclude: both cards
+    // cover src/generated/api.rs.
+    let guarded = with_active_cycle();
+    activate(&guarded, &Draft::new("F-001", &["src/**"]));
+    let collision = try_activate(&guarded, &Draft::new("F-002", &["src/generated/**"]));
+    assert_eq!(collision.status.code(), Some(5));
+    assert_eq!(
+        error_code(&collision),
+        "CH-POLICY-OWNERSHIP-OVERLAP",
+        "the fixture must overlap before the generated subtree is excluded"
+    );
+
     let workspace = with_active_cycle();
-    // F-001 owns src/** except the generated subtree; F-002 owns exactly that
-    // subtree. Without excludes taking effect these would collide.
     activate(
         &workspace,
-        &Draft::new("F-001", &["src/handwritten.rs"]).excludes(&["src/generated/**"]),
+        &Draft::new("F-001", &["src/**"]).excludes(&["src/generated/**"]),
     );
-    activate(&workspace, &Draft::new("F-002", &["src/generated/api.rs"]));
+    let admitted = try_activate(&workspace, &Draft::new("F-002", &["src/generated/**"]));
+    assert!(
+        admitted.status.success(),
+        "the exclude must release the generated subtree: {}{}",
+        String::from_utf8_lossy(&admitted.stdout),
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+
+    // Preserve the direct discriminator for effective_includes: when one
+    // include is cancelled completely, it cannot contend with a broader card.
+    // The recorded mutation restores that cancelled include and is caught
+    // here even though the natural subtree carve-out above remains valid.
+    let cancelled = with_active_cycle();
+    activate(
+        &cancelled,
+        &Draft::new("F-001", &["src/generated/**"]).excludes(&["src/generated/**"]),
+    );
+    let broad = try_activate(&cancelled, &Draft::new("F-002", &["src/**"]));
+    assert!(
+        broad.status.success(),
+        "a fully cancelled include must not retain an ownership claim: {}{}",
+        String::from_utf8_lossy(&broad.stdout),
+        String::from_utf8_lossy(&broad.stderr)
+    );
 }
 
 #[test]

@@ -42,6 +42,17 @@ const DEPENDENCY_MANIFESTS: [&str; 10] = [
     "pyproject.toml",
 ];
 
+/// True when a repository-relative path names a recognized dependency manifest.
+///
+/// Monorepos commonly keep manifests below the repository root. Matching the
+/// final path segment preserves the explicit supported set while applying the
+/// same declaration rule at every depth.
+fn is_dependency_manifest(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| DEPENDENCY_MANIFESTS.contains(&name))
+}
+
 /// How serious a finding is.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -268,7 +279,7 @@ fn check_path(
         ));
     }
 
-    if DEPENDENCY_MANIFESTS.contains(&path)
+    if is_dependency_manifest(path)
         && !card
             .write_scope
             .include
@@ -607,29 +618,53 @@ mod tests {
 
     #[test]
     fn an_undeclared_dependency_manifest_blocks() {
+        // Keep this expectation independent from DEPENDENCY_MANIFESTS. If the
+        // production list loses an ecosystem, iterating the production list
+        // here would silently shrink the test with it.
+        let expected = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "package.json",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "go.mod",
+            "go.sum",
+            "requirements.txt",
+            "pyproject.toml",
+        ];
         let card = card_with(&["**"], &[], &[]);
-        let report = verify(
-            &card,
-            "sha256:x",
-            &facts(":100644 100644 a b M\0Cargo.lock\0"),
-        );
-        assert!(!report.passed);
-        assert!(kinds(&report).contains(&"undeclared-dependency-manifest"));
+
+        for manifest in expected {
+            for path in [manifest.to_owned(), format!("nested/{manifest}")] {
+                let raw_diff = format!(":100644 100644 a b M\0{path}\0");
+                let report = verify(&card, "sha256:x", &facts(&raw_diff));
+                let blocking: Vec<_> = report
+                    .blocking()
+                    .iter()
+                    .map(|finding| (finding.kind.as_str(), finding.path.as_deref()))
+                    .collect();
+                assert_eq!(
+                    blocking,
+                    vec![("undeclared-dependency-manifest", Some(path.as_str()))],
+                    "`**` admits {path}, so only the explicit dependency-manifest rule may block it"
+                );
+            }
+        }
     }
 
     #[test]
     fn an_explicitly_declared_manifest_is_allowed() {
-        let card = card_with(&["Cargo.lock"], &[], &[]);
-        let report = verify(
-            &card,
-            "sha256:x",
-            &facts(":100644 100644 a b M\0Cargo.lock\0"),
-        );
-        assert!(
-            report.passed,
-            "naming the manifest explicitly is how a card takes responsibility for it: {:?}",
-            report.findings
-        );
+        for path in ["Cargo.lock", "nested/Cargo.lock"] {
+            let card = card_with(&[path], &[], &[]);
+            let raw_diff = format!(":100644 100644 a b M\0{path}\0");
+            let report = verify(&card, "sha256:x", &facts(&raw_diff));
+            assert!(
+                report.passed,
+                "naming {path} explicitly is how a card takes responsibility for it: {:?}",
+                report.findings
+            );
+        }
     }
 
     #[test]

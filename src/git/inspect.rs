@@ -300,12 +300,12 @@ pub fn parse_worktree_porcelain(raw: &str) -> Vec<WorktreeEntry> {
 ///
 /// Returns an error when Git cannot be executed.
 pub fn supports_worktrees() -> Result<bool, HarnessError> {
-    Ok(run(&GitScope::None, ["worktree", "list", "-h"])?
-        .stdout
-        .contains("worktree")
-        || run(&GitScope::None, ["worktree", "-h"])?
-            .stderr
-            .contains("worktree"))
+    // Git exits 129 after showing usage for a recognized subcommand. An old
+    // Git that does not know `worktree` exits 1; its diagnostic repeats the
+    // word "worktree", so searching help text produces a false positive.
+    const USAGE_EXIT: i32 = 129;
+    let help = run(&GitScope::None, ["worktree", "-h"])?;
+    Ok(help.code == Some(USAGE_EXIT))
 }
 
 /// Resolves a revision to one exact commit object ID.

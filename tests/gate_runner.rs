@@ -4,6 +4,7 @@ mod support;
 
 use std::fs;
 
+use change_harness::domain::digest::Digest;
 use serde_json::Value;
 use support::Workspace;
 
@@ -231,7 +232,11 @@ fn logs_are_written_outside_git_history_and_their_digests_recorded() {
     let workspace = Workspace::initialized();
     let path = workspace.gate_definition(
         "noisy",
-        &definition("gate.noisy", "[\"sh\", \"-c\", \"echo hello\"]", 60),
+        &definition(
+            "gate.noisy",
+            "[\"sh\", \"-c\", \"echo receipt-stdout; echo receipt-stderr >&2\"]",
+            60,
+        ),
     );
     workspace.gate(&["register", "--definition", &path]);
     workspace.cycle(&[
@@ -247,13 +252,50 @@ fn logs_are_written_outside_git_history_and_their_digests_recorded() {
 
     let envelope = workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.noisy"]);
     let log_location = envelope["data"]["log_location"].as_str().unwrap();
-    let stdout = fs::read_to_string(std::path::Path::new(log_location).join("stdout.log")).unwrap();
-    assert_eq!(stdout, "hello\n");
+    let stdout = fs::read(std::path::Path::new(log_location).join("stdout.log")).unwrap();
+    let stderr = fs::read(std::path::Path::new(log_location).join("stderr.log")).unwrap();
+    assert_eq!(stdout, b"receipt-stdout\n");
+    assert_eq!(stderr, b"receipt-stderr\n");
+    assert!(
+        !stdout.is_empty() && !stderr.is_empty() && stdout != stderr,
+        "the fixture must write distinct, non-empty evidence to both logs"
+    );
+
+    let expected_stdout_digest = Digest::of_bytes(&stdout);
+    let expected_stderr_digest = Digest::of_bytes(&stderr);
     assert!(
         envelope["data"]["stdout_digest"]
             .as_str()
             .unwrap()
-            .starts_with("sha256:")
+            .starts_with("sha256:"),
+        "receipt digests must retain their stable algorithm prefix"
+    );
+
+    let receipt_id = envelope["data"]["receipt_id"].as_str().unwrap();
+    let receipt_path = format!("receipts/{receipt_id}.json");
+    let committed: Value = serde_json::from_str(&support::capture(
+        &workspace.control,
+        &["show", &format!("HEAD:{receipt_path}")],
+    ))
+    .unwrap();
+    assert_eq!(
+        committed, envelope["data"],
+        "the command must report the exact receipt committed to control history"
+    );
+    assert_eq!(
+        committed["stdout_digest"].as_str().unwrap(),
+        expected_stdout_digest.as_str(),
+        "the versioned receipt stdout digest must identify stdout.log"
+    );
+    assert_eq!(
+        committed["stderr_digest"].as_str().unwrap(),
+        expected_stderr_digest.as_str(),
+        "the versioned receipt stderr digest must identify stderr.log"
+    );
+    assert_eq!(
+        committed["log_location"].as_str().unwrap(),
+        log_location,
+        "the versioned receipt must point at the evidence whose digests it carries"
     );
 
     // Section 14.3: logs live outside Git; only their location and digest are
@@ -263,7 +305,7 @@ fn logs_are_written_outside_git_history_and_their_digests_recorded() {
         !tracked.iter().any(|path| path.starts_with("logs/")),
         "logs must not enter control history: {tracked:?}"
     );
-    assert!(tracked.iter().any(|path| path.starts_with("receipts/")));
+    assert!(tracked.contains(&receipt_path));
 }
 
 #[test]

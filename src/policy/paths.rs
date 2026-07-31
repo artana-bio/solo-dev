@@ -210,6 +210,36 @@ pub fn patterns_intersect(left: &str, right: &str, case: CaseSensitivity) -> boo
     )
 }
 
+/// True when this bounded implementation can prove that every path matched by
+/// `candidate` is also matched by `container`.
+///
+/// Pattern containment is stricter than intersection. The proof deliberately
+/// covers only forms whose containment is obvious in this grammar: a concrete
+/// candidate path, identity, the universal `**`, or nesting below a literal
+/// `/**` prefix. More complex valid relationships return false so callers fail
+/// closed rather than granting ownership they cannot prove.
+#[must_use]
+pub fn provably_contains_pattern(container: &str, candidate: &str, case: CaseSensitivity) -> bool {
+    if !candidate.contains('*') {
+        return matches(container, candidate, case);
+    }
+
+    let normalize = |pattern: &str| segments(pattern, case).join("/");
+    let container = normalize(container);
+    let candidate = normalize(candidate);
+    if container == "**" || container == candidate {
+        return true;
+    }
+
+    let Some(prefix) = container.strip_suffix("/**") else {
+        return false;
+    };
+    !prefix.contains('*')
+        && candidate
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
 /// A resolved include/exclude scope.
 #[derive(Clone, Debug)]
 pub struct Scope<'a> {
@@ -261,9 +291,11 @@ impl<'a> Scope<'a> {
             .any(|pattern| matches(pattern, path, self.case))
     }
 
-    /// Every include pattern that is not fully cancelled by an exclude.
+    /// Every include pattern that is not provably cancelled by an exclude.
     ///
-    /// Used for overlap: two cards do not conflict over a region both exclude.
+    /// Used for overlap so a region this scope has removed completely cannot
+    /// retain an ownership claim. Subtree carve-outs against the other scope
+    /// are handled separately in [`Self::overlaps`].
     #[must_use]
     pub fn effective_includes(&self) -> Vec<&'a String> {
         self.include
@@ -272,17 +304,31 @@ impl<'a> Scope<'a> {
                 !self
                     .exclude
                     .iter()
-                    .any(|excluded| excluded == *pattern || excluded.as_str() == "**")
+                    .any(|excluded| provably_contains_pattern(excluded, pattern, self.case))
             })
             .collect()
     }
 
     /// True when this scope could contend with another for some path.
+    ///
+    /// An intersecting include pair is harmless when either scope has an
+    /// exclude proven to contain the opposing include. The proof is
+    /// deliberately conservative; an ambiguous carve-out remains a reported
+    /// overlap rather than risking two owners for one path.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> Option<(String, String)> {
         for left in self.effective_includes() {
             for right in other.effective_includes() {
-                if patterns_intersect(left, right, self.case) {
+                if patterns_intersect(left, right, self.case)
+                    && !self
+                        .exclude
+                        .iter()
+                        .any(|excluded| provably_contains_pattern(excluded, right, self.case))
+                    && !other
+                        .exclude
+                        .iter()
+                        .any(|excluded| provably_contains_pattern(excluded, left, self.case))
+                {
                     return Some((left.clone(), right.clone()));
                 }
             }
@@ -474,6 +520,48 @@ mod tests {
         let left = Scope::with_case(&left_include, &empty, SENSITIVE);
         let right = Scope::with_case(&right_include, &empty, SENSITIVE);
         assert!(left.overlaps(&right).is_none());
+    }
+
+    #[test]
+    fn an_excluded_subtree_does_not_overlap_its_owner() {
+        let broad_include = vec!["src/**".to_owned()];
+        let generated_exclude = vec!["src/generated/**".to_owned()];
+        let generated_include = vec!["src/generated/**".to_owned()];
+        let empty = vec![];
+        let broad = Scope::with_case(&broad_include, &generated_exclude, SENSITIVE);
+        let generated = Scope::with_case(&generated_include, &empty, SENSITIVE);
+
+        assert!(broad.allows("src/handwritten.rs"));
+        assert!(!broad.allows("src/generated/api.rs"));
+        assert!(generated.allows("src/generated/api.rs"));
+        assert!(broad.overlaps(&generated).is_none());
+        assert!(generated.overlaps(&broad).is_none());
+    }
+
+    #[test]
+    fn a_partial_or_unrelated_exclude_does_not_hide_real_overlap() {
+        let broad_include = vec!["src/**".to_owned()];
+        let generated_include = vec!["src/generated/**".to_owned()];
+        let partial_exclude = vec!["src/generated/private/**".to_owned()];
+        let unrelated_exclude = vec!["tests/**".to_owned()];
+        let broad_with_partial = Scope::with_case(&broad_include, &partial_exclude, SENSITIVE);
+        let broad_with_unrelated = Scope::with_case(&broad_include, &unrelated_exclude, SENSITIVE);
+        let generated = Scope::with_case(&generated_include, &[], SENSITIVE);
+
+        assert!(broad_with_partial.overlaps(&generated).is_some());
+        assert!(broad_with_unrelated.overlaps(&generated).is_some());
+    }
+
+    #[test]
+    fn a_fully_cancelled_include_cannot_overlap_a_broader_scope() {
+        let generated_include = vec!["src/generated/**".to_owned()];
+        let generated_exclude = vec!["src/generated/**".to_owned()];
+        let broad_include = vec!["src/**".to_owned()];
+        let cancelled = Scope::with_case(&generated_include, &generated_exclude, SENSITIVE);
+        let broad = Scope::with_case(&broad_include, &[], SENSITIVE);
+
+        assert!(cancelled.effective_includes().is_empty());
+        assert!(cancelled.overlaps(&broad).is_none());
     }
 
     #[test]

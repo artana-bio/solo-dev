@@ -232,9 +232,10 @@ integration, but the hook process retains Git's normal unbounded behaviour.
 directions were wrong and in opposite ways: a shared artifact covered by a glob
 include was **accepted** — one path with two owners, the exact thing the class
 exists to prevent — while a per-card source the card plainly owns was
-**refused**. Excludes were ignored entirely. Sources now require containment
-(`Scope::allows`) and shared paths are refused on intersection; the asymmetry is
-deliberate and stated at the function.
+**refused**. Excludes were ignored entirely. Concrete sources now use
+`Scope::allows`; source globs require a conservative containment proof and no
+intersection with an exclude; shared paths are refused on intersection. The
+asymmetry is deliberate and stated at the function.
 
 Three adjacent holes are **left open** and named at the check rather than
 implied closed: nothing compares one card's declared shared artifact against
@@ -274,6 +275,92 @@ should have caught it are the same finding twice.
 Recorded after the original tiers were drawn; it remains in this section so the
 time it was found is not obscured.
 
+**26. ✅ FIXED. Recognized dependency manifests below the repository root
+bypassed explicit declaration.** `DEPENDENCY_MANIFESTS.contains(path)` matched
+only root literals, so a card with `write_scope: ["**"]` could change
+`app/requirements.txt` with no finding even though the same root filename was
+protected. Verification now matches the final path segment while still
+requiring the card to name the complete changed path explicitly. The unit test
+independently enumerates all ten recognized names at root and below it; restoring
+the root-only check fails on `nested/Cargo.toml` with no blocking finding.
+
+**27. ✅ FIXED. Per-card source globs could describe files outside the card's
+scope.** `Scope::allows(source)` answered whether the write-scope glob matched
+the *text of the source pattern*, not whether every path described by that
+pattern was owned. It admitted both `include: ["src/*"]`, `sources:
+["src/**"]` and a `src/b/**` source intersecting an explicit
+`src/b/private/**` exclude. Generated source ownership now keeps ordinary scope
+matching for concrete paths, rejects any source glob intersecting an exclude,
+and accepts glob containment only when it can prove the safe common forms:
+identity, `**`, or nesting below a literal `/**` prefix. More complex valid
+relationships may fail closed; intersection is deliberately not presented as
+containment. Restoring `Scope::allows(source)` makes both counterexample tests
+accept invalid cards, while an owned nested glob with a disjoint exclude guards
+against blanket refusal.
+
+**28. ✅ FIXED. `doctor` could report worktree support when Git explicitly
+rejected the subcommand.** The detector searched stderr for the word
+`worktree`, so Git's standard `git: 'worktree' is not a git command` diagnostic
+was positive evidence. It now runs `git worktree -h` once and uses Git's exit
+contract: recognized subcommand usage exits 129, unknown subcommands exit 1.
+The probe test runs in an isolated child with fake Git 2.4.0; restoring the
+substring detector or hardcoding `true` fails at `a Git that rejects the
+worktree subcommand must not report worktree support`.
+
+**29. ⚠️ OPEN. Dependency-manifest policy is a finite engine-owned list.** The
+strongest reading of D-002 and Section 13.3 is still not met for an ecosystem
+outside the ten recognized filenames: a `**` card changing `Gemfile.lock`
+receives no dependency-manifest finding. Closing this durably requires
+project-configured manifest path patterns and therefore a project-schema and
+CLI contract change; expanding another hardcoded list would only move the
+boundary. F-025 narrows the false universal test name and records this limit
+instead of claiming that cross-language examples prove language neutrality.
+
+**30. ✅ FIXED. Nested scope excludes did not release ownership during card
+allocation.** Path-level checks correctly treated `include: ["src/**"]`,
+`exclude: ["src/generated/**"]` as not owning generated files, but overlap
+reduced scopes only by removing an include cancelled wholesale. A second card
+claiming `src/generated/**` was therefore refused, contradicting WP-220's
+completed acceptance evidence that two cards can share a directory by carving
+out the subtree one owns. Overlap now recognizes a carve-out when an exclude can
+provably contain the opposing include; exact cancellation uses the same
+conservative containment primitive. Natural broad-scope, full-cancellation,
+partial-exclude, unrelated-exclude, and reverse-order regressions prevent both
+the bypass and blanket acceptance. Restoring raw effective includes fails the
+direct cancellation discriminator; removing cross-scope carve-out handling
+fails the natural `src/**` minus `src/generated/**` allocation.
+
+**31. ✅ FIXED. Generated artifact paths and sources bypassed repository-path
+validation.** Write-scope patterns had a validator for absolute paths, parent
+traversal, raw `.git` spellings, and backslash separators, but
+`generated_artifacts[].path` and `sources[]` never reached that boundary. A
+per-card source
+`src/../secret/**` under `src/**` was accepted because textual prefix
+containment made it look owned. Card validation now applies the same
+repository-relative pattern policy to every artifact path and source before
+ownership evaluation. Separate path and source regressions prove `..` is
+refused specifically by that validator; restoring the omission makes the
+source counterexample validate successfully.
+
+**32. ✅ FIXED. A narrow exclude could falsely carve out an entire shared
+artifact glob.** The Shared check passed `artifact.path` to concrete-path
+`matches`, so `exclude: ["src/*"]` appeared to carve out shared path
+`src/**` because `*` matched the literal text `**`. Deeper files such as
+`src/deep/file.rs` remained card-owned and shared, leaving two owners. A shared
+glob is now carved out only when an exclude is proven to contain its complete
+pattern. Concrete-witness coverage proves partial exclusion remains refused,
+while an equal subtree exclude proves fully carved-out globs remain legal.
+
+**33. ✅ FIXED. Normalized and case-varied aliases bypassed the Git-internal
+path guard.** Matching deliberately normalizes leading `./` segments and case
+on case-insensitive hosts, but validation compared only the raw strings `.git`
+and `.git/...`. Write scopes and the newly validated generated paths/sources
+could therefore name `./.git/**`; `.GIT/**` was the same protected region on
+some hosts and admissible on others. Validation now finds the first semantic
+path segment and rejects `.git` case-insensitively for deterministic
+cross-host policy. Unit and end-to-end source/path regressions cover both alias
+forms; restoring the raw prefix check makes `./.git/**` validate successfully.
+
 ## Why failure injection did not catch defect 11
 
 `CHANGE_HARNESS_FAIL_AT` raises `RecoveryIncomplete`, whose category is
@@ -302,9 +389,10 @@ confirmed to survive the entire suite of 732 tests:
   old Git to run against — but that field only feeds `doctor`'s report. The
   check with teeth is `check_git_version`, and
   `an_unsatisfiable_minimum_git_version_fails_explicitly` already exercises it
-- deleting the worktree-support probe — **still open.** Report-only: nothing
-  acts on `supports_worktrees`, and it cannot be forced false on a host whose
-  Git supports worktrees. Recorded rather than papered over
+- deleting the worktree-support probe — ✅ **FIXED.** The probe test now runs an
+  isolated child against fake Git 2.4.0 that rejects `worktree`; hardcoding
+  support fails on the unsupported side. Writing that discriminator exposed and
+  fixed the false-positive parser recorded as defect 28
 - adding an illegal `Draft → Promoted` transition to the authoritative table
 - replacing the system clock with a fixed constant, so every timestamp in the
   audit trail becomes the same fabricated instant — ✅ **FIXED**, one test now

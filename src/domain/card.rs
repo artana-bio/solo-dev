@@ -317,6 +317,39 @@ pub struct CardDraft {
     pub rollback_strategy: String,
 }
 
+/// True when every path described by a generated-artifact source belongs to
+/// the card's write scope.
+///
+/// Concrete sources use ordinary scope membership. Glob sources need a
+/// containment proof instead: asking whether the include matches the glob text
+/// treats metacharacters as filename characters and can admit a source broader
+/// than the scope. This deliberately proves only the safe common cases: an
+/// identical pattern, `**`, or a source nested below a literal `/**` prefix.
+/// More complex relationships fail closed rather than turning intersection
+/// into containment. Any intersection with an exclude also fails closed.
+fn generated_source_is_owned(
+    source: &str,
+    scope: &crate::policy::paths::Scope<'_>,
+    include: &[String],
+    exclude: &[String],
+    case: crate::policy::paths::CaseSensitivity,
+) -> bool {
+    use crate::policy::paths::{patterns_intersect, provably_contains_pattern};
+
+    if !source.contains('*') {
+        return scope.allows(source);
+    }
+    if exclude
+        .iter()
+        .any(|pattern| patterns_intersect(pattern, source, case))
+    {
+        return false;
+    }
+    include
+        .iter()
+        .any(|pattern| provably_contains_pattern(pattern, source, case))
+}
+
 impl CardDraft {
     /// Checks each generated declaration, and what its class implies about
     /// this card's write scope.
@@ -336,21 +369,20 @@ impl CardDraft {
     /// The two arms deliberately use different tests, and the asymmetry is the
     /// point rather than an oversight:
     ///
-    /// - A per-card **source** must be *contained* in the scope. `Scope::allows`
-    ///   applies deny-by-default and lets an exclude override an include.
-    ///   Intersection would be wrong here: a card owning `src/a/**` could then
-    ///   name `src/**` as a source, which is exactly the staleness the rule
-    ///   exists to prevent.
+    /// - A per-card **source** must be *contained* in the scope. Concrete paths
+    ///   use `Scope::allows`; glob sources require a conservative containment
+    ///   proof and must not intersect an exclude. Intersection alone would be
+    ///   wrong here: a card owning `src/a/**` could then name `src/**` as a
+    ///   source, which is exactly the staleness the rule exists to prevent.
     /// - A shared **path** is refused on *intersection*, because
     ///   `artifact.path` may itself be a glob and any overlap means two owners.
     ///   Over-approximating toward refusal is `patterns_intersect`'s documented
     ///   policy.
     ///
-    /// One further asymmetry inside the shared arm: an exclude is tested with
-    /// `matches` rather than intersection, so an exclude naming one file does
-    /// not carve out a glob artifact path that merely overlaps it. Conservative
-    /// on purpose — the card stays refused — but it is a behaviour that exists
-    /// nowhere else in this crate.
+    /// A shared glob path is considered carved out only when one exclude is
+    /// proven to contain the entire artifact pattern. Treating that pattern as
+    /// one concrete path would let `src/*` appear to carve out `src/**`, even
+    /// though deeper shared files would still have two owners.
     ///
     /// Case sensitivity follows the host (`CaseSensitivity::host()`), as scope
     /// matching does everywhere. This is the first place it governs *draft
@@ -365,7 +397,9 @@ impl CardDraft {
     ///   per-card arm, only its `sources`.
     /// - `Transient` and `Serialized` are not checked at all.
     fn validate_generated_artifacts(&self) -> Result<(), HarnessError> {
-        use crate::policy::paths::{CaseSensitivity, Scope, matches, patterns_intersect};
+        use crate::policy::paths::{
+            CaseSensitivity, Scope, patterns_intersect, provably_contains_pattern,
+        };
 
         require_one_class_each(&self.generated_artifacts)?;
 
@@ -380,7 +414,13 @@ impl CardDraft {
             match artifact.class {
                 ArtifactClass::PerCard => {
                     for source in &artifact.sources {
-                        if !scope.allows(source) {
+                        if !generated_source_is_owned(
+                            source,
+                            &scope,
+                            &self.write_scope.include,
+                            &self.write_scope.exclude,
+                            case,
+                        ) {
                             return Err(invalid(format!(
                                 "per-card artifact `{}` is generated from `{source}`, which this card does not own; it would go stale the moment somebody else changed it",
                                 artifact.path
@@ -389,11 +429,10 @@ impl CardDraft {
                     }
                 }
                 ArtifactClass::Shared => {
-                    let carved_out = self
-                        .write_scope
-                        .exclude
-                        .iter()
-                        .any(|pattern| matches(pattern, &artifact.path, case));
+                    let carved_out =
+                        self.write_scope.exclude.iter().any(|pattern| {
+                            provably_contains_pattern(pattern, &artifact.path, case)
+                        });
                     let claimed = !carved_out
                         && self
                             .write_scope
@@ -482,43 +521,51 @@ impl CardDraft {
                 self.card_id
             )));
         }
-        self.validate_generated_artifacts()?;
-
         for pattern in self
             .write_scope
             .include
             .iter()
             .chain(&self.write_scope.exclude)
         {
-            validate_pattern(pattern).map_err(reject)?;
+            validate_pattern("write-scope", pattern).map_err(reject)?;
         }
+        for artifact in &self.generated_artifacts {
+            validate_pattern("generated artifact path", &artifact.path).map_err(reject)?;
+            for source in &artifact.sources {
+                validate_pattern("generated artifact source", source).map_err(reject)?;
+            }
+        }
+        self.validate_generated_artifacts()?;
         Ok(())
     }
 }
 
 /// Rejects patterns that could escape the repository or touch Git internals.
-fn validate_pattern(pattern: &str) -> Result<(), String> {
+fn validate_pattern(kind: &str, pattern: &str) -> Result<(), String> {
     if pattern.trim().is_empty() {
-        return Err("write-scope patterns must not be empty".to_owned());
+        return Err(format!("{kind} patterns must not be empty"));
     }
     if pattern.starts_with('/') {
         return Err(format!(
-            "write-scope pattern `{pattern}` must be repository-relative, not absolute"
+            "{kind} pattern `{pattern}` must be repository-relative, not absolute"
         ));
     }
     if pattern.split('/').any(|segment| segment == "..") {
         return Err(format!(
-            "write-scope pattern `{pattern}` must not traverse upward"
+            "{kind} pattern `{pattern}` must not traverse upward"
         ));
     }
-    if pattern == ".git" || pattern.starts_with(".git/") || pattern.starts_with(".git\\") {
+    let first_semantic_segment = pattern
+        .split('/')
+        .find(|segment| !segment.is_empty() && *segment != ".");
+    if first_semantic_segment.is_some_and(|segment| segment.eq_ignore_ascii_case(".git")) {
         return Err(format!(
-            "write-scope pattern `{pattern}` must not name Git internals"
+            "{kind} pattern `{pattern}` must not name Git internals"
         ));
     }
     if pattern.contains('\\') {
         return Err(format!(
-            "write-scope pattern `{pattern}` must use `/` separators"
+            "{kind} pattern `{pattern}` must use `/` separators"
         ));
     }
     Ok(())
@@ -888,6 +935,8 @@ risk: low
             "src/../../escape",
             ".git",
             ".git/config",
+            "./.git/**",
+            ".GIT/**",
             "src\\windows",
             "   ",
         ] {

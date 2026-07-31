@@ -1,4 +1,4 @@
-//! D-001: the engine is project-neutral.
+//! D-002: the engine is project- and language-neutral.
 //!
 //! Section 19.4 tests this with an ARTANA profile trial, which needs a second
 //! repository. Nothing else tested it at all, which meant a Rust or cargo
@@ -207,7 +207,7 @@ fn a_failing_gate_in_another_language_blocks_exactly_as_a_rust_one_would() {
 }
 
 #[test]
-fn the_engine_carries_no_language_specific_configuration() {
+fn language_neutral_configuration_still_guards_a_python_dependency_manifest() {
     // The project document is the only place a project describes itself to the
     // harness. If neutrality is real, nothing in it names a language, a build
     // tool, or a file extension.
@@ -236,4 +236,64 @@ fn the_engine_carries_no_language_specific_configuration() {
             "the command surface names `{term}`: {help}"
         );
     }
+
+    // A non-Rust dependency manifest must receive the same supply-chain guard
+    // without adding a language-specific setting to the project document.
+    // First prove this broad scope is otherwise usable, so the refusal below
+    // cannot be an unrelated scope or worktree failure.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Update dependencies",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(
+        worktree.join("app/neutral.txt"),
+        "ordinary in-scope change\n",
+    )
+    .unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "test: prove broad scope is admissible",
+        ],
+    );
+    let ordinary = workspace.work_json(&["verify", "--card-id", "F-001"]);
+    assert_eq!(
+        ordinary["data"]["passed"], true,
+        "the fixture must admit an ordinary Python-project path: {:?}",
+        ordinary["data"]["findings"]
+    );
+
+    fs::write(worktree.join("app/requirements.txt"), "example==1.0\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(
+        &worktree,
+        &["commit", "-q", "-m", "build: update Python dependencies"],
+    );
+    let guarded = workspace.work_raw(&["verify", "--card-id", "F-001"]);
+    assert_eq!(
+        guarded.status.code(),
+        Some(5),
+        "an undeclared foreign dependency manifest must be refused: {}{}",
+        String::from_utf8_lossy(&guarded.stdout),
+        String::from_utf8_lossy(&guarded.stderr)
+    );
+    let refusal = String::from_utf8_lossy(&guarded.stdout);
+    assert!(
+        refusal.contains(
+            "`app/requirements.txt` changes what the build resolves and must be named explicitly"
+        ),
+        "the refusal must come from the dependency-manifest policy, not an unrelated check: {refusal}"
+    );
 }
