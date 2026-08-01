@@ -451,6 +451,38 @@ fn a_file_written_around_the_harness_cannot_reach_control_history() {
 }
 
 #[test]
+fn a_refusal_leaves_the_index_as_it_found_it() {
+    // The check runs after `git add --all`, so the offending content is
+    // already staged when it fires. Left there, and with the pathspec dropping
+    // paths that no longer exist, an operator who deleted the bad file still
+    // had its staged copy — every later commit refusing on a file no longer on
+    // disk, with nothing on screen explaining why. A control that bricks the
+    // repository it protects is worse than the leak it prevents.
+    let workspace = Workspace::initialized();
+    fs::create_dir_all(workspace.control.join("cards")).unwrap();
+    fs::write(
+        workspace.control.join("cards/external.json"),
+        format!("{{\"note\":\"{TOKEN}\"}}\n"),
+    )
+    .unwrap();
+
+    let refused = workspace.cycle_raw(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "an ordinary objective",
+    ]);
+    assert_ne!(refused.status.code(), Some(0), "the credential is refused");
+
+    let staged = support::capture(&workspace.control, &["diff", "--cached", "--name-only"]);
+    assert!(
+        staged.is_empty(),
+        "a refusal must not leave the index holding what it refused: {staged}"
+    );
+}
+
+#[test]
 fn an_ordinary_card_is_still_accepted() {
     // The control that fires on ordinary evidence gets switched off. This is
     // the half of the behavior that keeps the other half deployable.

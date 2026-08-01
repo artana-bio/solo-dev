@@ -166,7 +166,17 @@ fn is_token_char(value: char) -> bool {
 }
 
 /// Length of the token starting at `rest`, when one of the prefixes matches.
-fn prefixed_at(rest: &str) -> Option<(SecretKind, usize)> {
+///
+/// `at_word_start` is false when the previous character continues a token, and
+/// no prefix matches there. Without it `sk-` matched mid-word and English is
+/// full of words ending in "sk": `task-550e8400-e29b-41d4-a716-446655440000`,
+/// `risk-0123…`, and `disk-0123…` were all refused as API keys. A card goal
+/// mentioning a task id is ordinary text, and a control that refuses ordinary
+/// text is one somebody turns off.
+fn prefixed_at(rest: &str, at_word_start: bool) -> Option<(SecretKind, usize)> {
+    if !at_word_start {
+        return None;
+    }
     for candidate in &PREFIXED {
         let Some(tail) = rest.strip_prefix(candidate.prefix) else {
             continue;
@@ -188,8 +198,8 @@ fn prefixed_at(rest: &str) -> Option<(SecretKind, usize)> {
 /// Separate from [`PREFIXED`] because the identifier is a fixed twenty
 /// characters of uppercase and digits; measuring it as a run would swallow an
 /// adjacent word and report the wrong span to the redactor.
-fn aws_key_at(rest: &str) -> Option<(SecretKind, usize)> {
-    if !(rest.starts_with("AKIA") || rest.starts_with("ASIA")) {
+fn aws_key_at(rest: &str, at_word_start: bool) -> Option<(SecretKind, usize)> {
+    if !at_word_start || !(rest.starts_with("AKIA") || rest.starts_with("ASIA")) {
         return None;
     }
     let body: Vec<char> = rest.chars().take(20).collect();
@@ -224,9 +234,26 @@ fn aws_key_at(rest: &str) -> Option<(SecretKind, usize)> {
 fn has_private_key_header(text: &str) -> bool {
     text.lines().any(|line| {
         let trimmed = line.trim();
-        trimmed.starts_with("-----BEGIN")
+        // Two forms, both still line-local, neither computing an end. The
+        // first is a real armour line. The second is the single-line shape a
+        // key takes inside a `.env` or a service-account JSON, where the
+        // newlines are literal `\n` and the whole key is one line that does
+        // not end in dashes — a reviewer committed one of those and watched it
+        // reach control history.
+        let armour = trimmed.starts_with("-----BEGIN")
             && trimmed.ends_with("-----")
-            && trimmed.contains("PRIVATE KEY")
+            && trimmed.contains("PRIVATE KEY");
+        //
+        // The escaped form additionally requires a literal backslash-n, which
+        // is what puts the key material on the header's line in the first
+        // place. Without that condition the rule also fires on a sentence that
+        // merely quotes a header — and "handle `-----BEGIN RSA PRIVATE
+        // KEY-----` headers" is a card goal somebody could plausibly write in
+        // this repository.
+        let escaped = trimmed.contains("-----BEGIN")
+            && trimmed.contains("PRIVATE KEY-----")
+            && trimmed.contains("\\n");
+        armour || escaped
     })
 }
 
@@ -267,8 +294,11 @@ pub fn find_all(text: &str) -> Vec<Match> {
             continue;
         }
         let rest = &text[index..];
-        let hit = prefixed_at(rest)
-            .or_else(|| aws_key_at(rest))
+        // A prefix only introduces a token at the start of one. `://` does
+        // not: it is always preceded by a scheme, which is token characters.
+        let at_word_start = !text[..index].chars().next_back().is_some_and(is_token_char);
+        let hit = prefixed_at(rest, at_word_start)
+            .or_else(|| aws_key_at(rest, at_word_start))
             .or_else(|| url_password_at(rest));
         if let Some((kind, length)) = hit {
             found.push(Match {
@@ -344,7 +374,12 @@ pub fn redact(text: &str) -> String {
 /// rewriting it would change the shape of a document a program is parsing.
 pub fn redact_json(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) if !find_all(text).is_empty() => {
+        // `first`, not `find_all`. A private key is not a span and never
+        // appears in `find_all`, so gating on that quietly stopped redacting
+        // PEM keys inside structured error details the moment private-key
+        // handling was simplified — two code paths asking the same question
+        // differently, which is how a simplification opens a hole.
+        serde_json::Value::String(text) if first(text).is_some() => {
             *text = redact(text);
         }
         serde_json::Value::Array(items) => {
@@ -384,27 +419,38 @@ pub fn redact_json(value: &mut serde_json::Value) {
 ///
 /// Returns [`ErrorCode::PolicySensitiveValue`] naming the document and field.
 pub fn refuse_secrets_in_document(relative: &str, contents: &str) -> Result<(), HarnessError> {
-    // Above this, parse into a tree and walk it is the wrong shape of work:
-    // a 100 MiB document took thirteen seconds, on a check that every control
-    // write in the lifecycle passes through. No durable record here is
-    // remotely this size, so the cap costs nothing real and bounds the worst
-    // case. The scan still happens — the fallback is a single linear pass over
-    // the text, which loses the field path and keeps the guarantee.
+    // Above this, parsing into a tree and walking it is the wrong shape of
+    // work: a 100 MiB document took thirteen seconds, on a check every control
+    // write passes through. No durable record here is remotely that size, so
+    // the cap costs nothing real and bounds the worst case.
     const PARSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
-    if contents.len() > PARSE_LIMIT_BYTES {
-        return refuse_secret(relative, contents);
-    }
-    match serde_json::from_str::<serde_json::Value>(contents) {
-        Ok(value) => {
-            let mut at = String::new();
-            if let Some((path, kind)) = first_in_json(&value, &mut at) {
-                return Err(sensitive(&format!("{relative}:{path}"), kind));
-            }
-            Ok(())
+    // The path is content too. A file named for a credential puts it in the
+    // tree permanently, and this function received `relative` as a label only
+    // — the name was never scanned, just printed in the refusal.
+    refuse_secret("the file name", relative)?;
+
+    // The tree first, for the precise field path in the message, and because
+    // an escaped `p` is a credential only after parsing.
+    if contents.len() <= PARSE_LIMIT_BYTES
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(contents)
+    {
+        let mut at = String::new();
+        if let Some((path, kind)) = first_in_json(&value, &mut at) {
+            return Err(sensitive(&format!("{relative}:{path}"), kind));
         }
-        Err(_) => refuse_secret(relative, contents),
     }
+
+    // Then the raw bytes, always, whatever the parse did or did not say.
+    //
+    // The tree is a *lossy* view: `serde_json` collapses duplicate keys
+    // last-wins, so `{"note":"<token>","note":"clean"}` walks as clean while
+    // git commits the file. Both reviewers found this independently, and it is
+    // the same mistake as the two before it one level deeper — per field
+    // missed fields, per writer missed writers, per parse misses whatever the
+    // parser drops. Neither view subsumes the other, so both are scanned: the
+    // bytes for completeness, the tree for precision.
+    refuse_secret(relative, contents)
 }
 
 /// The first credential in a JSON document, with its path.
@@ -796,6 +842,100 @@ mod tests {
             refuse_secrets_in_document("notes.txt", "ghp_0123456789abcdef0123456789abcdef0123")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_duplicate_key_cannot_hide_a_credential_from_the_document_scan() {
+        // Both reviewers found this independently. `serde_json` collapses
+        // duplicate keys last-wins, so the walk saw `clean` while git would
+        // have committed the file with the token still in it. The tree is a
+        // lossy view of the bytes; scanning only the tree secured the view.
+        let text = r#"{"note":"ghp_0123456789abcdef0123456789abcdef0123","note":"clean"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(text).is_ok(),
+            "the fixture must parse, or it proves nothing about the tree walk"
+        );
+        assert!(
+            refuse_secrets_in_document("cards/dup.json", text).is_err(),
+            "the raw bytes carry it whatever the parse says"
+        );
+
+        // Nested, and with the order reversed so the walk does see it.
+        for shape in [
+            r#"{"outer":{"k":"ghp_0123456789abcdef0123456789abcdef0123","k":"clean"}}"#,
+            r#"{"note":"clean","note":"ghp_0123456789abcdef0123456789abcdef0123"}"#,
+        ] {
+            assert!(refuse_secrets_in_document("cards/dup.json", shape).is_err());
+        }
+    }
+
+    #[test]
+    fn a_file_name_is_scanned_as_well_as_its_contents() {
+        // A credential used as a filename becomes a tree entry, permanently.
+        // The path had been passed in as a label for the message and never
+        // looked at.
+        let error = refuse_secrets_in_document(
+            "cards/ghp_0123456789abcdef0123456789abcdef0123.json",
+            r#"{"note":"ordinary"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicySensitiveValue);
+        assert!(
+            !error.to_string().contains("ghp_0123"),
+            "and the refusal does not repeat it: {error}"
+        );
+    }
+
+    #[test]
+    fn an_identifier_that_merely_ends_in_a_prefix_is_not_a_credential() {
+        // `sk-` was matched at every byte offset, and English is full of words
+        // ending in "sk". A card goal naming a task id was refused as an API
+        // key — a false positive on wholly ordinary text, which is the failure
+        // that gets a control switched off.
+        for ordinary in [
+            "Close task-550e8400-e29b-41d4-a716-446655440000 before the freeze",
+            "tracked as risk-0123456789abcdef0123 in the register",
+            "see disk-0123456789abcdef0123456789 for the layout",
+            "the ask-0123456789abcdef01234 ticket",
+        ] {
+            assert_eq!(first(ordinary), None, "flagged ordinary text: {ordinary}");
+        }
+        // The real shapes still match at a word start.
+        assert_eq!(
+            first("key sk-ant-api03-abcdefghijklmnopqrst here"),
+            Some(SecretKind::ApiKey)
+        );
+        assert_eq!(
+            first("AKIAIOSFODNN7EXAMPLE"),
+            Some(SecretKind::AwsAccessKeyId)
+        );
+    }
+
+    #[test]
+    fn a_private_key_flattened_onto_one_line_is_detected() {
+        // The `.env` and service-account form: the newlines are literal `\n`,
+        // so the header does not end its line and the armour rule misses it.
+        let env_form = r#"{"key":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n"}"#;
+        assert_eq!(first(env_form), Some(SecretKind::PrivateKey));
+        assert!(refuse_secrets_in_document("cards/F-001.json", env_form).is_err());
+    }
+
+    #[test]
+    fn a_private_key_inside_structured_details_is_blanked() {
+        // `redact_json` gated on `find_all`, and a private key is not a span,
+        // so simplifying private-key handling silently stopped redacting them
+        // in error details.
+        let mut value = serde_json::json!({
+            "field": "key",
+            "value": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+        });
+        redact_json(&mut value);
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("MIIEowIBAAKCAQEA"),
+            "key material reached the details payload: {rendered}"
+        );
+        assert!(rendered.contains("[redacted:private-key]"), "{rendered}");
     }
 
     #[test]

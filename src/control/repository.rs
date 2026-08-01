@@ -356,7 +356,20 @@ impl ControlRepository {
         // The index has no such loophole. Content is read back with `git show
         // :path` rather than from the worktree, because the index is what the
         // commit will contain and the two can differ.
-        refuse_staged_secrets(&self.scope())?;
+        // A refusal unstages before it returns, or the repository wedges. The
+        // offending content is already in the index by this point, and the
+        // pathspec above drops paths that no longer exist — so an operator who
+        // deleted the bad file found its staged copy still there, every later
+        // commit refusing on a file that was no longer on disk, with nothing
+        // on screen explaining why. Resetting restores the index to `HEAD` and
+        // leaves the worktree alone: the bad file stays where the operator can
+        // see and fix it, and once fixed the next commit simply works. A
+        // control that bricks the repository it protects is worse than the
+        // leak it prevents.
+        if let Err(refusal) = refuse_staged_secrets(&self.scope()) {
+            let _ = run(&self.scope(), ["reset", "-q"]);
+            return Err(refusal);
+        }
 
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the

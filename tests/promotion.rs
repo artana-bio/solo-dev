@@ -195,6 +195,51 @@ fn a_credential_cannot_be_recorded_through_a_real_acceptance() {
 }
 
 #[test]
+fn editing_a_pinned_review_refuses_acceptance_rather_than_changing_who_wrote_the_code() {
+    // The digest binding had no test at all: neutering the comparison left the
+    // entire suite green, so nothing would have caught its removal. It exists
+    // because matching a review by id alone trusted the file's *name* — edit
+    // `feature_actor_id` and the separation check compares against somebody
+    // else, turning the record that proves who wrote the code into the thing
+    // an author edits in order to bless it.
+    let (workspace, id) = reviewed(1);
+
+    let reviews = workspace.control.join("reviews");
+    let path = std::fs::read_dir(&reviews)
+        .expect("the review directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|kind| kind == "json"))
+        .expect("a recorded review");
+
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        record["feature_actor_id"], "operator",
+        "the fixture's author"
+    );
+    record["feature_actor_id"] = serde_json::json!("somebody-else");
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(&workspace.control, &["commit", "-q", "-m", "tamper"]);
+
+    // `operator` wrote the card. With the edit believed, they are no longer
+    // the implementer as far as the check can tell.
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "an altered approval must not decide who may accept"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-NOT-INTEGRABLE");
+}
+
+#[test]
 fn an_acceptance_dry_run_refuses_the_author_too() {
     // Regression, RV-000036. The check lived inside the record builder, which
     // the preview never calls, so a dry run succeeded for an implementer whose
