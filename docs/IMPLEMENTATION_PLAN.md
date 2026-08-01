@@ -2828,6 +2828,57 @@ Potential capabilities:
 
 Configuration declarations alone MUST NOT be described as enforced isolation.
 
+### WP-720 — Governed external actions
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | `Q-004`, `Q-005`, `WP-710`'s threat-model approval, and a named real workflow |
+| Target release | Undecided; not before the hardened single-repository release |
+
+Change Harness governs code changes and code-validation gates. A broader
+agent-work system would coordinate work whose effects leave the machine —
+publishing documentation, filing or updating tickets, cloud operations. This
+package holds the question. **It adds no capability**, and no connector is
+built until the decision below is accepted.
+
+It is first a scope decision, not a design one. Section 5.2 lists general job
+scheduling, automatic production deployment, and GitHub/GitLab/Jira/Linear
+integration as explicit MVP non-goals. Any external-action capability reverses
+at least one of them, so the first thing this package must produce is the
+argument for doing that, with the evidence, rather than a design that quietly
+assumes it.
+
+Questions to answer:
+
+- What is the general work-item model, and how does code work stay a
+  specialized case of it rather than being generalized away?
+- How are tool capabilities declared, scoped, and audited?
+- Which actions require explicit approval, and how is that approval bound to
+  exact inputs and intended effect — the way acceptance binds one landing
+  commit?
+- How are idempotency, retries, recovery, and partial external completion
+  represented? A gate is rerun against the landing commit and may be retried;
+  anything with an external effect therefore happens more than once.
+- How can a platform supply optional task or identity attestations without
+  making the harness vendor-specific?
+
+Sequencing note: the approval model cannot be specified honestly before
+`Q-004` says who may authorize and `WP-710` says what the executor can be
+prevented from doing. A read-only workflow could be specified now; an
+approval-gated write one could not.
+
+Acceptance:
+
+- a decision recorded in Section 22, with its open questions in Section 23,
+  rather than a separate architecture-decision document competing with those
+  registers;
+- an explicit position on each Section 5.2 non-goal it touches;
+- one narrow, real, read-only workflow specified end to end, and one
+  approval-gated write workflow specified end to end;
+- an explicit statement that no external-action capability ships with the
+  decision itself.
+
 ## 18. Dependency and execution order
 
 The required order is:
@@ -3389,6 +3440,7 @@ These are intentionally time-bounded and do not block `SPIKE-001`.
 | Q-004 | Cryptographic or OS-backed actor identity | Before security-sensitive multi-user use | Blocks hard authorization claim |
 | Q-005 | Sandboxed gate executor technology | Before gates may access sensitive repositories or credentials | Blocks sensitive/production gate use |
 | Q-006 | Long-term artifact storage backend | Before one-year landing-log retention is operational | Blocks hardened retention acceptance |
+| Q-007 | Whether the harness governs actions whose effects leave the machine, and under what trust boundaries | Before any connector, publication, or cloud-operation work begins | Blocks `WP-720`; until it is answered, a gate is a read-only check and external effects do not belong in one |
 
 ## 24. Definition of done for every work package
 
