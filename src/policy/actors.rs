@@ -35,20 +35,42 @@ use crate::error::{ErrorCode, HarnessError};
 
 /// The comparable form of a declared actor identifier.
 ///
-/// Trimmed and case-folded, because `reviewer-b`, `reviewer-b `, and
+/// Trimmed and lowercased, because `reviewer-b`, `reviewer-b `, and
 /// `Reviewer-B` are one person every time they differ, and a separation check
 /// that a trailing space defeats is not a check. Only the comparison is
 /// normalized — records keep the label exactly as it was declared, so an
 /// auditor reads what was typed rather than what was matched.
+///
+/// This is *simple lowercase mapping*, not case folding, and on its own it is
+/// not sufficient; see [`same`].
 #[must_use]
 pub fn normalize(actor: &str) -> String {
     actor.trim().to_lowercase()
 }
 
 /// Whether two declared identifiers name the same actor.
+///
+/// Lowercase **or** uppercase agreement, not lowercase alone. Rust's
+/// `to_lowercase` is Unicode simple lowercase mapping, which is not case
+/// folding: an identifier containing the German sharp s lowercases to itself
+/// while its uppercase spelling lowercases to a double s, so two spellings of
+/// one name compared unequal. A reviewer drove a full lifecycle with such an
+/// identifier and recorded both an acceptance and a promotion under the other
+/// spelling — the guarantee this module exists to provide, defeated by a case
+/// variant, and introduced by the normalization added to fix a *different*
+/// case-sensitivity defect.
+///
+/// Uppercase catches that pair where lowercase does not, and the reverse holds
+/// for other scripts, so both are compared. Proper case folding needs a
+/// Unicode table this crate does not carry; agreeing on either mapping is a
+/// deliberate over-approximation, and over-matching is the safe direction. A
+/// false match refuses two genuinely distinct people and is fixed by choosing
+/// a more distinct identifier; a false mismatch lets an author bless their own
+/// work.
 #[must_use]
 pub fn same(left: &str, right: &str) -> bool {
-    normalize(left) == normalize(right)
+    let (left, right) = (left.trim(), right.trim());
+    left.to_lowercase() == right.to_lowercase() || left.to_uppercase() == right.to_uppercase()
 }
 
 /// Refuses when the actor taking `role` also produced one of the changes.
@@ -57,16 +79,31 @@ pub fn same(left: &str, right: &str) -> bool {
 /// duplicates are harmless. `subject` names what is being acted on, so the
 /// refusal says which integration rather than only which person.
 ///
+/// An unnamed actor is refused outright. `check_independence` already refuses
+/// a review that names no reviewer, and the step that authorizes moving the
+/// protected branch held itself to a lower standard than the one before it —
+/// an acceptance could be recorded, and a promotion run, under an empty owner.
+/// That is not a bypass beyond what D-013 discloses, since an empty string is
+/// simply a second declared name, but a record authorizing a published commit
+/// should not be able to name nobody.
+///
 /// # Errors
 ///
 /// Returns [`ErrorCode::PolicySameActor`] naming the role, the actor, and the
-/// card they wrote.
+/// card they wrote, or [`ErrorCode::PolicyIncompleteReview`] when the actor is
+/// unnamed.
 pub fn refuse_author_acting_as<'a>(
     role: &str,
     actor: &str,
     subject: &str,
     implementers: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), HarnessError> {
+    if actor.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: format!("the {role} for {subject} must be named"),
+            code: ErrorCode::PolicyIncompleteReview,
+        });
+    }
     for (card_id, implementer) in implementers {
         if same(actor, implementer) {
             return Err(HarnessError::Control {
@@ -113,6 +150,46 @@ mod tests {
             rendered.contains("acceptance owner"),
             "names the role: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_non_ascii_case_variant_is_the_same_actor() {
+        // Regression, RV-000038, the one exploitable finding. `to_lowercase`
+        // is simple lowercase mapping, not case folding: the German sharp s
+        // lowercases to itself while its uppercase spelling lowercases to a
+        // double s, so two spellings of one name compared unequal and a
+        // reviewer recorded both an acceptance and a promotion under the other
+        // one. Comparing both mappings closes it; over-matching is the safe
+        // direction for a separation check.
+        assert!(same("Stra\u{df}e", "STRASSE"));
+        assert!(same("STRASSE", "Stra\u{df}e"));
+        assert!(same("  Stra\u{df}e\t", "strasse"));
+        assert!(
+            refuse_author_acting_as(
+                "acceptance owner",
+                "STRASSE",
+                "INT-001",
+                [("F-001", "Stra\u{df}e")],
+            )
+            .is_err(),
+            "the case variant must not reach the authorizing step"
+        );
+        // Genuinely different names still differ.
+        assert!(!same("Stra\u{df}e", "Strasser"));
+    }
+
+    #[test]
+    fn an_unnamed_actor_is_refused() {
+        // `check_independence` refuses a review that names no reviewer; the
+        // step that authorizes moving the protected branch did not, so an
+        // acceptance could be recorded and a promotion run under an empty
+        // owner.
+        for blank in ["", "   ", "\t"] {
+            let error =
+                refuse_author_acting_as("acceptance owner", blank, "INT-001", [("F-001", "a")])
+                    .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview, "{blank:?}");
+        }
     }
 
     #[test]

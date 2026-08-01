@@ -82,7 +82,7 @@ yours to keep rather than something you will be refused for breaking.
 | --- | --- | --- |
 | Coordinator | Cycles, cards, gate registration, integration from `prepare` to `promote` | `--actor` on `cycle`/`card`/`gate register`; `--actor-id` on `integration` |
 | Implementer | One card at a time — its worktree, its gates, its handoff | `--actor` on `work`, `gate run`, `handoff create` |
-| Reviewer | The verdict on a candidate they did not write | `--actor` on `review`; `--reviewer-actor-id` on `integration review` |
+| Reviewer | The verdict on a candidate they did not write | the verdict's own `reviewer_actor_id` for `review record`; `--reviewer-actor-id` on `integration review` |
 | Acceptance owner | Whether a verified integration may move the protected branch | `--acceptance-owner` |
 
 **A command being available is not authority to run it.** Most of this table

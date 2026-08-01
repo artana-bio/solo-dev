@@ -153,7 +153,11 @@ fn deleting_a_member_review_refuses_acceptance_rather_than_permitting_it() {
         "the refusal names the member and points at the diagnosis: {rendered}"
     );
 
-    // And the same for promotion, which derives its check from the same lookup.
+    // Promotion is attempted too, but note what it proves: a failed acceptance
+    // leaves the integration `reviewed`, so this refuses on status before ever
+    // reaching the member lookup. It pins that promotion does not somehow
+    // proceed, not that the lookup fails closed there — a reviewer checked the
+    // latter separately, by deleting the review after a successful acceptance.
     let promoted =
         workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "operator"]);
     assert_ne!(promoted.status.code(), Some(0));
@@ -222,6 +226,142 @@ fn an_acceptance_dry_run_refuses_the_author_too() {
     ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn a_non_ascii_case_variant_of_the_implementer_cannot_accept_or_promote() {
+    // Regression, RV-000038, the exploitable finding. `to_lowercase` is simple
+    // lowercase mapping, not case folding: the German sharp s lowercases to
+    // itself while its uppercase spelling lowercases to a double s. A reviewer
+    // drove exactly this lifecycle and recorded both an acceptance and a
+    // promotion under the other spelling, moving the authority.
+    //
+    // Driven end to end rather than asserted on `same` alone, because the unit
+    // test proves the comparison and this proves the lifecycle actually reaches
+    // it — the exploit was demonstrated here, so the fix is proved here.
+    const AUTHOR: &str = "Stra\u{df}e";
+    const SHOUTED: &str = "STRASSE";
+
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    workspace.work(&["start", "--card-id", "F-001", "--actor", AUTHOR]);
+    let worktree = workspace.worktrees.join("F-001");
+    fs::create_dir_all(worktree.join("src/F-001")).unwrap();
+    fs::write(worktree.join("src/F-001/a.rs"), "// work\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: work"]);
+    workspace.gate(&[
+        "run",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.unit",
+        "--actor",
+        AUTHOR,
+    ]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+        "--actor",
+        AUTHOR,
+    ]);
+
+    workspace.review(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n",
+    )
+    .unwrap();
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict.display().to_string(),
+        "--actor",
+        "reviewer",
+    ]);
+
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "int-reviewer",
+    ]);
+
+    // The whole point: a different *spelling* of the author, not a different
+    // person.
+    let accepted = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        SHOUTED,
+    ]);
+    assert_eq!(
+        accepted.status.code(),
+        Some(5),
+        "a case variant is the author"
+    );
+    assert_eq!(error_code(&accepted), "CH-POLICY-SAME-ACTOR");
+
+    // And promotion, after a legitimate acceptance, is refused the same way.
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    let promoted =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", SHOUTED]);
+    assert_eq!(promoted.status.code(), Some(5));
+    assert_eq!(error_code(&promoted), "CH-POLICY-SAME-ACTOR");
+    assert_eq!(
+        workspace.authority_head(),
+        workspace.integration_json(&["inspect", "--integration-id", &id])["data"]["expected_main_sha"]
+            .as_str()
+            .unwrap(),
+        "the protected branch must not have moved"
+    );
 }
 
 #[test]
