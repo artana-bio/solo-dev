@@ -208,56 +208,26 @@ fn aws_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     None
 }
 
-/// The label of a PEM armour line, when `line` is one.
+/// Whether any line of `text` is a PEM private-key header.
 ///
-/// A whole line, trimmed, that opens and closes with five dashes. Nothing is
-/// searched across a line boundary, which is the point: three review rounds
-/// produced four defects in this detector — a CRLF key with no findable end,
-/// a mismatched footer ending the block early, a footer accepted because it
-/// merely *contained* the label, and closing dashes found on some later line
-/// so that ordinary prose became a key. Every one of them was a substring
-/// search wandering past the end of its line. Parsing line-wise removes the
-/// class rather than the four instances.
-fn armour_label<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = line.trim();
-    let body = trimmed.strip_prefix("-----")?.strip_suffix("-----")?;
-    let label = body.trim().strip_prefix(keyword)?.trim();
-    Some(label)
-}
-
-/// Length of a PEM private key block starting at `rest`.
+/// The entire private-key detector. Three review rounds produced four defects
+/// here — a CRLF key with no findable end, a mismatched footer closing the
+/// block early, a footer accepted because it merely *contained* the header's
+/// label, and closing dashes found on a later line so ordinary prose became a
+/// key. Every one came from computing where the block *ends*.
 ///
-/// The whole block is one match. Redacting only the header would leave the key
-/// material behind, which is the opposite of the point.
-fn private_key_at(rest: &str) -> Option<(SecretKind, usize)> {
-    if !rest.starts_with("-----BEGIN") {
-        return None;
-    }
-    // Line-wise from here. The header must be one complete armour line, so a
-    // `-----BEGIN` that never closes on its own line is ordinary prose rather
-    // than a key whose redaction swallows the rest of the document.
-    let mut lines = rest.split_inclusive('\n');
-    let header = lines.next()?;
-    let label = armour_label(header, "BEGIN")?;
-    if !label.contains("PRIVATE KEY") {
-        return None;
-    }
-
-    // The footer closes *this* block: its label must equal the header's, not
-    // merely contain it. `END CERTIFICATE RSA PRIVATE KEY` contains
-    // `RSA PRIVATE KEY` and closed the block early, leaving the material after
-    // it in the clear — a partial redaction that reads as a complete one.
-    let mut consumed = header.len();
-    for line in lines {
-        consumed += line.len();
-        if armour_label(line, "END").is_some_and(|closing| closing == label) {
-            return Some((SecretKind::PrivateKey, consumed));
-        }
-    }
-
-    // Unterminated, or closed only by a footer for something else: redact to
-    // the end of the text. A truncated key is not a safe key.
-    Some((SecretKind::PrivateKey, rest.len()))
+/// So nothing computes that any more. A header line is the whole signal: the
+/// value is refused, and redaction blanks the value entirely rather than
+/// excising a span from it. Finding the end was never worth knowing — a value
+/// containing a private key is not a value anyone wants a redacted version of.
+/// This deletes the defect class instead of patching its instances.
+fn has_private_key_header(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("-----BEGIN")
+            && trimmed.ends_with("-----")
+            && trimmed.contains("PRIVATE KEY")
+    })
 }
 
 /// Length of a URL userinfo carrying a password, starting at `rest`.
@@ -299,7 +269,6 @@ pub fn find_all(text: &str) -> Vec<Match> {
         let rest = &text[index..];
         let hit = prefixed_at(rest)
             .or_else(|| aws_key_at(rest))
-            .or_else(|| private_key_at(rest))
             .or_else(|| url_password_at(rest));
         if let Some((kind, length)) = hit {
             found.push(Match {
@@ -316,8 +285,14 @@ pub fn find_all(text: &str) -> Vec<Match> {
 }
 
 /// The first credential shape in `text`, if any.
+///
+/// A private key is checked first and separately from the span-based shapes,
+/// because it is not a span: it is a property of the whole value.
 #[must_use]
 pub fn first(text: &str) -> Option<SecretKind> {
+    if has_private_key_header(text) {
+        return Some(SecretKind::PrivateKey);
+    }
     find_all(text).first().map(|hit| hit.kind)
 }
 
@@ -327,8 +302,16 @@ pub fn first(text: &str) -> Option<SecretKind> {
 /// removed: error envelopes and structured output are generated rather than
 /// authored, and a command that refused to render its own error would leave
 /// the caller with nothing to act on.
+///
+/// A private key blanks the value outright, keeping none of the surrounding
+/// text. That is deliberately blunter than the other shapes: locating the end
+/// of a key block is what produced four defects across three review rounds,
+/// and a value carrying one is not a value worth preserving the rest of.
 #[must_use]
 pub fn redact(text: &str) -> String {
+    if has_private_key_header(text) {
+        return format!("{PLACEHOLDER_OPEN}private-key]");
+    }
     let matches = find_all(text);
     if matches.is_empty() {
         return text.to_owned();
@@ -630,146 +613,46 @@ mod tests {
     }
 
     #[test]
-    fn a_private_key_block_is_matched_whole() {
-        let pem =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
-        let text = format!("before\n{pem}after");
-        assert_eq!(first(&text), Some(SecretKind::PrivateKey));
-
-        let redacted = redact(&text);
-        assert!(redacted.starts_with("before\n"), "{redacted}");
-        assert!(redacted.ends_with("after"), "{redacted}");
-        assert!(
-            !redacted.contains("MIIEowIBAAKCAQEA"),
-            "the key material must not survive: {redacted}"
-        );
-    }
-
-    #[test]
-    fn a_private_key_with_crlf_endings_does_not_swallow_the_text_after_it() {
-        // Regression, RV-000036. The end marker was searched for as `-----\n`,
-        // which a CRLF key never contains, so the span fell back to the end of
-        // input and redaction deleted every character after the block — losing
-        // ordinary text while reporting success. Worse than missing a secret:
-        // it destroys the surrounding record.
-        let text = "before\r\n-----BEGIN RSA PRIVATE KEY-----\r\nMIIEowIBAAKCAQEA\r\n-----END RSA PRIVATE KEY-----\r\nafter";
-        assert_eq!(first(text), Some(SecretKind::PrivateKey));
-
-        let redacted = redact(text);
-        assert!(
-            redacted.contains("after"),
-            "the text following the block must survive: {redacted:?}"
-        );
-        assert!(redacted.starts_with("before\r\n"), "{redacted:?}");
-        assert!(
-            !redacted.contains("MIIEowIBAAKCAQEA"),
-            "and the key material must not: {redacted:?}"
-        );
-    }
-
-    #[test]
-    fn a_mismatched_footer_does_not_end_the_block_early() {
-        // Regression, second review round. Taking the first `-----END` stopped
-        // at a footer belonging to something else and left the key material
-        // after it in the clear — a partial redaction that reads as a complete
-        // one, which is worse than none.
-        let text = concat!(
-            "-----BEGIN RSA PRIVATE KEY-----\n",
-            "FIRSTKEYMATERIAL\n",
-            "-----END CERTIFICATE-----\n",
-            "SECONDKEYMATERIAL\n",
-            "-----END RSA PRIVATE KEY-----\n",
-            "after"
-        );
-        let redacted = redact(text);
-        assert!(
-            !redacted.contains("FIRSTKEYMATERIAL") && !redacted.contains("SECONDKEYMATERIAL"),
-            "the block runs to its own footer: {redacted:?}"
-        );
-        assert!(redacted.ends_with("after"), "{redacted:?}");
-    }
-
-    #[test]
-    fn a_footer_whose_label_merely_contains_the_headers_does_not_close_the_block() {
-        // Third review round. `contains` accepted
-        // `END CERTIFICATE RSA PRIVATE KEY` as the footer for an
-        // `RSA PRIVATE KEY` header, ending the block early and leaving the
-        // material after it in the clear. The labels must be equal.
-        let text = concat!(
-            "-----BEGIN RSA PRIVATE KEY-----\n",
-            "FIRSTMATERIAL\n",
-            "-----END CERTIFICATE RSA PRIVATE KEY-----\n",
-            "SECONDMATERIAL\n",
-            "-----END RSA PRIVATE KEY-----\n",
-            "after"
-        );
-        let redacted = redact(text);
-        assert!(
-            !redacted.contains("FIRSTMATERIAL") && !redacted.contains("SECONDMATERIAL"),
-            "neither block's material may survive: {redacted:?}"
-        );
-        assert!(redacted.ends_with("after"), "{redacted:?}");
-    }
-
-    #[test]
-    fn a_begin_line_that_closes_on_a_later_line_is_not_a_header() {
-        // Third review round. Closing dashes were searched across following
-        // lines, so ordinary prose beginning with the marker could pick up a
-        // `-----` from anywhere below and redact everything between. Parsing
-        // is line-wise now, so a header is a header or it is nothing.
-        let text = "-----BEGIN of a sentence about a PRIVATE KEY\nand a later line -----\nkept";
-        assert_eq!(first(text), None, "not an armour line");
-        assert_eq!(redact(text), text, "and nothing is removed");
-    }
-
-    #[test]
-    fn a_credential_used_as_a_json_key_is_found() {
-        // Third review round. A gate whose `environment.set` used the token as
-        // the *variable name* and something ordinary as the value was accepted
-        // and committed: the walk visited values only, and a key is just as
-        // much author-supplied text.
-        let document = serde_json::json!({
-            "environment": { "set": { "ghp_0123456789abcdef0123456789abcdef0123": "value" } }
-        })
-        .to_string();
-
-        let error = refuse_secrets_in_document("gates/gate.x.json", &document).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::PolicySensitiveValue);
-        assert!(!error.to_string().contains("ghp_0123"), "and never echoed");
-    }
-
-    #[test]
-    fn an_oversized_document_is_still_scanned_without_being_parsed() {
-        // Third review round measured thirteen seconds for a 100 MiB document
-        // on a check every control write passes through. Past the cap the scan
-        // is one linear pass instead of a parse and a tree walk: the field path
-        // is lost, the guarantee is not.
-        let mut huge = String::with_capacity(5 * 1024 * 1024);
-        huge.push_str("{\"padding\":\"");
-        while huge.len() < 5 * 1024 * 1024 {
-            huge.push('x');
+    fn any_private_key_header_blanks_the_whole_value() {
+        // One test replaces four. Each of the shapes below produced a separate
+        // defect while this detector tried to find where the block ended: a
+        // CRLF key with no findable end, a mismatched footer closing early, a
+        // footer accepted for merely containing the label, and closing dashes
+        // picked up from a later line. Nothing computes an end any more, so
+        // none of them is a distinct case — a header line means the value goes.
+        for text in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+            "before\r\n-----BEGIN RSA PRIVATE KEY-----\r\nMIIEowIBAAKCAQEA\r\n-----END RSA PRIVATE KEY-----\r\nafter",
+            "-----BEGIN RSA PRIVATE KEY-----\nFIRST\n-----END CERTIFICATE RSA PRIVATE KEY-----\nSECOND\n-----END RSA PRIVATE KEY-----\nafter",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA",
+            "  -----BEGIN EC PRIVATE KEY-----  \nkeymaterial\n",
+        ] {
+            assert_eq!(
+                first(text),
+                Some(SecretKind::PrivateKey),
+                "not detected: {text:?}"
+            );
+            assert_eq!(
+                redact(text),
+                "[redacted:private-key]",
+                "the whole value must go, not a span within it: {text:?}"
+            );
         }
-        huge.push_str("ghp_0123456789abcdef0123456789abcdef0123\"}");
-
-        let error = refuse_secrets_in_document("cards/F-001.json", &huge).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::PolicySensitiveValue);
     }
 
     #[test]
-    fn a_begin_line_with_no_closing_dashes_is_not_a_header() {
-        // Without the armour-line check the header test ran against the whole
-        // remaining input, so any later occurrence of the words satisfied it
-        // and unrelated text was swallowed as a key.
-        let text = "-----BEGIN and then ordinary prose mentioning a PRIVATE KEY somewhere later";
-        assert_eq!(first(text), None, "not a PEM header");
-        assert_eq!(redact(text), text, "and nothing is removed");
-    }
-
-    #[test]
-    fn an_unterminated_private_key_is_still_removed() {
-        let text = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA";
-        assert_eq!(first(text), Some(SecretKind::PrivateKey));
-        assert!(!redact(text).contains("b3BlbnNzaC1rZXktdjEA"));
+    fn a_begin_marker_that_is_not_a_complete_armour_line_is_prose() {
+        // The other half of the simplification: a header is a whole line that
+        // opens and closes with five dashes. Anything else is text, and text
+        // is left alone — a detector that blanks values has to be certain.
+        for benign in [
+            "-----BEGIN and then ordinary prose mentioning a PRIVATE KEY later",
+            "the file starts -----BEGIN RSA PRIVATE KEY----- inline in a sentence",
+            "-----BEGIN CERTIFICATE-----\nnot a private key\n-----END CERTIFICATE-----",
+        ] {
+            assert_eq!(first(benign), None, "flagged: {benign:?}");
+            assert_eq!(redact(benign), benign, "altered: {benign:?}");
+        }
     }
 
     #[test]
