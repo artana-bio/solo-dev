@@ -81,6 +81,38 @@ change-harness doctor --workspace .
 Git ≥ 2.50 is required (for `git merge-tree --write-tree`) and validated
 rather than silently degraded.
 
+## Roles, authority, and when to stop
+
+Every command in this CLI is available to you at every moment. That is a
+property of a single-user local tool, not a grant. The harness records the
+role you declare and cannot verify it (D-013), so most of what follows is
+yours to keep rather than something you will be refused for breaking.
+
+| Role | Owns | Declares itself as |
+| --- | --- | --- |
+| Coordinator | Cycles, cards, gate registration, integration from `prepare` to `promote` | `--actor` on `cycle`/`card`/`gate register`; `--actor-id` on `integration` |
+| Implementer | One card at a time — its worktree, its gates, its handoff | `--actor` on `work`, `gate run`, `handoff create` |
+| Reviewer | The verdict on a candidate they did not write | `--actor` on `review`; `--reviewer-actor-id` on `integration review` |
+| Acceptance owner | Whether a verified integration may move the protected branch | `--acceptance-owner` |
+
+**A command being available is not authority to run it.** Nothing stops an
+implementer from recording their own acceptance, registering a gate, or
+promoting. The two cases the harness does refuse are self-review of a card and
+reviewing your own integration verification; everything else rests on you
+declaring the role you are actually in.
+
+**Escalate and stop** — do not resolve it yourself — when any of these is
+ambiguous: what is in scope, who owns a file or a decision, how much risk a
+change carries, what the acceptance criteria actually require, or what the
+product is supposed to do. These are the questions where a confident wrong
+answer is expensive and a question is cheap. Write down what you were about to
+assume, and ask. `work block --actor …` exists for the case where you cannot
+proceed at all.
+
+Throughout this guide: a **refusal** is something the tool does, and a **rule**
+is something you do. Where the difference matters it is stated. Do not read a
+rule as a guarantee that something will catch you.
+
 ## The actor-flag split (read this before anything fails)
 
 Different command families name the acting party differently. This is a known,
@@ -170,6 +202,16 @@ stops a gate from reaching the network, and `gate show` prints
 `network_enforced=false` beside the declaration. Do not read `denied` as
 isolation, and do not put a credential in `environment.set` on the theory that
 the gate cannot phone home with it.
+
+**A gate is a read-only check.** It observes the candidate and reports;
+publishing, deploying, notifying, filing, or writing to any system outside the
+worktree does not belong in one. Two reasons, and the second is the one that
+bites: a gate is rerun against the landing commit during integration and may
+be retried on failure, so anything it does externally happens more than once
+and at times nobody chose; and a receipt is evidence about a commit, which it
+stops being the moment the run also changed the world. The harness cannot
+check this — `argv` is whatever was registered — so it is a rule, not a
+refusal.
 
 ### 2. Open a cycle
 
