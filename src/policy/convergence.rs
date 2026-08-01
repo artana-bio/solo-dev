@@ -18,6 +18,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::policy::paths::{self, CaseSensitivity};
+
 /// How wide a card's declared scope is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeBreadth {
@@ -62,13 +64,16 @@ pub const BROAD_AREA_COUNT: usize = 4;
 /// the area it started in. Two notions of "area" is what made that possible.
 ///
 /// Returns `None` only for a path with no non-empty component at all.
+///
+/// Takes the canonical spelling first, so that the areas agree with the path
+/// counts about which declarations name the same file.
 fn area_of(path: &str) -> Option<String> {
-    let trimmed = path.trim_start_matches("./");
-    let mut parts = trimmed.split('/').filter(|part| !part.is_empty());
+    let canonical = paths::canonical(path, CaseSensitivity::host());
+    let mut parts = canonical.split('/');
     match (parts.next(), parts.next()) {
         (Some("src"), Some(second)) if !second.contains('*') => Some(format!("src/{second}")),
-        (Some(first), _) => Some(first.to_owned()),
-        (None, _) => None,
+        (Some(first), _) if !first.is_empty() => Some(first.to_owned()),
+        _ => None,
     }
 }
 
@@ -76,7 +81,12 @@ impl ScopeBreadth {
     /// Measures a card's include list.
     #[must_use]
     pub fn measure(include: &[String]) -> Self {
-        let distinct: BTreeSet<&str> = include.iter().map(String::as_str).collect();
+        let case = CaseSensitivity::host();
+        let distinct: BTreeSet<String> = include
+            .iter()
+            .map(|path| paths::canonical(path, case))
+            .filter(|path| !path.is_empty())
+            .collect();
         let areas: BTreeSet<String> = distinct.iter().filter_map(|path| area_of(path)).collect();
         Self {
             paths: distinct.len(),
@@ -527,6 +537,74 @@ mod tests {
             breadth.advisory().is_none(),
             "and so nothing to say about it"
         );
+    }
+
+    #[test]
+    fn one_path_spelled_many_ways_is_one_path() {
+        // Round 3 of this card's own review, verbatim: the same file written
+        // thirteen ways. Round 2 had fixed identical strings, which is the
+        // narrower half of the same defect — the count was still comparing
+        // spellings rather than paths.
+        let aliased = paths(&[
+            "src/a.rs",
+            "./src/a.rs",
+            ".//src/a.rs",
+            "././src/a.rs",
+            "src//a.rs",
+            "src///a.rs",
+            "src/./a.rs",
+            "src/.//a.rs",
+            "src//./a.rs",
+            "src/a.rs/",
+            "src/a.rs//",
+            "./src/a.rs/",
+            ".//src//a.rs",
+        ]);
+        let breadth = ScopeBreadth::measure(&aliased);
+        assert_eq!(breadth.paths, 1, "thirteen spellings of one file");
+        assert_eq!(breadth.areas, 1, "and therefore one area, not two");
+        assert!(breadth.advisory().is_none());
+    }
+
+    #[test]
+    fn finding_locations_are_compared_as_paths_too() {
+        // `measure` canonicalizes before it asks for areas, so the scope tests
+        // cannot see whether `area_of` does it as well. Finding locations come
+        // straight from a reviewer's verdict and are never canonicalized on
+        // the way in, which makes this the only place that property is
+        // observable — and a reviewer writing `./src/policy/b.rs` in round 3
+        // must not read as the card spreading somewhere new.
+        let history = [
+            Round::new(["src/policy/a.rs", "src/policy/b.rs", "src/policy/c.rs"]),
+            Round::new(["src/policy/a.rs", "src/policy/b.rs"]),
+            Round::new(["./src/./policy//d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert!(
+            trend.new_areas.is_empty(),
+            "a differently spelled path is not a new area: {:?}",
+            trend.new_areas
+        );
+        assert!(trend.advisory().is_none(), "and so there is nothing to say");
+    }
+
+    #[test]
+    fn case_aliases_follow_the_host() {
+        // Not an exotic input — a typo in one include entry. On macOS these
+        // are the same file, and the harness already treats them as the same
+        // path everywhere else; this asks that the count agree.
+        let mixed = paths(&["src/policy/a.rs", "SRC/Policy/a.rs"]);
+        let breadth = ScopeBreadth::measure(&mixed);
+        let expected = if CaseSensitivity::host() == CaseSensitivity::Insensitive {
+            1
+        } else {
+            2
+        };
+        assert_eq!(
+            breadth.paths, expected,
+            "path identity must match the host the harness is running on"
+        );
+        assert_eq!(breadth.areas, expected);
     }
 
     #[test]
