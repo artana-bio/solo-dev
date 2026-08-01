@@ -19,6 +19,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     policy::allocation::{Claim, check_admissible, check_dependencies},
+    policy::convergence::ScopeBreadth,
 };
 
 /// Schema identifier for a card's mutable state file.
@@ -567,7 +568,11 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             )?;
             control.commit(expected, &format!("card: activate {card_id} r1"))?;
 
-            Ok(CommandOutcome::new(
+            // Leading signal, asked while the answer is still cheap. The card
+            // is already written and activation has already succeeded; this
+            // only decides whether to say something about its breadth.
+            let breadth = ScopeBreadth::measure(&record.write_scope.include);
+            let mut outcome = CommandOutcome::new(
                 "card.activate",
                 format!(
                     "Activated card {card_id} at revision 1\ndigest: {digest}\nstate: {}",
@@ -578,9 +583,15 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
                     "revision": 1,
                     "digest": digest.as_str(),
                     "state": CardState::Ready.name(),
+                    "scope_paths": breadth.paths,
+                    "scope_areas": breadth.areas,
                 }),
             )
-            .with_project(config.project_id.clone()))
+            .with_project(config.project_id.clone());
+            if let Some(advisory) = breadth.advisory() {
+                outcome = outcome.with_warning(advisory);
+            }
+            Ok(outcome)
         },
     )
 }

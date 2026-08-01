@@ -28,6 +28,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
+    policy::convergence::{Round, Trend},
 };
 
 /// Subcommands under `review`.
@@ -594,11 +595,16 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &format!("review: {} {card_id}", verdict.decision.name()),
             )?;
 
+            // Read back after the commit so the history includes this round;
+            // the trend is about the sequence, and the round being recorded is
+            // the most informative point in it.
+            let history = reviews_for(control, &card_id)?;
             Ok(report_review(
                 &review,
                 &digest,
                 next_state,
                 &config.project_id,
+                &history,
             ))
         },
     )
@@ -610,6 +616,7 @@ fn report_review(
     digest: &crate::domain::digest::Digest,
     next_state: CardState,
     project_id: &crate::domain::ids::ProjectId,
+    history: &[ReviewRecord],
 ) -> CommandOutcome {
     let text = format!(
         "Recorded `{}` for card {}\nreview: {}\nreviewer: {}\ncandidate: {}\nfindings: {}\ncard state: {next_state}",
@@ -631,6 +638,25 @@ fn report_review(
         }),
     )
     .with_project(project_id.clone());
+
+    // Lagging signal. Every round this card has had, including this one,
+    // reduced to open findings and where they landed. Silent until three
+    // rounds exist and silent while the card is converging — a signal that
+    // fires on healthy work is one people learn to skip.
+    let rounds: Vec<Round> = history
+        .iter()
+        .map(|past| {
+            Round::new(
+                past.findings
+                    .iter()
+                    .filter(|finding| finding.disposition.blocks_approval())
+                    .map(|finding| finding.location.as_str()),
+            )
+        })
+        .collect();
+    if let Some(advisory) = Trend::measure(&rounds).advisory() {
+        outcome = outcome.with_warning(advisory);
+    }
 
     if !review.gate_adequacy.gates_observe_acceptance {
         // SPIKE-001 F-5: surfaced rather than buried. A green gate that cannot
