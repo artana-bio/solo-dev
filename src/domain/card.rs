@@ -794,6 +794,43 @@ mod tests {
     }
 
     #[test]
+    fn every_free_text_field_of_a_card_is_scanned() {
+        // The card is the first durable record in the lifecycle, so it is the
+        // first place a credential can become permanent. Enumerated so a field
+        // added to the struct and not to the scan fails here.
+        const SECRET: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+        /// A named field and the mutator that plants a credential in it.
+        type Poison = (&'static str, fn(&mut CardDraft));
+        let poison: [Poison; 6] = [
+            ("title", |d| d.title = SECRET.to_owned()),
+            ("goal", |d| d.goal = SECRET.to_owned()),
+            ("rollback_strategy", |d| {
+                d.rollback_strategy = SECRET.to_owned();
+            }),
+            ("non_goals[0]", |d| d.non_goals = vec![SECRET.to_owned()]),
+            ("acceptance.behaviors[0]", |d| {
+                d.acceptance.behaviors = vec![SECRET.to_owned()];
+            }),
+            ("exclusive_resources[0]", |d| {
+                d.exclusive_resources = vec![SECRET.to_owned()];
+            }),
+        ];
+
+        assert!(draft().validate().is_ok(), "the fixture is clean");
+        for (field, poison) in poison {
+            let mut draft = draft();
+            poison(&mut draft);
+            let error = draft
+                .validate()
+                .expect_err(&format!("`{field}` must be scanned"));
+            assert_eq!(error.code(), ErrorCode::PolicySensitiveValue, "{field}");
+            let rendered = error.to_string();
+            assert!(rendered.contains(field), "{field}: {rendered}");
+            assert!(!rendered.contains(SECRET), "{field} echoed it: {rendered}");
+        }
+    }
+
+    #[test]
     fn equivalent_drafts_produce_the_same_digest() {
         // Same content authored with fields in a different order.
         let yaml_one = "\

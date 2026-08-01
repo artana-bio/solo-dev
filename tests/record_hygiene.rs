@@ -215,6 +215,82 @@ fn a_gate_definition_carrying_a_credential_value_is_refused() {
 }
 
 #[test]
+fn a_credential_in_gate_argv_is_refused() {
+    // `WP-530`'s leak fixture used to be the only thing exercising this path,
+    // by registering a gate whose argv held an example AWS key. Fixing that
+    // fixture removed the coverage with it, so the case is pinned here on
+    // purpose: an argument list is as committed as any other part of the
+    // definition, and `--header Authorization: Bearer …` is a realistic way to
+    // reach it.
+    let workspace = Workspace::initialized();
+    let body = format!(
+        "schema: harness.gate/v1\ngate_id: gate.fetch\nrevision: 1\nargv: [\"curl\", \"-H\", \"Authorization: Bearer {TOKEN}\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: allowed\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+    );
+    let path = workspace.gate_definition("fetch", &body);
+
+    let output = workspace.gate_raw(&["validate", "--definition", &path]);
+    assert_ne!(output.status.code(), Some(0), "must not be accepted");
+    let whole = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        whole.contains("gate.argv[2]"),
+        "the refusal names the argument position: {whole}"
+    );
+    assert!(!whole.contains(TOKEN), "and does not echo it: {whole}");
+}
+
+#[test]
+fn a_text_mode_error_redacts_what_the_envelope_would_have() {
+    // Text is the default output mode, and a terminal is scrollback. Covered
+    // separately because it renders through a different path in `main` than
+    // the JSON envelope does.
+    let workspace = Workspace::initialized();
+    let output = Workspace::run(&[
+        "cycle".to_owned(),
+        "create".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--cycle-id".to_owned(),
+        TOKEN.to_owned(),
+        "--objective".to_owned(),
+        "an identifier that is really a token".to_owned(),
+    ]);
+
+    assert_ne!(output.status.code(), Some(0));
+    let whole = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!whole.contains(TOKEN), "text mode leaked it: {whole}");
+    assert!(
+        whole.contains("[redacted:github-token]"),
+        "and it says something was removed: {whole}"
+    );
+}
+
+#[test]
+fn structured_error_details_are_redacted_too() {
+    // `message` and `details` are built from different sources — one from the
+    // error's Display, one from its structured fields — so proving the first
+    // is redacted says nothing about the second.
+    let workspace = Workspace::initialized();
+    let output = workspace.cycle_raw(&[
+        "create",
+        "--cycle-id",
+        TOKEN,
+        "--objective",
+        "an identifier that is really a token",
+    ]);
+
+    let body = envelope(&output);
+    let details = serde_json::to_string(&body["error"]["details"]).unwrap();
+    assert!(
+        !details.contains(TOKEN),
+        "the details payload carried it through: {details}"
+    );
+}
+
+#[test]
 fn an_ordinary_card_is_still_accepted() {
     // The control that fires on ordinary evidence gets switched off. This is
     // the half of the behavior that keeps the other half deployable.

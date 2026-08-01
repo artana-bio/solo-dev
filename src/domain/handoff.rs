@@ -436,6 +436,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_free_text_field_of_a_declaration_is_scanned() {
+        // Enumerated rather than sampled. The scan is a per-field loop, so the
+        // way it breaks is a field being added to the struct and not to the
+        // loop — which no test that poisons one field would ever notice.
+        const SECRET: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+        /// A named field and the mutator that plants a credential in it.
+        type Poison = (&'static str, fn(&mut ActorDeclaration));
+        let poison: [Poison; 6] = [
+            ("behavior_delivered", |d| {
+                d.behavior_delivered = SECRET.to_owned();
+            }),
+            ("rollback_notes", |d| {
+                d.rollback_notes = SECRET.to_owned();
+            }),
+            ("implementation_decisions[0]", |d| {
+                d.implementation_decisions = vec![SECRET.to_owned()];
+            }),
+            ("assumptions[0]", |d| {
+                d.assumptions = vec![SECRET.to_owned()];
+            }),
+            ("known_limitations[0]", |d| {
+                d.known_limitations = vec![SECRET.to_owned()];
+            }),
+            ("residual_risks[0]", |d| {
+                d.residual_risks = vec![SECRET.to_owned()];
+            }),
+        ];
+
+        assert!(declaration().validate().is_ok(), "the fixture is clean");
+        for (field, poison) in poison {
+            let mut declaration = declaration();
+            poison(&mut declaration);
+            let error = declaration
+                .validate()
+                .expect_err(&format!("`{field}` must be scanned"));
+            assert_eq!(error.code(), ErrorCode::PolicySensitiveValue, "{field}");
+            let rendered = error.to_string();
+            assert!(rendered.contains(field), "{field}: {rendered}");
+            assert!(!rendered.contains(SECRET), "{field} echoed it: {rendered}");
+        }
+    }
+
     fn handoff() -> HandoffRecord {
         HandoffRecord {
             schema: HANDOFF_SCHEMA.to_owned(),
