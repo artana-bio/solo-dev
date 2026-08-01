@@ -21,6 +21,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::diff::ChangedPath,
+    policy::hygiene,
 };
 
 /// Schema identifier for a handoff.
@@ -98,6 +99,23 @@ impl ActorDeclaration {
                 ),
                 code: ErrorCode::PolicyIncompleteHandoff,
             });
+        }
+
+        // Last point at which a credential can be kept out. The declaration is
+        // committed to control from here on, and control history is the
+        // integrity chain, so there is no later stage that could remove it
+        // without breaking the thing the record exists to prove.
+        hygiene::refuse_secret("handoff.behavior_delivered", &self.behavior_delivered)?;
+        hygiene::refuse_secret("handoff.rollback_notes", &self.rollback_notes)?;
+        for (field, entries) in [
+            ("implementation_decisions", &self.implementation_decisions),
+            ("assumptions", &self.assumptions),
+            ("known_limitations", &self.known_limitations),
+            ("residual_risks", &self.residual_risks),
+        ] {
+            for (index, entry) in entries.iter().enumerate() {
+                hygiene::refuse_secret(&format!("handoff.{field}[{index}]"), entry)?;
+            }
         }
         Ok(())
     }

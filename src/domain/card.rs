@@ -17,6 +17,7 @@ use crate::{
         ids::{CardId, CycleId},
     },
     error::{ErrorCode, HarnessError},
+    policy::hygiene,
 };
 
 /// Schema identifier for an activated card.
@@ -514,6 +515,24 @@ impl CardDraft {
                 "base_sha must be a full 40-character object ID, found `{}`",
                 self.base_sha
             )));
+        }
+
+        // The card is the first durable record in the lifecycle, so it is the
+        // first place a credential can become permanent.
+        hygiene::refuse_secrets([
+            ("card.title", self.title.as_str()),
+            ("card.goal", self.goal.as_str()),
+            ("card.rollback_strategy", self.rollback_strategy.as_str()),
+        ])?;
+        for (field, entries) in [
+            ("non_goals", &self.non_goals),
+            ("acceptance.behaviors", &self.acceptance.behaviors),
+            ("acceptance.regressions", &self.acceptance.regressions),
+            ("exclusive_resources", &self.exclusive_resources),
+        ] {
+            for (index, entry) in entries.iter().enumerate() {
+                hygiene::refuse_secret(&format!("card.{field}[{index}]"), entry)?;
+            }
         }
         if self.depends_on.contains(&self.card_id) {
             return Err(reject(format!(

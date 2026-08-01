@@ -5,5 +5,6 @@
 //! whether a mutation is allowed.
 
 pub mod allocation;
+pub mod hygiene;
 pub mod paths;
 pub mod verification;

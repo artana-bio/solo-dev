@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::ids::{OperationId, ProjectId},
     error::HarnessError,
+    policy::hygiene,
 };
 
 /// Schema identifier for a successful command result.
@@ -73,16 +74,26 @@ pub struct CommandErrorEnvelope {
 
 impl CommandErrorEnvelope {
     /// Builds an envelope for one failure.
+    /// Builds an envelope for one failure.
+    ///
+    /// The message and details are redacted on the way out. Unlike a card or a
+    /// handoff, an error is generated rather than authored, so there is nobody
+    /// to hand it back to for correction — and an error is the likeliest place
+    /// for an input to be echoed, because saying what was wrong usually means
+    /// quoting it. Failing closed here would leave a caller with no diagnosis
+    /// at all, so this one surface redacts instead of refusing.
     #[must_use]
     pub fn new(command: impl Into<String>, error: &HarnessError) -> Self {
+        let mut details = error.details();
+        hygiene::redact_json(&mut details);
         Self {
             schema: ERROR_SCHEMA.to_owned(),
             command: command.into(),
             status: "error".to_owned(),
             error: CommandErrorBody {
                 code: error.code().as_string(),
-                message: error.to_string(),
-                details: error.details(),
+                message: hygiene::redact(&error.to_string()),
+                details,
                 recovery: error.code().recovery().to_owned(),
             },
         }

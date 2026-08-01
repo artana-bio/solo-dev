@@ -25,6 +25,7 @@ use crate::{
         ids::{CardId, CycleId, ReviewId},
     },
     error::{ErrorCode, HarnessError},
+    policy::hygiene,
 };
 
 /// Schema identifier for a review.
@@ -325,6 +326,26 @@ impl ReviewRecord {
                 reason: "a review must state how gate adequacy was established".to_owned(),
                 code: ErrorCode::PolicyIncompleteReview,
             });
+        }
+
+        // A review states specifically what was run, which is exactly the kind
+        // of prose that ends up carrying a token pasted from a terminal.
+        hygiene::refuse_secret("review.gate_adequacy.basis", &self.gate_adequacy.basis)?;
+        for (index, behavior) in self.gate_adequacy.unobserved_behaviors.iter().enumerate() {
+            hygiene::refuse_secret(
+                &format!("review.gate_adequacy.unobserved_behaviors[{index}]"),
+                behavior,
+            )?;
+        }
+        for (index, finding) in self.findings.iter().enumerate() {
+            hygiene::refuse_secret(
+                &format!("review.findings[{index}].location"),
+                &finding.location,
+            )?;
+            hygiene::refuse_secret(&format!("review.findings[{index}].detail"), &finding.detail)?;
+        }
+        for (index, risk) in self.residual_risks.iter().enumerate() {
+            hygiene::refuse_secret(&format!("review.residual_risks[{index}]"), risk)?;
         }
 
         Ok(())

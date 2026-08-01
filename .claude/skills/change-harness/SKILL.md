@@ -40,6 +40,16 @@ one and the harness will usually refuse you later, at a worse moment.
 6. **A review is evidence only if it tried to break something.** Record what
    you tried that failed. Approving because the diff "looks right" is the
    failure mode this tool exists to prevent.
+7. **Never put a credential in a record.** Cards, handoffs, reviews, and gate
+   definitions are committed to the control repository, and control history is
+   the integrity chain — nothing can remove one later without breaking what
+   the record proves. The harness refuses the shapes it recognizes (exit 5,
+   `CH-POLICY-SENSITIVE-VALUE`, naming the field and not the value), but it
+   recognizes *shapes*: an internal token with no distinctive prefix passes
+   straight through, so the rule is yours to keep. A gate that needs a
+   credential names it under `environment.allow` and lets the host supply it —
+   `environment.set` holds literal values and is committed with the
+   definition.
 
 ## Setup
 
@@ -366,6 +376,7 @@ worktrees; `close` refuses to delete anything that would become unreachable.
 | You see | It means | Do |
 | --- | --- | --- |
 | `CH-POLICY-CANDIDATE-OUT-OF-SCOPE` (exit 5) | The candidate touches a path outside `write_scope`; the path is named | Drop the change, or `card revise` with the corrected scope, `work resume`, re-gate, re-handoff |
+| `CH-POLICY-SENSITIVE-VALUE` (exit 5) | A record carries what looks like a credential; the field is named, the value never is | Remove it from that field and rotate it — it has been on this machine in plaintext |
 | `CH-POLICY-INVALID-TRANSITION` (exit 5) | The command is not legal from the current state; permitted states are listed | `card status` to see where you are; after `changes_requested`, `work resume` first |
 | `CH-POLICY-NOT-INTEGRABLE` (exit 5) | A named card is not approved-and-current | `integration ready` explains exactly why |
 | `CH-POLICY-OWNERSHIP-OVERLAP` (exit 5) | The card's write scope overlaps another active card's | Narrow one scope (`card revise`), or wait for the other card to land — overlap is refused at activation, not discovered at merge |

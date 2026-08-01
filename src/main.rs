@@ -7,6 +7,7 @@ use change_harness::{
     command_path,
     error::{ErrorCode, HarnessError},
     execute, failure_format,
+    policy::hygiene,
 };
 
 /// Renders a clap parse failure through the stable envelope when JSON was asked
@@ -91,7 +92,7 @@ fn main() -> ExitCode {
             // result, in text and JSON alike. In JSON mode they are also
             // inside the envelope.
             for warning in &execution.warnings {
-                eprintln!("warning: {warning}");
+                eprintln!("warning: {}", hygiene::redact(warning));
             }
             ExitCode::from(ExitCategory::Success)
         }
@@ -103,7 +104,10 @@ fn main() -> ExitCode {
                     Ok(rendered) => println!("{rendered}"),
                     Err(nested) => eprintln!("error: {nested}"),
                 },
-                OutputFormat::Text => eprintln!("error: {error}"),
+                // Text mode redacts for the same reason the envelope does: a
+                // terminal is scrollback, and scrollback is where a pasted
+                // token ends up when the diagnosis quotes what it refused.
+                OutputFormat::Text => eprintln!("error: {}", hygiene::redact(&error.to_string())),
             }
             ExitCode::from(error.category())
         }
