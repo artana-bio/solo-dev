@@ -2306,6 +2306,32 @@ fn require_invariants_addressed(
     })
 }
 
+/// Refuses an integration review recorded by whoever ran the verification.
+///
+/// Section 15.1's independence rule applies here too: whoever ran the gates
+/// cannot be the one who judges what they proved.
+///
+/// The identifier validation runs here rather than a bare comparison, so this
+/// site inherits the unnamed-actor refusal the other separation steps have. It
+/// accepted an empty reviewer id until now — the hole this card closed one step
+/// later at acceptance and left open here.
+fn refuse_verifier_reviewing(
+    verification: &VerificationRecord,
+    reviewer_actor_id: &str,
+) -> Result<(), HarnessError> {
+    actors::refuse_unusable("integration reviewer", reviewer_actor_id)?;
+    actors::refuse_unusable("verifier", &verification.verified_by)?;
+    if actors::same(&verification.verified_by, reviewer_actor_id) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "{reviewer_actor_id} verified this integration and cannot also review it"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
+}
+
 fn run_integration_review(
     args: &ReviewArgs,
     clock: &dyn Clock,
@@ -2349,17 +2375,7 @@ fn run_integration_review(
                 .check_transition(IntegrationStatus::Reviewed)?;
             let verification = load_verification(control, &integration_id)?;
 
-            // Section 15.1's independence rule applies here too: whoever ran
-            // the gates cannot be the one who judges what they proved.
-            if actors::same(&verification.verified_by, &args.reviewer_actor_id) {
-                return Err(HarnessError::Control {
-                    reason: format!(
-                        "{} verified this integration and cannot also review it",
-                        args.reviewer_actor_id
-                    ),
-                    code: ErrorCode::PolicySameActor,
-                });
-            }
+            refuse_verifier_reviewing(&verification, &args.reviewer_actor_id)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 
             record.status = IntegrationStatus::Reviewed;

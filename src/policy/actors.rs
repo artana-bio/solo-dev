@@ -35,42 +35,84 @@ use crate::error::{ErrorCode, HarnessError};
 
 /// The comparable form of a declared actor identifier.
 ///
-/// Trimmed and lowercased, because `reviewer-b`, `reviewer-b `, and
-/// `Reviewer-B` are one person every time they differ, and a separation check
-/// that a trailing space defeats is not a check. Only the comparison is
-/// normalized — records keep the label exactly as it was declared, so an
-/// auditor reads what was typed rather than what was matched.
+/// Whitespace runs collapse to one space and ASCII letters fold to lowercase,
+/// because `reviewer-b`, `reviewer-b `, `Reviewer-B`, and `Alvaro  Alvarez`
+/// with two spaces are one person every time they differ. Only the comparison
+/// is normalized — records keep the label exactly as declared, so an auditor
+/// reads what was typed rather than what was matched.
 ///
-/// This is *simple lowercase mapping*, not case folding, and on its own it is
-/// not sufficient; see [`same`].
-#[must_use]
-pub fn normalize(actor: &str) -> String {
-    actor.trim().to_lowercase()
+/// Total and unambiguous because [`refuse_unusable`] has already established
+/// the identifier is ASCII. Do not call this on unvalidated input.
+fn normalize(actor: &str) -> String {
+    actor
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Refuses an identifier this module cannot compare safely.
+///
+/// **Declared actor identifiers are ASCII.** That is a restriction on what may
+/// be typed, and it is deliberate, because the alternative was three rounds of
+/// getting the comparison wrong:
+///
+/// Exact equality made `Operator` a different person from `operator`. Adding
+/// simple lowercase mapping fixed that and was defeated by the small sharp s,
+/// which lowercases to itself while its uppercase spelling lowercases to a
+/// double s. Comparing both mappings fixed *that* and was defeated by the
+/// capital sharp s, which lowercases to the small form and uppercases to
+/// itself, so the relation was not even transitive — and a reviewer's
+/// exhaustive sweep of every Unicode scalar found it, not the previous fix's
+/// reasoning. Separately, canonically equivalent spellings and zero-width
+/// characters produce identifiers that render identically and compare
+/// differently.
+///
+/// Each fix closed the instance it was shown and left the class open. Correct
+/// Unicode identity needs case folding *and* normalization, which needs tables
+/// this crate does not carry. So the comparison stops trying to be clever about
+/// characters it cannot reason about and refuses them instead: within ASCII,
+/// `to_ascii_lowercase` is total, there is one encoding per glyph, and nothing
+/// is invisible.
+///
+/// The cost is real. A name like `Álvaro` cannot be an actor identifier. An
+/// actor id is an identifier for separation, not a display name, and refusing
+/// it with a clear message beats silently treating two spellings of one person
+/// as two people at the step that authorizes publishing a commit.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyIncompleteReview`] when the identifier is empty,
+/// non-ASCII, or contains an ASCII control character.
+pub fn refuse_unusable(role: &str, actor: &str) -> Result<(), HarnessError> {
+    let trimmed = actor.trim();
+    let reject = |reason: String| HarnessError::Control {
+        reason,
+        code: ErrorCode::PolicyIncompleteReview,
+    };
+    if trimmed.is_empty() {
+        return Err(reject(format!("the {role} must be named")));
+    }
+    if !trimmed.is_ascii() {
+        return Err(reject(format!(
+            "the {role} `{trimmed}` is not ASCII; actor identifiers are compared for separation and must be ASCII, because outside it one name has spellings that render identically and compare differently. Use an ASCII identifier"
+        )));
+    }
+    if trimmed.chars().any(|value| value.is_ascii_control()) {
+        return Err(reject(format!(
+            "the {role} contains a control character; actor identifiers must be printable ASCII"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether two declared identifiers name the same actor.
 ///
-/// Lowercase **or** uppercase agreement, not lowercase alone. Rust's
-/// `to_lowercase` is Unicode simple lowercase mapping, which is not case
-/// folding: an identifier containing the German sharp s lowercases to itself
-/// while its uppercase spelling lowercases to a double s, so two spellings of
-/// one name compared unequal. A reviewer drove a full lifecycle with such an
-/// identifier and recorded both an acceptance and a promotion under the other
-/// spelling — the guarantee this module exists to provide, defeated by a case
-/// variant, and introduced by the normalization added to fix a *different*
-/// case-sensitivity defect.
-///
-/// Uppercase catches that pair where lowercase does not, and the reverse holds
-/// for other scripts, so both are compared. Proper case folding needs a
-/// Unicode table this crate does not carry; agreeing on either mapping is a
-/// deliberate over-approximation, and over-matching is the safe direction. A
-/// false match refuses two genuinely distinct people and is fixed by choosing
-/// a more distinct identifier; a false mismatch lets an author bless their own
-/// work.
+/// Both sides must already have passed [`refuse_unusable`]; within ASCII this
+/// comparison is total, which is the entire reason for that restriction.
 #[must_use]
 pub fn same(left: &str, right: &str) -> bool {
-    let (left, right) = (left.trim(), right.trim());
-    left.to_lowercase() == right.to_lowercase() || left.to_uppercase() == right.to_uppercase()
+    normalize(left) == normalize(right)
 }
 
 /// Refuses when the actor taking `role` also produced one of the changes.
@@ -98,13 +140,12 @@ pub fn refuse_author_acting_as<'a>(
     subject: &str,
     implementers: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), HarnessError> {
-    if actor.trim().is_empty() {
-        return Err(HarnessError::Control {
-            reason: format!("the {role} for {subject} must be named"),
-            code: ErrorCode::PolicyIncompleteReview,
-        });
-    }
+    refuse_unusable(&format!("{role} for {subject}"), actor)?;
     for (card_id, implementer) in implementers {
+        // Both sides, because a comparison is only as total as its worse half:
+        // an ASCII acceptance owner against a non-ASCII implementer is exactly
+        // the shape that let an author bless their own work.
+        refuse_unusable(&format!("implementer of {card_id}"), implementer)?;
         if same(actor, implementer) {
             return Err(HarnessError::Control {
                 reason: format!(
@@ -153,43 +194,63 @@ mod tests {
     }
 
     #[test]
-    fn a_non_ascii_case_variant_is_the_same_actor() {
-        // Regression, RV-000038, the one exploitable finding. `to_lowercase`
-        // is simple lowercase mapping, not case folding: the German sharp s
-        // lowercases to itself while its uppercase spelling lowercases to a
-        // double s, so two spellings of one name compared unequal and a
-        // reviewer recorded both an acceptance and a promotion under the other
-        // one. Comparing both mappings closes it; over-matching is the safe
-        // direction for a separation check.
-        assert!(same("Stra\u{df}e", "STRASSE"));
-        assert!(same("STRASSE", "Stra\u{df}e"));
-        assert!(same("  Stra\u{df}e\t", "strasse"));
-        assert!(
-            refuse_author_acting_as(
-                "acceptance owner",
-                "STRASSE",
-                "INT-001",
-                [("F-001", "Stra\u{df}e")],
-            )
-            .is_err(),
-            "the case variant must not reach the authorizing step"
-        );
-        // Genuinely different names still differ.
-        assert!(!same("Stra\u{df}e", "Strasser"));
+    fn every_case_variant_that_defeated_this_check_is_now_refused() {
+        // Three rounds of fixes each closed the character they were shown.
+        // Exact equality lost to `Operator`; simple lowercase lost to the small
+        // sharp s; comparing both mappings lost to the capital sharp s, whose
+        // orbit it split non-transitively. The class is closed by refusing what
+        // cannot be compared rather than by widening what is compared, so every
+        // row below is a refusal and none depends on having enumerated it.
+        for identifier in [
+            "Stra\u{df}e",                  // small sharp s
+            "STRA\u{1e9e}E",                // capital sharp s, the round-7 bypass
+            "\u{130}zmir",                  // Turkish dotted I
+            "\u{3bf}\u{3b4}\u{3cc}\u{3c2}", // Greek final sigma
+            "caf\u{e9}",                    // composed
+            "cafe\u{301}",                  // decomposed, renders identically
+            "alv\u{200b}aro",               // zero-width space, invisible
+            "\u{430}lvaro",                 // Cyrillic homoglyph
+        ] {
+            assert!(
+                refuse_unusable("acceptance owner", identifier).is_err(),
+                "{identifier:?} must be refused, not compared"
+            );
+        }
     }
 
     #[test]
-    fn an_unnamed_actor_is_refused() {
-        // `check_independence` refuses a review that names no reviewer; the
-        // step that authorizes moving the protected branch did not, so an
-        // acceptance could be recorded and a promotion run under an empty
-        // owner.
+    fn ordinary_ascii_identifiers_still_compare_as_people_expect() {
+        assert!(same("Operator", "OPERATOR"));
+        assert!(same("reviewer-b ", " Reviewer-B"));
+        assert!(same("Alvaro  Alvarez", "alvaro alvarez"));
+        assert!(!same("reviewer-b", "reviewer-c"));
+        for usable in ["operator", "Alvaro Alvarez", "reviewer-b", "o"] {
+            assert!(refuse_unusable("reviewer", usable).is_ok(), "{usable}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_or_unprintable_actor_is_refused() {
         for blank in ["", "   ", "\t"] {
-            let error =
-                refuse_author_acting_as("acceptance owner", blank, "INT-001", [("F-001", "a")])
-                    .unwrap_err();
+            let error = refuse_unusable("acceptance owner", blank).unwrap_err();
             assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview, "{blank:?}");
         }
+        assert!(refuse_unusable("acceptance owner", "oper\u{7}ator").is_err());
+    }
+
+    #[test]
+    fn a_non_ascii_implementer_cannot_be_compared_away() {
+        // The other half: an ASCII blesser against a non-ASCII implementer is
+        // the shape that let an author bless their own work, so both sides are
+        // validated rather than only the one being challenged.
+        let error = refuse_author_acting_as(
+            "acceptance owner",
+            "owner",
+            "INT-001",
+            [("F-001", "STRA\u{1e9e}E")],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
     }
 
     #[test]
