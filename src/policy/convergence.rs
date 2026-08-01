@@ -22,6 +22,11 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeBreadth {
     /// Distinct paths the card may write.
+    ///
+    /// Distinct, not the length of the include list. Round 2 of this card's
+    /// own review declared one path thirteen times and was told the card
+    /// spanned "13 path(s)" — a number that is simply false, and one the
+    /// envelope publishes for programs to read.
     pub paths: usize,
     /// Distinct top-level areas those paths fall under.
     pub areas: usize,
@@ -71,9 +76,10 @@ impl ScopeBreadth {
     /// Measures a card's include list.
     #[must_use]
     pub fn measure(include: &[String]) -> Self {
-        let areas: BTreeSet<String> = include.iter().filter_map(|path| area_of(path)).collect();
+        let distinct: BTreeSet<&str> = include.iter().map(String::as_str).collect();
+        let areas: BTreeSet<String> = distinct.iter().filter_map(|path| area_of(path)).collect();
         Self {
-            paths: include.len(),
+            paths: distinct.len(),
             areas: areas.len(),
             area_names: areas.into_iter().collect(),
         }
@@ -186,20 +192,33 @@ impl Trend {
         }
     }
 
-    /// True when the open-finding count is not falling across the rounds.
+    /// True when this round did not improve on the best any earlier round
+    /// reached.
     ///
     /// Volume alone is not the signal. A round of twelve findings that becomes
     /// six then two is a card being finished. Four, then four, then five, is a
     /// card whose bottom nobody has found.
+    ///
+    /// Measured against the lowest earlier round rather than the first one.
+    /// Round 2 of this card's own review found the first-round comparison
+    /// reading `5 → 3 → 3` as converging, because 3 is still below 5 — a card
+    /// that made early progress and then stopped, which is the most common
+    /// shape a stuck card actually has, and precisely what this exists to
+    /// catch. Against the running best it is flat, correctly.
+    ///
+    /// Using the best rather than the immediately preceding round also keeps
+    /// `3 → 4 → 3` flat: recovering ground already held is not progress.
     #[must_use]
     pub fn is_flat(&self) -> bool {
-        let Some(first) = self.per_round.first() else {
+        let Some((last, earlier)) = self.per_round.split_last() else {
             return false;
         };
-        let Some(last) = self.per_round.last() else {
+        if *last == 0 {
+            // An approval closes the card. Zero open is the end state, not a
+            // plateau, however many rounds it took to get there.
             return false;
-        };
-        *last >= *first && *last > 0
+        }
+        earlier.iter().min().is_some_and(|best| last >= best)
     }
 
     /// The advisory to show after recording, when there is one.
@@ -442,6 +461,71 @@ mod tests {
         assert!(
             trend.advisory().is_none(),
             "a card converging inside one area must not be nagged"
+        );
+    }
+
+    #[test]
+    fn a_card_that_fell_and_then_stopped_is_flat() {
+        // Round 2 of this card's own review. Measured against the *first*
+        // round, 5 → 3 → 3 looked like progress because 3 is below 5, so a
+        // card that made early headway and then stalled — the most common
+        // shape a stuck card has — was told it was converging.
+        let history = [
+            Round::new(["src/policy/a.rs"; 5]),
+            Round::new(["src/policy/a.rs"; 3]),
+            Round::new(["src/policy/a.rs"; 3]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![5, 3, 3]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "nothing new, so the flat count is the only thing that can speak"
+        );
+        assert!(trend.is_flat(), "3 is no better than the 3 before it");
+
+        let advisory = trend.advisory().expect("a plateau is a signal");
+        assert!(advisory.contains("5 → 3 → 3"), "{advisory}");
+        assert!(advisory.contains("not falling"), "{advisory}");
+    }
+
+    #[test]
+    fn regaining_ground_already_held_is_not_progress() {
+        // 3 → 4 → 3 is back where it started. Comparing against the round
+        // immediately before would call this falling.
+        let history = [
+            Round::new(["src/a.rs"; 3]),
+            Round::new(["src/a.rs"; 4]),
+            Round::new(["src/a.rs"; 3]),
+        ];
+        assert!(Trend::measure(&history).is_flat());
+    }
+
+    #[test]
+    fn a_long_card_making_steady_progress_is_never_nagged() {
+        // Every round a new low. The check must stay quiet for as long as
+        // that holds, however many rounds it takes.
+        let history: Vec<Round> = [10, 9, 8, 7, 6, 5]
+            .into_iter()
+            .map(|count| Round::new(std::iter::repeat_n("src/a.rs", count)))
+            .collect();
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![10, 9, 8, 7, 6, 5]);
+        assert!(!trend.is_flat());
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
+    fn one_path_declared_many_times_is_one_path() {
+        // Round 2 of this card's own review: `include.len()` counted entries,
+        // so thirteen copies of one file were reported as "13 path(s)" — a
+        // number that is false, and that the envelope publishes.
+        let repeated = paths(&["src/policy/actors.rs"; 13]);
+        let breadth = ScopeBreadth::measure(&repeated);
+        assert_eq!(breadth.paths, 1, "one distinct path");
+        assert_eq!(breadth.areas, 1);
+        assert!(
+            breadth.advisory().is_none(),
+            "and so nothing to say about it"
         );
     }
 
