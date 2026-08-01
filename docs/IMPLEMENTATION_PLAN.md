@@ -5,12 +5,12 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 51 |
-| Plan date | 2026-07-30 |
+| Plan revision | 52 |
+| Plan date | 2026-07-31 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `claude/project-status-review-543d65` |
+| Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
 | Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 858 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects; every one is now fixed with a mutation proof or explicitly, deliberately left open with a named reason, per `docs/DEFECT-REGISTER.md`. Criterion 9 (no critical or high open defect) now reads `MET` — see Section 19.3. What remains open is criterion 2 (an honest, unresolved bound on scenario-coverage soundness, not a pass or a fail) and the acceptance owner's own signature. |
 | Next executable work package | Acceptance owner resolves Section 19.3 criterion 2 (a larger mutation-audit effort, or a named acceptance of residual risk) and signs the release record; then `WP-530` and `WP-540` |
@@ -3117,6 +3117,7 @@ and `WP-510`: check a claim before writing it down.
 | D-078 | Certify criterion 9 `MET` and bring the Section 19.3 record current | Accepted | A fresh-context reviewer (Claude Sonnet 5; no role in authoring any Section 19.3 code, `F-021`, or its review) re-read `docs/DEFECT-REGISTER.md` end to end and confirmed every entry is either fixed with a mutation proof or explicitly, deliberately left open with a named reason. One recurring low-severity item: an unlabeled bullet under "The test suite" restates the already-closed `Draft → Promoted` coverage gap without its own resolution marker; already found and dispositioned `accepted_risk` by `RV-000025` as zero functional impact, since the authoritative Tier-4 entry for the same defect, earlier in the same file, is unambiguous — not a new finding, and not critical or high severity. Independently spot-checked the higher-severity fix rather than resting on the two prior reports alone: built `change-harness` from `main` at `e70b1a2`, drove it directly against a fresh scratch project, and confirmed both `handoff create --dry-run` and the real command refuse a candidate touching one out-of-scope file with `CH-POLICY-CANDIDATE-OUT-OF-SCOPE`, exit 5, naming the exact path and writing no record, while the identical lease handed off normally once the file was in scope. Criterion 9 now reads `MET`. Criterion 2 remains a genuinely open bound rather than a pass, left for the acceptance owner to close with either a larger mutation-audit effort or a named acceptance of residual risk. The acceptance-signature line (criterion 12) is untouched — that decision belongs to the acceptance owner alone. |
 | D-079 | Accept criterion 2 (all 40 scenarios pass) as disclosed residual risk rather than extend the mutation audit further | Accepted | Only 2 of 18 known over-claiming tests intersect the Section 16.2 scenario trace, both checked and holding; the other ~48 of ~50 tests the trace cites have never been mutation-tested by anyone. That is a real, open bound on confidence, not a demonstrated pass. The acceptance owner weighed extending the audit — of unknown size, following a pattern where every prior round of looking harder found more, D-075's own founding observation — against accepting the bound as it stands, given that severity had converged toward zero even as count had not: everything found in the final rounds was low-severity or already independently guarded. Chose to accept and disclose rather than extend. The criterion is recorded `ACCEPTED RISK`, not rounded up to `MET` — the distinction is the entire point of disclosing it at all, and remains open for future work at the acceptance owner's discretion. |
 | D-080 | Sign the Section 19.3 release record | Accepted | Alvaro Alvarez, acceptance owner, 2026-07-30. Eleven of twelve criteria independently certified `MET` — nine by a certification review that mutation-tested each one by breaking its underlying mechanism and confirming the cited test actually fails, two (work-package completion, README accuracy) by direct record inspection where mutation testing does not apply. The twelfth, criterion 2, is `ACCEPTED RISK` under D-079, not `MET` — the signature certifies that distinction rather than obscuring it. This is what the release record represents: not the absence of open questions, but that every open question is named, evidenced, and knowingly carried rather than hidden. Signing does not modify or supersede any individual defect, decision, or review already recorded in this document or in `docs/DEFECT-REGISTER.md`. |
+| D-081 | Lift D-014's public-distribution hold and distribute Change Harness under an ARTANA proprietary, all-rights-reserved license | Accepted 2026-07-31 by Alvaro Alvarez; implemented by `F-026` | `LICENSE` names ARTANA and grants no redistribution rights. `F-026` adds tag-triggered GitHub Release artifacts and a checksum-verifying installer. Cargo's `publish = false` remains in place because this decision authorizes repository release artifacts, not crates.io publication. |
 
 ### 19.5 Multi-repository gate
 
@@ -3214,13 +3215,14 @@ Tier 1 of the register is closed.
 | Field | Current value |
 | --- | --- |
 | Active work package | None |
-| Active implementation branch | None |
-| Active implementation worktree | None |
-| Active owner | None |
-| Active blocker | None |
-| Next work package | `SELFHOST-001` |
-| Next branch name | `selfhost/SELFHOST-001` |
-| Next acceptance evidence | `WP-100` deliverables, unit tests covering every exit-code category, committed JSON round-trip fixtures, and unchanged `doctor` behavior |
+| Active card | `F-026` — first public binary distribution |
+| Status | Implementation complete, independently re-verified outside the sandbox (native release build run and its binary executed; `install.sh` run unmodified against a hand-built fake release, including a deliberate checksum-mismatch and an unsupported-OS case), committed, and handed to gate/handoff/review |
+| Active implementation branch | `card/F-026` |
+| Active implementation worktree | `/Users/alvaro/Documents/Code/change-harness-worktrees/F-026` |
+| Active owner | Codex, landed by the acceptance owner |
+| Active blocker | None. `LICENSE` is now tracked and committed alongside the rest of this card's diff. |
+| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
+| Acceptance evidence | `cargo fmt --check` passed; all 877 tests passed with the sandbox-only `ps` shim noted above; strict Clippy passed; `cargo build --release` produced a binary reporting `change-harness 0.1.0`; PyYAML parsed the workflow and confirmed the `v*` trigger and four targets; installer tests passed for piped success/overwrite, checksum mismatch, unsupported OS, and unsupported architecture. |
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
@@ -3377,7 +3379,6 @@ These are intentionally time-bounded and do not block `SPIKE-001`.
 
 | ID | Decision needed | Deadline | Blocking effect |
 | --- | --- | --- | --- |
-| Q-001 | Open-source or proprietary license | Before any public remote, package publication, or external distribution | Blocks public distribution only |
 | Q-002 | Minimum supported macOS version | Before hardened release | Blocks compatibility claim |
 | Q-003 | Linux support level | Before multi-project external trial | Blocks Linux support claim |
 | Q-004 | Cryptographic or OS-backed actor identity | Before security-sensitive multi-user use | Blocks hard authorization claim |
