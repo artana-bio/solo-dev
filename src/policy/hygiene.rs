@@ -545,11 +545,26 @@ fn name_words(name: &str) -> Vec<String> {
 
 /// Whether an environment variable name announces that its value is a secret.
 ///
+/// **Scope: `gate.environment.set` keys, and nothing else.** Not the JSON walk,
+/// not any other record, not any future one. Broadening this is a regression
+/// even where it looks like an improvement, so it is `pub(crate)` and has one
+/// caller.
+///
+/// Everything else here matches on *shape* — issuer prefixes, PEM header
+/// lines, URL userinfo — which is near-zero false positive because those
+/// shapes mean one thing. Matching on a name is a guess about intent, and
+/// wrong often enough to matter: a dataset schema with a column called
+/// `api_key`, a config describing which variable to read, a test fixture. Any
+/// record legitimately *about* credentials trips it. The one field that earns
+/// the guess is `environment.set`, whose entire purpose is to carry a literal
+/// runtime value into a committed definition; there, a credential-shaped name
+/// is a strong signal and the remedy is always the same — move it to `allow`.
+///
 /// Matched on whole words rather than as a substring. Substring matching read
 /// `TOKENIZER` as a credential and refused an ordinary variable, and a check
 /// that fires on innocuous names is a check somebody turns off.
 #[must_use]
-pub fn is_credential_name(name: &str) -> bool {
+pub(crate) fn is_credential_name(name: &str) -> bool {
     let words = name_words(name);
     CREDENTIAL_NAME_MARKERS.iter().any(|marker| {
         let marker: Vec<&str> = marker.split('_').collect();
@@ -780,6 +795,35 @@ mod tests {
         assert!(
             refuse_secrets_in_document("notes.txt", "ghp_0123456789abcdef0123456789abcdef0123")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_record_that_merely_talks_about_credentials_is_not_refused() {
+        // The boundary scans shapes, never names. A record is allowed to
+        // describe credentials — a dataset schema with a column called
+        // `api_key`, a config naming which variable to read, a document
+        // discussing a password field — because being *about* a secret is not
+        // being one. Name matching belongs to `gate.environment.set` alone.
+        //
+        // This guards a direction, not a line: wiring `is_credential_name`
+        // into the walk would look like a hardening and would refuse ordinary
+        // records for a whole class of future work.
+        let schema = serde_json::json!({
+            "table": "events",
+            "columns": [
+                {"name": "api_key", "type": "text", "nullable": false},
+                {"name": "password", "type": "text"},
+                {"name": "client_secret", "type": "text"},
+            ],
+            "notes": "the api_key column stores a hash, never the token itself",
+            "credentials": {"api_key": "read from the environment at run time"},
+        })
+        .to_string();
+
+        assert!(
+            refuse_secrets_in_document("analysis/schema.json", &schema).is_ok(),
+            "a record describing credentials carries none"
         );
     }
 

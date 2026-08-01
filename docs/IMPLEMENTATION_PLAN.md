@@ -2868,6 +2868,35 @@ Sequencing note: the approval model cannot be specified honestly before
 prevented from doing. A read-only workflow could be specified now; an
 approval-gated write one could not.
 
+#### Record hygiene under a general work model
+
+Recorded here rather than built. `F-027`'s hygiene controls were designed for a
+harness that governs deploys, and they do not generalize unexamined. A research
+or analytics work item legitimately stores credential-shaped strings as
+evidence — a log excerpt, a captured request, a dataset schema whose columns
+are named `api_key`. Strict refusal is right for the current scope and wrong
+for that one.
+
+Three questions this package must answer:
+
+- **The policy is per project, and visible.** Strict refusal suits a harness
+  moving a protected branch; one analyzing logs needs to keep what it found.
+  Whichever is in force must be legible to a reviewer reading a record, because
+  a reviewer who cannot tell which policy applied cannot judge what the absence
+  of a refusal means.
+- **There is a recorded override, not only a refusal.** Re-submission carrying
+  an explicit acknowledgment — a named actor declaring this string is not a
+  live secret — beats both a hard block and a silent pass. It keeps the work
+  moving and leaves the better audit trail, and it is the shape every other
+  decision in this harness already takes: somebody took responsibility, on the
+  record.
+- **The blast radius needs an answer.** The check runs at the commit boundary
+  (D-088), so one flagged string refuses a commit that may carry several
+  unrelated records. That trade is right while refusals are rare and the
+  operator is a person who can fix the one field. Under a general work model,
+  with many items committing concurrently, it becomes one item's judgment call
+  blocking everybody else's work.
+
 Acceptance:
 
 - a decision recorded in Section 22, with its open questions in Section 23,
