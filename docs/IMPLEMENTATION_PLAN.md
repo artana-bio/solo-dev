@@ -2828,6 +2828,57 @@ Potential capabilities:
 
 Configuration declarations alone MUST NOT be described as enforced isolation.
 
+### WP-720 — Governed external actions
+
+| Field | Value |
+| --- | --- |
+| Status | `DEFERRED` |
+| Dependencies | `Q-004`, `Q-005`, `WP-710`'s threat-model approval, and a named real workflow |
+| Target release | Undecided; not before the hardened single-repository release |
+
+Change Harness governs code changes and code-validation gates. A broader
+agent-work system would coordinate work whose effects leave the machine —
+publishing documentation, filing or updating tickets, cloud operations. This
+package holds the question. **It adds no capability**, and no connector is
+built until the decision below is accepted.
+
+It is first a scope decision, not a design one. Section 5.2 lists general job
+scheduling, automatic production deployment, and GitHub/GitLab/Jira/Linear
+integration as explicit MVP non-goals. Any external-action capability reverses
+at least one of them, so the first thing this package must produce is the
+argument for doing that, with the evidence, rather than a design that quietly
+assumes it.
+
+Questions to answer:
+
+- What is the general work-item model, and how does code work stay a
+  specialized case of it rather than being generalized away?
+- How are tool capabilities declared, scoped, and audited?
+- Which actions require explicit approval, and how is that approval bound to
+  exact inputs and intended effect — the way acceptance binds one landing
+  commit?
+- How are idempotency, retries, recovery, and partial external completion
+  represented? A gate is rerun against the landing commit and may be retried;
+  anything with an external effect therefore happens more than once.
+- How can a platform supply optional task or identity attestations without
+  making the harness vendor-specific?
+
+Sequencing note: the approval model cannot be specified honestly before
+`Q-004` says who may authorize and `WP-710` says what the executor can be
+prevented from doing. A read-only workflow could be specified now; an
+approval-gated write one could not.
+
+Acceptance:
+
+- a decision recorded in Section 22, with its open questions in Section 23,
+  rather than a separate architecture-decision document competing with those
+  registers;
+- an explicit position on each Section 5.2 non-goal it touches;
+- one narrow, real, read-only workflow specified end to end, and one
+  approval-gated write workflow specified end to end;
+- an explicit statement that no external-action capability ships with the
+  decision itself.
+
 ## 18. Dependency and execution order
 
 The required order is:
@@ -3118,6 +3169,11 @@ and `WP-510`: check a claim before writing it down.
 | D-079 | Accept criterion 2 (all 40 scenarios pass) as disclosed residual risk rather than extend the mutation audit further | Accepted | Only 2 of 18 known over-claiming tests intersect the Section 16.2 scenario trace, both checked and holding; the other ~48 of ~50 tests the trace cites have never been mutation-tested by anyone. That is a real, open bound on confidence, not a demonstrated pass. The acceptance owner weighed extending the audit — of unknown size, following a pattern where every prior round of looking harder found more, D-075's own founding observation — against accepting the bound as it stands, given that severity had converged toward zero even as count had not: everything found in the final rounds was low-severity or already independently guarded. Chose to accept and disclose rather than extend. The criterion is recorded `ACCEPTED RISK`, not rounded up to `MET` — the distinction is the entire point of disclosing it at all, and remains open for future work at the acceptance owner's discretion. |
 | D-080 | Sign the Section 19.3 release record | Accepted | Alvaro Alvarez, acceptance owner, 2026-07-30. Eleven of twelve criteria independently certified `MET` — nine by a certification review that mutation-tested each one by breaking its underlying mechanism and confirming the cited test actually fails, two (work-package completion, README accuracy) by direct record inspection where mutation testing does not apply. The twelfth, criterion 2, is `ACCEPTED RISK` under D-079, not `MET` — the signature certifies that distinction rather than obscuring it. This is what the release record represents: not the absence of open questions, but that every open question is named, evidenced, and knowingly carried rather than hidden. Signing does not modify or supersede any individual defect, decision, or review already recorded in this document or in `docs/DEFECT-REGISTER.md`. |
 | D-081 | Lift D-014's public-distribution hold and distribute Change Harness under an ARTANA proprietary, all-rights-reserved license | Accepted 2026-07-31 by Alvaro Alvarez; implemented by `F-026` | `LICENSE` names ARTANA and grants no redistribution rights. `F-026` adds tag-triggered GitHub Release artifacts and a checksum-verifying installer. Cargo's `publish = false` remains in place because this decision authorizes repository release artifacts, not crates.io publication. |
+| D-082 | Qualify the gate network policy at every surface that reports it, and leave the serialized field alone | Accepted | `network_policy` is declarative — `declares_network_denied` has no non-test caller and `run_attempt` restricts nothing — yet `gate show`, `gate validate`, and the receipt environment fingerprint all rendered the bare variant beside a timeout and an allowlist that are genuinely imposed, so the one decorative field in the group read exactly like the enforced ones. Encoding advisory-ness in the schema instead would re-digest every registered gate, because `GateDefinition::digest` covers `network_policy` and `Receipt::staleness` compares `gate_digest`: every receipt in flight would report stale for a change that alters no behavior. The qualification therefore lives in presentation — `NetworkPolicy::describe` for humans, `network_policy_enforced` in the envelope, `network_enforced=` in the fingerprint — all driven by one `NetworkPolicy::ENFORCED` constant for `WP-710` to flip. Section 14.1 and `WP-710` already forbid describing a declaration as isolation; this makes the output obey what the source comment alone was saying. |
+| D-083, D-086 – D-091 | Reserved: record-hygiene decisions, split out of `F-027` | Reserved | These numbers were issued to the record-hygiene work and travel with it. The code is preserved at tag `f027-full-with-hygiene` and the work is filed as `artana-bio/solo-dev#13`; the rows return with it. Reserved rather than deleted so a later card cannot claim a number the preserved branch already uses — removing them outright is what left this table broken in the first place. |
+| D-084 | Separate the author from acceptance and promotion; permit the acceptance owner to promote; normalize declared identifiers before comparing | Accepted | Independence was enforced at both review steps and nowhere else, so acceptance — the only thing that authorizes moving the protected branch — was self-grantable, and promotion after it likewise. The policy is now: authorization is not self-granted (acceptance owner ≠ every member's feature actor), execution is not performed by the author (promoter ≠ the same set), and the authorizer may execute their own decision (promoter *may* be the acceptance owner). The third is the load-bearing one: Section 15.1's model is one human and many agent sessions, so requiring a fourth distinct party to run `promote` would make the documented way of working impossible, and a control that blocks the normal path gets worked around rather than kept. Comparison is defined only over ASCII identifiers; see D-092. Implementers are read from each member's approving review, which the member already pins by id and digest, and a review that will not load refuses the step rather than being skipped — see D-085. All four refusals are about declared identities and D-013 still holds: the same person under two names defeats every one of them, and Q-004 is where that stops being true. |
+| D-092 | Declared actor identifiers are ASCII, and anything else is refused rather than compared | Accepted 2026-08-01 by Alvaro Alvarez | Three fixes to this comparison each closed the character they were shown and left the class open. Exact equality made `Operator` a different person from `operator`. Simple lowercase mapping fixed that and lost to the small sharp s, which lowercases to itself while its uppercase spelling lowercases to a double s — a reviewer drove a full lifecycle with it and both accepted and promoted their own work. Comparing both mappings fixed *that* and lost to the capital sharp s, which lowercases to the small form and uppercases to itself, so the relation was not even transitive; all four separation refusals fell and the protected branch moved. An exhaustive sweep of every Unicode scalar found it — not the fix's reasoning, which claimed in this register and in the source to over-approximate case folding and was wrong in exactly the one place that was exploitable. Separately, canonically equivalent and zero-width spellings render identically and compare differently. Correct Unicode identity needs case folding and normalization tables this crate does not carry, so the comparison stops reasoning about characters it cannot and refuses them: within ASCII `to_ascii_lowercase` is total, one glyph has one encoding, and nothing is invisible. Both sides of every comparison are validated, because a comparison is only as total as its worse half. The cost is accepted: a non-ASCII personal name cannot be an actor identifier, which is a restriction on an identifier used for separation rather than on a display name. |
+| D-085 | A separation check fails closed on missing evidence, accepting that a damaged control repository can halt the lifecycle | Accepted; supersedes the fallback D-084 first shipped | The first implementation skipped a member whose review would not load, reasoning that refusing an acceptance over an unreadable file turns a corrupt-control problem into a deadlock at the worst possible moment. The independent review of `F-027` (`RV-000036`) deleted one review file and then self-accepted as the implementer: absence of evidence had become a granted authorization. The reasoning was sound in general and wrong here — availability is the right instinct for a diagnostic and never for the step that authorizes publishing a commit. The lookup now refuses, names the member, and points at `audit`, whose job under D-058 is precisely to report evidence that has gone missing. The check also moved to *after* the acceptance-digest comparison in `check_promotion`: run before it, a tampered plan reported an unfindable review when what the operator needed to hear was that the plan had changed since acceptance. |
 
 ### 19.5 Multi-repository gate
 
@@ -3384,6 +3440,7 @@ These are intentionally time-bounded and do not block `SPIKE-001`.
 | Q-004 | Cryptographic or OS-backed actor identity | Before security-sensitive multi-user use | Blocks hard authorization claim |
 | Q-005 | Sandboxed gate executor technology | Before gates may access sensitive repositories or credentials | Blocks sensitive/production gate use |
 | Q-006 | Long-term artifact storage backend | Before one-year landing-log retention is operational | Blocks hardened retention acceptance |
+| Q-007 | Whether the harness governs actions whose effects leave the machine, and under what trust boundaries | Before any connector, publication, or cloud-operation work begins | Blocks `WP-720`; until it is answered, a gate is a read-only check and external effects do not belong in one |
 
 ## 24. Definition of done for every work package
 

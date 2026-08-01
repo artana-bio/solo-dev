@@ -47,6 +47,50 @@ fn a_registered_gate_is_listed_with_its_digest() {
 }
 
 #[test]
+fn no_surface_reports_the_network_policy_as_an_enforced_control() {
+    // The runner restricts nothing about the network, so `denied` describes
+    // what the gate asked for. Every place that shows it has to say so, or a
+    // reader comparing it against the timeout and the allowlist beside it —
+    // both of which are real — concludes it is one of them.
+    let workspace = Workspace::initialized();
+
+    let shown = workspace.gate_json(&["show", "--gate-id", "gate.unit"]);
+    assert_eq!(
+        shown["data"]["definition"]["network_policy"], "denied",
+        "the declaration itself is unchanged"
+    );
+    assert_eq!(
+        shown["data"]["network_policy_enforced"], false,
+        "and a program reading the envelope is told it is not imposed"
+    );
+
+    let text = String::from_utf8(
+        Workspace::run(&[
+            "gate".to_owned(),
+            "show".to_owned(),
+            "--gate-id".to_owned(),
+            "gate.unit".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert!(
+        text.contains("network: denied (declared, not enforced)"),
+        "a human reading `gate show` is told the same thing: {text}"
+    );
+
+    let definition =
+        workspace.gate_definition("advisory", &definition("gate.advisory", 1, "[true]"));
+    let validated = workspace.gate_json(&["validate", "--definition", &definition]);
+    assert_eq!(
+        validated["data"]["network_policy_enforced"], false,
+        "`gate validate` qualifies it before the definition is ever stored"
+    );
+}
+
+#[test]
 fn a_card_cannot_introduce_a_command() {
     // The card schema has no field that carries a command. Naming a gate that
     // does not exist is the closest a card can come, and it is refused.

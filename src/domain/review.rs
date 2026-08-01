@@ -25,6 +25,7 @@ use crate::{
         ids::{CardId, CycleId, ReviewId},
     },
     error::{ErrorCode, HarnessError},
+    policy::actors,
 };
 
 /// Schema identifier for a review.
@@ -428,13 +429,12 @@ impl ReviewRecord {
 ///
 /// Returns a policy error when the two identities match.
 pub fn check_independence(reviewer: &str, feature_actor: &str) -> Result<(), HarnessError> {
-    if reviewer.trim().is_empty() {
-        return Err(HarnessError::Control {
-            reason: "a review must name its reviewer".to_owned(),
-            code: ErrorCode::PolicyIncompleteReview,
-        });
-    }
-    if reviewer == feature_actor {
+    actors::refuse_unusable("reviewer", reviewer)?;
+    actors::refuse_unusable("feature actor", feature_actor)?;
+    // Normalized, because `reviewer-b ` and `Reviewer-B` were the same person
+    // every time they differed from `reviewer-b`, and a separation check a
+    // trailing space defeats is not a check.
+    if actors::same(reviewer, feature_actor) {
         return Err(HarnessError::Control {
             reason: format!(
                 "`{reviewer}` produced this candidate and cannot review it; independence is procedural, so the harness can only refuse the obvious case"

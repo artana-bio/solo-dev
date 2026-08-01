@@ -59,6 +59,33 @@ pub enum NetworkPolicy {
     Allowed,
 }
 
+impl NetworkPolicy {
+    /// Whether the harness imposes the declared policy on a running gate.
+    ///
+    /// Always false. Nothing in [`crate::runner`] restricts network access, so
+    /// a gate declaring [`Self::Denied`] still reaches whatever its host can.
+    /// `WP-710` is the package that can flip this; until it does, every
+    /// surface that reports the policy has to say which of the two it means.
+    pub const ENFORCED: bool = false;
+
+    /// Renders the policy together with whether it is imposed.
+    ///
+    /// Reporting the bare variant was the defect. `gate show` printed
+    /// `network: Denied` beside a timeout and an allowlist that are both real,
+    /// so the one decorative field in the group read exactly like the enforced
+    /// ones — and the receipt carried that reading into the evidence record.
+    /// Section 14.1 and `WP-710` forbid describing a declaration as isolation,
+    /// which an unqualified `Denied` does to every reader who has not read
+    /// this file.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Denied => "denied (declared, not enforced)",
+            Self::Allowed => "allowed (declared)",
+        }
+    }
+}
+
 /// How many times a gate may run before its result counts.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -436,6 +463,32 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(base, changed.digest().unwrap());
         }
+    }
+
+    #[test]
+    fn every_rendering_of_a_network_policy_states_its_enforcement_status() {
+        // The point is not the wording, it is that neither variant can reach a
+        // reader as a bare fact. Stated as a relationship rather than as
+        // today's answer, so `WP-710` flipping `ENFORCED` fails here and sends
+        // whoever flipped it to `describe`, instead of silently leaving a
+        // caveat on a policy that by then actually holds.
+        let expected = if NetworkPolicy::ENFORCED {
+            "enforced"
+        } else {
+            "declared"
+        };
+        for policy in [NetworkPolicy::Denied, NetworkPolicy::Allowed] {
+            assert!(
+                policy.describe().contains(expected),
+                "{policy:?} renders as `{}`, which never says `{expected}`",
+                policy.describe()
+            );
+        }
+        assert_eq!(
+            NetworkPolicy::Denied.describe().contains("not enforced"),
+            !NetworkPolicy::ENFORCED,
+            "the variant a reader would mistake for isolation says outright whether it is one"
+        );
     }
 
     #[test]

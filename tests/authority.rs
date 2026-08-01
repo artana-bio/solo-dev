@@ -81,6 +81,44 @@ fn init_seeds_the_protected_branch_from_the_candidate() {
 }
 
 #[test]
+fn a_candidate_that_moves_after_init_does_not_change_the_cycle_baseline() {
+    // The adoption section in the skill turns on this: `project init` captures
+    // the candidate's protected branch, and `cycle activate` reads the
+    // *authority's* head afterwards. Someone documenting it from the outside
+    // naturally writes "the current main becomes the baseline when the first
+    // cycle is activated", which is wrong by however many commits landed in
+    // between. Pinned here because the sentence is easier to get wrong than
+    // the code is.
+    let workspace = Workspace::new();
+    let at_init = workspace.candidate_head();
+    assert!(init(&workspace).status.success());
+
+    capture(
+        &workspace.repository,
+        &["commit", "-q", "--allow-empty", "-m", "landed elsewhere"],
+    );
+    let moved_on = workspace.candidate_head();
+    assert_ne!(
+        moved_on, at_init,
+        "the fixture must actually move the branch"
+    );
+
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    let activated = workspace.cycle_json(&["activate", "--cycle-id", "C-001"]);
+
+    assert_eq!(
+        activated["data"]["baseline_sha"], at_init,
+        "the baseline is the commit init saw, not whatever the candidate reached since"
+    );
+}
+
+#[test]
 fn init_registers_the_authority_remote_in_the_candidate() {
     let workspace = Workspace::new();
     assert!(init(&workspace).status.success());

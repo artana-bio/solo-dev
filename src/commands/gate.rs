@@ -15,7 +15,7 @@ use crate::{
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         clock::Clock,
-        gate::{GATE_DIR, GateDefinition},
+        gate::{GATE_DIR, GateDefinition, NetworkPolicy},
         ids::{CardId, ReceiptId},
     },
     error::{ErrorCode, HarnessError},
@@ -241,12 +241,12 @@ fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     Ok(CommandOutcome::new(
         "gate.validate",
         format!(
-            "Gate `{}` revision {} is valid\nargv: {:?}\ntimeout: {}s\nnetwork: {:?}\nmax attempts: {}",
+            "Gate `{}` revision {} is valid\nargv: {:?}\ntimeout: {}s\nnetwork: {}\nmax attempts: {}",
             gate.gate_id,
             gate.revision,
             gate.argv,
             gate.timeout_seconds,
-            gate.network_policy,
+            gate.network_policy.describe(),
             gate.retry_policy.max_attempts
         ),
         serde_json::json!({
@@ -254,6 +254,7 @@ fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
             "revision": gate.revision,
             "digest": gate.digest()?.as_str(),
             "valid": true,
+            "network_policy_enforced": NetworkPolicy::ENFORCED,
         }),
     ))
 }
@@ -401,7 +402,7 @@ fn run_show(args: &ShowArgs) -> Result<CommandOutcome, HarnessError> {
     Ok(CommandOutcome::new(
         "gate.show",
         format!(
-            "Gate `{}` revision {}\ndigest: {digest}\nargv: {:?}\nworking directory: {}\ntimeout: {}s\nnetwork: {:?}\nmax attempts: {}",
+            "Gate `{}` revision {}\ndigest: {digest}\nargv: {:?}\nworking directory: {}\ntimeout: {}s\nnetwork: {}\nmax attempts: {}",
             gate.gate_id,
             gate.revision,
             gate.argv,
@@ -411,12 +412,13 @@ fn run_show(args: &ShowArgs) -> Result<CommandOutcome, HarnessError> {
                 &gate.working_directory
             },
             gate.timeout_seconds,
-            gate.network_policy,
+            gate.network_policy.describe(),
             gate.retry_policy.max_attempts
         ),
         serde_json::json!({
             "definition": gate,
             "digest": digest.as_str(),
+            "network_policy_enforced": NetworkPolicy::ENFORCED,
         }),
     )
     .with_project(config.project_id.clone()))

@@ -48,6 +48,7 @@ use crate::{
         inspect, integration_worktree, landing,
         merge::{Conflict, ConflictClass, merge_tree},
     },
+    policy::actors,
     runner::{
         environment_fingerprint,
         receipt::{LOG_DIR, RECEIPT_SCHEMA, Receipt},
@@ -2195,6 +2196,65 @@ pub struct ReviewArgs {
     pub dry_run: bool,
 }
 
+/// Who implemented each card this integration carries, as `(card, actor)`.
+///
+/// Read from each member's approving review rather than from its handoff: the
+/// review already records `feature_actor_id`, the member already pins the
+/// review by id and digest, and going through the handoff would re-derive the
+/// same fact from a record the approval was bound to anyway.
+///
+/// Fails closed when a member's review cannot be found. An earlier version
+/// skipped it, so that a damaged control repository could not deadlock the
+/// lifecycle — and a reviewer proved the consequence by deleting one review
+/// file and then self-accepting as the implementer. Absence of evidence became
+/// a granted authorization, which is the worst possible direction for this
+/// particular check to fail in. The member pins the review by id *and* digest,
+/// so a review that will not load is not an ordinary missing file; it is the
+/// record the approval was bound to, gone. `audit` reports it as a discrepancy
+/// (D-058), and `project recover` or a restored backup is the way out.
+///
+/// # Errors
+///
+/// Returns a precondition error naming the member whose review is missing, and
+/// any error the control repository itself raises.
+pub fn member_implementers(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<(String, String)>, HarnessError> {
+    let mut found = Vec::new();
+    for member in &record.members {
+        let reviews = crate::commands::review::reviews_for(control, &member.card_id)?;
+        let review = reviews
+            .iter()
+            .find(|review| review.review_id == member.review_id)
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "integration {} names review {} for card {}, and it cannot be read; the approval this step relies on is missing, so who implemented {} cannot be established. Run `audit` to see what else is affected",
+                    record.integration_id, member.review_id, member.card_id, member.card_id
+                ),
+                code: ErrorCode::PreconditionNotFound,
+            })?;
+
+        // Matching the id alone trusted the file's *name*. The member pins a
+        // digest too, and editing a review's `feature_actor_id` changed who the
+        // separation check compared against — turning the record that proves
+        // who wrote the code into the thing an author edits in order to approve
+        // it. Everything else in this harness binds to a digest for exactly
+        // that reason; this lookup did not.
+        if review.digest()? != member.review_digest {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} for card {} no longer digests to what integration {} pinned; the approval was altered after it was recorded. Run `audit`",
+                    member.review_id, member.card_id, record.integration_id
+                ),
+                code: ErrorCode::PolicyNotIntegrable,
+            });
+        }
+        found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
+    }
+    Ok(found)
+}
+
 /// Reads an integration's verification record.
 ///
 /// # Errors
@@ -2246,6 +2306,32 @@ fn require_invariants_addressed(
     })
 }
 
+/// Refuses an integration review recorded by whoever ran the verification.
+///
+/// Section 15.1's independence rule applies here too: whoever ran the gates
+/// cannot be the one who judges what they proved.
+///
+/// The identifier validation runs here rather than a bare comparison, so this
+/// site inherits the unnamed-actor refusal the other separation steps have. It
+/// accepted an empty reviewer id until now — the hole this card closed one step
+/// later at acceptance and left open here.
+fn refuse_verifier_reviewing(
+    verification: &VerificationRecord,
+    reviewer_actor_id: &str,
+) -> Result<(), HarnessError> {
+    actors::refuse_unusable("integration reviewer", reviewer_actor_id)?;
+    actors::refuse_unusable("verifier", &verification.verified_by)?;
+    if actors::same(&verification.verified_by, reviewer_actor_id) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "{reviewer_actor_id} verified this integration and cannot also review it"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
+}
+
 fn run_integration_review(
     args: &ReviewArgs,
     clock: &dyn Clock,
@@ -2289,17 +2375,7 @@ fn run_integration_review(
                 .check_transition(IntegrationStatus::Reviewed)?;
             let verification = load_verification(control, &integration_id)?;
 
-            // Section 15.1's independence rule applies here too: whoever ran
-            // the gates cannot be the one who judges what they proved.
-            if verification.verified_by == args.reviewer_actor_id {
-                return Err(HarnessError::Control {
-                    reason: format!(
-                        "{} verified this integration and cannot also review it",
-                        args.reviewer_actor_id
-                    ),
-                    code: ErrorCode::PolicySameActor,
-                });
-            }
+            refuse_verifier_reviewing(&verification, &args.reviewer_actor_id)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 
             record.status = IntegrationStatus::Reviewed;
@@ -2388,11 +2464,35 @@ struct PromotionChecks {
     acceptance_id: String,
 }
 
+/// Refuses a promotion run by someone who wrote one of the cards it carries.
+///
+/// Promotion executes a decision somebody else authorized, so the author does
+/// not get to run it either. The acceptance owner *may* — Section 15.1's model
+/// is one human and many agent sessions, and requiring a fourth distinct party
+/// to press the button would make that model impossible to follow. The full
+/// policy is in [`crate::policy::actors`].
+fn refuse_author_promoting(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    actor_id: &str,
+) -> Result<(), HarnessError> {
+    let implementers = member_implementers(control, record)?;
+    actors::refuse_author_acting_as(
+        "promoter",
+        actor_id,
+        &record.integration_id.to_string(),
+        implementers
+            .iter()
+            .map(|(card, actor)| (card.as_str(), actor.as_str())),
+    )
+}
+
 /// Verifies everything Section 13.6 requires before the authority is touched.
 fn check_promotion(
     control: &ControlRepository,
     config: &crate::config::ProjectConfig,
     record: &IntegrationRecord,
+    actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
     if record.status != IntegrationStatus::Accepted {
         return Err(HarnessError::Control {
@@ -2454,6 +2554,14 @@ fn check_promotion(
             code: ErrorCode::PolicyNotVerified,
         });
     }
+
+    // Deliberately after the plan has been proved intact, not before. Asking
+    // who is allowed to promote a tampered plan answers the less useful
+    // question first: run ahead of the digest comparison, this reported a
+    // member whose review could not be found, when what the operator needed to
+    // hear was that the plan had changed since acceptance. Still well before
+    // anything is mutated, which is all the separation check requires.
+    refuse_author_promoting(control, record, actor_id)?;
 
     // Step 4: the authority must still be where the plan expected.
     let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
@@ -2622,7 +2730,7 @@ fn preview_promote(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
-    let checks = check_promotion(&control, &config, &record)?;
+    let checks = check_promotion(&control, &config, &record, &args.actor_id)?;
 
     Ok(CommandOutcome::new(
         "integration.promote",
@@ -2803,7 +2911,7 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
-            let checks = check_promotion(control, &config, &record)?;
+            let checks = check_promotion(control, &config, &record, &args.actor_id)?;
 
             // Steps 7, 9, and 10. Named on both sides of the authority
             // update, because "we were about to publish" and "we published and
