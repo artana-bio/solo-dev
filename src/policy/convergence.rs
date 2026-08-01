@@ -1,0 +1,677 @@
+//! Advisory signals that a card is too big, or is not converging.
+//!
+//! Both are **report-only** and cannot be made to block. That is the design,
+//! not a limitation. Counting rounds and findings is mechanical; deciding to
+//! split a card is judgment, and a harness that split cards automatically
+//! would be making a product decision from a file count. What it can do is
+//! stop the signal being invisible.
+//!
+//! It was invisible. `F-027` bundled seven unrelated issues across 24 files,
+//! ran four review rounds and about seventeen findings before anyone said the
+//! word "split", and the control repository held every number needed to say it
+//! after round two. Nothing was missing except a line of output.
+//!
+//! The two checks sit at opposite ends. Scope breadth is *leading* — it asks
+//! the question at activation, when the answer is cheap. Convergence is
+//! *lagging* — it can only speak once rounds exist, but by then it knows
+//! something the first check cannot: whether the work is actually settling.
+
+use std::collections::BTreeSet;
+
+use crate::policy::paths::{self, CaseSensitivity};
+
+/// How wide a card's declared scope is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeBreadth {
+    /// Distinct paths the card may write.
+    ///
+    /// Distinct, not the length of the include list. Round 2 of this card's
+    /// own review declared one path thirteen times and was told the card
+    /// spanned "13 path(s)" — a number that is simply false, and one the
+    /// envelope publishes for programs to read.
+    pub paths: usize,
+    /// Distinct top-level areas those paths fall under.
+    pub areas: usize,
+    /// The areas themselves, in a stable order, for the message.
+    pub area_names: Vec<String>,
+}
+
+/// Paths above which a card stops looking like one reviewable outcome.
+///
+/// Not a rule about repositories in general — a threshold this crate can
+/// defend. Every card that has landed here touched fewer than this; the one
+/// that did not was `F-027`, at 24, which took eight review rounds and a split.
+/// A card at the boundary is asked a question, not refused.
+pub const BROAD_PATH_COUNT: usize = 12;
+
+/// Areas above which a card is probably several cards.
+///
+/// "One independently reviewable outcome" is the plan's phrase. A reviewer
+/// holding four unrelated areas in their head at once is not reviewing one
+/// outcome, whatever the card says it is about.
+pub const BROAD_AREA_COUNT: usize = 4;
+
+/// The area a declared path or a finding location belongs to.
+///
+/// The first component — `src`, `tests`, `docs` — or the second where the
+/// first is `src`, so `src/policy/**` and `src/commands/**` count separately.
+/// That is the granularity at which this codebase's cards actually differ.
+///
+/// One definition, shared by both signals, because this card's own first
+/// review round found the trend comparing raw finding *locations* while
+/// calling them areas: a card whose findings moved from `src/policy/a.rs` to
+/// `src/policy/b.rs` read as spreading into somewhere new when it had not left
+/// the area it started in. Two notions of "area" is what made that possible.
+///
+/// Returns `None` only for a path with no non-empty component at all.
+///
+/// Takes the canonical spelling first, so that the areas agree with the path
+/// counts about which declarations name the same file.
+fn area_of(path: &str) -> Option<String> {
+    let canonical = paths::canonical(path, CaseSensitivity::host());
+    let mut parts = canonical.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("src"), Some(second)) if !second.contains('*') => Some(format!("src/{second}")),
+        (Some(first), _) if !first.is_empty() => Some(first.to_owned()),
+        _ => None,
+    }
+}
+
+impl ScopeBreadth {
+    /// Measures a card's include list.
+    #[must_use]
+    pub fn measure(include: &[String]) -> Self {
+        let case = CaseSensitivity::host();
+        let distinct: BTreeSet<String> = include
+            .iter()
+            .map(|path| paths::canonical(path, case))
+            .filter(|path| !path.is_empty())
+            .collect();
+        let areas: BTreeSet<String> = distinct.iter().filter_map(|path| area_of(path)).collect();
+        Self {
+            paths: distinct.len(),
+            areas: areas.len(),
+            area_names: areas.into_iter().collect(),
+        }
+    }
+
+    /// The advisory to show at activation, when there is one.
+    ///
+    /// Phrased as a question. The card may well be right — a mechanical rename
+    /// touches fifty files and is one outcome — and the author is the one who
+    /// knows.
+    #[must_use]
+    pub fn advisory(&self) -> Option<String> {
+        // `<=`, not `<`: both constants name the breadth a card may reach and
+        // still be one outcome, so the advisory begins one past them. Round 1
+        // of this card's review found the strict form firing at exactly 12
+        // paths, which the declaration promised would be silent.
+        if self.paths <= BROAD_PATH_COUNT && self.areas <= BROAD_AREA_COUNT {
+            return None;
+        }
+        Some(format!(
+            "this card declares {} path(s) across {} area(s) ({}); a card is meant to be one independently reviewable outcome, and past that breadth a reviewer is holding several at once. If it is several, splitting now is far cheaper than splitting after the review rounds",
+            self.paths,
+            self.areas,
+            self.area_names.join(", ")
+        ))
+    }
+}
+
+/// One review round, reduced to what the trend needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Round {
+    /// How many findings the reviewer left open.
+    ///
+    /// Findings, not distinct locations. Two open findings naming the same
+    /// file are two problems, and a card sitting at three open findings every
+    /// round is stuck whether or not they share a line. Counting the set
+    /// instead — which this did until round 1 of its own review — reads a
+    /// stuck card as converging, which is the one reading that must never
+    /// happen silently.
+    pub open_findings: usize,
+    /// The areas those findings fall under.
+    pub areas: BTreeSet<String>,
+}
+
+impl Round {
+    /// Builds a round from the locations of a review's open findings.
+    ///
+    /// Takes one item per open finding, duplicates included.
+    #[must_use]
+    pub fn new<'a>(open_locations: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut open_findings = 0;
+        let mut areas = BTreeSet::new();
+        for location in open_locations {
+            open_findings += 1;
+            if let Some(area) = area_of(location) {
+                areas.insert(area);
+            }
+        }
+        Self {
+            open_findings,
+            areas,
+        }
+    }
+}
+
+/// What the rounds so far say about whether the card is settling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Trend {
+    /// How many rounds have been recorded, including this one.
+    pub rounds: usize,
+    /// Open findings in each round, oldest first.
+    pub per_round: Vec<usize>,
+    /// Areas in this round that no earlier round named.
+    pub new_areas: Vec<String>,
+}
+
+/// Rounds below which a trend says nothing worth printing.
+///
+/// Two points is a line through any two numbers. Three is the first round
+/// where "still not settling" is a statement rather than an observation.
+pub const MIN_ROUNDS_FOR_TREND: usize = 3;
+
+impl Trend {
+    /// Computes the trend across every round recorded for a card.
+    ///
+    /// `rounds` is oldest first and includes the round being recorded.
+    #[must_use]
+    pub fn measure(rounds: &[Round]) -> Self {
+        let seen: BTreeSet<&String> = rounds
+            .iter()
+            .rev()
+            .skip(1)
+            .flat_map(|round| round.areas.iter())
+            .collect();
+        let new_areas = rounds
+            .last()
+            .map(|latest| {
+                latest
+                    .areas
+                    .iter()
+                    .filter(|area| !seen.contains(area))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            rounds: rounds.len(),
+            per_round: rounds.iter().map(|round| round.open_findings).collect(),
+            new_areas,
+        }
+    }
+
+    /// True when this round did not improve on the best any earlier round
+    /// reached.
+    ///
+    /// Volume alone is not the signal. A round of twelve findings that becomes
+    /// six then two is a card being finished. Four, then four, then five, is a
+    /// card whose bottom nobody has found.
+    ///
+    /// Measured against the lowest earlier round rather than the first one.
+    /// Round 2 of this card's own review found the first-round comparison
+    /// reading `5 → 3 → 3` as converging, because 3 is still below 5 — a card
+    /// that made early progress and then stopped, which is the most common
+    /// shape a stuck card actually has, and precisely what this exists to
+    /// catch. Against the running best it is flat, correctly.
+    ///
+    /// Using the best rather than the immediately preceding round also keeps
+    /// `3 → 4 → 3` flat: recovering ground already held is not progress.
+    #[must_use]
+    pub fn is_flat(&self) -> bool {
+        let Some((last, earlier)) = self.per_round.split_last() else {
+            return false;
+        };
+        if *last == 0 {
+            // An approval closes the card. Zero open is the end state, not a
+            // plateau, however many rounds it took to get there.
+            return false;
+        }
+        earlier.iter().min().is_some_and(|best| last >= best)
+    }
+
+    /// The advisory to show after recording, when there is one.
+    ///
+    /// Silent until there is enough history to mean anything, and silent when
+    /// the card is converging — a card that is nearly done should not be
+    /// nagged about its size.
+    #[must_use]
+    pub fn advisory(&self) -> Option<String> {
+        if self.rounds < MIN_ROUNDS_FOR_TREND {
+            return None;
+        }
+        let spreading = !self.new_areas.is_empty();
+        if !self.is_flat() && !spreading {
+            return None;
+        }
+
+        // Clauses joined rather than written into a `String`: `write!` into a
+        // `String` needs an `expect` to discharge its `Result`, and a panic
+        // site — however unreachable — on the one code path whose entire claim
+        // is that it cannot change what a command does is the wrong shape.
+        let mut clauses: Vec<String> = Vec::new();
+        if self.is_flat() {
+            clauses.push("open findings are not falling".to_owned());
+        }
+        if spreading {
+            clauses.push(format!(
+                "round {} raised {} finding(s) in area(s) no earlier round named ({})",
+                self.rounds,
+                self.new_areas.len(),
+                self.new_areas.join(", ")
+            ));
+        }
+        let counts: Vec<String> = self.per_round.iter().map(ToString::to_string).collect();
+        Some(format!(
+            "this card is on review round {} with open findings per round of {}; {}. Findings that keep appearing in new places usually mean the card is several cards. Consider splitting it — this is a signal, not a refusal, and the judgment is yours",
+            self.rounds,
+            counts.join(" → "),
+            clauses.join(" and ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_ordinary_card_draws_no_scope_advisory() {
+        // Every card that landed cleanly in this repository is this shape.
+        let narrow = ScopeBreadth::measure(&paths(&["src/policy/actors.rs", "tests/promotion.rs"]));
+        assert_eq!(narrow.areas, 2);
+        assert!(narrow.advisory().is_none());
+    }
+
+    #[test]
+    fn the_card_this_check_exists_for_is_flagged() {
+        // F-027's declared scope, verbatim: seven unrelated issues, 24 paths,
+        // eight review rounds, and a split that should have happened at round
+        // two. The check has to catch this one or it catches nothing.
+        let f027 = ScopeBreadth::measure(&paths(&[
+            ".claude/skills/change-harness/SKILL.md",
+            "docs/IMPLEMENTATION_PLAN.md",
+            "src/cli/output.rs",
+            "src/commands/acceptance.rs",
+            "src/commands/gate.rs",
+            "src/commands/integration.rs",
+            "src/control/repository.rs",
+            "src/domain/acceptance.rs",
+            "src/domain/card.rs",
+            "src/domain/gate.rs",
+            "src/domain/handoff.rs",
+            "src/domain/review.rs",
+            "src/error.rs",
+            "src/main.rs",
+            "src/policy/actors.rs",
+            "src/policy/hygiene.rs",
+            "src/policy/mod.rs",
+            "src/runner/mod.rs",
+            "tests/audit.rs",
+            "tests/authority.rs",
+            "tests/gate_registry.rs",
+            "tests/promotion.rs",
+            "tests/record_hygiene.rs",
+            "tests/review.rs",
+        ]));
+        assert_eq!(f027.paths, 24);
+
+        let advisory = f027.advisory().expect("F-027 must be flagged");
+        assert!(advisory.contains("24 path(s)"), "{advisory}");
+        assert!(
+            advisory.contains("splitting now is far cheaper"),
+            "the advisory has to say what to do about it: {advisory}"
+        );
+    }
+
+    #[test]
+    fn the_path_threshold_is_exclusive_and_decides_on_paths_alone() {
+        // Both sides of the boundary, in one test, so neither can drift on its
+        // own. Round 1 of this card's own review found `<` where the
+        // declaration promised "more than", so exactly the threshold fired.
+        let at: Vec<String> = (0..BROAD_PATH_COUNT)
+            .map(|index| format!("src/domain/f{index}.rs"))
+            .collect();
+        let breadth = ScopeBreadth::measure(&at);
+        assert_eq!(breadth.paths, BROAD_PATH_COUNT);
+        assert_eq!(breadth.areas, 1, "all one area, so paths decide this");
+        assert!(
+            breadth.advisory().is_none(),
+            "exactly {BROAD_PATH_COUNT} paths is the widest a card may be and stay quiet"
+        );
+
+        let mut over = at;
+        over.push("src/domain/one_more.rs".to_owned());
+        assert!(
+            ScopeBreadth::measure(&over).advisory().is_some(),
+            "one path past it is not"
+        );
+    }
+
+    #[test]
+    fn the_area_threshold_is_exclusive_and_decides_on_areas_alone() {
+        let at = paths(&[
+            "src/policy/a.rs",
+            "src/runner/b.rs",
+            "tests/c.rs",
+            "docs/d.md",
+        ]);
+        let breadth = ScopeBreadth::measure(&at);
+        assert_eq!(breadth.areas, BROAD_AREA_COUNT);
+        assert!(
+            breadth.paths <= BROAD_PATH_COUNT,
+            "the path count must not be what decides this"
+        );
+        assert!(
+            breadth.advisory().is_none(),
+            "exactly {BROAD_AREA_COUNT} areas is the widest a card may be and stay quiet"
+        );
+
+        let mut over = at;
+        over.push(".claude/skills/e.md".to_owned());
+        let wider = ScopeBreadth::measure(&over);
+        assert_eq!(wider.areas, BROAD_AREA_COUNT + 1);
+        assert!(wider.advisory().is_some(), "one area past it is not");
+    }
+
+    #[test]
+    fn a_glob_under_src_counts_as_its_own_area() {
+        let breadth = ScopeBreadth::measure(&paths(&["src/policy/**", "src/commands/**"]));
+        assert_eq!(breadth.area_names, vec!["src/commands", "src/policy"]);
+        let bare = ScopeBreadth::measure(&paths(&["src/**"]));
+        assert_eq!(bare.area_names, vec!["src"], "a bare src glob is one area");
+    }
+
+    #[test]
+    fn a_trend_says_nothing_before_it_can_mean_anything() {
+        // Two points is a line through any two numbers.
+        for rounds in 1..MIN_ROUNDS_FOR_TREND {
+            let history: Vec<Round> = (0..rounds).map(|_| Round::new(["src/a.rs"])).collect();
+            assert!(
+                Trend::measure(&history).advisory().is_none(),
+                "{rounds} round(s) is not a trend"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_that_is_settling_is_left_alone() {
+        // Twelve findings becoming six becoming one is a card being finished,
+        // and nagging it about its size would train people to ignore this.
+        let history = [
+            Round::new(["src/a.rs", "src/b.rs", "src/c.rs"]),
+            Round::new(["src/a.rs", "src/b.rs"]),
+            Round::new(["src/a.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![3, 2, 1]);
+        assert!(!trend.is_flat());
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
+    fn findings_that_stay_flat_are_flagged() {
+        let history = [
+            Round::new(["src/a.rs", "src/b.rs"]),
+            Round::new(["src/a.rs", "src/b.rs"]),
+            Round::new(["src/a.rs", "src/b.rs"]),
+        ];
+        let advisory = Trend::measure(&history)
+            .advisory()
+            .expect("flat is a signal");
+        assert!(advisory.contains("2 → 2 → 2"), "{advisory}");
+        assert!(advisory.contains("not falling"), "{advisory}");
+        assert!(
+            advisory.contains("not a refusal"),
+            "an advisory has to say it is advisory: {advisory}"
+        );
+    }
+
+    #[test]
+    fn findings_that_keep_moving_to_new_areas_are_flagged_even_while_falling() {
+        // The F-027 shape, and the reason volume alone is the wrong measure:
+        // the count came down while every round found a defect somewhere the
+        // last round had not looked.
+        let history = [
+            Round::new(["src/policy/hygiene.rs", "src/domain/card.rs", "src/main.rs"]),
+            Round::new(["src/control/repository.rs", "src/policy/hygiene.rs"]),
+            Round::new(["tests/authority.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert!(!trend.is_flat(), "the count is falling");
+        assert_eq!(trend.new_areas, vec!["tests"], "an area, not a location");
+
+        let advisory = trend.advisory().expect("spreading is a signal on its own");
+        assert!(advisory.contains("no earlier round named"), "{advisory}");
+    }
+
+    #[test]
+    fn an_area_named_two_rounds_ago_is_not_new() {
+        // Round 5 of this card's own review: nothing pinned "no *earlier*
+        // round" as meaning all of them rather than the last one. Restricting
+        // the comparison to the previous round alone passed every committed
+        // test, because each history either held its areas throughout or
+        // introduced one no round had ever named.
+        //
+        // Here round 3 returns to `tests`, which round 1 named and round 2 did
+        // not. A card revisiting ground it has already been over is not
+        // spreading.
+        let history = [
+            Round::new(["tests/a.rs", "tests/b.rs", "tests/c.rs"]),
+            Round::new(["docs/x.md", "docs/y.md"]),
+            Round::new(["tests/d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![3, 2, 1]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "round 1 named `tests`, so round 3 is not new ground: {:?}",
+            trend.new_areas
+        );
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
+    fn a_new_file_inside_an_area_already_named_is_not_spreading() {
+        // Round 1 of this card's own review. The trend compared raw finding
+        // locations while calling them areas, so a card being worked through
+        // one module file by file — the most ordinary shape a converging card
+        // has — was told it was spreading somewhere new every round.
+        let history = [
+            Round::new(["src/policy/a.rs", "src/policy/b.rs", "src/policy/c.rs"]),
+            Round::new(["src/policy/a.rs", "src/policy/b.rs"]),
+            Round::new(["src/policy/d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![3, 2, 1]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "d.rs is new, src/policy is not: {:?}",
+            trend.new_areas
+        );
+        assert!(
+            trend.advisory().is_none(),
+            "a card converging inside one area must not be nagged"
+        );
+    }
+
+    #[test]
+    fn a_card_that_fell_and_then_stopped_is_flat() {
+        // Round 2 of this card's own review. Measured against the *first*
+        // round, 5 → 3 → 3 looked like progress because 3 is below 5, so a
+        // card that made early headway and then stalled — the most common
+        // shape a stuck card has — was told it was converging.
+        let history = [
+            Round::new(["src/policy/a.rs"; 5]),
+            Round::new(["src/policy/a.rs"; 3]),
+            Round::new(["src/policy/a.rs"; 3]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![5, 3, 3]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "nothing new, so the flat count is the only thing that can speak"
+        );
+        assert!(trend.is_flat(), "3 is no better than the 3 before it");
+
+        let advisory = trend.advisory().expect("a plateau is a signal");
+        assert!(advisory.contains("5 → 3 → 3"), "{advisory}");
+        assert!(advisory.contains("not falling"), "{advisory}");
+    }
+
+    #[test]
+    fn regaining_ground_already_held_is_not_progress() {
+        // 3 → 4 → 3 is back where it started. Comparing against the round
+        // immediately before would call this falling.
+        let history = [
+            Round::new(["src/a.rs"; 3]),
+            Round::new(["src/a.rs"; 4]),
+            Round::new(["src/a.rs"; 3]),
+        ];
+        assert!(Trend::measure(&history).is_flat());
+    }
+
+    #[test]
+    fn a_long_card_making_steady_progress_is_never_nagged() {
+        // Every round a new low. The check must stay quiet for as long as
+        // that holds, however many rounds it takes.
+        let history: Vec<Round> = [10, 9, 8, 7, 6, 5]
+            .into_iter()
+            .map(|count| Round::new(std::iter::repeat_n("src/a.rs", count)))
+            .collect();
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![10, 9, 8, 7, 6, 5]);
+        assert!(!trend.is_flat());
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
+    fn one_path_declared_many_times_is_one_path() {
+        // Round 2 of this card's own review: `include.len()` counted entries,
+        // so thirteen copies of one file were reported as "13 path(s)" — a
+        // number that is false, and that the envelope publishes.
+        let repeated = paths(&["src/policy/actors.rs"; 13]);
+        let breadth = ScopeBreadth::measure(&repeated);
+        assert_eq!(breadth.paths, 1, "one distinct path");
+        assert_eq!(breadth.areas, 1);
+        assert!(
+            breadth.advisory().is_none(),
+            "and so nothing to say about it"
+        );
+    }
+
+    #[test]
+    fn one_path_spelled_many_ways_is_one_path() {
+        // Round 3 of this card's own review, verbatim: the same file written
+        // thirteen ways. Round 2 had fixed identical strings, which is the
+        // narrower half of the same defect — the count was still comparing
+        // spellings rather than paths.
+        let aliased = paths(&[
+            "src/a.rs",
+            "./src/a.rs",
+            ".//src/a.rs",
+            "././src/a.rs",
+            "src//a.rs",
+            "src///a.rs",
+            "src/./a.rs",
+            "src/.//a.rs",
+            "src//./a.rs",
+            "src/a.rs/",
+            "src/a.rs//",
+            "./src/a.rs/",
+            ".//src//a.rs",
+        ]);
+        let breadth = ScopeBreadth::measure(&aliased);
+        assert_eq!(breadth.paths, 1, "thirteen spellings of one file");
+        assert_eq!(breadth.areas, 1, "and therefore one area, not two");
+        assert!(breadth.advisory().is_none());
+    }
+
+    #[test]
+    fn finding_locations_are_compared_as_paths_too() {
+        // `measure` canonicalizes before it asks for areas, so the scope tests
+        // cannot see whether `area_of` does it as well. Finding locations come
+        // straight from a reviewer's verdict and are never canonicalized on
+        // the way in, which makes this the only place that property is
+        // observable — and a reviewer writing `./src/policy/b.rs` in round 3
+        // must not read as the card spreading somewhere new.
+        let history = [
+            Round::new(["src/policy/a.rs", "src/policy/b.rs", "src/policy/c.rs"]),
+            Round::new(["src/policy/a.rs", "src/policy/b.rs"]),
+            Round::new(["./src/./policy//d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert!(
+            trend.new_areas.is_empty(),
+            "a differently spelled path is not a new area: {:?}",
+            trend.new_areas
+        );
+        assert!(trend.advisory().is_none(), "and so there is nothing to say");
+    }
+
+    #[test]
+    fn case_aliases_follow_the_host() {
+        // Not an exotic input — a typo in one include entry. On macOS these
+        // are the same file, and the harness already treats them as the same
+        // path everywhere else; this asks that the count agree.
+        let mixed = paths(&["src/policy/a.rs", "SRC/Policy/a.rs"]);
+        let breadth = ScopeBreadth::measure(&mixed);
+        let expected = if CaseSensitivity::host() == CaseSensitivity::Insensitive {
+            1
+        } else {
+            2
+        };
+        assert_eq!(
+            breadth.paths, expected,
+            "path identity must match the host the harness is running on"
+        );
+        assert_eq!(breadth.areas, expected);
+    }
+
+    #[test]
+    fn a_round_with_nothing_open_is_not_flat() {
+        // An approval closes the card. Zero open findings is the end state, not
+        // a plateau, however many rounds it took to get there.
+        let history = [
+            Round::new(["src/a.rs"]),
+            Round::new(["src/a.rs"]),
+            Round::new([]),
+        ];
+        let trend = Trend::measure(&history);
+        assert!(!trend.is_flat());
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
+    fn several_open_findings_at_one_location_count_separately() {
+        // Round 1 of this card's own review, and the worse half of the same
+        // mistake: counting the *set* of locations read a card stuck at three
+        // open findings as converging 3 → 2 → 1 and said nothing. Two findings
+        // in one file are two problems.
+        let round = Round::new(["src/a.rs", "src/a.rs", "src/b.rs"]);
+        assert_eq!(round.open_findings, 3, "three findings");
+        assert_eq!(round.areas.len(), 2, "but two areas");
+
+        let stuck = [
+            Round::new(["src/a.rs", "src/b.rs", "src/c.rs"]),
+            Round::new(["src/a.rs", "src/a.rs", "src/b.rs"]),
+            Round::new(["src/a.rs", "src/a.rs", "src/a.rs"]),
+        ];
+        let trend = Trend::measure(&stuck);
+        assert_eq!(
+            trend.per_round,
+            vec![3, 3, 3],
+            "three open findings in every round"
+        );
+        assert!(trend.is_flat());
+        assert!(
+            trend.advisory().is_some(),
+            "a card stuck at three open findings must not read as converging"
+        );
+    }
+}

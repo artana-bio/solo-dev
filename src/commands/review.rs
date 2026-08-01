@@ -28,6 +28,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
+    policy::convergence::{Round, Trend},
 };
 
 /// Subcommands under `review`.
@@ -177,7 +178,47 @@ fn next_review_id(control: &ControlRepository) -> Result<ReviewId, HarnessError>
     format!("RV-{:06}", highest + 1).parse()
 }
 
+/// Orders a record identifier by its trailing number rather than as text.
+///
+/// Identifiers are allocated `RV-000001`, `RV-000002`, and so on, and are
+/// zero-padded to six digits — so sorting them as text is chronological right
+/// up to `RV-999999`, and wrong immediately after it, because `RV-1000000`
+/// sorts before `RV-999999`. Round 4 of `F-029`'s review reached that boundary
+/// with the real allocator and watched a chronological `3 → 2 → 1` arrive as
+/// `1 → 3 → 2`, which reads as a card that is not converging.
+///
+/// Returns `None` for a name with no trailing digits, which sorts first and
+/// then by name — there is no such identifier today, and inventing an order
+/// for one is not this function's business.
+fn ordinal(name: &str) -> Option<u128> {
+    let start = name
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    name.get(start..)
+        .filter(|rest| !rest.is_empty())?
+        .parse()
+        .ok()
+}
+
+/// Orders record identifiers oldest first.
+///
+/// A named function rather than a closure at the call site so that a test can
+/// bind to the ordering the reader actually uses. The first version of that
+/// test repeated the comparator inline and would have passed against a plain
+/// lexical sort — it certified a copy of the code instead of the code.
+fn sort_oldest_first(names: &mut [String]) {
+    names.sort_by(|left, right| {
+        ordinal(left)
+            .cmp(&ordinal(right))
+            .then_with(|| left.cmp(right))
+    });
+}
+
 /// Every review recorded for one card, oldest first.
+///
+/// "Oldest first" is load-bearing: `Trend` reads these rounds in order and
+/// reports whether the card is settling, so an ordering that is merely usually
+/// chronological would make the signal quietly wrong rather than absent.
 ///
 /// # Errors
 ///
@@ -202,7 +243,7 @@ pub fn reviews_for(
                 .then(|| path.file_stem()?.to_str().map(ToOwned::to_owned))?
         })
         .collect();
-    names.sort();
+    sort_oldest_first(&mut names);
 
     let mut reviews = Vec::new();
     for name in names {
@@ -594,11 +635,16 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &format!("review: {} {card_id}", verdict.decision.name()),
             )?;
 
+            // Read back after the commit so the history includes this round;
+            // the trend is about the sequence, and the round being recorded is
+            // the most informative point in it.
+            let history = reviews_for(control, &card_id)?;
             Ok(report_review(
                 &review,
                 &digest,
                 next_state,
                 &config.project_id,
+                &history,
             ))
         },
     )
@@ -610,6 +656,7 @@ fn report_review(
     digest: &crate::domain::digest::Digest,
     next_state: CardState,
     project_id: &crate::domain::ids::ProjectId,
+    history: &[ReviewRecord],
 ) -> CommandOutcome {
     let text = format!(
         "Recorded `{}` for card {}\nreview: {}\nreviewer: {}\ncandidate: {}\nfindings: {}\ncard state: {next_state}",
@@ -631,6 +678,25 @@ fn report_review(
         }),
     )
     .with_project(project_id.clone());
+
+    // Lagging signal. Every round this card has had, including this one,
+    // reduced to open findings and where they landed. Silent until three
+    // rounds exist and silent while the card is converging — a signal that
+    // fires on healthy work is one people learn to skip.
+    let rounds: Vec<Round> = history
+        .iter()
+        .map(|past| {
+            Round::new(
+                past.findings
+                    .iter()
+                    .filter(|finding| finding.disposition.blocks_approval())
+                    .map(|finding| finding.location.as_str()),
+            )
+        })
+        .collect();
+    if let Some(advisory) = Trend::measure(&rounds).advisory() {
+        outcome = outcome.with_warning(advisory);
+    }
 
     if !review.gate_adequacy.gates_observe_acceptance {
         // SPIKE-001 F-5: surfaced rather than buried. A green gate that cannot
@@ -718,4 +784,59 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifiers_order_by_number_across_a_width_boundary() {
+        // Round 4 of F-029's review, reached with the real allocator: as text,
+        // `RV-1000000` sorts before `RV-999999`, so the round that came last
+        // arrives first and `Trend` measures a card that is converging as one
+        // that is not. Zero padding hides this for the first 999,999 reviews.
+        let mut names = vec![
+            "RV-1000000".to_owned(),
+            "RV-999999".to_owned(),
+            "RV-000002".to_owned(),
+            "RV-999998".to_owned(),
+            "RV-000010".to_owned(),
+        ];
+        sort_oldest_first(&mut names);
+        assert_eq!(
+            names,
+            vec![
+                "RV-000002",
+                "RV-000010",
+                "RV-999998",
+                "RV-999999",
+                "RV-1000000",
+            ],
+            "oldest first, by number"
+        );
+    }
+
+    #[test]
+    fn an_identifier_with_no_trailing_number_is_ordered_by_name() {
+        // No identifier looks like this today. The point is that it sorts
+        // somewhere defined rather than panicking or being dropped.
+        assert_eq!(ordinal("RV-000007"), Some(7));
+        assert_eq!(ordinal("7"), Some(7));
+        assert_eq!(ordinal("RV-"), None);
+        assert_eq!(ordinal(""), None);
+
+        // Round 5 of this card's own review: the assertions above name a
+        // fallback ordering and never reach one, so inverting the tie-break
+        // survived them. Numberless names sort before numbered ones and among
+        // themselves by name.
+        let mut names = vec![
+            "RV-000001".to_owned(),
+            "RV-".to_owned(),
+            String::new(),
+            "RV-000002".to_owned(),
+        ];
+        sort_oldest_first(&mut names);
+        assert_eq!(names, vec!["", "RV-", "RV-000001", "RV-000002"]);
+    }
 }
