@@ -27,10 +27,12 @@ one and the harness will usually refuse you later, at a worse moment.
 2. **`delivered_sha` is the exact commit you delivered.** The harness refuses a
    handoff whose branch head disagrees. Never write "the branch" or a stale
    SHA.
-3. **One actor, one role.** The reviewer must be a different actor in a fresh
-   context from the implementer. Identity is declared, not proven (D-013) —
-   the harness records it and cannot verify it. Honor the separation anyway;
-   independent review bound to exact commits is the entire product.
+3. **One actor, one role.** The reviewer is a different actor, in a separate
+   task or agent thread that starts cold — not a later turn of the
+   conversation that wrote the code. Step 7 says exactly what that thread may
+   receive. Identity is declared, not proven (D-013): the harness records it
+   and cannot verify it. Honor the separation anyway; independent review bound
+   to exact commits is the entire product.
 4. **Treat refusals as information.** Exit 5 means a state machine is
    protecting an invariant. Read `error.code` and `error.recovery`, fix the
    state, retry. Never work around a refusal with raw git.
@@ -291,17 +293,45 @@ The harness refuses if the branch head is not `delivered_sha`, if the tree is
 dirty, if a feature gate receipt is missing or stale, or if any changed path
 falls outside the card's write scope.
 
-### 7. Review — different actor, fresh context
+### 7. Review — a separate task, a fresh context
+
+For every card with `review_policy: independent`, the implementer does not
+review. Create or request a **separate reviewer task or agent thread**. Not a
+new section of the same conversation, not a subagent handed your working
+state — a thread that starts cold.
+
+The reviewer receives exactly:
+
+- the activated card revision and its review criteria;
+- the handoff declaration;
+- the exact delivered commit, and the baseline it builds from;
+- the complete diff, and any contract-domain changes in it;
+- the feature gate receipts;
+- the repository files and reproducible evidence needed to evaluate the change.
+
+The reviewer does **not** receive the implementation conversation, your
+private reasoning, your working summary, or unfiltered author context. Nor an
+instruction to approve: no "this is ready, please sign off", no framing that
+supplies the conclusion. Handing the reviewer your reasoning is how a review
+becomes a second reading of the same argument, which is worth nothing. What
+survives contact with a cold reader is the point.
+
+The harness enforces the mechanical half — exact-commit binding, stale-review
+rejection, and a reviewer actor different from the handoff actor (exit 5,
+`CH-POLICY-SELF-REVIEW`). It cannot enforce the rest. **Actor identity is
+declared, not proven** (D-013, D-017): a fresh context is a strong review
+practice, not an attested one, and nothing here can tell whether you really
+opened a new thread. Honor it anyway; independent review bound to exact
+commits is the entire product.
 
 ```bash
 change-harness review begin  --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
 ```
 
-The reviewer reads the card revision, the handoff, and the candidate at its
-exact SHA. Review discipline: verify claims by breaking things — apply the
-mutation a test claims to catch and confirm it fails at the assertion that
-matters; drive the real binary against the real behavior. Then write:
+Review discipline: verify claims by breaking things — apply the mutation a
+test claims to catch and confirm it fails at the assertion that matters; drive
+the real binary against the real behavior. Then write:
 
 ```yaml
 reviewer_actor_id: reviewer-b
