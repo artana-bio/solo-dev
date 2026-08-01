@@ -400,17 +400,63 @@ fast-forward then fails, the command exits 9 and records
 back — rewinding a published branch is worse than a recoverable gap. Run
 `project recover --resume` to finish the local sync.
 
-## Bootstrapping a new project
+## Adopt an existing repository
+
+`project init` puts a repository you already have under governance. It does
+not create your project, move it, or rewrite one commit of its history — it
+registers the checkout and builds the two repositories the harness owns
+around it.
+
+Four paths, three of them new, and **all of them absolute**. `--repository .`
+is refused (`expected an absolute path, found `.``); your working directory is
+never consulted, so it makes no difference whether you run this from inside
+the project or anywhere else.
+
+| Flag | What it points at |
+| --- | --- |
+| `--repository` | The project you already cloned. Must exist, be a Git repository, and have at least one commit on the protected branch. |
+| `--control` | **New.** Cards, reviews, receipts, integration records. Must be absent or empty. |
+| `--authority` | **New.** The bare repository that owns the protected branch. |
+| `--worktree-root` | **New**, optional. Where card worktrees are allocated; defaults to `<the control's parent>/<project-id>-worktrees`. |
 
 ```bash
 change-harness project init \
-  --project-id example \
-  --repository /path/to/repo \
-  --control /path/to/control \
-  --authority /path/to/authority.git \
-  --worktree-root /path/to/worktrees
+  --project-id       example \
+  --repository       /abs/path/to/your-existing-repo \
+  --control          /abs/path/to/example-control \
+  --authority        /abs/path/to/example-authority.git \
+  --worktree-root    /abs/path/to/example-worktrees
 ```
 
-Creates control and authority, registers the authority as a remote of the
-candidate. It refuses an occupied control directory and never overwrites an
-existing remote. Then register gates (step 1) and open your first cycle.
+Nothing is created inside the repository being governed. Control and authority
+are siblings, not subdirectories, and the candidate gains exactly one thing: a
+remote named `harness-authority`. An existing remote of that name is never
+repointed.
+
+### Where the baseline comes from, and when
+
+**`project init` reads the candidate's protected branch and seeds the empty
+authority with it.** That is the moment your history is captured.
+
+`cycle activate` later freezes the cycle baseline to the *authority's* head —
+deliberately not the candidate's, because the candidate's branch is whatever a
+local actor last did, while the authority's is what has been accepted. So if
+your `main` gains commits between `project init` and your first
+`cycle activate`, the baseline is the commit **init** saw, not the newer one.
+There is no confirmation step for this; the sequence is the record. If you
+want the newer commit as your baseline, promote it through the harness, or
+initialize after it exists.
+
+An authority that already exists and is compatible is adopted unchanged, and
+then *it* supplies the baseline — the candidate's branch is not read at all.
+
+### Init is a one-time registration
+
+Re-running it with identical configuration reports there is nothing to do.
+Re-running it against a control repository bound to a *different*
+configuration refuses rather than rebinding, and it refuses a control
+directory that already holds files nobody checked.
+
+Once it succeeds, work stops happening in your original checkout: register
+gates (step 1), open a cycle, and take each card into the worktree the harness
+allocates for it.
