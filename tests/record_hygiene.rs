@@ -412,6 +412,45 @@ fn an_acceptance_record_is_scanned_like_every_other_durable_record() {
 }
 
 #[test]
+fn a_file_written_around_the_harness_cannot_reach_control_history() {
+    // Third review round, and the finding that falsified the previous fix. The
+    // check had been placed in `write_atomic` on the claim that every durable
+    // record passes through it. `commit` stages with `git add --all`, so a file
+    // placed under a tracked path by any other means was committed without ever
+    // meeting that function — the reviewer wrote a card directly and watched
+    // the token reach HEAD. A check on one writer is only ever as good as the
+    // claim that it is the only writer.
+    let workspace = Workspace::initialized();
+
+    fs::create_dir_all(workspace.control.join("cards")).unwrap();
+    fs::write(
+        workspace.control.join("cards/externally-written.json"),
+        format!("{{\"note\":\"{TOKEN}\"}}\n"),
+    )
+    .unwrap();
+
+    // Any command that commits will stage it.
+    let output = workspace.cycle_raw(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "an ordinary objective",
+    ]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "the commit must refuse while the staged file carries a credential"
+    );
+
+    let committed = support::capture(&workspace.control, &["log", "--all", "-p"]);
+    assert!(
+        !committed.contains(TOKEN),
+        "nothing carrying it may reach control history"
+    );
+}
+
+#[test]
 fn an_ordinary_card_is_still_accepted() {
     // The control that fires on ordinary evidence gets switched off. This is
     // the half of the behavior that keeps the other half deployable.

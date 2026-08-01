@@ -208,18 +208,21 @@ fn aws_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     None
 }
 
-/// Offset just past the `-----` that closes the armour line starting at
-/// `from`, ignoring the `-----` that opened it.
+/// The label of a PEM armour line, when `line` is one.
 ///
-/// Line endings are not part of the search. Matching `-----\n` looked
-/// reasonable and meant a CRLF key had no findable end marker, so the span
-/// fell back to the end of input and redaction deleted every character after
-/// the block — losing ordinary text while reporting success.
-fn armour_line_end(rest: &str, from: usize) -> Option<usize> {
-    const MARKER: &str = "-----";
-    let after_opening = from + MARKER.len();
-    let closing = rest.get(after_opening..)?.find(MARKER)?;
-    Some(after_opening + closing + MARKER.len())
+/// A whole line, trimmed, that opens and closes with five dashes. Nothing is
+/// searched across a line boundary, which is the point: three review rounds
+/// produced four defects in this detector — a CRLF key with no findable end,
+/// a mismatched footer ending the block early, a footer accepted because it
+/// merely *contained* the label, and closing dashes found on some later line
+/// so that ordinary prose became a key. Every one of them was a substring
+/// search wandering past the end of its line. Parsing line-wise removes the
+/// class rather than the four instances.
+fn armour_label<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix("-----")?.strip_suffix("-----")?;
+    let label = body.trim().strip_prefix(keyword)?.trim();
+    Some(label)
 }
 
 /// Length of a PEM private key block starting at `rest`.
@@ -230,41 +233,30 @@ fn private_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     if !rest.starts_with("-----BEGIN") {
         return None;
     }
-    // A `-----BEGIN` line with no closing dashes is not a header; without this
-    // the header check ran against the whole remaining input, so any later
-    // occurrence of the words satisfied it. Everything to the end is still
-    // redacted below when the block is merely unterminated — the distinction
-    // is between "no header at all" and "header, no footer".
-    let header_end = armour_line_end(rest, 0)?;
-    let header = &rest[..header_end];
-    if !header.contains("PRIVATE KEY") {
+    // Line-wise from here. The header must be one complete armour line, so a
+    // `-----BEGIN` that never closes on its own line is ordinary prose rather
+    // than a key whose redaction swallows the rest of the document.
+    let mut lines = rest.split_inclusive('\n');
+    let header = lines.next()?;
+    let label = armour_label(header, "BEGIN")?;
+    if !label.contains("PRIVATE KEY") {
         return None;
     }
 
-    // The footer has to be the one that closes *this* block. Taking the first
-    // `-----END` stopped at a mismatched footer and left the key material of
-    // the following block in the clear, which is the failure mode that matters
-    // here: a partial redaction reads as a successful one.
-    let label = header
-        .trim_start_matches('-')
-        .trim_start_matches("BEGIN")
-        .trim()
-        .trim_end_matches('-')
-        .trim();
-    let mut cursor = header_end;
-    while let Some(offset) = rest[cursor..].find("-----END") {
-        let start = cursor + offset;
-        let Some(end) = armour_line_end(rest, start) else {
-            break;
-        };
-        if rest[start..end].contains(label) {
-            return Some((SecretKind::PrivateKey, end));
+    // The footer closes *this* block: its label must equal the header's, not
+    // merely contain it. `END CERTIFICATE RSA PRIVATE KEY` contains
+    // `RSA PRIVATE KEY` and closed the block early, leaving the material after
+    // it in the clear — a partial redaction that reads as a complete one.
+    let mut consumed = header.len();
+    for line in lines {
+        consumed += line.len();
+        if armour_label(line, "END").is_some_and(|closing| closing == label) {
+            return Some((SecretKind::PrivateKey, consumed));
         }
-        cursor = end;
     }
 
-    // Unterminated, or terminated only by a footer for something else: redact
-    // to the end of the text. A truncated key is not a safe key.
+    // Unterminated, or closed only by a footer for something else: redact to
+    // the end of the text. A truncated key is not a safe key.
     Some((SecretKind::PrivateKey, rest.len()))
 }
 
@@ -409,6 +401,17 @@ pub fn redact_json(value: &mut serde_json::Value) {
 ///
 /// Returns [`ErrorCode::PolicySensitiveValue`] naming the document and field.
 pub fn refuse_secrets_in_document(relative: &str, contents: &str) -> Result<(), HarnessError> {
+    // Above this, parse into a tree and walk it is the wrong shape of work:
+    // a 100 MiB document took thirteen seconds, on a check that every control
+    // write in the lifecycle passes through. No durable record here is
+    // remotely this size, so the cap costs nothing real and bounds the worst
+    // case. The scan still happens — the fallback is a single linear pass over
+    // the text, which loses the field path and keeps the guarantee.
+    const PARSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+    if contents.len() > PARSE_LIMIT_BYTES {
+        return refuse_secret(relative, contents);
+    }
     match serde_json::from_str::<serde_json::Value>(contents) {
         Ok(value) => {
             let mut at = String::new();
@@ -438,7 +441,13 @@ fn first_in_json(value: &serde_json::Value, at: &mut String) -> Option<(String, 
                 at.push('.');
             }
             at.push_str(name);
-            let found = first_in_json(field, at);
+            // The key too, not only the value. A gate whose `environment.set`
+            // used a credential as the *variable name* and something ordinary
+            // as the value was accepted and committed: the walk visited values
+            // and a key is just as much author-supplied text.
+            let found = first(name)
+                .map(|kind| (at.clone(), kind))
+                .or_else(|| first_in_json(field, at));
             at.truncate(restore);
             found
         }),
@@ -447,10 +456,16 @@ fn first_in_json(value: &serde_json::Value, at: &mut String) -> Option<(String, 
 }
 
 /// The refusal every hygiene check raises.
+///
+/// The field path is redacted too. That looks paranoid until a credential is
+/// used as a JSON *key*, at which point the path naming where the value sits
+/// is the value — and the refusal quoting it becomes the leak it exists to
+/// prevent. Found by the test for key scanning, one line after adding it.
 fn sensitive(field: &str, kind: SecretKind) -> HarnessError {
     HarnessError::Control {
         reason: format!(
-            "`{field}` contains what looks like {}; a control record is committed history and cannot be redacted afterwards. Remove the value and rotate it — it has been on this machine in plaintext",
+            "`{}` contains what looks like {}; a control record is committed history and cannot be redacted afterwards. Remove the value and rotate it — it has been on this machine in plaintext",
+            redact(field),
             kind.label()
         ),
         code: ErrorCode::PolicySensitiveValue,
@@ -672,6 +687,72 @@ mod tests {
             "the block runs to its own footer: {redacted:?}"
         );
         assert!(redacted.ends_with("after"), "{redacted:?}");
+    }
+
+    #[test]
+    fn a_footer_whose_label_merely_contains_the_headers_does_not_close_the_block() {
+        // Third review round. `contains` accepted
+        // `END CERTIFICATE RSA PRIVATE KEY` as the footer for an
+        // `RSA PRIVATE KEY` header, ending the block early and leaving the
+        // material after it in the clear. The labels must be equal.
+        let text = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "FIRSTMATERIAL\n",
+            "-----END CERTIFICATE RSA PRIVATE KEY-----\n",
+            "SECONDMATERIAL\n",
+            "-----END RSA PRIVATE KEY-----\n",
+            "after"
+        );
+        let redacted = redact(text);
+        assert!(
+            !redacted.contains("FIRSTMATERIAL") && !redacted.contains("SECONDMATERIAL"),
+            "neither block's material may survive: {redacted:?}"
+        );
+        assert!(redacted.ends_with("after"), "{redacted:?}");
+    }
+
+    #[test]
+    fn a_begin_line_that_closes_on_a_later_line_is_not_a_header() {
+        // Third review round. Closing dashes were searched across following
+        // lines, so ordinary prose beginning with the marker could pick up a
+        // `-----` from anywhere below and redact everything between. Parsing
+        // is line-wise now, so a header is a header or it is nothing.
+        let text = "-----BEGIN of a sentence about a PRIVATE KEY\nand a later line -----\nkept";
+        assert_eq!(first(text), None, "not an armour line");
+        assert_eq!(redact(text), text, "and nothing is removed");
+    }
+
+    #[test]
+    fn a_credential_used_as_a_json_key_is_found() {
+        // Third review round. A gate whose `environment.set` used the token as
+        // the *variable name* and something ordinary as the value was accepted
+        // and committed: the walk visited values only, and a key is just as
+        // much author-supplied text.
+        let document = serde_json::json!({
+            "environment": { "set": { "ghp_0123456789abcdef0123456789abcdef0123": "value" } }
+        })
+        .to_string();
+
+        let error = refuse_secrets_in_document("gates/gate.x.json", &document).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicySensitiveValue);
+        assert!(!error.to_string().contains("ghp_0123"), "and never echoed");
+    }
+
+    #[test]
+    fn an_oversized_document_is_still_scanned_without_being_parsed() {
+        // Third review round measured thirteen seconds for a 100 MiB document
+        // on a check every control write passes through. Past the cap the scan
+        // is one linear pass instead of a parse and a tree walk: the field path
+        // is lost, the guarantee is not.
+        let mut huge = String::with_capacity(5 * 1024 * 1024);
+        huge.push_str("{\"padding\":\"");
+        while huge.len() < 5 * 1024 * 1024 {
+            huge.push('x');
+        }
+        huge.push_str("ghp_0123456789abcdef0123456789abcdef0123\"}");
+
+        let error = refuse_secrets_in_document("cards/F-001.json", &huge).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicySensitiveValue);
     }
 
     #[test]

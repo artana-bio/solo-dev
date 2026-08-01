@@ -345,6 +345,19 @@ impl ControlRepository {
             stage.extend_from_slice(&present);
             run_ok(&self.scope(), stage)?;
         }
+        // Scan exactly what is about to be committed, whatever wrote it.
+        //
+        // `write_atomic` was the wrong boundary, and a reviewer proved it by
+        // dropping a file straight into `cards/`: `git add --all` staged it and
+        // the credential reached `HEAD` without passing that function once. Any
+        // check on a single writer is only as good as the claim that it is the
+        // only writer, and here that claim was false.
+        //
+        // The index has no such loophole. Content is read back with `git show
+        // :path` rather than from the worktree, because the index is what the
+        // commit will contain and the two can differ.
+        refuse_staged_secrets(&self.scope())?;
+
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
         // worktree permanently dirty; asking `is_clean` would send every commit
@@ -384,6 +397,29 @@ impl ControlRepository {
                 code: ErrorCode::InternalControlCorrupt,
             })
     }
+}
+
+/// Refuses to commit when anything staged carries a recognized credential.
+///
+/// The index rather than the writer, because a check on one writer is only as
+/// strong as the claim that it is the only one — and `git add --all` stages
+/// whatever is on disk under a tracked path, however it got there.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicySensitiveValue`] naming the staged file and the
+/// field within it, or any error Git raises while reading the index.
+fn refuse_staged_secrets(scope: &GitScope) -> Result<(), HarnessError> {
+    let listed = run(scope, ["diff", "--cached", "--name-only", "-z"])?;
+    for relative in listed.stdout.split('\0').filter(|name| !name.is_empty()) {
+        // A deletion stages no content to inspect.
+        let blob = run(scope, ["show", &format!(":{relative}")])?;
+        if !blob.success() {
+            continue;
+        }
+        hygiene::refuse_secrets_in_document(relative, &blob.stdout)?;
+    }
+    Ok(())
 }
 
 /// Writes the project document and commits it, given an already-created

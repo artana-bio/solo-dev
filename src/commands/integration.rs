@@ -2234,6 +2234,22 @@ pub fn member_implementers(
                 ),
                 code: ErrorCode::PreconditionNotFound,
             })?;
+
+        // Matching the id alone trusted the file's *name*. The member pins a
+        // digest too, and editing a review's `feature_actor_id` changed who the
+        // separation check compared against — turning the record that proves
+        // who wrote the code into the thing an author edits in order to approve
+        // it. Everything else in this harness binds to a digest for exactly
+        // that reason; this lookup did not.
+        if review.digest()? != member.review_digest {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} for card {} no longer digests to what integration {} pinned; the approval was altered after it was recorded. Run `audit`",
+                    member.review_id, member.card_id, record.integration_id
+                ),
+                code: ErrorCode::PolicyNotIntegrable,
+            });
+        }
         found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
     }
     Ok(found)
