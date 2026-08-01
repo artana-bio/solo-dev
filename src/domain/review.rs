@@ -347,6 +347,11 @@ impl ReviewRecord {
         for (index, risk) in self.residual_risks.iter().enumerate() {
             hygiene::refuse_secret(&format!("review.residual_risks[{index}]"), risk)?;
         }
+        // Actor identifiers are free strings from a `--actor` flag, so they are
+        // as capable of carrying a pasted token as any prose field, and they
+        // are committed with the record like everything else here.
+        hygiene::refuse_secret("review.reviewer_actor_id", &self.reviewer_actor_id)?;
+        hygiene::refuse_secret("review.feature_actor_id", &self.feature_actor_id)?;
 
         Ok(())
     }

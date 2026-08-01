@@ -291,6 +291,31 @@ fn structured_error_details_are_redacted_too() {
 }
 
 #[test]
+fn an_unparsable_command_line_does_not_echo_a_credential() {
+    // Regression, RV-000036. A usage error quotes what was typed — that is
+    // what makes it useful — so it is the one diagnostic guaranteed to echo an
+    // argument back. Both renderers were missed: text mode printed clap's
+    // output directly, and the JSON envelope redacted its message and details
+    // while rebuilding the top-level `command` field from raw arguments.
+    for mode in [Vec::new(), vec!["--output".to_owned(), "json".to_owned()]] {
+        let mut argv = vec![TOKEN.to_owned()];
+        argv.extend(mode.clone());
+        let output = Workspace::run(&argv);
+
+        assert_ne!(output.status.code(), Some(0), "an unknown subcommand");
+        let whole = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !whole.contains(TOKEN),
+            "a token mistyped as a subcommand reached the terminal ({mode:?}): {whole}"
+        );
+    }
+}
+
+#[test]
 fn an_ordinary_card_is_still_accepted() {
     // The control that fires on ordinary evidence gets switched off. This is
     // the half of the behavior that keeps the other half deployable.

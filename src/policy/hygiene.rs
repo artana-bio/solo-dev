@@ -206,6 +206,20 @@ fn aws_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     None
 }
 
+/// Offset just past the `-----` that closes the armour line starting at
+/// `from`, ignoring the `-----` that opened it.
+///
+/// Line endings are not part of the search. Matching `-----\n` looked
+/// reasonable and meant a CRLF key had no findable end marker, so the span
+/// fell back to the end of input and redaction deleted every character after
+/// the block — losing ordinary text while reporting success.
+fn armour_line_end(rest: &str, from: usize) -> Option<usize> {
+    const MARKER: &str = "-----";
+    let after_opening = from + MARKER.len();
+    let closing = rest.get(after_opening..)?.find(MARKER)?;
+    Some(after_opening + closing + MARKER.len())
+}
+
 /// Length of a PEM private key block starting at `rest`.
 ///
 /// The whole block is one match. Redacting only the header would leave the key
@@ -214,18 +228,18 @@ fn private_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     if !rest.starts_with("-----BEGIN") {
         return None;
     }
-    let header_end = rest.find("-----\n").or_else(|| rest.find("-----\r\n"))?;
-    let header = &rest[..header_end];
-    if !header.contains("PRIVATE KEY") {
+    let header_end = armour_line_end(rest, 0)?;
+    if !rest[..header_end].contains("PRIVATE KEY") {
         return None;
     }
-    // An unterminated block still gets redacted to the end of the text: a
-    // truncated key is not a safe key.
+    // An unterminated block is still redacted to the end of the text: a
+    // truncated key is not a safe key. A terminated one stops at its end
+    // marker, whatever line ending follows it.
     let end = rest
         .find("-----END")
-        .and_then(|start| rest[start..].find("-----\n").map(|to| start + to + 5))
+        .and_then(|start| armour_line_end(rest, start))
         .unwrap_or(rest.len());
-    Some((SecretKind::PrivateKey, end))
+    Some((SecretKind::PrivateKey, end.max(header_end)))
 }
 
 /// Length of a URL userinfo carrying a password, starting at `rest`.
@@ -401,13 +415,48 @@ const CREDENTIAL_NAME_MARKERS: [&str; 7] = [
     "API_KEY",
 ];
 
+/// Splits a variable name into upper-cased word parts.
+///
+/// `NPM_TOKEN` and `npmToken` both become `[NPM, TOKEN]`, so naming style does
+/// not decide whether a credential is recognized.
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for value in name.chars() {
+        if value.is_ascii_alphanumeric() {
+            // A lower-to-upper step is a word boundary in camelCase, and the
+            // only one that is not punctuation.
+            if previous_lower && value.is_ascii_uppercase() && !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            current.push(value.to_ascii_uppercase());
+            previous_lower = value.is_ascii_lowercase();
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+            previous_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 /// Whether an environment variable name announces that its value is a secret.
+///
+/// Matched on whole words rather than as a substring. Substring matching read
+/// `TOKENIZER` as a credential and refused an ordinary variable, and a check
+/// that fires on innocuous names is a check somebody turns off.
 #[must_use]
 pub fn is_credential_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    CREDENTIAL_NAME_MARKERS
-        .iter()
-        .any(|marker| upper.contains(marker))
+    let words = name_words(name);
+    CREDENTIAL_NAME_MARKERS.iter().any(|marker| {
+        let marker: Vec<&str> = marker.split('_').collect();
+        words
+            .windows(marker.len())
+            .any(|window| window.iter().zip(&marker).all(|(word, part)| word == part))
+    })
 }
 
 #[cfg(test)]
@@ -476,6 +525,28 @@ mod tests {
         assert!(
             !redacted.contains("MIIEowIBAAKCAQEA"),
             "the key material must not survive: {redacted}"
+        );
+    }
+
+    #[test]
+    fn a_private_key_with_crlf_endings_does_not_swallow_the_text_after_it() {
+        // Regression, RV-000036. The end marker was searched for as `-----\n`,
+        // which a CRLF key never contains, so the span fell back to the end of
+        // input and redaction deleted every character after the block — losing
+        // ordinary text while reporting success. Worse than missing a secret:
+        // it destroys the surrounding record.
+        let text = "before\r\n-----BEGIN RSA PRIVATE KEY-----\r\nMIIEowIBAAKCAQEA\r\n-----END RSA PRIVATE KEY-----\r\nafter";
+        assert_eq!(first(text), Some(SecretKind::PrivateKey));
+
+        let redacted = redact(text);
+        assert!(
+            redacted.contains("after"),
+            "the text following the block must survive: {redacted:?}"
+        );
+        assert!(redacted.starts_with("before\r\n"), "{redacted:?}");
+        assert!(
+            !redacted.contains("MIIEowIBAAKCAQEA"),
+            "and the key material must not: {redacted:?}"
         );
     }
 
@@ -550,11 +621,39 @@ mod tests {
 
     #[test]
     fn credential_shaped_variable_names_are_recognized() {
-        for name in ["NPM_TOKEN", "my_api_key", "DEPLOY_SECRET", "db_password"] {
+        for name in [
+            "NPM_TOKEN",
+            "my_api_key",
+            "DEPLOY_SECRET",
+            "db_password",
+            "npmToken",
+            "SERVICE-CREDENTIAL",
+        ] {
             assert!(is_credential_name(name), "{name}");
         }
         for name in ["PATH", "HOME", "CARGO_TERM_COLOR", "RUST_BACKTRACE"] {
             assert!(!is_credential_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_marker_word_inside_a_longer_word_is_not_a_credential() {
+        // Regression, RV-000036. Substring matching read `TOKENIZER` as a
+        // credential and refused an ordinary variable. A check that fires on
+        // innocuous names is a check somebody switches off, which costs more
+        // than the case it was meant to catch.
+        for benign in [
+            "TOKENIZER",
+            "TOKENIZER_VERSION",
+            "SECRETARY_EMAIL",
+            "PASSWORDLESS_MODE",
+            "CREDENTIALING_URL",
+        ] {
+            assert!(!is_credential_name(benign), "{benign} must be allowed");
+        }
+        assert!(
+            is_credential_name("TOKENIZER_API_KEY"),
+            "a real marker beside the innocent word is still caught"
+        );
     }
 }

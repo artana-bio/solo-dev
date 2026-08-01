@@ -15,6 +15,7 @@ use crate::{
         ids::{AcceptanceId, IntegrationId},
     },
     error::HarnessError,
+    policy::hygiene,
 };
 
 /// Schema identifier for an acceptance record.
@@ -88,6 +89,33 @@ impl AcceptanceRecord {
     #[must_use]
     pub fn relative_path(acceptance_id: &AcceptanceId) -> String {
         format!("{ACCEPTANCE_DIR}/{acceptance_id}.json")
+    }
+
+    /// Refuses a record carrying a recognized credential.
+    ///
+    /// The acceptance was the one durable record with no hygiene check at all,
+    /// which is a poor place for the omission: it is the record that
+    /// authorizes publishing a commit, so it is the one an auditor is most
+    /// likely to read years later.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy error naming the offending field and not its value.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        hygiene::refuse_secrets([
+            (
+                "acceptance.acceptance_owner",
+                self.acceptance_owner.as_str(),
+            ),
+            (
+                "acceptance.rollback_reference",
+                self.rollback_reference.as_str(),
+            ),
+        ])?;
+        for (index, risk) in self.residual_risks.iter().enumerate() {
+            hygiene::refuse_secret(&format!("acceptance.residual_risks[{index}]"), risk)?;
+        }
+        Ok(())
     }
 
     /// The acceptance's canonical digest.

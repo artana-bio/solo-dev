@@ -2203,16 +2203,20 @@ pub struct ReviewArgs {
 /// review by id and digest, and going through the handoff would re-derive the
 /// same fact from a record the approval was bound to anyway.
 ///
-/// A member whose review has gone missing contributes nothing rather than
-/// failing the caller. The separation check this feeds is a guard against a
-/// mistake, and refusing an acceptance because a review file is unreadable
-/// would turn a corrupt-control problem into a lifecycle deadlock at the one
-/// step that authorizes moving the protected branch. `audit` is the command
-/// that reports missing evidence as a discrepancy (D-058).
+/// Fails closed when a member's review cannot be found. An earlier version
+/// skipped it, so that a damaged control repository could not deadlock the
+/// lifecycle — and a reviewer proved the consequence by deleting one review
+/// file and then self-accepting as the implementer. Absence of evidence became
+/// a granted authorization, which is the worst possible direction for this
+/// particular check to fail in. The member pins the review by id *and* digest,
+/// so a review that will not load is not an ordinary missing file; it is the
+/// record the approval was bound to, gone. `audit` reports it as a discrepancy
+/// (D-058), and `project recover` or a restored backup is the way out.
 ///
 /// # Errors
 ///
-/// Returns an error only when the control repository itself cannot be read.
+/// Returns a precondition error naming the member whose review is missing, and
+/// any error the control repository itself raises.
 pub fn member_implementers(
     control: &ControlRepository,
     record: &IntegrationRecord,
@@ -2220,12 +2224,17 @@ pub fn member_implementers(
     let mut found = Vec::new();
     for member in &record.members {
         let reviews = crate::commands::review::reviews_for(control, &member.card_id)?;
-        if let Some(review) = reviews
+        let review = reviews
             .iter()
             .find(|review| review.review_id == member.review_id)
-        {
-            found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
-        }
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "integration {} names review {} for card {}, and it cannot be read; the approval this step relies on is missing, so who implemented {} cannot be established. Run `audit` to see what else is affected",
+                    record.integration_id, member.review_id, member.card_id, member.card_id
+                ),
+                code: ErrorCode::PreconditionNotFound,
+            })?;
+        found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
     }
     Ok(found)
 }
@@ -2453,8 +2462,6 @@ fn check_promotion(
     record: &IntegrationRecord,
     actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
-    refuse_author_promoting(control, record, actor_id)?;
-
     if record.status != IntegrationStatus::Accepted {
         return Err(HarnessError::Control {
             reason: format!(
@@ -2515,6 +2522,14 @@ fn check_promotion(
             code: ErrorCode::PolicyNotVerified,
         });
     }
+
+    // Deliberately after the plan has been proved intact, not before. Asking
+    // who is allowed to promote a tampered plan answers the less useful
+    // question first: run ahead of the digest comparison, this reported a
+    // member whose review could not be found, when what the operator needed to
+    // hear was that the plan had changed since acceptance. Still well before
+    // anything is mutated, which is all the separation check requires.
+    refuse_author_promoting(control, record, actor_id)?;
 
     // Step 4: the authority must still be where the plan expected.
     let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;

@@ -533,7 +533,10 @@ want the newer commit as your baseline, promote it through the harness, or
 initialize after it exists.
 
 An authority that already exists and is compatible is adopted unchanged, and
-then *it* supplies the baseline — the candidate's branch is not read at all.
+then *it* supplies the baseline rather than the candidate. The candidate's
+protected branch is still resolved and checked — initialization validates it
+in every case and refuses a repository that has no commit on it — it is
+simply not what the authority gets seeded from.
 
 ### Init is a one-time registration
 

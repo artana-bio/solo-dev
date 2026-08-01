@@ -201,6 +201,7 @@ fn preview_record(
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
     require_reviewed(&record)?;
+    refuse_author_accepting(&control, &record, &args.acceptance_owner)?;
 
     Ok(CommandOutcome::new(
         "acceptance.record",
@@ -219,6 +220,33 @@ fn preview_record(
     .with_project(config.project_id))
 }
 
+/// Refuses an acceptance recorded by someone who implemented a member card.
+///
+/// Acceptance is the only thing that authorizes moving the protected branch,
+/// and it was the one step in the lifecycle with no separation check at all —
+/// both reviews had one, and the step they lead to did not.
+///
+/// A free function rather than a step inside the record builder, because the
+/// dry run has to reach it too. When it lived in the builder, a preview
+/// succeeded for an implementer whose real acceptance was refused, which
+/// contradicts the documented promise that a dry run gives the same error the
+/// real command would.
+fn refuse_author_accepting(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    acceptance_owner: &str,
+) -> Result<(), HarnessError> {
+    let implementers = member_implementers(control, record)?;
+    actors::refuse_author_acting_as(
+        "acceptance owner",
+        acceptance_owner,
+        &record.integration_id.to_string(),
+        implementers
+            .iter()
+            .map(|(card, actor)| (card.as_str(), actor.as_str())),
+    )
+}
+
 /// Builds the acceptance record a validated decision becomes.
 fn build_acceptance(
     control: &ControlRepository,
@@ -228,20 +256,7 @@ fn build_acceptance(
     clock: &dyn Clock,
 ) -> Result<AcceptanceRecord, HarnessError> {
     let verification = load_verification(control, &record.integration_id)?;
-
-    // Acceptance is the only thing that authorizes moving the protected
-    // branch, and until now it was the one step in the lifecycle with no
-    // separation check at all — both reviews had one, and the step they lead
-    // to did not.
-    let implementers = member_implementers(control, record)?;
-    actors::refuse_author_acting_as(
-        "acceptance owner",
-        &args.acceptance_owner,
-        &record.integration_id.to_string(),
-        implementers
-            .iter()
-            .map(|(card, actor)| (card.as_str(), actor.as_str())),
-    )?;
+    refuse_author_accepting(control, record, &args.acceptance_owner)?;
 
     let Some(landing_sha) = record.landing_sha.clone() else {
         return Err(HarnessError::Control {
@@ -253,7 +268,7 @@ fn build_acceptance(
         });
     };
 
-    Ok(AcceptanceRecord {
+    let acceptance = AcceptanceRecord {
         schema: ACCEPTANCE_SCHEMA.to_owned(),
         acceptance_id: next_acceptance_id(control)?,
         integration_id: record.integration_id.clone(),
@@ -268,7 +283,9 @@ fn build_acceptance(
         }),
         accepted_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
-    })
+    };
+    acceptance.validate()?;
+    Ok(acceptance)
 }
 
 fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

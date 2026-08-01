@@ -95,7 +95,11 @@ impl ActorDeclaration {
             return Err(HarnessError::Control {
                 reason: format!(
                     "delivered_sha must be a full 40-character object ID, found `{}`",
-                    self.delivered_sha
+                    // Redacted for the same reason as the card's `base_sha`:
+                    // this check runs before the hygiene scan below, so it
+                    // would otherwise be the one place a pasted token is
+                    // quoted straight back at the author.
+                    hygiene::redact(&self.delivered_sha)
                 ),
                 code: ErrorCode::PolicyIncompleteHandoff,
             });

@@ -118,6 +118,68 @@ fn an_acceptance_binds_the_exact_landing_commit_and_its_evidence() {
 }
 
 #[test]
+fn deleting_a_member_review_refuses_acceptance_rather_than_permitting_it() {
+    // Regression, RV-000036, the one finding that was exploitable. The
+    // implementer lookup used to skip a member whose review would not load, so
+    // that a damaged control repository could not deadlock the lifecycle. The
+    // reviewer deleted one review file and then self-accepted: absence of
+    // evidence had become a granted authorization. It now fails closed.
+    let (workspace, id) = reviewed(1);
+
+    let reviews = workspace.control.join("reviews");
+    let victim = std::fs::read_dir(&reviews)
+        .expect("the review directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|kind| kind == "json"))
+        .expect("a recorded review");
+    std::fs::remove_file(&victim).unwrap();
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a missing approval must never read as permission"
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("F-001") && rendered.contains("audit"),
+        "the refusal names the member and points at the diagnosis: {rendered}"
+    );
+
+    // And the same for promotion, which derives its check from the same lookup.
+    let promoted =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "operator"]);
+    assert_ne!(promoted.status.code(), Some(0));
+}
+
+#[test]
+fn an_acceptance_dry_run_refuses_the_author_too() {
+    // Regression, RV-000036. The check lived inside the record builder, which
+    // the preview never calls, so a dry run succeeded for an implementer whose
+    // real acceptance was refused — contradicting the documented promise that
+    // a dry run gives the same error the real command would.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+        "--dry-run",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
 fn the_implementer_cannot_accept_their_own_integration() {
     // Acceptance is the only thing that authorizes moving the protected
     // branch. Both reviews already refuse a self-verdict; the step they lead

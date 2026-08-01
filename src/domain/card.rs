@@ -511,9 +511,13 @@ impl CardDraft {
             ));
         }
         if self.base_sha.len() != 40 || !self.base_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // Redacted rather than quoted. A structural validator echoing its
+            // input is the ordinary way a bad paste reaches a log, and this
+            // one runs before the hygiene scan below ever sees the field.
+            // A genuine typo still shows; a credential does not.
             return Err(reject(format!(
                 "base_sha must be a full 40-character object ID, found `{}`",
-                self.base_sha
+                hygiene::redact(&self.base_sha)
             )));
         }
 
@@ -523,15 +527,45 @@ impl CardDraft {
             ("card.title", self.title.as_str()),
             ("card.goal", self.goal.as_str()),
             ("card.rollback_strategy", self.rollback_strategy.as_str()),
+            // Both are documented as closed sets — `feature | fix` and
+            // `independent` — but neither is an enum and nothing narrows them,
+            // so they accept whatever a draft supplies. Scanned rather than
+            // newly constrained: tightening them is a schema change that would
+            // refuse existing cards, and belongs to its own decision.
+            ("card.change_kind", self.change_kind.as_str()),
+            ("card.review_policy", self.review_policy.as_str()),
         ])?;
         for (field, entries) in [
             ("non_goals", &self.non_goals),
             ("acceptance.behaviors", &self.acceptance.behaviors),
             ("acceptance.regressions", &self.acceptance.regressions),
             ("exclusive_resources", &self.exclusive_resources),
+            ("contract_reads", &self.contract_reads),
+            ("contract_changes", &self.contract_changes),
+            ("write_scope.include", &self.write_scope.include),
+            ("write_scope.exclude", &self.write_scope.exclude),
+            // Gate names are resolved against the registry at activation, but
+            // the draft reaches control before that, so an unresolvable name
+            // is still a written record by then.
+            ("named_gates.feature", &self.named_gates.feature),
+            ("named_gates.review", &self.named_gates.review),
+            ("named_gates.integration", &self.named_gates.integration),
         ] {
             for (index, entry) in entries.iter().enumerate() {
                 hygiene::refuse_secret(&format!("card.{field}[{index}]"), entry)?;
+            }
+        }
+        for (index, artifact) in self.generated_artifacts.iter().enumerate() {
+            let at = format!("card.generated_artifacts[{index}]");
+            hygiene::refuse_secret(&format!("{at}.path"), &artifact.path)?;
+            if let Some(generator) = &artifact.generator {
+                hygiene::refuse_secret(&format!("{at}.generator"), generator)?;
+            }
+            if let Some(identifier) = &artifact.identifier {
+                hygiene::refuse_secret(&format!("{at}.identifier"), identifier)?;
+            }
+            for (source, value) in artifact.sources.iter().enumerate() {
+                hygiene::refuse_secret(&format!("{at}.sources[{source}]"), value)?;
             }
         }
         if self.depends_on.contains(&self.card_id) {
@@ -794,40 +828,113 @@ mod tests {
     }
 
     #[test]
-    fn every_free_text_field_of_a_card_is_scanned() {
-        // The card is the first durable record in the lifecycle, so it is the
-        // first place a credential can become permanent. Enumerated so a field
-        // added to the struct and not to the scan fails here.
+    fn every_string_a_card_can_carry_is_either_scanned_or_structurally_constrained() {
+        // Regression, RV-000036. The previous version of this test enumerated
+        // the fields by hand — and the hand that wrote it was the hand that
+        // wrote the scan, so it listed exactly what the scan already covered
+        // and certified a completeness it did not have. `contract_reads` and
+        // `contract_changes` were both missing from each.
+        //
+        // The list now comes from serde rather than from memory: serialize the
+        // draft, walk every string leaf, plant a credential in each one, and
+        // require the record to refuse. Anything that cannot carry free text —
+        // an identifier, a SHA, an enum — refuses for its own reason instead,
+        // and is named here so that exemption is a decision on the page rather
+        // than a silent gap.
         const SECRET: &str = "ghp_0123456789abcdef0123456789abcdef0123";
-        /// A named field and the mutator that plants a credential in it.
-        type Poison = (&'static str, fn(&mut CardDraft));
-        let poison: [Poison; 6] = [
-            ("title", |d| d.title = SECRET.to_owned()),
-            ("goal", |d| d.goal = SECRET.to_owned()),
-            ("rollback_strategy", |d| {
-                d.rollback_strategy = SECRET.to_owned();
-            }),
-            ("non_goals[0]", |d| d.non_goals = vec![SECRET.to_owned()]),
-            ("acceptance.behaviors[0]", |d| {
-                d.acceptance.behaviors = vec![SECRET.to_owned()];
-            }),
-            ("exclusive_resources[0]", |d| {
-                d.exclusive_resources = vec![SECRET.to_owned()];
-            }),
-        ];
+        // `change_kind` and `review_policy` were on this list on the first
+        // attempt, on the assumption that a documented closed set is an
+        // enforced one. Neither is an enum and nothing narrows them, so the
+        // walk caught them accepting a credential — which is the whole reason
+        // the list is derived from serde rather than from what I remember
+        // being true.
+        const STRUCTURALLY_CONSTRAINED: [&str; 6] =
+            ["card_id", "cycle_id", "base_sha", "risk", "schema", "class"];
 
-        assert!(draft().validate().is_ok(), "the fixture is clean");
-        for (field, poison) in poison {
-            let mut draft = draft();
-            poison(&mut draft);
-            let error = draft
+        let mut leaves = Vec::new();
+        collect_string_paths(
+            &serde_json::to_value(draft()).unwrap(),
+            String::new(),
+            &mut leaves,
+        );
+        assert!(
+            leaves.len() >= 12,
+            "the fixture must exercise a representative card: {leaves:?}"
+        );
+
+        for path in leaves {
+            let leaf = path.rsplit('.').next().unwrap_or(&path);
+            let constrained = STRUCTURALLY_CONSTRAINED
+                .iter()
+                .any(|name| leaf == *name || leaf.starts_with(&format!("{name}[")));
+
+            let mut value = serde_json::to_value(draft()).unwrap();
+            *pointer_mut(&mut value, &path) = serde_json::Value::String(SECRET.to_owned());
+            let Ok(poisoned) = serde_json::from_value::<CardDraft>(value) else {
+                assert!(constrained, "`{path}` rejects the value at parse time");
+                continue;
+            };
+
+            let error = poisoned
                 .validate()
-                .expect_err(&format!("`{field}` must be scanned"));
-            assert_eq!(error.code(), ErrorCode::PolicySensitiveValue, "{field}");
-            let rendered = error.to_string();
-            assert!(rendered.contains(field), "{field}: {rendered}");
-            assert!(!rendered.contains(SECRET), "{field} echoed it: {rendered}");
+                .expect_err(&format!("`{path}` accepted a credential"));
+            if !constrained {
+                assert_eq!(
+                    error.code(),
+                    ErrorCode::PolicySensitiveValue,
+                    "`{path}` is free text and must be refused as sensitive"
+                );
+            }
+            assert!(
+                !error.to_string().contains(SECRET),
+                "`{path}` echoed the value: {error}"
+            );
         }
+    }
+
+    /// Every string leaf in `value`, as dotted paths with `[i]` for arrays.
+    fn collect_string_paths(value: &serde_json::Value, at: String, into: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(_) => into.push(at),
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_string_paths(item, format!("{at}[{index}]"), into);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (name, field) in fields {
+                    let next = if at.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{at}.{name}")
+                    };
+                    collect_string_paths(field, next, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolves a path produced by [`collect_string_paths`] for mutation.
+    fn pointer_mut<'a>(value: &'a mut serde_json::Value, path: &str) -> &'a mut serde_json::Value {
+        let mut current = value;
+        for segment in path.split('.') {
+            let (name, indices) = match segment.find('[') {
+                Some(at) => (&segment[..at], &segment[at..]),
+                None => (segment, ""),
+            };
+            if !name.is_empty() {
+                current = current.get_mut(name).expect("a field named by serde");
+            }
+            for index in indices
+                .split(']')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.trim_start_matches('[').parse::<usize>().unwrap())
+            {
+                current = current.get_mut(index).expect("an index serde produced");
+            }
+        }
+        current
     }
 
     #[test]

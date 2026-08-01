@@ -274,6 +274,11 @@ impl GateDefinition {
         for (index, argument) in self.argv.iter().enumerate() {
             hygiene::refuse_secret(&format!("gate.argv[{index}]"), argument)?;
         }
+        hygiene::refuse_secret("gate.gate_id", &self.gate_id)?;
+        hygiene::refuse_secret("gate.working_directory", &self.working_directory)?;
+        for (index, artifact) in self.artifacts.iter().enumerate() {
+            hygiene::refuse_secret(&format!("gate.artifacts[{index}]"), artifact)?;
+        }
 
         Ok(())
     }
