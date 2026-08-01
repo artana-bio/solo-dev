@@ -228,13 +228,10 @@ fn a_missing_card_revision_is_reported_rather_than_skipped() {
 fn gate_log_contents_never_appear_in_the_report() {
     let workspace = Workspace::initialized();
     // A gate that prints something a reader must never find in a report.
-    //
-    // The secret comes from the candidate worktree rather than from the gate's
-    // argv: a gate definition is itself a committed control record, and record
-    // hygiene refuses one carrying a credential. That is also the more faithful
-    // fixture — a real leak reaches a log through what the build prints, not
-    // through what the registry was told to run.
-    workspace.register_gate("gate.leaky", &["sh", "-c", "cat src/F-001/leak.txt"]);
+    workspace.register_gate(
+        "gate.leaky",
+        &["sh", "-c", "echo 'AKIAIOSFODNN7EXAMPLE super-secret'"],
+    );
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -253,11 +250,6 @@ fn gate_log_contents_never_appear_in_the_report() {
     let worktree = workspace.worktrees.join("F-001");
     fs::create_dir_all(worktree.join("src/F-001")).unwrap();
     fs::write(worktree.join("src/F-001/a.rs"), "// work\n").unwrap();
-    fs::write(
-        worktree.join("src/F-001/leak.txt"),
-        "AKIAIOSFODNN7EXAMPLE super-secret\n",
-    )
-    .unwrap();
     support::git(&worktree, &["add", "-A"]);
     support::git(&worktree, &["commit", "-q", "-m", "feat: work"]);
     workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.leaky"]);

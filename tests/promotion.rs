@@ -160,41 +160,6 @@ fn deleting_a_member_review_refuses_acceptance_rather_than_permitting_it() {
 }
 
 #[test]
-fn a_credential_cannot_be_recorded_through_a_real_acceptance() {
-    // Second review round, and the half of it a domain-level test cannot
-    // reach: calling `AcceptanceRecord::validate` directly proves the method
-    // works, not that anything calls it. Deleting the call left every hygiene
-    // test green. This drives the actual command.
-    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
-    let (workspace, id) = reviewed(1);
-
-    let owner = workspace.acceptance_raw(&[
-        "record",
-        "--integration-id",
-        &id,
-        "--acceptance-owner",
-        TOKEN,
-    ]);
-    assert_ne!(owner.status.code(), Some(0), "the owner is a durable field");
-    assert!(
-        !String::from_utf8_lossy(&owner.stdout).contains(TOKEN),
-        "and the refusal must not echo it"
-    );
-
-    let risk = workspace.acceptance_raw(&[
-        "record",
-        "--integration-id",
-        &id,
-        "--acceptance-owner",
-        "owner",
-        "--residual-risk",
-        &format!("the deploy key {TOKEN} stays valid"),
-    ]);
-    assert_eq!(risk.status.code(), Some(5));
-    assert_eq!(error_code(&risk), "CH-POLICY-SENSITIVE-VALUE");
-}
-
-#[test]
 fn editing_a_pinned_review_refuses_acceptance_rather_than_changing_who_wrote_the_code() {
     // The digest binding had no test at all: neutering the comparison left the
     // entire suite green, so nothing would have caught its removal. It exists

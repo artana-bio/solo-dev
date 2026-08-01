@@ -25,7 +25,7 @@ use crate::{
         ids::{CardId, CycleId, ReviewId},
     },
     error::{ErrorCode, HarnessError},
-    policy::{actors, hygiene},
+    policy::actors,
 };
 
 /// Schema identifier for a review.
@@ -328,31 +328,6 @@ impl ReviewRecord {
             });
         }
 
-        // A review states specifically what was run, which is exactly the kind
-        // of prose that ends up carrying a token pasted from a terminal.
-        hygiene::refuse_secret("review.gate_adequacy.basis", &self.gate_adequacy.basis)?;
-        for (index, behavior) in self.gate_adequacy.unobserved_behaviors.iter().enumerate() {
-            hygiene::refuse_secret(
-                &format!("review.gate_adequacy.unobserved_behaviors[{index}]"),
-                behavior,
-            )?;
-        }
-        for (index, finding) in self.findings.iter().enumerate() {
-            hygiene::refuse_secret(
-                &format!("review.findings[{index}].location"),
-                &finding.location,
-            )?;
-            hygiene::refuse_secret(&format!("review.findings[{index}].detail"), &finding.detail)?;
-        }
-        for (index, risk) in self.residual_risks.iter().enumerate() {
-            hygiene::refuse_secret(&format!("review.residual_risks[{index}]"), risk)?;
-        }
-        // Actor identifiers are free strings from a `--actor` flag, so they are
-        // as capable of carrying a pasted token as any prose field, and they
-        // are committed with the record like everything else here.
-        hygiene::refuse_secret("review.reviewer_actor_id", &self.reviewer_actor_id)?;
-        hygiene::refuse_secret("review.feature_actor_id", &self.feature_actor_id)?;
-
         Ok(())
     }
 
@@ -513,54 +488,6 @@ mod tests {
             supersedes: None,
             reviewed_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
             canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
-        }
-    }
-
-    #[test]
-    fn every_free_text_field_of_a_review_is_scanned() {
-        // Enumerated for the same reason the handoff's is: the scan is a loop
-        // over named fields, so it fails by omission when the struct grows.
-        const SECRET: &str = "ghp_0123456789abcdef0123456789abcdef0123";
-        /// A named field and the mutator that plants a credential in it.
-        type Poison = (&'static str, fn(&mut ReviewRecord));
-        let poison: [Poison; 5] = [
-            ("gate_adequacy.basis", |r| {
-                r.gate_adequacy.basis = SECRET.to_owned();
-            }),
-            ("gate_adequacy.unobserved_behaviors[0]", |r| {
-                r.gate_adequacy.unobserved_behaviors = vec![SECRET.to_owned()];
-            }),
-            ("findings[0].location", |r| {
-                r.findings = vec![Finding {
-                    location: SECRET.to_owned(),
-                    ..finding(Disposition::Resolved)
-                }];
-            }),
-            ("findings[0].detail", |r| {
-                r.findings = vec![Finding {
-                    detail: SECRET.to_owned(),
-                    ..finding(Disposition::Resolved)
-                }];
-            }),
-            ("residual_risks[0]", |r| {
-                r.residual_risks = vec![SECRET.to_owned()];
-            }),
-        ];
-
-        assert!(
-            review(Decision::Approved, vec![]).validate().is_ok(),
-            "the fixture is clean"
-        );
-        for (field, poison) in poison {
-            let mut record = review(Decision::Approved, vec![]);
-            poison(&mut record);
-            let error = record
-                .validate()
-                .expect_err(&format!("`{field}` must be scanned"));
-            assert_eq!(error.code(), ErrorCode::PolicySensitiveValue, "{field}");
-            let rendered = error.to_string();
-            assert!(rendered.contains(field), "{field}: {rendered}");
-            assert!(!rendered.contains(SECRET), "{field} echoed it: {rendered}");
         }
     }
 

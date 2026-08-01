@@ -7,7 +7,6 @@ use change_harness::{
     command_path,
     error::{ErrorCode, HarnessError},
     execute, failure_format,
-    policy::hygiene,
 };
 
 /// Renders a clap parse failure through the stable envelope when JSON was asked
@@ -34,20 +33,13 @@ fn parse_or_report() -> Result<Cli, ExitCode> {
     }
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
-
-    // A usage error quotes what was typed — that is what makes it useful — so
-    // it is the one diagnostic guaranteed to echo an argument back. Rendering
-    // through `redact` rather than clap's own `print` is what keeps a token
-    // mistyped as a subcommand out of the terminal.
     if !asked_for_json(&raw) {
-        eprintln!("{}", hygiene::redact(error.render().to_string().trim()));
+        error.print().ok();
         return Err(ExitCode::from(ExitCategory::Usage));
     }
 
     // The command was never parsed, so the path is recovered from what was
     // typed: the leading non-flag tokens, which is exactly what was attempted.
-    // Redacted for the same reason, and separately from the envelope's own
-    // redaction, which only reaches the message and the details.
     let attempted: Vec<&str> = raw
         .iter()
         .take_while(|argument| !argument.starts_with('-'))
@@ -58,7 +50,7 @@ fn parse_or_report() -> Result<Cli, ExitCode> {
         reason: error.render().to_string().trim().to_owned(),
         code: ErrorCode::UsageInvalidArguments,
     };
-    match CommandErrorEnvelope::new(hygiene::redact(&attempted.join(".")), &failure).render() {
+    match CommandErrorEnvelope::new(attempted.join("."), &failure).render() {
         Ok(rendered) => println!("{rendered}"),
         Err(nested) => eprintln!("error: {nested}"),
     }
@@ -99,7 +91,7 @@ fn main() -> ExitCode {
             // result, in text and JSON alike. In JSON mode they are also
             // inside the envelope.
             for warning in &execution.warnings {
-                eprintln!("warning: {}", hygiene::redact(warning));
+                eprintln!("warning: {warning}");
             }
             ExitCode::from(ExitCategory::Success)
         }
@@ -111,10 +103,7 @@ fn main() -> ExitCode {
                     Ok(rendered) => println!("{rendered}"),
                     Err(nested) => eprintln!("error: {nested}"),
                 },
-                // Text mode redacts for the same reason the envelope does: a
-                // terminal is scrollback, and scrollback is where a pasted
-                // token ends up when the diagnosis quotes what it refused.
-                OutputFormat::Text => eprintln!("error: {}", hygiene::redact(&error.to_string())),
+                OutputFormat::Text => eprintln!("error: {error}"),
             }
             ExitCode::from(error.category())
         }

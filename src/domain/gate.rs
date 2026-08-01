@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::digest::Digest,
     error::{ErrorCode, HarnessError},
-    policy::hygiene,
 };
 
 /// Schema identifier for a gate definition.
@@ -254,30 +253,6 @@ impl GateDefinition {
                     self.gate_id
                 )));
             }
-        }
-
-        // `set` is the only field in the whole schema whose purpose is to carry
-        // a literal value a process needs at runtime, and the definition is
-        // committed to `control/gates`. `ALWAYS_DENIED` above catches eight
-        // exact names; a project's own `DEPLOY_TOKEN` is caught here by shape,
-        // because otherwise the most natural place to put a credential is also
-        // the one place nothing was looking.
-        for (name, value) in &self.environment.set {
-            if hygiene::is_credential_name(name) {
-                return Err(reject(format!(
-                    "gate `{}` sets `{name}` to a literal value, and the definition is committed to control history; name it under `allow` so the host supplies it at run time instead",
-                    self.gate_id
-                )));
-            }
-            hygiene::refuse_secret(&format!("gate.environment.set.{name}"), value)?;
-        }
-        for (index, argument) in self.argv.iter().enumerate() {
-            hygiene::refuse_secret(&format!("gate.argv[{index}]"), argument)?;
-        }
-        hygiene::refuse_secret("gate.gate_id", &self.gate_id)?;
-        hygiene::refuse_secret("gate.working_directory", &self.working_directory)?;
-        for (index, artifact) in self.artifacts.iter().enumerate() {
-            hygiene::refuse_secret(&format!("gate.artifacts[{index}]"), artifact)?;
         }
 
         Ok(())

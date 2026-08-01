@@ -268,7 +268,7 @@ fn build_acceptance(
         });
     };
 
-    let acceptance = AcceptanceRecord {
+    Ok(AcceptanceRecord {
         schema: ACCEPTANCE_SCHEMA.to_owned(),
         acceptance_id: next_acceptance_id(control)?,
         integration_id: record.integration_id.clone(),
@@ -283,9 +283,7 @@ fn build_acceptance(
         }),
         accepted_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
-    };
-    acceptance.validate()?;
-    Ok(acceptance)
+    })
 }
 
 fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

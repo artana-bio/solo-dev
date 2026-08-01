@@ -160,8 +160,6 @@ pub enum ErrorCode {
     PolicyDeliveredShaMismatch,
     /// The reviewer is the feature actor.
     PolicySelfReview,
-    /// A durable control record carries what looks like a credential.
-    PolicySensitiveValue,
     /// A review approved while findings remain open.
     PolicyOpenFindings,
     /// A review is missing a required field.
@@ -207,7 +205,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 79] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -277,7 +275,6 @@ impl ErrorCode {
         Self::PolicyIncompleteHandoff,
         Self::PolicyDeliveredShaMismatch,
         Self::PolicySelfReview,
-        Self::PolicySensitiveValue,
         Self::PolicyOpenFindings,
         Self::PolicyIncompleteReview,
         Self::PolicyStaleHandoff,
@@ -350,7 +347,6 @@ impl ErrorCode {
             | Self::PolicyIncompleteHandoff
             | Self::PolicyDeliveredShaMismatch
             | Self::PolicySelfReview
-            | Self::PolicySensitiveValue
             | Self::PolicyRiskReview
             | Self::PolicyOpenFindings
             | Self::PolicyIncompleteReview
@@ -447,7 +443,6 @@ impl ErrorCode {
             Self::PolicyIncompleteHandoff => "INCOMPLETE-HANDOFF",
             Self::PolicyDeliveredShaMismatch => "DELIVERED-SHA-MISMATCH",
             Self::PolicySelfReview => "SELF-REVIEW",
-            Self::PolicySensitiveValue => "SENSITIVE-VALUE",
             Self::PolicyRiskReview => "RISK-REVIEW",
             Self::PolicyOpenFindings => "OPEN-FINDINGS",
             Self::PolicyIncompleteReview => "INCOMPLETE-REVIEW",
@@ -650,9 +645,6 @@ impl ErrorCode {
             }
             Self::PolicySelfReview => {
                 "Have a different actor review this candidate in a fresh context."
-            }
-            Self::PolicySensitiveValue => {
-                "Remove the value from the named field and rotate it. A control record is committed history, so this refusal is the last point at which it can be kept out."
             }
             Self::PolicyOpenFindings => {
                 "Disposition each finding as resolved, accepted risk, or out of scope before approving."

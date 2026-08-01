@@ -6,6 +6,5 @@
 
 pub mod actors;
 pub mod allocation;
-pub mod hygiene;
 pub mod paths;
 pub mod verification;

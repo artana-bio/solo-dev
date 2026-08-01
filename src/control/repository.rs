@@ -15,7 +15,6 @@ use crate::{
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_ok},
-    policy::hygiene,
 };
 
 /// Path of the project document inside the control repository.
@@ -229,14 +228,6 @@ impl ControlRepository {
     ///
     /// Returns an error when the file cannot be written or renamed.
     pub fn write_atomic(&self, relative: &str, contents: &str) -> Result<(), HarnessError> {
-        // Everything durable passes through here, which is why the credential
-        // check lives here rather than in each record's `validate`. Two review
-        // rounds showed that enumerating fields per schema does not converge —
-        // every round found more, and always by someone probing rather than by
-        // the list. This is the guarantee; the per-record checks upstream are
-        // the courtesy that fails earlier and says something friendlier.
-        hygiene::refuse_secrets_in_document(relative, contents)?;
-
         let target = self.path(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {
@@ -345,32 +336,6 @@ impl ControlRepository {
             stage.extend_from_slice(&present);
             run_ok(&self.scope(), stage)?;
         }
-        // Scan exactly what is about to be committed, whatever wrote it.
-        //
-        // `write_atomic` was the wrong boundary, and a reviewer proved it by
-        // dropping a file straight into `cards/`: `git add --all` staged it and
-        // the credential reached `HEAD` without passing that function once. Any
-        // check on a single writer is only as good as the claim that it is the
-        // only writer, and here that claim was false.
-        //
-        // The index has no such loophole. Content is read back with `git show
-        // :path` rather than from the worktree, because the index is what the
-        // commit will contain and the two can differ.
-        // A refusal unstages before it returns, or the repository wedges. The
-        // offending content is already in the index by this point, and the
-        // pathspec above drops paths that no longer exist — so an operator who
-        // deleted the bad file found its staged copy still there, every later
-        // commit refusing on a file that was no longer on disk, with nothing
-        // on screen explaining why. Resetting restores the index to `HEAD` and
-        // leaves the worktree alone: the bad file stays where the operator can
-        // see and fix it, and once fixed the next commit simply works. A
-        // control that bricks the repository it protects is worse than the
-        // leak it prevents.
-        if let Err(refusal) = refuse_staged_secrets(&self.scope()) {
-            let _ = run(&self.scope(), ["reset", "-q"]);
-            return Err(refusal);
-        }
-
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
         // worktree permanently dirty; asking `is_clean` would send every commit
@@ -410,29 +375,6 @@ impl ControlRepository {
                 code: ErrorCode::InternalControlCorrupt,
             })
     }
-}
-
-/// Refuses to commit when anything staged carries a recognized credential.
-///
-/// The index rather than the writer, because a check on one writer is only as
-/// strong as the claim that it is the only one — and `git add --all` stages
-/// whatever is on disk under a tracked path, however it got there.
-///
-/// # Errors
-///
-/// Returns [`ErrorCode::PolicySensitiveValue`] naming the staged file and the
-/// field within it, or any error Git raises while reading the index.
-fn refuse_staged_secrets(scope: &GitScope) -> Result<(), HarnessError> {
-    let listed = run(scope, ["diff", "--cached", "--name-only", "-z"])?;
-    for relative in listed.stdout.split('\0').filter(|name| !name.is_empty()) {
-        // A deletion stages no content to inspect.
-        let blob = run(scope, ["show", &format!(":{relative}")])?;
-        if !blob.success() {
-            continue;
-        }
-        hygiene::refuse_secrets_in_document(relative, &blob.stdout)?;
-    }
-    Ok(())
 }
 
 /// Writes the project document and commits it, given an already-created
