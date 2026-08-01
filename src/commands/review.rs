@@ -467,6 +467,7 @@ const fn state_for(decision: Decision) -> CardState {
 /// verdict the schema offers, discarded because a transition refused it. The
 /// dependency question is asked where it decides something — of the review, at
 /// integration.
+/// Only an approval requires it; see the call site.
 fn require_current_handoff(
     control: &ControlRepository,
     card_id: &CardId,
@@ -508,7 +509,23 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     code: ErrorCode::PreconditionNotFound,
                 })?;
 
-            require_current_handoff(control, &card_id, &handoff, &state.current_digest)?;
+            // Only an approval. A verdict that found problems is a true
+            // statement about the candidate it was reached against, and it
+            // stays true when the branch moves; refusing to file it destroys
+            // the reviewer's work to protect an invariant that only approvals
+            // carry. The comment on the function below already makes this
+            // argument for dependency staleness — "a verdict the schema
+            // offers, discarded because a transition refused it" — and it
+            // applies one step over, to the candidate itself.
+            //
+            // Found by making the mistake four times on one card: each time a
+            // reviewer's findings were fixed before the verdict was filed, the
+            // branch moved, and the refusal below meant the verdict could
+            // never be recorded at all. Three of that card's review rounds
+            // survive only as prose inside a `handoff revoke --reason`.
+            if verdict.decision == Decision::Approved {
+                require_current_handoff(control, &card_id, &handoff, &state.current_digest)?;
+            }
 
             let next_state = state_for(verdict.decision);
             state.state.check_transition(next_state)?;
