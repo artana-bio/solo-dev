@@ -118,6 +118,72 @@ fn an_acceptance_binds_the_exact_landing_commit_and_its_evidence() {
 }
 
 #[test]
+fn the_implementer_cannot_accept_their_own_integration() {
+    // Acceptance is the only thing that authorizes moving the protected
+    // branch. Both reviews already refuse a self-verdict; the step they lead
+    // to did not, which left the authorization itself self-grantable.
+    // `approve_card` hands off as the default actor, `operator`.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("F-001"),
+        "the refusal names the card they wrote: {rendered}"
+    );
+}
+
+#[test]
+fn a_spelling_variant_does_not_get_around_the_separation_check() {
+    // The comparison was exact equality, so a trailing space or a capital
+    // letter was a different person as far as the harness was concerned.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        " Operator ",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn the_implementer_cannot_promote_their_own_integration() {
+    let (workspace, id) = accepted(1);
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "operator"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn the_acceptance_owner_may_promote_their_own_decision() {
+    // Deliberately permitted, and the reason the promoter rule is written
+    // against implementers rather than "everyone else". Section 15.1's model
+    // is one human and many agent sessions: the human accepts and the human
+    // promotes. A rule requiring a fourth distinct party there would make the
+    // documented way of working impossible, which is how a control ends up
+    // being worked around instead of kept.
+    let (workspace, id) = accepted(1);
+
+    let envelope =
+        workspace.integration_json(&["promote", "--integration-id", &id, "--actor-id", "owner"]);
+    assert_eq!(envelope["status"], "success");
+}
+
+#[test]
 fn an_unreviewed_integration_cannot_be_accepted() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[

@@ -95,11 +95,24 @@ yours to keep rather than something you will be refused for breaking.
 | Reviewer | The verdict on a candidate they did not write | `--actor` on `review`; `--reviewer-actor-id` on `integration review` |
 | Acceptance owner | Whether a verified integration may move the protected branch | `--acceptance-owner` |
 
-**A command being available is not authority to run it.** Nothing stops an
-implementer from recording their own acceptance, registering a gate, or
-promoting. The two cases the harness does refuse are self-review of a card and
-reviewing your own integration verification; everything else rests on you
-declaring the role you are actually in.
+**A command being available is not authority to run it.** Most of this table
+rests on you declaring the role you are actually in. Four cases are refused
+(exit 5), and they are the ones where the author would otherwise bless their
+own work:
+
+- reviewing a card you handed off — `CH-POLICY-SELF-REVIEW`;
+- reviewing an integration you verified — `CH-POLICY-SAME-ACTOR`;
+- accepting an integration carrying a card you implemented — `CH-POLICY-SAME-ACTOR`;
+- promoting one — `CH-POLICY-SAME-ACTOR`.
+
+The **acceptance owner may promote**, deliberately: acceptance is the
+authorization and promotion is executing it, and the one-human-many-agents
+model has the same person do both. Comparisons ignore surrounding space and
+letter case, so `Reviewer-B` will not pass as someone other than `reviewer-b`.
+
+None of this proves anything about who ran the command. The same person under
+two names defeats all four, and is meant to — Q-004 is where declared identity
+becomes attested identity.
 
 **Escalate and stop** — do not resolve it yourself — when any of these is
 ambiguous: what is in scope, who owns a file or a decision, how much risk a

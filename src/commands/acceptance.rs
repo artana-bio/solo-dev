@@ -13,7 +13,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
-        integration::{load_integration, load_verification},
+        integration::{load_integration, load_verification, member_implementers},
         transaction::with_transaction,
     },
     control::{event_store::EventDraft, repository::ControlRepository},
@@ -26,6 +26,7 @@ use crate::{
         integration::{IntegrationRecord, IntegrationStatus},
     },
     error::{ErrorCode, HarnessError},
+    policy::actors,
 };
 
 /// Subcommands under `acceptance`.
@@ -227,6 +228,21 @@ fn build_acceptance(
     clock: &dyn Clock,
 ) -> Result<AcceptanceRecord, HarnessError> {
     let verification = load_verification(control, &record.integration_id)?;
+
+    // Acceptance is the only thing that authorizes moving the protected
+    // branch, and until now it was the one step in the lifecycle with no
+    // separation check at all — both reviews had one, and the step they lead
+    // to did not.
+    let implementers = member_implementers(control, record)?;
+    actors::refuse_author_acting_as(
+        "acceptance owner",
+        &args.acceptance_owner,
+        &record.integration_id.to_string(),
+        implementers
+            .iter()
+            .map(|(card, actor)| (card.as_str(), actor.as_str())),
+    )?;
+
     let Some(landing_sha) = record.landing_sha.clone() else {
         return Err(HarnessError::Control {
             reason: format!(
