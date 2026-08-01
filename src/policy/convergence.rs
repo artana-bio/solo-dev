@@ -451,6 +451,32 @@ mod tests {
     }
 
     #[test]
+    fn an_area_named_two_rounds_ago_is_not_new() {
+        // Round 5 of this card's own review: nothing pinned "no *earlier*
+        // round" as meaning all of them rather than the last one. Restricting
+        // the comparison to the previous round alone passed every committed
+        // test, because each history either held its areas throughout or
+        // introduced one no round had ever named.
+        //
+        // Here round 3 returns to `tests`, which round 1 named and round 2 did
+        // not. A card revisiting ground it has already been over is not
+        // spreading.
+        let history = [
+            Round::new(["tests/a.rs", "tests/b.rs", "tests/c.rs"]),
+            Round::new(["docs/x.md", "docs/y.md"]),
+            Round::new(["tests/d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![3, 2, 1]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "round 1 named `tests`, so round 3 is not new ground: {:?}",
+            trend.new_areas
+        );
+        assert!(trend.advisory().is_none());
+    }
+
+    #[test]
     fn a_new_file_inside_an_area_already_named_is_not_spreading() {
         // Round 1 of this card's own review. The trend compared raw finding
         // locations while calling them areas, so a card being worked through

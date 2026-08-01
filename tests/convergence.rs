@@ -342,6 +342,47 @@ fn the_first_rounds_say_nothing_and_a_converging_card_stays_quiet() {
 }
 
 #[test]
+fn review_history_is_ordered_across_an_identifier_width_boundary() {
+    // Round 5 of this card's own review. The unit test binds to
+    // `sort_oldest_first`, so replacing the call inside `reviews_for` with a
+    // plain `names.sort()` left the helper tests, the convergence tests and
+    // the review tests all green while restoring the defect in full — clippy
+    // noticed only that the helper had become dead code. This drives the real
+    // reader instead of the function it is supposed to use.
+    let workspace = opened();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    review_round(&workspace, "F-001", 1, &[], &["src/a.rs"]);
+
+    // Move the first review to the last identifier before the width changes,
+    // so the allocator's next id is RV-1000000 — which sorts *before*
+    // RV-999999 as text, and after it as a number.
+    let reviews = workspace.control.join("reviews");
+    let first = reviews.join("RV-000001.json");
+    let body = fs::read_to_string(&first)
+        .unwrap()
+        .replace("RV-000001", "RV-999999");
+    fs::write(reviews.join("RV-999999.json"), body).unwrap();
+    fs::remove_file(&first).unwrap();
+
+    review_round(&workspace, "F-001", 2, &["src/a.rs"], &["src/a.rs"]);
+
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let ids: Vec<&str> = inspected["data"]["reviews"]
+        .as_array()
+        .expect("reviews are an array")
+        .iter()
+        .map(|review| review["review_id"].as_str().expect("each carries its id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["RV-999999", "RV-1000000"],
+        "oldest first; as text RV-1000000 would come first"
+    );
+}
+
+#[test]
 fn findings_that_stay_flat_are_flagged_and_the_record_is_still_written() {
     let workspace = opened();
     workspace.activate_card("F-001", &["src/**"]);

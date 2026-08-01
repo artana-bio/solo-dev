@@ -825,5 +825,18 @@ mod tests {
         assert_eq!(ordinal("7"), Some(7));
         assert_eq!(ordinal("RV-"), None);
         assert_eq!(ordinal(""), None);
+
+        // Round 5 of this card's own review: the assertions above name a
+        // fallback ordering and never reach one, so inverting the tie-break
+        // survived them. Numberless names sort before numbered ones and among
+        // themselves by name.
+        let mut names = vec![
+            "RV-000001".to_owned(),
+            "RV-".to_owned(),
+            String::new(),
+            "RV-000002".to_owned(),
+        ];
+        sort_oldest_first(&mut names);
+        assert_eq!(names, vec!["", "RV-", "RV-000001", "RV-000002"]);
     }
 }
