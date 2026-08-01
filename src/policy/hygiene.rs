@@ -17,6 +17,8 @@
 //! high-entropy strings generically would refuse ordinary evidence constantly
 //! until someone turned it off. A control nobody leaves on protects nothing.
 
+use std::fmt::Write as _;
+
 use crate::error::{ErrorCode, HarnessError};
 
 /// A credential shape the scanner recognizes.
@@ -228,18 +230,42 @@ fn private_key_at(rest: &str) -> Option<(SecretKind, usize)> {
     if !rest.starts_with("-----BEGIN") {
         return None;
     }
+    // A `-----BEGIN` line with no closing dashes is not a header; without this
+    // the header check ran against the whole remaining input, so any later
+    // occurrence of the words satisfied it. Everything to the end is still
+    // redacted below when the block is merely unterminated — the distinction
+    // is between "no header at all" and "header, no footer".
     let header_end = armour_line_end(rest, 0)?;
-    if !rest[..header_end].contains("PRIVATE KEY") {
+    let header = &rest[..header_end];
+    if !header.contains("PRIVATE KEY") {
         return None;
     }
-    // An unterminated block is still redacted to the end of the text: a
-    // truncated key is not a safe key. A terminated one stops at its end
-    // marker, whatever line ending follows it.
-    let end = rest
-        .find("-----END")
-        .and_then(|start| armour_line_end(rest, start))
-        .unwrap_or(rest.len());
-    Some((SecretKind::PrivateKey, end.max(header_end)))
+
+    // The footer has to be the one that closes *this* block. Taking the first
+    // `-----END` stopped at a mismatched footer and left the key material of
+    // the following block in the clear, which is the failure mode that matters
+    // here: a partial redaction reads as a successful one.
+    let label = header
+        .trim_start_matches('-')
+        .trim_start_matches("BEGIN")
+        .trim()
+        .trim_end_matches('-')
+        .trim();
+    let mut cursor = header_end;
+    while let Some(offset) = rest[cursor..].find("-----END") {
+        let start = cursor + offset;
+        let Some(end) = armour_line_end(rest, start) else {
+            break;
+        };
+        if rest[start..end].contains(label) {
+            return Some((SecretKind::PrivateKey, end));
+        }
+        cursor = end;
+    }
+
+    // Unterminated, or terminated only by a footer for something else: redact
+    // to the end of the text. A truncated key is not a safe key.
+    Some((SecretKind::PrivateKey, rest.len()))
 }
 
 /// Length of a URL userinfo carrying a password, starting at `rest`.
@@ -360,6 +386,77 @@ pub fn redact_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Refuses a document about to become part of control history.
+///
+/// This is the guarantee; the per-record `validate` calls are a courtesy. Two
+/// review rounds established that enumerating the fields to scan does not
+/// converge: the first missed `contract_reads` and `contract_changes`, the
+/// rebuild missed `change_kind`, `review_policy`, and a draft's gate names,
+/// and the round after that found cycle objectives, release invariants, and
+/// integration-review residual risks still open. Each was the same mistake —
+/// a list written from memory of a schema — and each was found by someone
+/// probing rather than by the list.
+///
+/// So the check moved to the one place every durable record passes through.
+/// A field added to any schema is covered the day it is added, by nobody
+/// remembering anything.
+///
+/// `relative` names the document; the reported path is the JSON pointer within
+/// it, so a refusal still says exactly where to look. Content that is not JSON
+/// is scanned as text — the location is coarser, and refusing is what matters.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicySensitiveValue`] naming the document and field.
+pub fn refuse_secrets_in_document(relative: &str, contents: &str) -> Result<(), HarnessError> {
+    match serde_json::from_str::<serde_json::Value>(contents) {
+        Ok(value) => {
+            let mut at = String::new();
+            if let Some((path, kind)) = first_in_json(&value, &mut at) {
+                return Err(sensitive(&format!("{relative}:{path}"), kind));
+            }
+            Ok(())
+        }
+        Err(_) => refuse_secret(relative, contents),
+    }
+}
+
+/// The first credential in a JSON document, with its path.
+fn first_in_json(value: &serde_json::Value, at: &mut String) -> Option<(String, SecretKind)> {
+    match value {
+        serde_json::Value::String(text) => first(text).map(|kind| (at.clone(), kind)),
+        serde_json::Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
+            let restore = at.len();
+            write!(at, "[{index}]").expect("writing to a String cannot fail");
+            let found = first_in_json(item, at);
+            at.truncate(restore);
+            found
+        }),
+        serde_json::Value::Object(fields) => fields.iter().find_map(|(name, field)| {
+            let restore = at.len();
+            if !at.is_empty() {
+                at.push('.');
+            }
+            at.push_str(name);
+            let found = first_in_json(field, at);
+            at.truncate(restore);
+            found
+        }),
+        _ => None,
+    }
+}
+
+/// The refusal every hygiene check raises.
+fn sensitive(field: &str, kind: SecretKind) -> HarnessError {
+    HarnessError::Control {
+        reason: format!(
+            "`{field}` contains what looks like {}; a control record is committed history and cannot be redacted afterwards. Remove the value and rotate it — it has been on this machine in plaintext",
+            kind.label()
+        ),
+        code: ErrorCode::PolicySensitiveValue,
+    }
+}
+
 /// Refuses `text` when it carries a recognized credential.
 ///
 /// `field` names where the value was found — a JSON-ish path such as
@@ -370,16 +467,10 @@ pub fn redact_json(value: &mut serde_json::Value) {
 ///
 /// Returns [`ErrorCode::PolicySensitiveValue`] naming the field and the shape.
 pub fn refuse_secret(field: &str, text: &str) -> Result<(), HarnessError> {
-    if let Some(kind) = first(text) {
-        return Err(HarnessError::Control {
-            reason: format!(
-                "`{field}` contains what looks like {}; a control record is committed history and cannot be redacted afterwards. Remove the value and rotate it — it has been on this machine in plaintext",
-                kind.label()
-            ),
-            code: ErrorCode::PolicySensitiveValue,
-        });
+    match first(text) {
+        Some(kind) => Err(sensitive(field, kind)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuses every field in `fields`, which pairs a path with its text.
@@ -420,22 +511,33 @@ const CREDENTIAL_NAME_MARKERS: [&str; 7] = [
 /// `NPM_TOKEN` and `npmToken` both become `[NPM, TOKEN]`, so naming style does
 /// not decide whether a credential is recognized.
 fn name_words(name: &str) -> Vec<String> {
+    let characters: Vec<char> = name.chars().collect();
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut previous_lower = false;
-    for value in name.chars() {
-        if value.is_ascii_alphanumeric() {
-            // A lower-to-upper step is a word boundary in camelCase, and the
-            // only one that is not punctuation.
-            if previous_lower && value.is_ascii_uppercase() && !current.is_empty() {
+    for (index, value) in characters.iter().enumerate() {
+        if !value.is_ascii_alphanumeric() {
+            if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
             }
-            current.push(value.to_ascii_uppercase());
-            previous_lower = value.is_ascii_lowercase();
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-            previous_lower = false;
+            continue;
         }
+        let previous = index.checked_sub(1).map(|at| characters[at]);
+        // Two boundaries, not one. `npmToken` breaks at the lower-to-upper
+        // step; `myAPIKey` breaks between the run of capitals and the word
+        // that follows it, which the first rule alone reads as one long word —
+        // so `APIKey` was accepted as an ordinary name until a reviewer tried
+        // it.
+        let after_lower =
+            previous.is_some_and(|value| value.is_ascii_lowercase()) && value.is_ascii_uppercase();
+        let starts_a_word = previous.is_some_and(|value| value.is_ascii_uppercase())
+            && value.is_ascii_uppercase()
+            && characters
+                .get(index + 1)
+                .is_some_and(char::is_ascii_lowercase);
+        if (after_lower || starts_a_word) && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(value.to_ascii_uppercase());
     }
     if !current.is_empty() {
         words.push(current);
@@ -551,6 +653,38 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatched_footer_does_not_end_the_block_early() {
+        // Regression, second review round. Taking the first `-----END` stopped
+        // at a footer belonging to something else and left the key material
+        // after it in the clear — a partial redaction that reads as a complete
+        // one, which is worse than none.
+        let text = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "FIRSTKEYMATERIAL\n",
+            "-----END CERTIFICATE-----\n",
+            "SECONDKEYMATERIAL\n",
+            "-----END RSA PRIVATE KEY-----\n",
+            "after"
+        );
+        let redacted = redact(text);
+        assert!(
+            !redacted.contains("FIRSTKEYMATERIAL") && !redacted.contains("SECONDKEYMATERIAL"),
+            "the block runs to its own footer: {redacted:?}"
+        );
+        assert!(redacted.ends_with("after"), "{redacted:?}");
+    }
+
+    #[test]
+    fn a_begin_line_with_no_closing_dashes_is_not_a_header() {
+        // Without the armour-line check the header test ran against the whole
+        // remaining input, so any later occurrence of the words satisfied it
+        // and unrelated text was swallowed as a key.
+        let text = "-----BEGIN and then ordinary prose mentioning a PRIVATE KEY somewhere later";
+        assert_eq!(first(text), None, "not a PEM header");
+        assert_eq!(redact(text), text, "and nothing is removed");
+    }
+
+    #[test]
     fn an_unterminated_private_key_is_still_removed() {
         let text = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA";
         assert_eq!(first(text), Some(SecretKind::PrivateKey));
@@ -634,6 +768,55 @@ mod tests {
         for name in ["PATH", "HOME", "CARGO_TERM_COLOR", "RUST_BACKTRACE"] {
             assert!(!is_credential_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn an_acronym_run_before_a_word_is_still_split() {
+        // Regression, second review round. Whole-word matching fixed
+        // `TOKENIZER` and introduced the mirror defect: `myAPIKey` has no
+        // lower-to-upper step between `API` and `Key`, so it read as one word
+        // and passed. A run of capitals ends where the next word begins.
+        for name in ["myAPIKey", "APIKey", "AWSSecretValue", "myDBPassword"] {
+            assert!(is_credential_name(name), "{name} must be recognized");
+        }
+        assert_eq!(name_words("myAPIKey"), vec!["MY", "API", "KEY"]);
+        assert_eq!(name_words("APIKey"), vec!["API", "KEY"]);
+        assert_eq!(name_words("NPM_TOKEN"), vec!["NPM", "TOKEN"]);
+        assert_eq!(
+            name_words("TOKENIZER"),
+            vec!["TOKENIZER"],
+            "an unbroken run stays one word"
+        );
+    }
+
+    #[test]
+    fn a_document_is_scanned_wherever_the_credential_sits_in_it() {
+        // The boundary check is the guarantee: it does not know or care which
+        // schema it is looking at, so a field added to any record is covered
+        // the day it is added.
+        let document = serde_json::json!({
+            "schema": "harness.cycle/v1",
+            "objective": "ordinary text",
+            "release_invariants": ["fine", "uses ghp_0123456789abcdef0123456789abcdef0123"],
+        })
+        .to_string();
+
+        let error = refuse_secrets_in_document("cycles/C-001.json", &document).unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("cycles/C-001.json:release_invariants[1]"),
+            "the refusal locates it inside the document: {rendered}"
+        );
+        assert!(!rendered.contains("ghp_0123"), "and does not echo it");
+
+        assert!(
+            refuse_secrets_in_document("cycles/C-002.json", r#"{"objective":"clean"}"#).is_ok()
+        );
+        // Content that is not JSON is still scanned, coarsely.
+        assert!(
+            refuse_secrets_in_document("notes.txt", "ghp_0123456789abcdef0123456789abcdef0123")
+                .is_err()
+        );
     }
 
     #[test]

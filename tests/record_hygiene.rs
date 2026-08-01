@@ -316,6 +316,102 @@ fn an_unparsable_command_line_does_not_echo_a_credential() {
 }
 
 #[test]
+fn a_cycle_record_cannot_carry_a_credential_either() {
+    // Second review round. Cycles were never on the per-record list, and
+    // nobody noticed until someone tried. They are covered now not because
+    // they were added to a list, but because every durable write goes through
+    // one check that does not know which schema it is looking at.
+    let workspace = Workspace::initialized();
+
+    let objective = workspace.cycle_raw(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        &format!("ship it with {TOKEN}"),
+    ]);
+    assert_eq!(objective.status.code(), Some(5), "the objective is durable");
+    assert_eq!(error_code(&objective), "CH-POLICY-SENSITIVE-VALUE");
+    assert!(
+        !String::from_utf8_lossy(&objective.stdout).contains(TOKEN),
+        "and the refusal does not echo it"
+    );
+
+    let invariant = workspace.cycle_raw(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "ordinary",
+        "--release-invariant",
+        &format!("the deploy key {TOKEN} stays valid"),
+    ]);
+    assert_eq!(invariant.status.code(), Some(5));
+    assert_eq!(error_code(&invariant), "CH-POLICY-SENSITIVE-VALUE");
+}
+
+#[test]
+fn an_acceptance_record_is_scanned_like_every_other_durable_record() {
+    // Second review round found this one absent entirely: removing
+    // `AcceptanceRecord::validate` left every hygiene test green, because none
+    // of them reached an acceptance. Checked at the domain level because
+    // driving a full reviewed integration to acceptance belongs in
+    // `tests/promotion.rs`, and the point here is the field coverage.
+    use change_harness::domain::acceptance::{
+        ACCEPTANCE_SCHEMA, AcceptanceDecision, AcceptanceRecord,
+    };
+    use change_harness::domain::clock::{Clock as _, FixedClock};
+    use change_harness::domain::digest::{CANONICAL_ALGORITHM, Digest};
+
+    let clean = AcceptanceRecord {
+        schema: ACCEPTANCE_SCHEMA.to_owned(),
+        acceptance_id: "ACC-000001".parse().unwrap(),
+        integration_id: "INT-001".parse().unwrap(),
+        landing_sha: "a".repeat(40),
+        integration_record_digest: Digest::of_bytes(b"integration"),
+        receipt_ids: vec![],
+        acceptance_owner: "owner".to_owned(),
+        decision: AcceptanceDecision::Accepted,
+        residual_risks: vec![],
+        rollback_reference: "revert the landing commit".to_owned(),
+        accepted_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
+        canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
+    };
+    assert!(clean.validate().is_ok(), "the fixture is clean");
+
+    for (field, poisoned) in [
+        (
+            "acceptance.acceptance_owner",
+            AcceptanceRecord {
+                acceptance_owner: TOKEN.to_owned(),
+                ..clean.clone()
+            },
+        ),
+        (
+            "acceptance.rollback_reference",
+            AcceptanceRecord {
+                rollback_reference: TOKEN.to_owned(),
+                ..clean.clone()
+            },
+        ),
+        (
+            "acceptance.residual_risks[0]",
+            AcceptanceRecord {
+                residual_risks: vec![TOKEN.to_owned()],
+                ..clean.clone()
+            },
+        ),
+    ] {
+        let error = poisoned
+            .validate()
+            .expect_err(&format!("`{field}` must be scanned"));
+        let rendered = error.to_string();
+        assert!(rendered.contains(field), "{field}: {rendered}");
+        assert!(!rendered.contains(TOKEN), "{field} echoed it: {rendered}");
+    }
+}
+
+#[test]
 fn an_ordinary_card_is_still_accepted() {
     // The control that fires on ordinary evidence gets switched off. This is
     // the half of the behavior that keeps the other half deployable.

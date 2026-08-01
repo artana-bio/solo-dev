@@ -15,6 +15,7 @@ use crate::{
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_ok},
+    policy::hygiene,
 };
 
 /// Path of the project document inside the control repository.
@@ -228,6 +229,14 @@ impl ControlRepository {
     ///
     /// Returns an error when the file cannot be written or renamed.
     pub fn write_atomic(&self, relative: &str, contents: &str) -> Result<(), HarnessError> {
+        // Everything durable passes through here, which is why the credential
+        // check lives here rather than in each record's `validate`. Two review
+        // rounds showed that enumerating fields per schema does not converge —
+        // every round found more, and always by someone probing rather than by
+        // the list. This is the guarantee; the per-record checks upstream are
+        // the courtesy that fails earlier and says something friendlier.
+        hygiene::refuse_secrets_in_document(relative, contents)?;
+
         let target = self.path(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {

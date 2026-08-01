@@ -827,6 +827,32 @@ mod tests {
         CardRecord::activate(&draft(), 1, "alvaro", stamp()).unwrap()
     }
 
+    /// A draft with every collection populated, for the hygiene walk.
+    ///
+    /// Separate from [`draft`] because that one is pinned by the committed
+    /// digest vector, and churning it to serve a different test would blunt
+    /// the signal that vector exists to give. The walk needs the opposite
+    /// property: every field present, because it can only visit paths the
+    /// fixture produces.
+    fn populated_draft() -> CardDraft {
+        CardDraft {
+            contract_reads: vec!["units".to_owned()],
+            contract_changes: vec!["temperature".to_owned()],
+            exclusive_resources: vec!["the conversion table".to_owned()],
+            non_goals: vec!["No Kelvin".to_owned()],
+            named_gates: NamedGates {
+                feature: vec!["gate.unit".to_owned()],
+                review: vec!["gate.review".to_owned()],
+                integration: vec!["gate.all".to_owned()],
+            },
+            acceptance: Acceptance {
+                behaviors: vec!["converts correctly".to_owned()],
+                regressions: vec!["still rejects nonsense".to_owned()],
+            },
+            ..draft()
+        }
+    }
+
     #[test]
     fn every_string_a_card_can_carry_is_either_scanned_or_structurally_constrained() {
         // Regression, RV-000036. The previous version of this test enumerated
@@ -841,6 +867,13 @@ mod tests {
         // an identifier, a SHA, an enum — refuses for its own reason instead,
         // and is named here so that exemption is a decision on the page rather
         // than a silent gap.
+        //
+        // The walk is only as complete as the fixture: it visits paths the
+        // fixture produces, so an empty vector exempts its field silently.
+        // `contract_reads` and `contract_changes` were empty here, and the
+        // reviewer showed this test stayed green with their scan deleted. The
+        // assertion below pins every collection non-empty, because that flaw
+        // is invisible from inside the test that suffers from it.
         const SECRET: &str = "ghp_0123456789abcdef0123456789abcdef0123";
         // `change_kind` and `review_policy` were on this list on the first
         // attempt, on the assumption that a documented closed set is an
@@ -853,7 +886,7 @@ mod tests {
 
         let mut leaves = Vec::new();
         collect_string_paths(
-            &serde_json::to_value(draft()).unwrap(),
+            &serde_json::to_value(populated_draft()).unwrap(),
             String::new(),
             &mut leaves,
         );
@@ -861,6 +894,24 @@ mod tests {
             leaves.len() >= 12,
             "the fixture must exercise a representative card: {leaves:?}"
         );
+        // Every collection the schema declares must contribute at least one
+        // element, or the walk skips it and reports nothing.
+        for collection in [
+            "non_goals",
+            "contract_reads",
+            "contract_changes",
+            "exclusive_resources",
+            "write_scope.include",
+            "write_scope.exclude",
+            "named_gates.feature",
+            "named_gates.integration",
+            "acceptance.behaviors",
+        ] {
+            assert!(
+                leaves.iter().any(|path| path.starts_with(collection)),
+                "`{collection}` is empty in the fixture, so this test does not cover it"
+            );
+        }
 
         for path in leaves {
             let leaf = path.rsplit('.').next().unwrap_or(&path);
@@ -868,7 +919,7 @@ mod tests {
                 .iter()
                 .any(|name| leaf == *name || leaf.starts_with(&format!("{name}[")));
 
-            let mut value = serde_json::to_value(draft()).unwrap();
+            let mut value = serde_json::to_value(populated_draft()).unwrap();
             *pointer_mut(&mut value, &path) = serde_json::Value::String(SECRET.to_owned());
             let Ok(poisoned) = serde_json::from_value::<CardDraft>(value) else {
                 assert!(constrained, "`{path}` rejects the value at parse time");
