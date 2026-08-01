@@ -54,6 +54,23 @@ fn segments(value: &str, case: CaseSensitivity) -> Vec<String> {
         .collect()
 }
 
+/// One path's canonical spelling, for deciding whether two declarations name
+/// the same file.
+///
+/// `src/a.rs`, `./src/a.rs`, `src//a.rs`, `src/./a.rs` and `src/a.rs/` are one
+/// path, and on a case-insensitive host so is `SRC/a.rs`. Exposes the identity
+/// the rest of this module already matches by, so that a caller comparing
+/// declared paths agrees with the harness about what "the same path" means
+/// rather than inventing a second answer.
+///
+/// It exists because a caller did invent one: `ScopeBreadth` compared raw
+/// strings, and a card declaring one file thirteen ways was reported as
+/// declaring thirteen paths.
+#[must_use]
+pub fn canonical(value: &str, case: CaseSensitivity) -> String {
+    segments(value, case).join("/")
+}
+
 /// Matches one segment against one non-`**` pattern segment.
 fn segment_matches(pattern: &str, name: &str) -> bool {
     if pattern == "*" {

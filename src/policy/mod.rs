@@ -6,5 +6,6 @@
 
 pub mod actors;
 pub mod allocation;
+pub mod convergence;
 pub mod paths;
 pub mod verification;
