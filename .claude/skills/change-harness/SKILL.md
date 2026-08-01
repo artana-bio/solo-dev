@@ -27,10 +27,12 @@ one and the harness will usually refuse you later, at a worse moment.
 2. **`delivered_sha` is the exact commit you delivered.** The harness refuses a
    handoff whose branch head disagrees. Never write "the branch" or a stale
    SHA.
-3. **One actor, one role.** The reviewer must be a different actor in a fresh
-   context from the implementer. Identity is declared, not proven (D-013) —
-   the harness records it and cannot verify it. Honor the separation anyway;
-   independent review bound to exact commits is the entire product.
+3. **One actor, one role.** The reviewer is a different actor, in a separate
+   task or agent thread that starts cold — not a later turn of the
+   conversation that wrote the code. Step 7 says exactly what that thread may
+   receive. Identity is declared, not proven (D-013): the harness records it
+   and cannot verify it. Honor the separation anyway; independent review bound
+   to exact commits is the entire product.
 4. **Treat refusals as information.** Exit 5 means a state machine is
    protecting an invariant. Read `error.code` and `error.recovery`, fix the
    state, retry. Never work around a refusal with raw git.
@@ -68,6 +70,51 @@ change-harness doctor --workspace .
 
 Git ≥ 2.50 is required (for `git merge-tree --write-tree`) and validated
 rather than silently degraded.
+
+## Roles, authority, and when to stop
+
+Every command in this CLI is available to you at every moment. That is a
+property of a single-user local tool, not a grant. The harness records the
+role you declare and cannot verify it (D-013), so most of what follows is
+yours to keep rather than something you will be refused for breaking.
+
+| Role | Owns | Declares itself as |
+| --- | --- | --- |
+| Coordinator | Cycles, cards, gate registration, integration from `prepare` to `promote` | `--actor` on `cycle`/`card`/`gate register`; `--actor-id` on `integration` |
+| Implementer | One card at a time — its worktree, its gates, its handoff | `--actor` on `work`, `gate run`, `handoff create` |
+| Reviewer | The verdict on a candidate they did not write | the verdict's own `reviewer_actor_id` for `review record`; `--reviewer-actor-id` on `integration review` |
+| Acceptance owner | Whether a verified integration may move the protected branch | `--acceptance-owner` |
+
+**A command being available is not authority to run it.** Most of this table
+rests on you declaring the role you are actually in. Four cases are refused
+(exit 5), and they are the ones where the author would otherwise bless their
+own work:
+
+- reviewing a card you handed off — `CH-POLICY-SELF-REVIEW`;
+- reviewing an integration you verified — `CH-POLICY-SAME-ACTOR`;
+- accepting an integration carrying a card you implemented — `CH-POLICY-SAME-ACTOR`;
+- promoting one — `CH-POLICY-SAME-ACTOR`.
+
+The **acceptance owner may promote**, deliberately: acceptance is the
+authorization and promotion is executing it, and the one-human-many-agents
+model has the same person do both. Comparisons ignore surrounding space and
+letter case, so `Reviewer-B` will not pass as someone other than `reviewer-b`.
+
+None of this proves anything about who ran the command. The same person under
+two names defeats all four, and is meant to — Q-004 is where declared identity
+becomes attested identity.
+
+**Escalate and stop** — do not resolve it yourself — when any of these is
+ambiguous: what is in scope, who owns a file or a decision, how much risk a
+change carries, what the acceptance criteria actually require, or what the
+product is supposed to do. These are the questions where a confident wrong
+answer is expensive and a question is cheap. Write down what you were about to
+assume, and ask. `work block --actor …` exists for the case where you cannot
+proceed at all.
+
+Throughout this guide: a **refusal** is something the tool does, and a **rule**
+is something you do. Where the difference matters it is stated. Do not read a
+rule as a guarantee that something will catch you.
 
 ## The actor-flag split (read this before anything fails)
 
@@ -147,8 +194,26 @@ change-harness gate register --definition gate.test.json
 change-harness gate list
 ```
 
-Gates run with a cleared environment (only the allowlist survives) and never
-inherit credentials.
+Gates run with a cleared environment: only the allowlist survives, and eight
+credential variables (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `NPM_TOKEN` and
+the rest) are refused at registration even when a definition names them. That
+part is enforced.
+
+`network_policy` is **not**. It records what the gate says it needs; nothing
+stops a gate from reaching the network, and `gate show` prints
+`denied (declared, not enforced)` for exactly that reason. Receipts carry
+`network_enforced=false` beside the declaration. Do not read `denied` as
+isolation.
+
+**A gate is a read-only check.** It observes the candidate and reports;
+publishing, deploying, notifying, filing, or writing to any system outside the
+worktree does not belong in one. Two reasons, and the second is the one that
+bites: a gate is rerun against the landing commit during integration and may
+be retried on failure, so anything it does externally happens more than once
+and at times nobody chose; and a receipt is evidence about a commit, which it
+stops being the moment the run also changed the world. The harness cannot
+check this — `argv` is whatever was registered — so it is a rule, not a
+refusal.
 
 ### 2. Open a cycle
 
@@ -272,17 +337,45 @@ The harness refuses if the branch head is not `delivered_sha`, if the tree is
 dirty, if a feature gate receipt is missing or stale, or if any changed path
 falls outside the card's write scope.
 
-### 7. Review — different actor, fresh context
+### 7. Review — a separate task, a fresh context
+
+For every card with `review_policy: independent`, the implementer does not
+review. Create or request a **separate reviewer task or agent thread**. Not a
+new section of the same conversation, not a subagent handed your working
+state — a thread that starts cold.
+
+The reviewer receives exactly:
+
+- the activated card revision and its review criteria;
+- the handoff declaration;
+- the exact delivered commit, and the baseline it builds from;
+- the complete diff, and any contract-domain changes in it;
+- the feature gate receipts;
+- the repository files and reproducible evidence needed to evaluate the change.
+
+The reviewer does **not** receive the implementation conversation, your
+private reasoning, your working summary, or unfiltered author context. Nor an
+instruction to approve: no "this is ready, please sign off", no framing that
+supplies the conclusion. Handing the reviewer your reasoning is how a review
+becomes a second reading of the same argument, which is worth nothing. What
+survives contact with a cold reader is the point.
+
+The harness enforces the mechanical half — exact-commit binding, stale-review
+rejection, and a reviewer actor different from the handoff actor (exit 5,
+`CH-POLICY-SELF-REVIEW`). It cannot enforce the rest. **Actor identity is
+declared, not proven** (D-013, D-017): a fresh context is a strong review
+practice, not an attested one, and nothing here can tell whether you really
+opened a new thread. Honor it anyway; independent review bound to exact
+commits is the entire product.
 
 ```bash
 change-harness review begin  --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
 ```
 
-The reviewer reads the card revision, the handoff, and the candidate at its
-exact SHA. Review discipline: verify claims by breaking things — apply the
-mutation a test claims to catch and confirm it fails at the assertion that
-matters; drive the real binary against the real behavior. Then write:
+Review discipline: verify claims by breaking things — apply the mutation a
+test claims to catch and confirm it fails at the assertion that matters; drive
+the real binary against the real behavior. Then write:
 
 ```yaml
 reviewer_actor_id: reviewer-b
@@ -380,17 +473,66 @@ fast-forward then fails, the command exits 9 and records
 back — rewinding a published branch is worse than a recoverable gap. Run
 `project recover --resume` to finish the local sync.
 
-## Bootstrapping a new project
+## Adopt an existing repository
+
+`project init` puts a repository you already have under governance. It does
+not create your project, move it, or rewrite one commit of its history — it
+registers the checkout and builds the two repositories the harness owns
+around it.
+
+Four paths, three of them new, and **all of them absolute**. `--repository .`
+is refused (`expected an absolute path, found `.``); your working directory is
+never consulted, so it makes no difference whether you run this from inside
+the project or anywhere else.
+
+| Flag | What it points at |
+| --- | --- |
+| `--repository` | The project you already cloned. Must exist, be a Git repository, and have at least one commit on the protected branch. |
+| `--control` | **New.** Cards, reviews, receipts, integration records. Must be absent or empty. |
+| `--authority` | **New.** The bare repository that owns the protected branch. |
+| `--worktree-root` | **New**, optional. Where card worktrees are allocated; defaults to `<the control's parent>/<project-id>-worktrees`. |
 
 ```bash
 change-harness project init \
-  --project-id example \
-  --repository /path/to/repo \
-  --control /path/to/control \
-  --authority /path/to/authority.git \
-  --worktree-root /path/to/worktrees
+  --project-id       example \
+  --repository       /abs/path/to/your-existing-repo \
+  --control          /abs/path/to/example-control \
+  --authority        /abs/path/to/example-authority.git \
+  --worktree-root    /abs/path/to/example-worktrees
 ```
 
-Creates control and authority, registers the authority as a remote of the
-candidate. It refuses an occupied control directory and never overwrites an
-existing remote. Then register gates (step 1) and open your first cycle.
+Nothing is created inside the repository being governed. Control and authority
+are siblings, not subdirectories, and the candidate gains exactly one thing: a
+remote named `harness-authority`. An existing remote of that name is never
+repointed.
+
+### Where the baseline comes from, and when
+
+**`project init` reads the candidate's protected branch and seeds the empty
+authority with it.** That is the moment your history is captured.
+
+`cycle activate` later freezes the cycle baseline to the *authority's* head —
+deliberately not the candidate's, because the candidate's branch is whatever a
+local actor last did, while the authority's is what has been accepted. So if
+your `main` gains commits between `project init` and your first
+`cycle activate`, the baseline is the commit **init** saw, not the newer one.
+There is no confirmation step for this; the sequence is the record. If you
+want the newer commit as your baseline, promote it through the harness, or
+initialize after it exists.
+
+An authority that already exists and is compatible is adopted unchanged, and
+then *it* supplies the baseline rather than the candidate. The candidate's
+protected branch is still resolved and checked — initialization validates it
+in every case and refuses a repository that has no commit on it — it is
+simply not what the authority gets seeded from.
+
+### Init is a one-time registration
+
+Re-running it with identical configuration reports there is nothing to do.
+Re-running it against a control repository bound to a *different*
+configuration refuses rather than rebinding, and it refuses a control
+directory that already holds files nobody checked.
+
+Once it succeeds, work stops happening in your original checkout: register
+gates (step 1), open a cycle, and take each card into the worktree the harness
+allocates for it.

@@ -118,6 +118,331 @@ fn an_acceptance_binds_the_exact_landing_commit_and_its_evidence() {
 }
 
 #[test]
+fn deleting_a_member_review_refuses_acceptance_rather_than_permitting_it() {
+    // Regression, RV-000036, the one finding that was exploitable. The
+    // implementer lookup used to skip a member whose review would not load, so
+    // that a damaged control repository could not deadlock the lifecycle. The
+    // reviewer deleted one review file and then self-accepted: absence of
+    // evidence had become a granted authorization. It now fails closed.
+    let (workspace, id) = reviewed(1);
+
+    let reviews = workspace.control.join("reviews");
+    let victim = std::fs::read_dir(&reviews)
+        .expect("the review directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|kind| kind == "json"))
+        .expect("a recorded review");
+    std::fs::remove_file(&victim).unwrap();
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a missing approval must never read as permission"
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("F-001") && rendered.contains("audit"),
+        "the refusal names the member and points at the diagnosis: {rendered}"
+    );
+
+    // Promotion is attempted too, but note what it proves: a failed acceptance
+    // leaves the integration `reviewed`, so this refuses on status before ever
+    // reaching the member lookup. It pins that promotion does not somehow
+    // proceed, not that the lookup fails closed there — a reviewer checked the
+    // latter separately, by deleting the review after a successful acceptance.
+    let promoted =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "operator"]);
+    assert_ne!(promoted.status.code(), Some(0));
+}
+
+#[test]
+fn editing_a_pinned_review_refuses_acceptance_rather_than_changing_who_wrote_the_code() {
+    // The digest binding had no test at all: neutering the comparison left the
+    // entire suite green, so nothing would have caught its removal. It exists
+    // because matching a review by id alone trusted the file's *name* — edit
+    // `feature_actor_id` and the separation check compares against somebody
+    // else, turning the record that proves who wrote the code into the thing
+    // an author edits in order to bless it.
+    let (workspace, id) = reviewed(1);
+
+    let reviews = workspace.control.join("reviews");
+    let path = std::fs::read_dir(&reviews)
+        .expect("the review directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|kind| kind == "json"))
+        .expect("a recorded review");
+
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        record["feature_actor_id"], "operator",
+        "the fixture's author"
+    );
+    record["feature_actor_id"] = serde_json::json!("somebody-else");
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(&workspace.control, &["commit", "-q", "-m", "tamper"]);
+
+    // `operator` wrote the card. With the edit believed, they are no longer
+    // the implementer as far as the check can tell.
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "an altered approval must not decide who may accept"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-NOT-INTEGRABLE");
+}
+
+#[test]
+fn an_acceptance_dry_run_refuses_the_author_too() {
+    // Regression, RV-000036. The check lived inside the record builder, which
+    // the preview never calls, so a dry run succeeded for an implementer whose
+    // real acceptance was refused — contradicting the documented promise that
+    // a dry run gives the same error the real command would.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+        "--dry-run",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
+    // Three rounds of fixes each closed the character they were shown and left
+    // the class open: exact equality lost to `Operator`, simple lowercase to
+    // the small sharp s, and comparing both mappings to the capital sharp s,
+    // whose case orbit it split non-transitively — all four separation
+    // refusals fell and the protected branch moved.
+    //
+    // The class is closed by refusing identifiers the comparison cannot reason
+    // about. This asserts the strongest form of that: such an identifier never
+    // reaches acceptance, because the *first* separation check to read it —
+    // the card review — already refuses. Nothing downstream has to be right.
+    const AUTHOR: &str = "STRA\u{1e9e}E";
+
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    workspace.work(&["start", "--card-id", "F-001", "--actor", AUTHOR]);
+    let worktree = workspace.worktrees.join("F-001");
+    fs::create_dir_all(worktree.join("src/F-001")).unwrap();
+    fs::write(worktree.join("src/F-001/a.rs"), "// work\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: work"]);
+    workspace.gate(&[
+        "run",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.unit",
+        "--actor",
+        AUTHOR,
+    ]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+        "--actor",
+        AUTHOR,
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+
+    // The double-s spelling is the same name to a reader and was a different
+    // actor to the previous comparison. It never gets the chance to be either.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n",
+    )
+    .unwrap();
+    let recorded = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict.display().to_string(),
+        "--actor",
+        "reviewer",
+    ]);
+    assert_eq!(recorded.status.code(), Some(5));
+    assert_eq!(error_code(&recorded), "CH-POLICY-INCOMPLETE-REVIEW");
+    assert!(
+        String::from_utf8_lossy(&recorded.stdout).contains("ASCII"),
+        "the refusal must say why, or the author cannot act on it"
+    );
+}
+
+#[test]
+fn the_implementer_cannot_accept_their_own_integration() {
+    // Acceptance is the only thing that authorizes moving the protected
+    // branch. Both reviews already refuse a self-verdict; the step they lead
+    // to did not, which left the authorization itself self-grantable.
+    // `approve_card` hands off as the default actor, `operator`.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "operator",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("F-001"),
+        "the refusal names the card they wrote: {rendered}"
+    );
+}
+
+#[test]
+fn a_spelling_variant_does_not_get_around_the_separation_check() {
+    // The comparison was exact equality, so a trailing space or a capital
+    // letter was a different person as far as the harness was concerned.
+    let (workspace, id) = reviewed(1);
+
+    let output = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        " Operator ",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn the_implementer_cannot_promote_their_own_integration() {
+    let (workspace, id) = accepted(1);
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "operator"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn a_promote_dry_run_refuses_the_author_too() {
+    // The dry run runs the real preconditions, so a separation refusal must
+    // surface there rather than waiting for the real promotion. Covered
+    // separately because `preview_promote` reaches `check_promotion` by its
+    // own path.
+    let (workspace, id) = accepted(1);
+
+    let output = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "operator",
+        "--dry-run",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn the_integration_reviewer_cannot_be_the_verifier_under_a_spelling_variant() {
+    // The card-level self-review check and this one are separate comparisons
+    // in separate files; normalizing one said nothing about the other.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+
+    let output = workspace.integration_raw(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        " Verifier ",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn the_acceptance_owner_may_promote_their_own_decision() {
+    // Deliberately permitted, and the reason the promoter rule is written
+    // against implementers rather than "everyone else". Section 15.1's model
+    // is one human and many agent sessions: the human accepts and the human
+    // promotes. A rule requiring a fourth distinct party there would make the
+    // documented way of working impossible, which is how a control ends up
+    // being worked around instead of kept.
+    let (workspace, id) = accepted(1);
+
+    let envelope =
+        workspace.integration_json(&["promote", "--integration-id", &id, "--actor-id", "owner"]);
+    assert_eq!(envelope["status"], "success");
+}
+
+#[test]
 fn an_unreviewed_integration_cannot_be_accepted() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[

@@ -118,6 +118,25 @@ fn self_review_is_refused() {
 }
 
 #[test]
+fn self_review_is_refused_through_a_spelling_variant() {
+    // The comparison was exact equality, so `Operator` and `operator ` were
+    // different people and the check was one keystroke from being bypassed by
+    // accident. It still proves nothing about who ran the command — but it
+    // should not be defeated by a capital letter.
+    for variant in ["Operator", "operator ", " OPERATOR"] {
+        let (workspace, _) = handed_off();
+        let path = verdict(&workspace, &approval(variant));
+
+        let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+        assert_eq!(
+            error_code(&output),
+            "CH-POLICY-SELF-REVIEW",
+            "`{variant}` is the handoff actor"
+        );
+    }
+}
+
+#[test]
 fn approving_over_an_open_finding_is_refused() {
     let (workspace, _) = handed_off();
     let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";

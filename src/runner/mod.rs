@@ -88,6 +88,11 @@ pub fn environment_fingerprint(gate: &GateDefinition) -> String {
         format!("arch={}", std::env::consts::ARCH),
         format!("harness={}", env!("CARGO_PKG_VERSION")),
         format!("network={:?}", gate.network_policy),
+        // Recorded beside the declaration rather than left to the reader. A
+        // receipt saying only `network=Denied` describes what the gate asked
+        // for as though it were what the runner imposed, which is the one
+        // thing Section 14.1 says evidence must never do.
+        format!("network_enforced={}", NetworkPolicy::ENFORCED),
     ];
     let mut allowed: Vec<&String> = gate.environment.allow.iter().collect();
     allowed.sort();
@@ -716,6 +721,30 @@ mod tests {
         assert!(
             fingerprint.contains("allow=[HOME,PATH]"),
             "the allowlist is sorted so the fingerprint is stable: {fingerprint}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_never_records_a_declared_policy_without_its_enforcement() {
+        // A receipt is evidence. `network=Denied` alone reads as a control the
+        // runner applied, and the runner applies nothing, so the enforcement
+        // status travels with the declaration rather than being inferred.
+        let denied = gate(&["true"]);
+        let fingerprint = environment_fingerprint(&denied);
+        assert!(
+            fingerprint.contains("network=Denied"),
+            "the declaration is still recorded: {fingerprint}"
+        );
+        assert!(
+            fingerprint.contains("network_enforced=false"),
+            "and it is never recorded alone: {fingerprint}"
+        );
+
+        let mut allowed = gate(&["true"]);
+        allowed.network_policy = NetworkPolicy::Allowed;
+        assert!(
+            environment_fingerprint(&allowed).contains("network_enforced=false"),
+            "the qualification does not depend on which policy was declared"
         );
     }
 }

@@ -4,6 +4,7 @@
 //! testable in isolation and cannot accidentally mutate anything while deciding
 //! whether a mutation is allowed.
 
+pub mod actors;
 pub mod allocation;
 pub mod paths;
 pub mod verification;
