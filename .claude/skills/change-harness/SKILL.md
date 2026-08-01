@@ -147,8 +147,17 @@ change-harness gate register --definition gate.test.json
 change-harness gate list
 ```
 
-Gates run with a cleared environment (only the allowlist survives) and never
-inherit credentials.
+Gates run with a cleared environment: only the allowlist survives, and eight
+credential variables (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `NPM_TOKEN` and
+the rest) are refused at registration even when a definition names them. That
+part is enforced.
+
+`network_policy` is **not**. It records what the gate says it needs; nothing
+stops a gate from reaching the network, and `gate show` prints
+`denied (declared, not enforced)` for exactly that reason. Receipts carry
+`network_enforced=false` beside the declaration. Do not read `denied` as
+isolation, and do not put a credential in `environment.set` on the theory that
+the gate cannot phone home with it.
 
 ### 2. Open a cycle
 
