@@ -16,7 +16,7 @@
 //! *lagging* — it can only speak once rounds exist, but by then it knows
 //! something the first check cannot: whether the work is actually settling.
 
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::collections::BTreeSet;
 
 /// How wide a card's declared scope is.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,28 +44,34 @@ pub const BROAD_PATH_COUNT: usize = 12;
 /// outcome, whatever the card says it is about.
 pub const BROAD_AREA_COUNT: usize = 4;
 
+/// The area a declared path or a finding location belongs to.
+///
+/// The first component — `src`, `tests`, `docs` — or the second where the
+/// first is `src`, so `src/policy/**` and `src/commands/**` count separately.
+/// That is the granularity at which this codebase's cards actually differ.
+///
+/// One definition, shared by both signals, because this card's own first
+/// review round found the trend comparing raw finding *locations* while
+/// calling them areas: a card whose findings moved from `src/policy/a.rs` to
+/// `src/policy/b.rs` read as spreading into somewhere new when it had not left
+/// the area it started in. Two notions of "area" is what made that possible.
+///
+/// Returns `None` only for a path with no non-empty component at all.
+fn area_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches("./");
+    let mut parts = trimmed.split('/').filter(|part| !part.is_empty());
+    match (parts.next(), parts.next()) {
+        (Some("src"), Some(second)) if !second.contains('*') => Some(format!("src/{second}")),
+        (Some(first), _) => Some(first.to_owned()),
+        (None, _) => None,
+    }
+}
+
 impl ScopeBreadth {
     /// Measures a card's include list.
-    ///
-    /// The area of a path is its first component — `src`, `tests`, `docs` — or
-    /// its second where the first is `src`, so `src/policy/**` and
-    /// `src/commands/**` count separately. That is the granularity at which
-    /// this codebase's cards actually differ.
     #[must_use]
     pub fn measure(include: &[String]) -> Self {
-        let mut areas = BTreeSet::new();
-        for path in include {
-            let trimmed = path.trim_start_matches("./");
-            let mut parts = trimmed.split('/').filter(|part| !part.is_empty());
-            let area = match (parts.next(), parts.next()) {
-                (Some("src"), Some(second)) if !second.contains('*') => {
-                    format!("src/{second}")
-                }
-                (Some(first), _) => first.to_owned(),
-                (None, _) => continue,
-            };
-            areas.insert(area);
-        }
+        let areas: BTreeSet<String> = include.iter().filter_map(|path| area_of(path)).collect();
         Self {
             paths: include.len(),
             areas: areas.len(),
@@ -80,7 +86,11 @@ impl ScopeBreadth {
     /// knows.
     #[must_use]
     pub fn advisory(&self) -> Option<String> {
-        if self.paths < BROAD_PATH_COUNT && self.areas < BROAD_AREA_COUNT {
+        // `<=`, not `<`: both constants name the breadth a card may reach and
+        // still be one outcome, so the advisory begins one past them. Round 1
+        // of this card's review found the strict form firing at exactly 12
+        // paths, which the declaration promised would be silent.
+        if self.paths <= BROAD_PATH_COUNT && self.areas <= BROAD_AREA_COUNT {
             return None;
         }
         Some(format!(
@@ -95,21 +105,36 @@ impl ScopeBreadth {
 /// One review round, reduced to what the trend needs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Round {
-    /// Findings the reviewer left open.
+    /// How many findings the reviewer left open.
+    ///
+    /// Findings, not distinct locations. Two open findings naming the same
+    /// file are two problems, and a card sitting at three open findings every
+    /// round is stuck whether or not they share a line. Counting the set
+    /// instead — which this did until round 1 of its own review — reads a
+    /// stuck card as converging, which is the one reading that must never
+    /// happen silently.
     pub open_findings: usize,
-    /// Distinct locations those findings named.
-    pub locations: BTreeSet<String>,
+    /// The areas those findings fall under.
+    pub areas: BTreeSet<String>,
 }
 
 impl Round {
-    /// Builds a round from a review's open findings.
+    /// Builds a round from the locations of a review's open findings.
+    ///
+    /// Takes one item per open finding, duplicates included.
     #[must_use]
     pub fn new<'a>(open_locations: impl IntoIterator<Item = &'a str>) -> Self {
-        let locations: BTreeSet<String> =
-            open_locations.into_iter().map(ToOwned::to_owned).collect();
+        let mut open_findings = 0;
+        let mut areas = BTreeSet::new();
+        for location in open_locations {
+            open_findings += 1;
+            if let Some(area) = area_of(location) {
+                areas.insert(area);
+            }
+        }
         Self {
-            open_findings: locations.len(),
-            locations,
+            open_findings,
+            areas,
         }
     }
 }
@@ -121,7 +146,7 @@ pub struct Trend {
     pub rounds: usize,
     /// Open findings in each round, oldest first.
     pub per_round: Vec<usize>,
-    /// Locations in this round that no earlier round named.
+    /// Areas in this round that no earlier round named.
     pub new_areas: Vec<String>,
 }
 
@@ -141,15 +166,15 @@ impl Trend {
             .iter()
             .rev()
             .skip(1)
-            .flat_map(|round| round.locations.iter())
+            .flat_map(|round| round.areas.iter())
             .collect();
         let new_areas = rounds
             .last()
             .map(|latest| {
                 latest
-                    .locations
+                    .areas
                     .iter()
-                    .filter(|location| !seen.contains(location))
+                    .filter(|area| !seen.contains(area))
                     .cloned()
                     .collect()
             })
@@ -187,33 +212,33 @@ impl Trend {
         if self.rounds < MIN_ROUNDS_FOR_TREND {
             return None;
         }
-        let counts: Vec<String> = self.per_round.iter().map(ToString::to_string).collect();
         let spreading = !self.new_areas.is_empty();
         if !self.is_flat() && !spreading {
             return None;
         }
 
-        let mut reason = String::new();
+        // Clauses joined rather than written into a `String`: `write!` into a
+        // `String` needs an `expect` to discharge its `Result`, and a panic
+        // site — however unreachable — on the one code path whose entire claim
+        // is that it cannot change what a command does is the wrong shape.
+        let mut clauses: Vec<String> = Vec::new();
         if self.is_flat() {
-            reason.push_str("open findings are not falling");
+            clauses.push("open findings are not falling".to_owned());
         }
         if spreading {
-            if !reason.is_empty() {
-                reason.push_str(" and ");
-            }
-            write!(
-                reason,
+            clauses.push(format!(
                 "round {} raised {} finding(s) in area(s) no earlier round named ({})",
                 self.rounds,
                 self.new_areas.len(),
                 self.new_areas.join(", ")
-            )
-            .expect("writing to a String cannot fail");
+            ));
         }
+        let counts: Vec<String> = self.per_round.iter().map(ToString::to_string).collect();
         Some(format!(
-            "this card is on review round {} with open findings per round of {}; {reason}. Findings that keep appearing in new places usually mean the card is several cards. Consider splitting it — this is a signal, not a refusal, and the judgment is yours",
+            "this card is on review round {} with open findings per round of {}; {}. Findings that keep appearing in new places usually mean the card is several cards. Consider splitting it — this is a signal, not a refusal, and the judgment is yours",
             self.rounds,
-            counts.join(" → ")
+            counts.join(" → "),
+            clauses.join(" and ")
         ))
     }
 }
@@ -276,39 +301,53 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_but_shallow_card_is_flagged_on_paths_alone() {
-        let many = ScopeBreadth::measure(&paths(&[
-            "src/domain/a.rs",
-            "src/domain/b.rs",
-            "src/domain/c.rs",
-            "src/domain/d.rs",
-            "src/domain/e.rs",
-            "src/domain/f.rs",
-            "src/domain/g.rs",
-            "src/domain/h.rs",
-            "src/domain/i.rs",
-            "src/domain/j.rs",
-            "src/domain/k.rs",
-            "src/domain/l.rs",
-        ]));
-        assert_eq!(many.areas, 1, "all one area");
-        assert!(many.advisory().is_some(), "but twelve paths is broad");
+    fn the_path_threshold_is_exclusive_and_decides_on_paths_alone() {
+        // Both sides of the boundary, in one test, so neither can drift on its
+        // own. Round 1 of this card's own review found `<` where the
+        // declaration promised "more than", so exactly the threshold fired.
+        let at: Vec<String> = (0..BROAD_PATH_COUNT)
+            .map(|index| format!("src/domain/f{index}.rs"))
+            .collect();
+        let breadth = ScopeBreadth::measure(&at);
+        assert_eq!(breadth.paths, BROAD_PATH_COUNT);
+        assert_eq!(breadth.areas, 1, "all one area, so paths decide this");
+        assert!(
+            breadth.advisory().is_none(),
+            "exactly {BROAD_PATH_COUNT} paths is the widest a card may be and stay quiet"
+        );
+
+        let mut over = at;
+        over.push("src/domain/one_more.rs".to_owned());
+        assert!(
+            ScopeBreadth::measure(&over).advisory().is_some(),
+            "one path past it is not"
+        );
     }
 
     #[test]
-    fn a_deep_but_narrow_card_is_flagged_on_areas_alone() {
-        let scattered = ScopeBreadth::measure(&paths(&[
+    fn the_area_threshold_is_exclusive_and_decides_on_areas_alone() {
+        let at = paths(&[
             "src/policy/a.rs",
             "src/runner/b.rs",
             "tests/c.rs",
             "docs/d.md",
-        ]));
-        assert_eq!(scattered.paths, 4);
-        assert_eq!(scattered.areas, 4);
+        ]);
+        let breadth = ScopeBreadth::measure(&at);
+        assert_eq!(breadth.areas, BROAD_AREA_COUNT);
         assert!(
-            scattered.advisory().is_some(),
-            "four areas is several cards"
+            breadth.paths <= BROAD_PATH_COUNT,
+            "the path count must not be what decides this"
         );
+        assert!(
+            breadth.advisory().is_none(),
+            "exactly {BROAD_AREA_COUNT} areas is the widest a card may be and stay quiet"
+        );
+
+        let mut over = at;
+        over.push(".claude/skills/e.md".to_owned());
+        let wider = ScopeBreadth::measure(&over);
+        assert_eq!(wider.areas, BROAD_AREA_COUNT + 1);
+        assert!(wider.advisory().is_some(), "one area past it is not");
     }
 
     #[test]
@@ -365,21 +404,45 @@ mod tests {
     }
 
     #[test]
-    fn findings_that_keep_moving_to_new_places_are_flagged_even_while_falling() {
+    fn findings_that_keep_moving_to_new_areas_are_flagged_even_while_falling() {
         // The F-027 shape, and the reason volume alone is the wrong measure:
         // the count came down while every round found a defect somewhere the
         // last round had not looked.
         let history = [
             Round::new(["src/policy/hygiene.rs", "src/domain/card.rs", "src/main.rs"]),
             Round::new(["src/control/repository.rs", "src/policy/hygiene.rs"]),
-            Round::new(["src/policy/actors.rs"]),
+            Round::new(["tests/authority.rs"]),
         ];
         let trend = Trend::measure(&history);
         assert!(!trend.is_flat(), "the count is falling");
-        assert_eq!(trend.new_areas, vec!["src/policy/actors.rs"]);
+        assert_eq!(trend.new_areas, vec!["tests"], "an area, not a location");
 
         let advisory = trend.advisory().expect("spreading is a signal on its own");
         assert!(advisory.contains("no earlier round named"), "{advisory}");
+    }
+
+    #[test]
+    fn a_new_file_inside_an_area_already_named_is_not_spreading() {
+        // Round 1 of this card's own review. The trend compared raw finding
+        // locations while calling them areas, so a card being worked through
+        // one module file by file — the most ordinary shape a converging card
+        // has — was told it was spreading somewhere new every round.
+        let history = [
+            Round::new(["src/policy/a.rs", "src/policy/b.rs", "src/policy/c.rs"]),
+            Round::new(["src/policy/a.rs", "src/policy/b.rs"]),
+            Round::new(["src/policy/d.rs"]),
+        ];
+        let trend = Trend::measure(&history);
+        assert_eq!(trend.per_round, vec![3, 2, 1]);
+        assert!(
+            trend.new_areas.is_empty(),
+            "d.rs is new, src/policy is not: {:?}",
+            trend.new_areas
+        );
+        assert!(
+            trend.advisory().is_none(),
+            "a card converging inside one area must not be nagged"
+        );
     }
 
     #[test]
@@ -397,8 +460,30 @@ mod tests {
     }
 
     #[test]
-    fn repeated_locations_within_one_round_count_once() {
+    fn several_open_findings_at_one_location_count_separately() {
+        // Round 1 of this card's own review, and the worse half of the same
+        // mistake: counting the *set* of locations read a card stuck at three
+        // open findings as converging 3 → 2 → 1 and said nothing. Two findings
+        // in one file are two problems.
         let round = Round::new(["src/a.rs", "src/a.rs", "src/b.rs"]);
-        assert_eq!(round.open_findings, 2);
+        assert_eq!(round.open_findings, 3, "three findings");
+        assert_eq!(round.areas.len(), 2, "but two areas");
+
+        let stuck = [
+            Round::new(["src/a.rs", "src/b.rs", "src/c.rs"]),
+            Round::new(["src/a.rs", "src/a.rs", "src/b.rs"]),
+            Round::new(["src/a.rs", "src/a.rs", "src/a.rs"]),
+        ];
+        let trend = Trend::measure(&stuck);
+        assert_eq!(
+            trend.per_round,
+            vec![3, 3, 3],
+            "three open findings in every round"
+        );
+        assert!(trend.is_flat());
+        assert!(
+            trend.advisory().is_some(),
+            "a card stuck at three open findings must not read as converging"
+        );
     }
 }

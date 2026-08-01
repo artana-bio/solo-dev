@@ -1,4 +1,7 @@
-use std::process::ExitCode;
+use std::{
+    io::{self, Write as _},
+    process::ExitCode,
+};
 
 use clap::Parser;
 
@@ -90,8 +93,19 @@ fn main() -> ExitCode {
             // Advisories go to stderr so a piped stdout carries only the
             // result, in text and JSON alike. In JSON mode they are also
             // inside the envelope.
+            //
+            // Written through a locked handle with the result discarded,
+            // because `eprintln!` panics when the write fails. By this point
+            // the command has already succeeded and its state change is
+            // committed, so a reader that closed the pipe — `2>&-`, or a
+            // `head` that has seen enough — would turn an advisory into exit
+            // 101 over work that actually landed. An advisory that can change
+            // the exit status is not an advisory. Dropping the line is the
+            // right outcome: in JSON mode the envelope carries the warnings
+            // too, which is where anything programmatic reads them.
+            let mut stderr = io::stderr().lock();
             for warning in &execution.warnings {
-                eprintln!("warning: {warning}");
+                let _ = writeln!(stderr, "warning: {warning}");
             }
             ExitCode::from(ExitCategory::Success)
         }

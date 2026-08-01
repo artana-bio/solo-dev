@@ -29,12 +29,8 @@ fn opened() -> Workspace {
     workspace
 }
 
-/// Activates a card with an arbitrary include list.
-fn activate_with_scope(
-    workspace: &Workspace,
-    card_id: &str,
-    include: &[&str],
-) -> std::process::Output {
+/// Stores a draft with an arbitrary include list, without activating it.
+fn draft_with_scope(workspace: &Workspace, card_id: &str, include: &[String]) {
     let list = include
         .iter()
         .map(|value| format!("\"{value}\""))
@@ -47,6 +43,16 @@ fn activate_with_scope(
     let path = workspace.root.join(format!("{card_id}.yaml"));
     fs::write(&path, body).unwrap();
     workspace.card(&["create", "--draft", &path.display().to_string()]);
+}
+
+/// Activates a card with an arbitrary include list.
+fn activate_with_scope(
+    workspace: &Workspace,
+    card_id: &str,
+    include: &[&str],
+) -> std::process::Output {
+    let owned: Vec<String> = include.iter().map(|value| (*value).to_owned()).collect();
+    draft_with_scope(workspace, card_id, &owned);
     workspace.card_raw(&["activate", "--card-id", card_id])
 }
 
@@ -116,13 +122,92 @@ fn a_broad_card_is_flagged_at_activation_and_still_activates() {
 }
 
 #[test]
-fn scope_breadth_is_reported_in_the_envelope_too() {
-    // A program driving this cannot read a warning off stderr and act on it.
+fn the_activation_envelope_carries_the_scope_counts() {
+    // A program driving this CLI cannot read a warning off stderr and act on
+    // it, so the envelope is the only place these numbers are usable.
+    //
+    // Round 1 of this card's own review: the test that claimed this coverage
+    // never opened the activation output. It asserted that a later `card
+    // status` succeeded, which stayed true with both fields deleted.
     let workspace = opened();
-    activate_with_scope(&workspace, "F-001", &["src/a.rs", "tests/b.rs"]);
+    let output = activate_with_scope(
+        &workspace,
+        "F-001",
+        &["src/policy/a.rs", "src/runner/b.rs", "tests/c.rs"],
+    );
+    assert!(output.status.success());
 
-    let shown = workspace.card_json(&["status", "--card-id", "F-001"]);
-    assert_eq!(shown["status"], "success");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("activation must emit the JSON envelope on stdout");
+    assert_eq!(envelope["data"]["scope_paths"], 3, "{envelope}");
+    assert_eq!(envelope["data"]["scope_areas"], 3, "{envelope}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_warning_that_cannot_be_printed_leaves_the_exit_status_alone() {
+    // Round 1 of this card's own review, and the finding that mattered most.
+    //
+    // `eprintln!` panics when the write fails. The advisory is printed after
+    // the command has succeeded and its state change is committed, so a closed
+    // stderr turned a card that really had been activated into exit 101. An
+    // advisory that can change the exit status is not an advisory, and this
+    // card's whole claim is that neither check can refuse anything.
+    //
+    // Stderr is a pipe whose read end is already closed, so the write fails
+    // with `EPIPE` and stays failed. Closing descriptor 2 instead does *not*
+    // reproduce this: the first file the harness opens is handed the lowest
+    // free descriptor, which is then 2, and the advisory writes into it
+    // successfully. That version of this test passed against the unfixed
+    // binary, which is the only reason this note exists.
+    let workspace = opened();
+    let broad: Vec<String> = (0..20).map(|index| format!("src/f{index}.rs")).collect();
+    draft_with_scope(&workspace, "F-001", &broad);
+
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "card",
+            "activate",
+            "--output",
+            "json",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--card-id",
+            "F-001",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(writer))
+        .spawn()
+        .expect("the CLI should start");
+    let output = child.wait_with_output().expect("the CLI should finish");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unprintable advisory must not change the exit status (101 is a panic)"
+    );
+
+    // And the half that makes the assertion above mean something: the command
+    // really did reach the advisory, having already committed its work.
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the envelope still reaches stdout");
+    assert_eq!(envelope["status"], "success", "{envelope}");
+    assert!(
+        envelope["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("independently reviewable outcome")))),
+        "the warning that could not be printed is still in the envelope: {envelope}"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "ready",
+        "the activation it could not report stands"
+    );
 }
 
 /// Drives a card to a recorded review carrying the given open finding
