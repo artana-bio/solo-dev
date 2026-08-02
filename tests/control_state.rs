@@ -616,6 +616,61 @@ fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
 }
 
 #[test]
+fn a_split_index_refusal_does_not_create_or_change_shared_indexes() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before = control.head().unwrap();
+
+    git(&fixture.control, &["config", "core.splitIndex", "true"]);
+    git(&fixture.control, &["update-index", "--split-index"]);
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+    let before_shared_indexes = shared_index_snapshot(&fixture.control);
+    assert!(
+        !before_shared_indexes.is_empty(),
+        "the fixture must exercise Git's split-index path"
+    );
+
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    let invalid_bytes = b"{\"note\":\"\xff\"}\n";
+    fs::write(
+        fixture.control.join("cards/split-invalid.json"),
+        invalid_bytes,
+    )
+    .unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, invalid_bytes);
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    assert_eq!(output.status.code(), Some(5), "encoding refusal expected");
+    assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index
+    );
+    assert_eq!(
+        shared_index_snapshot(&fixture.control),
+        before_shared_indexes,
+        "a refusal must not create, change, or delete durable shared indexes"
+    );
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "the rejected blob must not enter Git's object database"
+    );
+}
+
+#[test]
 fn a_clean_filter_cannot_create_a_non_text_control_blob() {
     let fixture = Fixture::new();
     assert!(fixture.init().status.success());
@@ -760,6 +815,23 @@ fn git_has_object(repo: &Path, object: &str) -> bool {
         .status()
         .unwrap()
         .success()
+}
+
+fn shared_index_snapshot(repo: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut snapshot = fs::read_dir(repo.join(".git"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.starts_with("sharedindex.") && entry.metadata().unwrap().is_file() {
+                Some((name, fs::read(entry.path()).unwrap()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshot
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! candidate actor cannot rewrite the policy that judges it.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
@@ -362,6 +362,20 @@ impl ControlRepository {
                 durable_objects.as_os_str(),
             ),
         ];
+        let quarantine_overrides = [OsString::from("core.splitIndex=false")];
+        if quarantine_index.exists() {
+            // A copied split index can make Git write a new sharedindex file
+            // beside the real repository even when GIT_INDEX_FILE is
+            // quarantined. Materialize a full quarantine index first; this
+            // command writes only the quarantine index path.
+            run_with_config_and_environment(
+                &self.scope(),
+                &quarantine_overrides,
+                &quarantine_environment,
+                ["update-index", "--no-split-index"],
+            )?
+            .require_success()?;
+        }
 
         // `--all` within each named path, so a deletion inside one is staged as
         // well as an addition. Paths absent from disk are dropped first: `git
@@ -375,8 +389,13 @@ impl ControlRepository {
         if !present.is_empty() {
             let mut stage: Vec<&str> = vec!["add", "--all", "--"];
             stage.extend_from_slice(&present);
-            run_with_config_and_environment(&self.scope(), &[], &quarantine_environment, stage)?
-                .require_success()?;
+            run_with_config_and_environment(
+                &self.scope(),
+                &quarantine_overrides,
+                &quarantine_environment,
+                stage,
+            )?
+            .require_success()?;
         }
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
@@ -384,14 +403,18 @@ impl ControlRepository {
         // into `git commit` with nothing staged, which fails.
         let staged = run_with_config_and_environment(
             &self.scope(),
-            &[],
+            &quarantine_overrides,
             &quarantine_environment,
             ["diff", "--cached", "--quiet"],
         )?;
         if staged.success() {
             return Ok(None);
         }
-        refuse_non_text_control_entries(&self.scope(), &quarantine_environment)?;
+        refuse_non_text_control_entries(
+            &self.scope(),
+            &quarantine_overrides,
+            &quarantine_environment,
+        )?;
         index_lock.write_from(&quarantine_index)?;
         let promoted_objects = promote_quarantine_objects(&quarantine_objects, &durable_objects)?;
         if let Err(error) = index_lock.install(&durable_index) {
@@ -442,11 +465,12 @@ impl ControlRepository {
 /// this check passes.
 fn refuse_non_text_control_entries(
     scope: &GitScope,
+    overrides: &[OsString],
     environment: &[(&OsStr, &OsStr)],
 ) -> Result<(), HarnessError> {
     let paths = run_with_config_and_environment(
         scope,
-        &[],
+        overrides,
         environment,
         ["diff", "--cached", "--name-only", "-z"],
     )?
@@ -460,7 +484,7 @@ fn refuse_non_text_control_entries(
             code: ErrorCode::PolicyControlEncoding,
         })?;
         let spec = format!(":{relative}");
-        let blob = run_with_config_and_environment(scope, &[], environment, ["show", &spec])?;
+        let blob = run_with_config_and_environment(scope, overrides, environment, ["show", &spec])?;
         if blob.success() {
             refuse_non_text_control_bytes(relative, &blob.stdout_bytes)?;
         }
