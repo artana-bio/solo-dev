@@ -533,6 +533,65 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
 }
 
 #[test]
+fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
+    // Round 1 of this card's own review, driven through the real CLI exactly
+    // as the reviewer drove it. Accounting was existential by location, so one
+    // `resolved` discharged every prior finding there: two criticals at
+    // `src/a.rs:10`, one resolved, and the approval was recorded with the
+    // second gone. A real defect disappearing between rounds is the single
+    // thing this rule exists to prevent.
+    let (workspace, _) = handed_off();
+
+    let two = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass\n    disposition: open\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: destructive operation is not bounded\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, two),
+    ]);
+
+    next_round(&workspace, "fixed-one");
+
+    let half = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed only the authorization bypass\nresidual_risks: []\n";
+    let refused = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, half),
+    ]);
+    assert!(
+        !refused.status.success(),
+        "one resolution must not answer for two findings"
+    );
+    assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
+    let envelope: Value = serde_json::from_slice(&refused.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("1 of 2 accounted for"), "{message}");
+    assert!(
+        message.contains("critical"),
+        "the refusal still names what it is protecting: {message}"
+    );
+
+    // The fixture has to be able to succeed: one entry per finding goes
+    // through, and the record then says what became of each.
+    let both = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: the destructive operation is now bounded\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, both),
+    ]);
+    assert_eq!(
+        workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
+        true,
+        "answering for each finding is the way through, and it must work"
+    );
+}
+
+#[test]
 fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
     // Otherwise the disposition manufactures a history of persistence: a
     // first-time observation filed as though three rounds had already seen it.
