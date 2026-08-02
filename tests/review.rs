@@ -430,6 +430,162 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
     );
 }
 
+/// Moves the card on one round: resume, change something, gate, hand off, and
+/// open the next review. Leaves it ready for another verdict.
+fn next_round(workspace: &Workspace, note: &str) {
+    workspace.work(&["resume", "--card-id", "F-001"]);
+    let worktree = workspace.worktrees.join("F-001");
+    fs::write(
+        worktree.join("src/a.rs"),
+        format!("fn main() {{ /* {note} */ }}\n"),
+    )
+    .unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "fix: partial"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join(format!("declaration-{note}.yaml"));
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: {note}\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+}
+
+#[test]
+fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval() {
+    // `artana-bio/solo-dev#14`. A re-review had to disposition every prior
+    // open finding as resolved, accepted or out of scope, and the common shape
+    // of a long-running card is none of those: worked on, partly closed, still
+    // there. Recording `RV-000039` on `F-027` hit exactly this and was refused.
+    let (workspace, _) = handed_off();
+
+    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the comparison loses to a case variant\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, opened),
+    ]);
+
+    next_round(&workspace, "narrowed");
+
+    // The verdict that used to be unrecordable.
+    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the demonstrated character is closed; the class survives at another\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, carried),
+    ]);
+
+    // It is in the record as carried rather than freshly raised, which is what
+    // makes "round three of the same defect" legible to a reader.
+    let reviews = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let second = &reviews["data"]["reviews"][1];
+    assert_eq!(second["findings"][0]["disposition"], "still_open");
+    assert_eq!(second["findings"][0]["location"], "src/a.rs");
+
+    // And it settles nothing: the next round cannot approve over it.
+    next_round(&workspace, "still-not-fixed");
+    let premature = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class survives\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let refused = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, premature),
+    ]);
+    assert!(
+        !refused.status.success(),
+        "carrying a finding forward must not clear it"
+    );
+    assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
+
+    // The fixture has to be able to succeed, or the refusal proves nothing:
+    // the same approval with the finding actually settled goes through.
+    let settled = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class is closed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, settled),
+    ]);
+    assert_eq!(
+        workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
+        true,
+        "settling it is still the way through"
+    );
+}
+
+#[test]
+fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
+    // Otherwise the disposition manufactures a history of persistence: a
+    // first-time observation filed as though three rounds had already seen it.
+    let (workspace, _) = handed_off();
+
+    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, opened),
+    ]);
+
+    next_round(&workspace, "elsewhere");
+
+    let invented = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: fixed\n    disposition: resolved\n  - severity: high\n    location: src/never-seen.rs\n    detail: pretending this has been here for rounds\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let refused = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, invented),
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
+    let envelope: Value = serde_json::from_slice(&refused.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("src/never-seen.rs"), "{message}");
+}
+
+#[test]
+fn the_first_review_of_a_card_cannot_carry_a_finding_forward() {
+    // `check_supersedes` only runs when a predecessor exists, so the very
+    // first review is the one place a fabricated carry-forward would not meet
+    // it. Refused where the record is built instead.
+    let (workspace, _) = handed_off();
+
+    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: claiming this survived a round that never happened\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let refused = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, carried),
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
+    let envelope: Value = serde_json::from_slice(&refused.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("first review"), "{message}");
+}
+
 #[test]
 fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
     // The check applies to every re-review, not only approvals. A
