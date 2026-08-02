@@ -19,8 +19,9 @@ use std::fs;
 
 use support::Workspace;
 
-/// A card handed off and under review, plus the candidate that was handed off.
-fn under_review() -> (Workspace, String) {
+/// A card handed off, plus the candidate that was handed off. No review has
+/// begun yet — `under_review` below adds that.
+fn handed_off() -> (Workspace, String) {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -56,6 +57,13 @@ fn under_review() -> (Workspace, String) {
         "--declaration",
         &declaration.display().to_string(),
     ]);
+    (workspace, reviewed)
+}
+
+/// The same, with a review actually begun. What every test but the
+/// review-begin gap test wants.
+fn under_review() -> (Workspace, String) {
+    let (workspace, reviewed) = handed_off();
     workspace.review(&["begin", "--card-id", "F-001"]);
     (workspace, reviewed)
 }
@@ -279,10 +287,12 @@ fn changes_requested_against_a_revoked_handoff_is_still_recordable() {
 }
 
 #[test]
-fn an_active_card_with_no_handoff_still_cannot_be_reviewed() {
-    // The guard on the transition that was just opened. `active ->
-    // changes_requested` exists so a reviewer can file after a revocation, not
-    // so a card can reach `changes_requested` without anyone reviewing it.
+fn an_active_card_with_no_handoff_at_all_cannot_be_reviewed() {
+    // The only guard the new transition leans on, and it is narrower than it
+    // sounds: it establishes that a card nobody handed off cannot be reviewed,
+    // and nothing more. A *revoked* handoff satisfies it — see the test below,
+    // which says so plainly rather than letting this one's name imply
+    // otherwise. Review round 3 (RV-000056) caught exactly that overclaim.
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -313,6 +323,47 @@ fn an_active_card_with_no_handoff_still_cannot_be_reviewed() {
         "refused for the absent handoff: {}",
         envelope["error"]["message"]
     );
+}
+
+#[test]
+fn recording_a_verdict_does_not_yet_require_that_a_review_began() {
+    // A known gap, stated rather than discovered. `review record` has never
+    // checked that `review begin` happened: a handoff that was created and then
+    // revoked, with no review round at any point, is enough to file a verdict.
+    //
+    // On the protected branch this already succeeds for `blocked`; permitting
+    // `active -> changes_requested` widens it to the second verdict. Closing it
+    // needs a durable signal that a review began for the current handoff, which
+    // is a lifecycle question rather than a staleness one and is filed as its
+    // own card. It is not an authority bypass — `check_independence` still
+    // refuses a reviewer who is the handoff actor.
+    //
+    // This test asserts the behaviour as it is so that closing the gap is a
+    // deliberate edit here, not a surprise failure somewhere else.
+    for decision in ["blocked", "changes_requested"] {
+        let (workspace, _) = handed_off();
+        workspace.handoff(&[
+            "revoke",
+            "--card-id",
+            "F-001",
+            "--reason",
+            "withdrawn before any review began",
+        ]);
+
+        let path = verdict_file(&workspace, decision);
+        let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+        assert_eq!(
+            envelope["status"], "success",
+            "{decision} is recordable with no review round: this is the gap"
+        );
+
+        let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+        assert_eq!(
+            inspected["data"]["reviews"].as_array().unwrap().len(),
+            1,
+            "and it reaches the record"
+        );
+    }
 }
 
 #[test]
