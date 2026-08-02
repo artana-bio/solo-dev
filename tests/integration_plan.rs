@@ -119,6 +119,134 @@ fn an_invalidated_approval_is_reported_as_stale_rather_than_absent() {
     );
 }
 
+/// Drives a card to a non-approval verdict recorded *after* the branch moved.
+///
+/// `F-028` made this reachable on purpose: a verdict that found problems is a
+/// true statement about the candidate it was reached against, and refusing to
+/// file it once the branch moves destroys the reviewer's work. What `F-028`
+/// then declared as one of its own acceptance regressions — that a card left
+/// this way stays out of integration — nothing in the durable suite checked.
+/// That card's reviewer verified it by hand across eleven scenarios;
+/// `artana-bio/solo-dev#15` item 2 is the gap that left behind.
+fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, decision: &str) {
+    workspace.work(&["start", "--card-id", card_id]);
+
+    let worktree = workspace.worktrees.join(card_id);
+    let path = worktree.join(format!("src/{card_id}/a.rs"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("// {card_id}\n")).unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: reviewed"]);
+    workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        card_id,
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", card_id]);
+
+    // The branch moves while the reviewer is still reading it.
+    fs::write(worktree.join(format!("src/{card_id}/b.rs")), "// more\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: moved on"]);
+
+    let verdict = workspace.root.join(format!("{card_id}-verdict.yaml"));
+    fs::write(
+        &verdict,
+        format!(
+            "reviewer_actor_id: reviewer-session\ndecision: {decision}\nfindings:\n  - severity: high\n    location: src/{card_id}/a.rs\n    detail: the candidate has a defect\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n"
+        ),
+    )
+    .unwrap();
+    workspace.review(&[
+        "record",
+        "--card-id",
+        card_id,
+        "--verdict",
+        &verdict.display().to_string(),
+    ]);
+}
+
+/// Asserts a card is absent from `ready`, named in `not_ready` with a reason,
+/// and refused by `prepare` — the three surfaces that together have to agree
+/// before "not integrable" means anything.
+fn assert_not_integrable(workspace: &Workspace, card_id: &str, state: &str) {
+    let envelope = workspace.integration_json(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready_ids(&envelope).contains(&card_id.to_owned()),
+        "{card_id} must not be offered for integration: {envelope}"
+    );
+
+    let waiting = envelope["data"]["not_ready"]
+        .as_array()
+        .expect("a not-ready list")
+        .iter()
+        .find(|entry| entry["card_id"] == card_id)
+        .unwrap_or_else(|| panic!("{card_id} must be named with a reason: {envelope}"));
+    assert_eq!(waiting["state"], state);
+    assert!(
+        waiting["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not `approved`"),
+        "unexpected reason: {waiting}"
+    );
+
+    // And the half that actually protects the protected branch: naming the
+    // card explicitly is refused, not quietly dropped from the selection.
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--card-id",
+        card_id,
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-NOT-INTEGRABLE");
+}
+
+#[test]
+fn a_card_left_in_changes_requested_by_a_stale_verdict_is_not_integrable() {
+    let workspace = cycle_with(1);
+    left_non_approved_by_a_stale_verdict(&workspace, "F-001", "changes_requested");
+    assert_not_integrable(&workspace, "F-001", "changes_requested");
+}
+
+#[test]
+fn a_card_left_blocked_by_a_stale_verdict_is_not_integrable() {
+    let workspace = cycle_with(1);
+    left_non_approved_by_a_stale_verdict(&workspace, "F-001", "blocked");
+    assert_not_integrable(&workspace, "F-001", "blocked");
+}
+
+#[test]
+fn a_stale_non_approval_does_not_drag_down_an_approved_sibling() {
+    // The other direction, so the two tests above cannot pass by refusing
+    // everything: a card left non-approved by a stale verdict must not stop a
+    // genuinely approved card in the same cycle from integrating.
+    let workspace = cycle_with(2);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    left_non_approved_by_a_stale_verdict(&workspace, "F-002", "changes_requested");
+
+    let envelope = workspace.integration_json(&["ready", "--cycle-id", "C-001"]);
+    assert_eq!(ready_ids(&envelope), ["F-001"]);
+    assert_not_integrable(&workspace, "F-002", "changes_requested");
+}
+
 #[test]
 fn preparing_selects_only_approved_candidates() {
     let workspace = cycle_with(2);
