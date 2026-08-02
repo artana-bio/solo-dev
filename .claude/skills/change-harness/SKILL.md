@@ -25,8 +25,11 @@ one and the harness will usually refuse you later, at a worse moment.
    the path. Forgetting the test file you obviously must edit is the classic
    case.
 2. **`delivered_sha` is the exact commit you delivered.** The harness refuses a
-   handoff whose branch head disagrees. Never write "the branch" or a stale
-   SHA.
+   handoff whose branch head disagrees. Never write "the branch," a stale
+   SHA, or a full hash reconstructed from memory of a short one — run
+   `git rev-parse HEAD` in the worktree at the moment you write it. A
+   hand-expanded guess is indistinguishable from a fabricated one until the
+   harness refuses it.
 3. **One actor, one role.** The reviewer is a different actor, in a separate
    task or agent thread that starts cold — not a later turn of the
    conversation that wrote the code. Step 7 says exactly what that thread may
@@ -41,7 +44,21 @@ one and the harness will usually refuse you later, at a worse moment.
    harness manages.
 6. **A review is evidence only if it tried to break something.** Record what
    you tried that failed. Approving because the diff "looks right" is the
-   failure mode this tool exists to prevent.
+   failure mode this tool exists to prevent — and it applies to you before
+   you hand off, not only to the reviewer after. Mutate what you wrote and
+   confirm the test actually fails; a test written immediately after its own
+   implementation is a suspect, not a witness.
+7. **Check whether another session already owns the ground you are about to
+   cover.** `cycle status --cycle-id <id>` lists active cards before you
+   author a new one. Two sessions racing the same *file* is caught at
+   activation (`CH-POLICY-OWNERSHIP-OVERLAP`); two sessions racing the same
+   *issue* in different files is not caught by anything. Look first.
+8. **A claim about state you did not just read is not a fact.** Writing a
+   decision-register row, a defect entry, or a review finding based on what
+   you remember from an adjacent worktree or an earlier turn is how a false
+   statement gets recorded while you are in the middle of correcting a false
+   statement. Read the file you are describing, in the tree you are
+   describing, before you write the sentence.
 
 ## Setup
 
@@ -271,6 +288,14 @@ afterward use `card revise --card-id F-001 --draft new.yaml --reason "..."`,
 which supersedes the revision, invalidates existing approvals, and returns the
 card to `ready` — run `work resume` to step it back to work.
 
+Base the new draft on the card's *current* revision, not the file you first
+wrote. The control repository stores each revision separately
+(`cards/<id>/rN.json`), and `draft.json` is permanently revision 1 — `card
+status --card-id F-001` reports which `N` is current. Editing `draft.json` to
+build revision 3 silently reverts every field revision 2 already changed;
+nothing in the CLI catches this today, so diff every stored revision before
+submitting if you did not author the one you are building on.
+
 Scope authoring guidance: paths are matched exactly or by glob. Both sides of a
 rename are checked. Include every test and doc file the change needs; a scope
 you have to revise later costs a re-handoff and a fresh review.
@@ -368,6 +393,13 @@ practice, not an attested one, and nothing here can tell whether you really
 opened a new thread. Honor it anyway; independent review bound to exact
 commits is the entire product.
 
+**Decide your stopping rule before round one, and write it down.** Nothing in
+this tool bounds how many review rounds a card goes through — this is a rule,
+not a refusal. "Land unless the next review finds an exploitable bypass,"
+decided before you start, is one you can hold yourself to under pressure.
+Deciding it after round three, once you are tired of finding things, is not
+the same rule.
+
 ```bash
 change-harness review begin  --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
@@ -375,7 +407,11 @@ change-harness review record --card-id F-001 --verdict verdict.yaml --actor revi
 
 Review discipline: verify claims by breaking things — apply the mutation a
 test claims to catch and confirm it fails at the assertion that matters; drive
-the real binary against the real behavior. Then write:
+the real binary against the real behavior. The same applies to documentation:
+a decision-register row or defect-log entry is a claim about what the code
+does, and rereading it only checks that it reads well — reproduce the
+scenario it describes against the actual code before you trust the sentence.
+Then write:
 
 ```yaml
 reviewer_actor_id: reviewer-b
