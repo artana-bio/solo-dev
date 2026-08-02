@@ -361,21 +361,63 @@ impl HandoffRecord {
         card_digest: &Digest,
         dependencies: &[DependencyStanding],
     ) -> Option<String> {
-        if self.status == HandoffStatus::Revoked {
-            return Some("the handoff was revoked".to_owned());
-        }
-        if self.candidate_sha != candidate_sha {
-            return Some(format!(
+        self.revocation_staleness()
+            .or_else(|| self.candidate_staleness(candidate_sha))
+            .or_else(|| self.card_binding_staleness(card_digest))
+            .or_else(|| self.dependency_binding_staleness(dependencies))
+    }
+
+    /// Every question [`staleness`](Self::staleness) asks except whether the
+    /// branch still holds the commit that was handed off.
+    ///
+    /// A verdict that found problems is a true statement about the candidate
+    /// the reviewer read, and it stays true when the branch moves — so the
+    /// review path skips the candidate question for a non-approval. It skips
+    /// only that one. A handoff that was revoked was withdrawn from review
+    /// altogether, and a card revised underneath a handoff changed what the
+    /// reviewer was measuring against; neither is a statement that survives,
+    /// and both still refuse here.
+    ///
+    /// The two entry points are composed from the same parts in the same order
+    /// so that whichever reason applies, it is the reason either one reports.
+    #[must_use]
+    pub fn staleness_ignoring_candidate(
+        &self,
+        card_digest: &Digest,
+        dependencies: &[DependencyStanding],
+    ) -> Option<String> {
+        self.revocation_staleness()
+            .or_else(|| self.card_binding_staleness(card_digest))
+            .or_else(|| self.dependency_binding_staleness(dependencies))
+    }
+
+    /// The handoff was withdrawn by whoever made it.
+    fn revocation_staleness(&self) -> Option<String> {
+        (self.status == HandoffStatus::Revoked).then(|| "the handoff was revoked".to_owned())
+    }
+
+    /// The branch no longer holds the commit that was handed off.
+    fn candidate_staleness(&self, candidate_sha: &str) -> Option<String> {
+        (self.candidate_sha != candidate_sha).then(|| {
+            format!(
                 "handoff describes candidate {} but the branch is now {candidate_sha}",
                 self.candidate_sha
-            ));
-        }
-        if self.card_digest != *card_digest {
-            return Some(format!(
+            )
+        })
+    }
+
+    /// The card was revised after the handoff bound itself to a revision.
+    fn card_binding_staleness(&self, card_digest: &Digest) -> Option<String> {
+        (self.card_digest != *card_digest).then(|| {
+            format!(
                 "handoff was bound to card digest {} but the card is now {card_digest}",
                 self.card_digest
-            ));
-        }
+            )
+        })
+    }
+
+    /// A declared dependency moved or lost its approval.
+    fn dependency_binding_staleness(&self, dependencies: &[DependencyStanding]) -> Option<String> {
         dependency_staleness("handoff", &self.dependency_bindings, dependencies)
     }
 }
@@ -532,6 +574,80 @@ mod tests {
             )
             .unwrap();
         assert!(revised.contains("card is now"), "{revised}");
+    }
+
+    #[test]
+    fn ignoring_the_candidate_still_asks_every_other_question() {
+        let card = Digest::of_bytes(b"card");
+        let revised = Digest::of_bytes(b"revised");
+
+        // The branch moving is the one thing it stops asking about.
+        assert!(
+            handoff()
+                .staleness_ignoring_candidate(&card, DEPENDENCIES_NOT_CHECKED)
+                .is_none()
+        );
+
+        let revoked = HandoffRecord {
+            status: HandoffStatus::Revoked,
+            ..handoff()
+        };
+        assert_eq!(
+            revoked
+                .staleness_ignoring_candidate(&card, DEPENDENCIES_NOT_CHECKED)
+                .as_deref(),
+            Some("the handoff was revoked"),
+            "a withdrawn handoff is not something any verdict outlives"
+        );
+
+        let rebound = handoff()
+            .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
+            .expect("a card revised underneath the handoff is still staleness");
+        assert!(rebound.contains("card is now"), "{rebound}");
+
+        let dependency = handoff()
+            .staleness_ignoring_candidate(&card, &standing(Some(&"e".repeat(40)), true))
+            .expect("the dependency question is still asked when it is asked at all");
+        assert!(dependency.contains("dependency"), "{dependency}");
+    }
+
+    #[test]
+    fn both_entry_points_report_the_same_reason_in_the_same_order() {
+        // The two are composed from one set of parts precisely so that a
+        // caller dropping the candidate question cannot silently reorder the
+        // rest. With a moved branch *and* a revised card, the whole check
+        // reports the candidate first, and the narrower one reports the card
+        // rather than falling silent.
+        let record = handoff();
+        let revised = Digest::of_bytes(b"revised");
+
+        let whole = record
+            .staleness(&"c".repeat(40), &revised, DEPENDENCIES_NOT_CHECKED)
+            .unwrap();
+        assert!(whole.contains("branch is now"), "{whole}");
+
+        let narrower = record
+            .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
+            .unwrap();
+        assert!(narrower.contains("card is now"), "{narrower}");
+
+        // And revocation still precedes both in either entry point.
+        let revoked = HandoffRecord {
+            status: HandoffStatus::Revoked,
+            ..handoff()
+        };
+        assert_eq!(
+            revoked
+                .staleness(&"c".repeat(40), &revised, DEPENDENCIES_NOT_CHECKED)
+                .as_deref(),
+            Some("the handoff was revoked")
+        );
+        assert_eq!(
+            revoked
+                .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
+                .as_deref(),
+            Some("the handoff was revoked")
+        );
     }
 
     #[test]
