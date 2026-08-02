@@ -161,6 +161,12 @@ fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, de
     fs::write(worktree.join(format!("src/{card_id}/b.rs")), "// more\n").unwrap();
     support::git(&worktree, &["add", "-A"]);
     support::git(&worktree, &["commit", "-q", "-m", "feat: moved on"]);
+    let moved = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        head, moved,
+        "the fixture has to actually move the branch, or these tests are \
+         about an ordinary non-approval and say nothing about F-028"
+    );
 
     let verdict = workspace.root.join(format!("{card_id}-verdict.yaml"));
     fs::write(
@@ -177,6 +183,26 @@ fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, de
         "--verdict",
         &verdict.display().to_string(),
     ]);
+
+    // And the verdict really is bound to the candidate that was read, not to
+    // the branch as it now stands. Without this the fixture proves only that
+    // a non-approved card is excluded, which `preparing_selects_only_approved_
+    // candidates` already covers — deleting the three lines above left every
+    // test here green, which is how the first version of this shipped.
+    let recorded = workspace.review_json(&["inspect", "--card-id", card_id]);
+    let last = recorded["data"]["reviews"]
+        .as_array()
+        .expect("a review list")
+        .last()
+        .expect("the verdict just recorded");
+    assert_eq!(
+        last["candidate_sha"], head,
+        "the review names the candidate it read"
+    );
+    assert_ne!(
+        last["candidate_sha"], moved,
+        "which is no longer what the branch holds"
+    );
 }
 
 /// Asserts a card is absent from `ready`, named in `not_ready` with a reason,
@@ -245,6 +271,23 @@ fn a_stale_non_approval_does_not_drag_down_an_approved_sibling() {
     let envelope = workspace.integration_json(&["ready", "--cycle-id", "C-001"]);
     assert_eq!(ready_ids(&envelope), ["F-001"]);
     assert_not_integrable(&workspace, "F-002", "changes_requested");
+
+    // Appearing in `ready` is not the same as being integrable, and this test
+    // only earns its place by reaching the surface where refusing everything
+    // would show. Breaking `select` so any non-approved sibling poisoned an
+    // omitted-card selection left the earlier version of this test green.
+    let prepared = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(
+        merge_order(&prepared),
+        ["F-001"],
+        "the approved sibling integrates on its own: {prepared}"
+    );
 }
 
 #[test]
