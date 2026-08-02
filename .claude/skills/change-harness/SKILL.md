@@ -480,10 +480,14 @@ Rules the harness enforces:
   `still_open` is for the common case that is neither settled nor new: worked
   on, not yet closed. It accounts for the prior finding without claiming it
   is resolved, and still blocks an approval exactly as `open` does.
-- An approval goes **stale** if the candidate changes, the card is revised, or
-  a dependency's own standing changes underneath it — three conditions, not
-  two; a fresh review fixes the first two and cannot fix the third by itself.
-  Staleness is reported, and integration refuses stale members.
+- An approval goes **stale** if the candidate changes or the card is revised.
+  A third, narrower condition covers dependencies: not any change to a
+  dependency's standing, but specifically when the commit this card recorded
+  as incorporated is no longer contained in what the dependency currently
+  stands approved at, or when a declared dependency has no recorded binding
+  at all. A dependency merely losing its own approval does not by itself
+  stale this one. Staleness is reported, and integration refuses stale
+  members.
 
 After `changes_requested`: `work resume --card-id F-001 --actor implementer-a`
 (the card cannot hand off from `changes_requested` directly), fix, re-run
@@ -540,6 +544,7 @@ worktrees; `close` refuses to delete anything that would become unreachable.
 | Handoff refuses a dirty worktree | Uncommitted or untracked files | Commit them, or add gate outputs to the project's `.gitignore` |
 | Handoff refuses the SHA | Branch head ≠ `delivered_sha` | Re-read HEAD, fix the declaration |
 | An approval is reported stale | Candidate or card changed after the review | New handoff, fresh review — the old approval is not deleted, it just no longer applies |
+| Stale specifically over a dependency | The dependency's standing approval no longer contains what this card recorded as incorporated, or has no recorded binding | A new handoff alone recomputes the binding; if the candidate does not yet build on the dependency's current commit, incorporate it first, then hand off and review again |
 | Lock held by another command | Concurrent mutation | Wait; `project status` diagnoses a stale holder; **never delete a lock file by hand** |
 | Exit 9 from anything | An operation was interrupted mid-mutation | `project status`, then `project recover` |
 
