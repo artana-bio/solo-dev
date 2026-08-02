@@ -163,12 +163,14 @@ recorded inconsistency — documented here as it is, not as it should be:
 | `integration review` | `--reviewer-actor-id` |
 | `acceptance record` | `--acceptance-owner` |
 
-`review begin`'s and `review record`'s own `--actor` are the generic
-"who ran this command" identity, same as every other row — they are
-**not** how the reviewer is identified. Self-review is refused by comparing
-the verdict's `reviewer_actor_id` against the handoff's `--actor` (from
-`handoff create`), two different flags on two different commands compared
-to each other; `review record`'s own `--actor` plays no part in it.
+Neither `--actor` determines the reviewer. `review begin`'s is genuinely
+used — it is the actor recorded on the `review.begun` event. `review
+record`'s is accepted and then read nowhere at all: the `review.recorded`
+event's actor is the verdict's own `reviewer_actor_id`, not the flag. Self-
+review is refused by comparing that field against the handoff's `--actor`
+(from `handoff create`, a different flag on a different command); `review
+record`'s own `--actor` plays no part in it and could be omitted from this
+table without losing anything true.
 
 `integration preflight` takes no actor at all. `work verify` and the
 read-only status commands (`cycle status`, `card status`, `gate list`) accept
@@ -338,8 +340,10 @@ Scope authoring guidance: paths are matched exactly or by glob. Both sides of a
 rename are checked. Include every test and doc file the change needs; a scope
 you have to revise later costs a re-handoff and a fresh review.
 
-`risk: high` and `risk: critical` require the eventual review verdict to
-declare `human_reviewer: true` — enforced, not advisory.
+`risk: high` and `risk: critical` require an *approving* review verdict to
+declare `human_reviewer: true` — enforced, not advisory. `changes_requested`
+and `blocked` verdicts do not require it: the gate is on what may approve a
+high-risk card, not on every word said about one along the way.
 
 ### 4. Work in the allocated worktree
 
@@ -454,7 +458,7 @@ Then write:
 ```yaml
 reviewer_actor_id: reviewer-b
 decision: changes_requested # approved | changes_requested | blocked
-human_reviewer: true        # required when card risk is high or critical
+human_reviewer: true        # required to approve a high/critical card, not for changes_requested or blocked
 findings:
   - severity: medium       # critical | high | medium | low
     location: src/thing.rs
@@ -502,9 +506,10 @@ leaves out are named in `warnings` with the reason — read them, silence is
 never the signal. `preflight` simulates the whole merge without touching a
 ref. `merge` combines in a disposable worktree. `land` builds the landing
 commit — baseline as first parent, integration head as second, moving no
-branch. `verify` reruns every member-named integration gate *against the
-landing commit*, because a gate that passed on an isolated candidate proves
-nothing about the combined tree.
+branch. `verify` reruns the union of every member's `feature`, `review`, and
+`integration` named gates *against the landing commit* — not only the ones
+named under `integration:` — because a gate that passed on an isolated
+candidate proves nothing about the combined tree.
 
 ### 9. Accept, promote, archive
 
