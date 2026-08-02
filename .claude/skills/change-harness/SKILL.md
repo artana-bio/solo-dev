@@ -193,9 +193,12 @@ Exit 1 is deliberately unassigned so an uncategorized panic stays
 distinguishable from every classified outcome.
 
 Every mutating command accepts `--dry-run` (the one exception:
-`project recover --resume` has no dry-run form). It runs the real checks
-against real state and changes nothing. A dry run that would refuse tells you
-so with the same error the real command would give.
+`project recover --resume` has no dry-run form). Most run the real checks
+against real state and change nothing, so a dry run that would refuse tells
+you so with the same error the real command would give. `handoff create` is
+a known exception: its preview does not check feature-gate evidence, so
+`--dry-run` can succeed where the real command refuses with
+`CH-GATE-EVIDENCE-STALE` over a missing or stale receipt.
 
 ## The lifecycle
 
@@ -264,18 +267,23 @@ change-harness cycle create --cycle-id C-001 --objective "One-line objective"
 change-harness cycle activate --cycle-id C-001
 ```
 
-Activation freezes the baseline to the authority's current head. Every card in
-the cycle builds from that exact commit.
+Activation freezes the cycle's baseline to the authority's current head.
+Every card in the cycle is meant to build from that exact commit — this is a
+rule, not a refusal. `base_sha` is validated only as a well-formed
+40-character commit id; nothing cross-checks it against the cycle's frozen
+baseline, and a card naming a later commit activates and starts without
+complaint.
 
 ### 3. Author and activate the card
 
 The card is the contract. Write the draft YAML completely — the deserializer
-rejects any key it does not know and requires every key below; it does not
-reject the ones left out of this example. `contract_reads`,
-`contract_changes`, `exclusive_resources`, and `generated_artifacts` are also
-valid keys, default to empty when omitted, and are not shown here for that
-reason — not because they do not exist. Declare `exclusive_resources` when
-ground rule 7 calls for it.
+rejects any key it does not know. Not every key below is required: `non_goals`
+and `depends_on` are shown but default to empty, same as `contract_reads`,
+`contract_changes`, `exclusive_resources`, and `generated_artifacts`, which
+are valid keys not shown here at all. `card_id`, `cycle_id`, `title`, `goal`,
+`risk`, `change_kind`, `base_sha`, `write_scope`, `named_gates`, `acceptance`,
+`review_policy`, and `rollback_strategy` are the ones actually required.
+Declare `exclusive_resources` when ground rule 7 calls for it.
 
 ```yaml
 card_id: F-001
@@ -445,8 +453,8 @@ Then write:
 
 ```yaml
 reviewer_actor_id: reviewer-b
-decision: approved         # approved | changes_requested | blocked
-human_reviewer: true       # required when card risk is high or critical
+decision: changes_requested # approved | changes_requested | blocked
+human_reviewer: true        # required when card risk is high or critical
 findings:
   - severity: medium       # critical | high | medium | low
     location: src/thing.rs
@@ -531,7 +539,9 @@ worktrees; `close` refuses to delete anything that would become unreachable.
 ## Recovery
 
 Mutating commands journal every step before performing it, so an interruption
-is attributable rather than guessed at. `project recover` reports; its
+is attributable rather than guessed at — `backup create` is the exception; it
+writes bundle files directly and is not journaled, so an interruption there is
+not something `project recover` can attribute. `project recover` reports; its
 `--resume` completes only an interrupted promotion (the one operation it can
 safely finish) and refuses anything else by name — disposition of other
 partials is an operator decision.
@@ -550,14 +560,14 @@ registers the checkout and builds the two repositories the harness owns
 around it.
 
 Four paths, three of them new, and **all of them absolute**. `--repository .`
-is refused (`expected an absolute path, found `.``); your working directory is
-never consulted, so it makes no difference whether you run this from inside
-the project or anywhere else.
+is refused (`` expected an absolute path, found `.` ``); your working
+directory is never consulted, so it makes no difference whether you run this
+from inside the project or anywhere else.
 
 | Flag | What it points at |
 | --- | --- |
 | `--repository` | The project you already cloned. Must exist, be a Git repository, and have at least one commit on the protected branch. |
-| `--control` | **New.** Cards, reviews, receipts, integration records. Must be absent or empty. |
+| `--control` | **New**, usually. Cards, reviews, receipts, integration records. An empty or absent directory initializes fresh; one already bound to an identical configuration is accepted as a no-op (see "Init is a one-time registration," below); one bound to a different configuration, or holding files nobody checked, is refused. |
 | `--authority` | **New.** The bare repository that owns the protected branch. |
 | `--worktree-root` | **New**, optional. Where card worktrees are allocated; defaults to `<the control's parent>/<project-id>-worktrees`. |
 
