@@ -462,17 +462,32 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 }
 
 /// Reports what `review record` would write, without writing it.
+///
+/// Tier 3 defect 24: a preview that skips a check the real command enforces
+/// is worse than no preview — it tells an operator a command will succeed
+/// when it will not, and the operator then runs the real one having been
+/// told it is safe. This one skipped the staleness question entirely for
+/// every decision, approvals included, because `require_current_handoff`
+/// was never called here at all. It now asks exactly what `run_record` asks,
+/// with the same `HandoffScope` split by decision.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
     verdict: &Verdict,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
+    let (_, state) = load_card(&control, card_id)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
         code: ErrorCode::PreconditionNotFound,
     })?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
+    let scope = if verdict.decision == Decision::Approved {
+        HandoffScope::Whole
+    } else {
+        HandoffScope::Bindings
+    };
+    require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(
