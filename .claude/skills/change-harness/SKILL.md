@@ -480,8 +480,10 @@ Rules the harness enforces:
   `still_open` is for the common case that is neither settled nor new: worked
   on, not yet closed. It accounts for the prior finding without claiming it
   is resolved, and still blocks an approval exactly as `open` does.
-- An approval goes **stale** if the candidate changes or the card is revised;
-  staleness is reported, and integration refuses stale members.
+- An approval goes **stale** if the candidate changes, the card is revised, or
+  a dependency's own standing changes underneath it — three conditions, not
+  two; a fresh review fixes the first two and cannot fix the third by itself.
+  Staleness is reported, and integration refuses stale members.
 
 After `changes_requested`: `work resume --card-id F-001 --actor implementer-a`
 (the card cannot hand off from `changes_requested` directly), fix, re-run
@@ -585,10 +587,11 @@ change-harness project init \
   --worktree-root    /abs/path/to/example-worktrees
 ```
 
-Nothing is created inside the repository being governed. Control and authority
-are siblings, not subdirectories, and the candidate gains exactly one thing: a
-remote named `harness-authority`. An existing remote of that name is never
-repointed.
+Nothing is created inside the repository being governed — that nesting is
+refused. Control and authority are meant to be siblings, but nothing stops
+either from being nested inside the *other*; the check only guards the
+candidate. The candidate gains exactly one thing: a remote named `harness-authority`. An
+existing remote of that name is never repointed.
 
 ### Where the baseline comes from, and when
 
@@ -604,9 +607,14 @@ There is no confirmation step for this; the sequence is the record. If you
 want the newer commit as your baseline, promote it through the harness, or
 initialize after it exists.
 
-An authority that already exists and is compatible is adopted unchanged, and
-then *it* supplies the baseline rather than the candidate. The candidate's
-protected branch is still resolved and checked — initialization validates it
+An authority that already exists, is compatible, and already holds the
+protected branch is adopted unchanged, and then *it* supplies the baseline
+rather than the candidate. A compatible authority that exists but does not
+yet hold that branch — an empty bare repository, say — is not left empty:
+init seeds it from the candidate, the same as a brand new one. "Compatible"
+and "already has the branch" are two different conditions, and only meeting
+both skips the seed. The candidate's protected branch is still resolved and
+checked either way — initialization validates it
 in every case and refuses a repository that has no commit on it — it is
 simply not what the authority gets seeded from.
 
