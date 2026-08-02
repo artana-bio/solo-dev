@@ -214,6 +214,72 @@ fn review_record_previews_a_staleness_refusal() {
 }
 
 #[test]
+fn review_record_previews_a_stale_self_review_as_stale() {
+    // Review round 1 of this exact card: independence pre-existed the
+    // staleness call this card adds, and ran first. A verdict that is both a
+    // self-review and stale reported CH-POLICY-SELF-REVIEW from the preview
+    // and CH-POLICY-STALE-HANDOFF from the real command — parity in
+    // presence, not in which reason wins when both apply. `run_record`
+    // checks staleness before independence, so the preview must too.
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+    workspace.handoff(&["revoke", "--card-id", "F-001", "--reason", "withdrawn"]);
+
+    // "operator" is the fixture's handoff actor, so this is also a
+    // self-review — both refusals apply at once.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+    )
+    .unwrap();
+    let path = verdict.display().to_string();
+
+    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    assert_parity(
+        "review record",
+        &real,
+        &workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-POLICY-STALE-HANDOFF",
+        "the real command must resolve this in favor of staleness, not independence"
+    );
+}
+
+#[test]
 fn handoff_create_previews_a_rewritten_branch_refusal() {
     let workspace = active_cycle();
     workspace.activate_card("F-001", &["src/**"]);
