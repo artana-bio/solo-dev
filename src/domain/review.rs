@@ -14,6 +14,8 @@
 //! both spike reviewers discovered independently that a green receipt proved
 //! nothing about the behavior it appeared to support.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -112,6 +114,23 @@ impl FindingSeverity {
 pub enum Disposition {
     /// Raised in this review and not yet addressed.
     Open,
+    /// Raised by an earlier review, worked on, and still there.
+    ///
+    /// The vocabulary above assumes every carried finding has been settled,
+    /// and the common shape of a long-running card is one that has not been.
+    /// Recording `RV-000039` on `F-027` hit it: the prior critical finding was
+    /// that the actor comparison lost to a case variant, the fix closed the
+    /// character that had been demonstrated, and the class survived at a
+    /// different character. Neither resolved, nor accepted, nor out of scope —
+    /// still open, at the same location, for the same reason.
+    ///
+    /// The workaround was to file the demonstrated instance `Resolved` and
+    /// raise the survivor as a new finding. That happened to be honest there,
+    /// because the two characters really were distinct defects, and it would
+    /// not be in general: it makes a fourth-round defect read as freshly
+    /// raised, and anyone counting findings per round sees churn where there
+    /// was persistence.
+    StillOpen,
     /// Addressed by the candidate under review.
     Resolved,
     /// Real, but accepted rather than fixed.
@@ -122,9 +141,32 @@ pub enum Disposition {
 
 impl Disposition {
     /// True when this finding still demands action before landing.
+    ///
+    /// `StillOpen` blocks exactly as `Open` does. That is what lets every
+    /// existing caller stay as it is: a carried-open finding refuses an
+    /// approval, counts toward the open total, and reaches convergence
+    /// detection without any of them learning the new variant.
     #[must_use]
     pub const fn blocks_approval(self) -> bool {
-        matches!(self, Self::Open)
+        matches!(self, Self::Open | Self::StillOpen)
+    }
+
+    /// True when naming a prior finding's location with this disposition is
+    /// an accounting for it rather than a fresh observation.
+    ///
+    /// The distinction [`Self::blocks_approval`] cannot make. Silently
+    /// dropping a prior finding is how a real defect disappears between
+    /// rounds, so a re-review has to say something about each one — but
+    /// "something" and "settled" are different requirements, and conflating
+    /// them is what left a persisting finding unrecordable.
+    ///
+    /// `Open` does not account for a prior finding. A reviewer who raises a
+    /// new problem at a location an earlier round already flagged has not
+    /// spoken to the earlier one, and reading it as though they had is the
+    /// silence this rule exists to eliminate.
+    #[must_use]
+    pub const fn accounts_for_prior(self) -> bool {
+        !matches!(self, Self::Open)
     }
 }
 
@@ -325,11 +367,35 @@ impl ReviewRecord {
                 .collect();
             return Err(HarnessError::Control {
                 reason: format!(
-                    "cannot approve with open findings at {}; disposition each as resolved, accepted risk, or out of scope",
+                    "cannot approve with open findings at {}; disposition each as resolved, accepted risk, or out of scope — carrying one forward as still open does not settle it",
                     open.join(", ")
                 ),
                 code: ErrorCode::PolicyOpenFindings,
             });
+        }
+
+        // A first review has nothing to carry anything forward from.
+        // `check_supersedes` catches a fabricated carry-forward, but only runs
+        // when a predecessor exists, so without this the very first review on
+        // a card could claim a finding had persisted from nowhere. `supersedes`
+        // is `Some` exactly when there is a predecessor, which makes this
+        // answerable here rather than at the call site.
+        if self.supersedes.is_none() {
+            let carried: Vec<&str> = self
+                .findings
+                .iter()
+                .filter(|finding| finding.disposition == Disposition::StillOpen)
+                .map(|finding| finding.location.as_str())
+                .collect();
+            if !carried.is_empty() {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "this is the first review of the card and it carries findings forward as still open at {}; there is no earlier review to carry them from, and a finding raised here is `open`",
+                        carried.join(", ")
+                    ),
+                    code: ErrorCode::PolicyOpenFindings,
+                });
+            }
         }
 
         if self.decision == Decision::ChangesRequested && self.findings.is_empty() {
@@ -395,12 +461,36 @@ impl ReviewRecord {
     /// re-review, and supersession without this check is only filing.
     ///
     /// A finding is accounted for when the new review names the same
-    /// `location` with a disposition that no longer blocks. Silence is not
-    /// resolution. Two distinct findings sharing one location collapse into a
-    /// single obligation, which is a real weakness of using `location` as the
-    /// identity — but the reviewer must still have looked at that location and
-    /// asserted something about it, and it is the eliminating of silence that
-    /// this check is for.
+    /// `location` with a disposition that accounts for a prior one — settled,
+    /// or explicitly carried forward as [`Disposition::StillOpen`]. Silence is
+    /// not resolution.
+    ///
+    /// Counted per location, not merely present. This docstring used to say
+    /// that two findings sharing one location collapse into a single
+    /// obligation, and defend it: the reviewer must at least have looked at
+    /// that location, and eliminating silence was what the check was for. A
+    /// reviewer refuted it by demonstration — two critical findings at
+    /// `src/a.rs:10`, one `resolved` naming that location, and the approval
+    /// was recorded with the second finding gone. Looking at a location is not
+    /// answering for everything found there, and the rule exists precisely so
+    /// that a real defect cannot disappear between rounds.
+    ///
+    /// So each location needs as many accounting entries as it had open
+    /// findings. Two findings resolved together need two entries saying so,
+    /// which is the record stating what happened to each rather than to the
+    /// file. `location` is still the identity, with all the imprecision that
+    /// carries; what is gone is the arithmetic that let one answer stand in
+    /// for many.
+    ///
+    /// The test used to be "no longer blocks", which made settling the only
+    /// way to account for a finding and left a persisting one unrecordable.
+    /// Accounting and settling are separate questions, and `StillOpen`
+    /// answers the first while failing the second on purpose.
+    ///
+    /// The converse is refused too: `StillOpen` at a location the superseded
+    /// review left nothing open at is not carrying anything forward, and
+    /// permitting it would let a review manufacture a history of persistence
+    /// that never happened.
     ///
     /// This applies to every re-review, not only approvals. A
     /// `changes_requested` that drops a prior finding would leave the next
@@ -411,29 +501,76 @@ impl ReviewRecord {
     ///
     /// Returns a policy error naming each unaccounted-for finding.
     pub fn check_supersedes(&self, superseded: &Self) -> Result<(), HarnessError> {
-        let dropped: Vec<String> = superseded
-            .open_findings()
-            .iter()
-            .filter(|prior| {
-                !self.findings.iter().any(|current| {
-                    current.location == prior.location && !current.disposition.blocks_approval()
-                })
-            })
-            .map(|finding| format!("{} ({})", finding.location, finding.severity.name()))
-            .collect();
-
-        if dropped.is_empty() {
-            return Ok(());
+        // Kept as findings rather than a count so the refusal can still name
+        // the severity of what it is protecting, which is the first thing a
+        // reader wants and the reason the old message carried it.
+        let mut prior_open: BTreeMap<&str, Vec<&Finding>> = BTreeMap::new();
+        for finding in superseded.open_findings() {
+            prior_open
+                .entry(finding.location.as_str())
+                .or_default()
+                .push(finding);
         }
 
-        Err(HarnessError::Control {
-            reason: format!(
-                "review {} left findings open at {}; this review must disposition each as resolved, accepted risk, or out of scope rather than omit them",
-                superseded.review_id,
-                dropped.join(", ")
-            ),
-            code: ErrorCode::PolicyOpenFindings,
-        })
+        let mut accounting: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut carried: BTreeMap<&str, usize> = BTreeMap::new();
+        for finding in &self.findings {
+            if finding.disposition.accounts_for_prior() {
+                *accounting.entry(finding.location.as_str()).or_default() += 1;
+            }
+            if finding.disposition == Disposition::StillOpen {
+                *carried.entry(finding.location.as_str()).or_default() += 1;
+            }
+        }
+
+        let dropped: Vec<String> = prior_open
+            .iter()
+            .filter_map(|(location, open)| {
+                let named = accounting.get(location).copied().unwrap_or_default();
+                if named >= open.len() {
+                    return None;
+                }
+                let severities: Vec<&str> =
+                    open.iter().map(|finding| finding.severity.name()).collect();
+                Some(format!(
+                    "{location} ({named} of {} accounted for; {})",
+                    open.len(),
+                    severities.join(", ")
+                ))
+            })
+            .collect();
+
+        if !dropped.is_empty() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} left findings open at {}; this review must disposition each one as resolved, accepted risk, out of scope, or still open — one entry does not answer for several findings at the same location",
+                    superseded.review_id,
+                    dropped.join(", ")
+                ),
+                code: ErrorCode::PolicyOpenFindings,
+            });
+        }
+
+        let invented: Vec<String> = carried
+            .iter()
+            .filter_map(|(location, forward)| {
+                let open = prior_open.get(location).map_or(0, Vec::len);
+                (*forward > open).then(|| format!("{location} ({forward} carried, {open} open)"))
+            })
+            .collect();
+
+        if !invented.is_empty() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} did not leave that many findings open at {}; a finding can only be carried forward as still open from a review that raised it, and one raised here is `open`",
+                    superseded.review_id,
+                    invented.join(", ")
+                ),
+                code: ErrorCode::PolicyOpenFindings,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -650,6 +787,296 @@ mod tests {
             &Digest::of_bytes(b"revised"),
             DEPENDENCIES_NOT_CHECKED
         ));
+    }
+
+    /// A finding at `location` with `disposition`.
+    fn finding_at(location: &str, disposition: Disposition) -> Finding {
+        Finding {
+            severity: FindingSeverity::Critical,
+            location: location.to_owned(),
+            detail: "the comparison loses to a case variant".to_owned(),
+            disposition,
+        }
+    }
+
+    /// A re-review, so `supersedes` is populated as the caller populates it.
+    fn re_review(decision: Decision, findings: Vec<Finding>) -> ReviewRecord {
+        let mut record = review(decision, findings);
+        record.supersedes = Some("RV-000001".parse().unwrap());
+        record
+    }
+
+    #[test]
+    fn a_finding_can_be_carried_forward_as_still_open() {
+        // The case that could not be recorded: worked on, partly closed, still
+        // there. Filing it `resolved` and raising a new finding was the only
+        // way to satisfy the carry rule, which makes a fourth-round defect
+        // read as freshly raised.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/policy/actors.rs", Disposition::Open)],
+        );
+        let again = re_review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/policy/actors.rs", Disposition::StillOpen)],
+        );
+
+        again
+            .validate()
+            .expect("a persisting finding is recordable");
+        again
+            .check_supersedes(&first)
+            .expect("naming it accounts for the prior finding");
+    }
+
+    #[test]
+    fn carrying_a_finding_forward_does_not_settle_it() {
+        // `StillOpen` satisfies the carry rule and nothing else. An approval
+        // over one must refuse exactly as it does over a fresh `open`.
+        let carried = re_review(
+            Decision::Approved,
+            vec![finding_at("src/policy/actors.rs", Disposition::StillOpen)],
+        );
+        let message = carried.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("cannot approve with open findings"),
+            "{message}"
+        );
+
+        assert!(Disposition::StillOpen.blocks_approval());
+        assert_eq!(
+            carried.open_findings().len(),
+            1,
+            "and it counts toward the open total, which is what reaches \
+             convergence detection unchanged"
+        );
+    }
+
+    #[test]
+    fn a_carried_finding_is_distinguishable_from_a_fresh_one() {
+        // "This is round five of the same defect" has to be legible in the
+        // record, which means the two must not serialize alike.
+        let carried = serde_json::to_string(&Disposition::StillOpen).unwrap();
+        let fresh = serde_json::to_string(&Disposition::Open).unwrap();
+        assert_eq!(carried, "\"still_open\"");
+        assert_eq!(fresh, "\"open\"");
+        assert_ne!(carried, fresh);
+    }
+
+    #[test]
+    fn dropping_a_prior_finding_is_still_refused() {
+        // The rule this change had to leave standing. Widening what accounts
+        // for a finding must not widen it to silence.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/policy/actors.rs", Disposition::Open)],
+        );
+        let silent = re_review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/other.rs", Disposition::Open)],
+        );
+
+        let message = silent.check_supersedes(&first).unwrap_err().to_string();
+        assert!(message.contains("src/policy/actors.rs"), "{message}");
+        assert!(
+            message.contains("still open"),
+            "the refusal names the new option: {message}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_open_finding_does_not_account_for_a_prior_one() {
+        // Raising a new problem where an earlier round found one is not
+        // speaking to the earlier one. Reading it as though it were is the
+        // silence the carry rule exists to eliminate.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/policy/actors.rs", Disposition::Open)],
+        );
+        let fresh = re_review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/policy/actors.rs", Disposition::Open)],
+        );
+        assert!(
+            fresh.check_supersedes(&first).is_err(),
+            "`open` at the same location is a new observation, not an accounting"
+        );
+    }
+
+    #[test]
+    fn a_carry_forward_from_nothing_is_refused() {
+        // Otherwise the disposition can manufacture a history of persistence.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/a.rs", Disposition::Open)],
+        );
+        let invented = re_review(
+            Decision::ChangesRequested,
+            vec![
+                finding_at("src/a.rs", Disposition::Resolved),
+                finding_at("src/never-seen.rs", Disposition::StillOpen),
+            ],
+        );
+
+        let message = invented.check_supersedes(&first).unwrap_err().to_string();
+        assert!(message.contains("src/never-seen.rs"), "{message}");
+        assert!(message.contains("1 carried, 0 open"), "{message}");
+    }
+
+    #[test]
+    fn the_first_review_of_a_card_cannot_carry_anything_forward() {
+        // `check_supersedes` only runs when a predecessor exists, so without
+        // this the very first review could claim a finding had persisted from
+        // nowhere. `supersedes` is `None` exactly then.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/a.rs", Disposition::StillOpen)],
+        );
+        assert!(first.supersedes.is_none(), "the fixture is a first review");
+
+        let message = first.validate().unwrap_err().to_string();
+        assert!(message.contains("first review"), "{message}");
+        assert!(message.contains("src/a.rs"), "{message}");
+    }
+
+    #[test]
+    fn one_resolution_cannot_answer_for_two_findings_at_one_location() {
+        // Round 1 of this card's own review, and the worst defect it found.
+        // Accounting was existential, so one `resolved` naming a location
+        // discharged every prior finding there. The reviewer gave a superseded
+        // review two criticals at `src/a.rs:10`, resolved one, and the
+        // approval was recorded with the second gone — the disappearance this
+        // whole rule exists to prevent, reaching an approval.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![
+                finding_at("src/a.rs:10", Disposition::Open),
+                finding_at("src/a.rs:10", Disposition::Open),
+            ],
+        );
+        let half = re_review(
+            Decision::Approved,
+            vec![finding_at("src/a.rs:10", Disposition::Resolved)],
+        );
+
+        let message = half.check_supersedes(&first).unwrap_err().to_string();
+        assert!(message.contains("src/a.rs:10"), "{message}");
+        assert!(
+            message.contains("1 of 2 accounted for"),
+            "the refusal has to say how far short it fell: {message}"
+        );
+
+        // Two entries for two findings is the way through, and it must work.
+        let both = re_review(
+            Decision::Approved,
+            vec![
+                finding_at("src/a.rs:10", Disposition::Resolved),
+                finding_at("src/a.rs:10", Disposition::Resolved),
+            ],
+        );
+        both.check_supersedes(&first)
+            .expect("one entry per finding accounts for both");
+    }
+
+    #[test]
+    fn more_findings_cannot_be_carried_forward_than_were_left_open() {
+        // The inverse of the same arithmetic: one prior finding permitted any
+        // number of carried-forward findings at that location, fabricating a
+        // history of persistence for observations nobody had made before.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/a.rs:10", Disposition::Open)],
+        );
+        let inflated = re_review(
+            Decision::ChangesRequested,
+            vec![
+                finding_at("src/a.rs:10", Disposition::StillOpen),
+                finding_at("src/a.rs:10", Disposition::StillOpen),
+            ],
+        );
+
+        let message = inflated.check_supersedes(&first).unwrap_err().to_string();
+        assert!(message.contains("2 carried, 1 open"), "{message}");
+
+        // Carrying exactly what was left open is fine.
+        let honest = re_review(
+            Decision::ChangesRequested,
+            vec![finding_at("src/a.rs:10", Disposition::StillOpen)],
+        );
+        honest
+            .check_supersedes(&first)
+            .expect("one carried from one open");
+    }
+
+    #[test]
+    fn a_split_verdict_at_one_location_is_counted_as_two() {
+        // The mixed case: two findings at a location, one genuinely fixed and
+        // one still there. Both entries count toward the accounting, and the
+        // carried one still blocks an approval.
+        let first = review(
+            Decision::ChangesRequested,
+            vec![
+                finding_at("src/a.rs:10", Disposition::Open),
+                finding_at("src/a.rs:10", Disposition::Open),
+            ],
+        );
+        let split = re_review(
+            Decision::ChangesRequested,
+            vec![
+                finding_at("src/a.rs:10", Disposition::Resolved),
+                finding_at("src/a.rs:10", Disposition::StillOpen),
+            ],
+        );
+
+        split
+            .check_supersedes(&first)
+            .expect("two entries answer for two findings");
+        assert_eq!(split.open_findings().len(), 1, "and one is still open");
+
+        // Round 2 of this card's own review: supplying two entries and
+        // asserting they are accepted does not show the second was needed.
+        // Restoring existential accounting left this green until the negative
+        // half was added.
+        for lone in [Disposition::Resolved, Disposition::StillOpen] {
+            let single = re_review(
+                Decision::ChangesRequested,
+                vec![finding_at("src/a.rs:10", lone)],
+            );
+            let message = single.check_supersedes(&first).unwrap_err().to_string();
+            assert!(
+                message.contains("1 of 2 accounted for"),
+                "one {lone:?} entry cannot answer for two findings: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settled_dispositions_are_unchanged() {
+        // The regression half: widening `accounts_for_prior` must not have
+        // changed what settles a finding or what blocks an approval.
+        for settled in [
+            Disposition::Resolved,
+            Disposition::AcceptedRisk,
+            Disposition::OutOfScope,
+        ] {
+            assert!(!settled.blocks_approval(), "{settled:?} must not block");
+            assert!(settled.accounts_for_prior(), "{settled:?} must account");
+
+            let first = review(
+                Decision::ChangesRequested,
+                vec![finding_at("src/a.rs", Disposition::Open)],
+            );
+            let after = re_review(Decision::Approved, vec![finding_at("src/a.rs", settled)]);
+            after
+                .validate()
+                .expect("a settled finding permits approval");
+            after
+                .check_supersedes(&first)
+                .expect("and accounts for the prior one");
+        }
+
+        assert!(Disposition::Open.blocks_approval());
+        assert!(!Disposition::Open.accounts_for_prior());
     }
 
     #[test]
