@@ -248,6 +248,74 @@ fn blocked_against_a_revoked_handoff_is_still_recordable() {
 }
 
 #[test]
+fn changes_requested_against_a_revoked_handoff_is_still_recordable() {
+    // Review round 2's finding (RV-000055). Revision 2 of this card closed the
+    // suppression route for `blocked` and left it open for this verdict: the
+    // staleness check passed and `active -> changes_requested` was then refused
+    // by the transition table, so the review was never written. Whichever
+    // verdict the reviewer reached, revoking must not decide it for them.
+    let (workspace, reviewed) = under_review();
+    revoke_the_handoff(&workspace);
+
+    let path = verdict_file(&workspace, "changes_requested");
+    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["data"]["review"]["decision"], "changes_requested");
+    assert_eq!(
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the verdict names the candidate the reviewer actually read"
+    );
+
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let recorded = inspected["data"]["reviews"]
+        .as_array()
+        .expect("the review history");
+    assert_eq!(recorded.len(), 1, "the verdict is in the record");
+    assert_eq!(
+        recorded[0]["findings"][0]["location"], "src/a.rs",
+        "and the findings came with it"
+    );
+}
+
+#[test]
+fn an_active_card_with_no_handoff_still_cannot_be_reviewed() {
+    // The guard on the transition that was just opened. `active ->
+    // changes_requested` exists so a reviewer can file after a revocation, not
+    // so a card can reach `changes_requested` without anyone reviewing it.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let path = verdict_file(&workspace, "changes_requested");
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a card nobody handed off has nothing to review"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no handoff"),
+        "refused for the absent handoff: {}",
+        envelope["error"]["message"]
+    );
+}
+
+#[test]
 fn the_verdict_against_a_revoked_handoff_reaches_the_record() {
     // The exit code alone would pass even if the verdict were accepted and
     // then dropped. What matters is that the findings are queryable afterwards
