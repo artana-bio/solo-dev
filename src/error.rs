@@ -148,6 +148,8 @@ pub enum ErrorCode {
     PolicyLocatorMismatch,
     /// A candidate changed paths outside its card's declared scope.
     PolicyCandidateOutOfScope,
+    /// A staged control entry is not valid control-record text.
+    PolicyControlEncoding,
     /// The gate runner could not execute or supervise a process.
     GateRunnerError,
     /// A named gate failed, timed out, or was signalled.
@@ -207,7 +209,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 81] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -271,6 +273,7 @@ impl ErrorCode {
         Self::PolicyArtifactNotOwned,
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
+        Self::PolicyControlEncoding,
         Self::GateRunnerError,
         Self::GateFailed,
         Self::GateEvidenceStale,
@@ -347,6 +350,7 @@ impl ErrorCode {
             | Self::PolicyArtifactNotOwned
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
+            | Self::PolicyControlEncoding
             | Self::PolicyIncompleteHandoff
             | Self::PolicyDeliveredShaMismatch
             | Self::PolicySelfReview
@@ -441,6 +445,7 @@ impl ErrorCode {
             Self::PolicyArtifactNotOwned => "ARTIFACT-NOT-OWNED",
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
+            Self::PolicyControlEncoding => "CONTROL-ENCODING",
             Self::GateRunnerError => "RUNNER-ERROR",
             Self::GateFailed => "FAILED",
             Self::GateEvidenceStale => "EVIDENCE-STALE",
@@ -566,6 +571,15 @@ impl ErrorCode {
         }
     }
 
+    const fn record_recovery(self) -> &'static str {
+        match self {
+            Self::PolicyControlEncoding => {
+                "Rewrite the named control entry as UTF-8 text without embedded NUL bytes, then retry."
+            }
+            _ => "Report this as a defect; a record-hygiene code reached the wrong recovery table.",
+        }
+    }
+
     const fn policy_recovery(self) -> &'static str {
         match self {
             Self::PolicyBackupNotIndependent
@@ -639,6 +653,7 @@ impl ErrorCode {
             Self::PolicyCandidateOutOfScope => {
                 "Revert the out-of-scope changes, or revise the card to declare them."
             }
+            Self::PolicyControlEncoding => self.record_recovery(),
             Self::PolicyIncompleteHandoff => {
                 "Supply every declaration field; an empty list is a claim, an absent one is not."
             }

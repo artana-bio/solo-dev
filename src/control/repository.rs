@@ -336,6 +336,14 @@ impl ControlRepository {
             stage.extend_from_slice(&present);
             run_ok(&self.scope(), stage)?;
         }
+        if let Err(refusal) = refuse_non_text_control_entries(&self.scope()) {
+            // The check runs after staging because the index is the exact
+            // object Git will commit. Reset only the index on refusal so the
+            // bad worktree content remains visible and the control repository
+            // can recover without carrying a rejected blob forward.
+            let _ = run(&self.scope(), ["reset", "-q"]);
+            return Err(refusal);
+        }
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
         // worktree permanently dirty; asking `is_clean` would send every commit
@@ -375,6 +383,43 @@ impl ControlRepository {
                 code: ErrorCode::InternalControlCorrupt,
             })
     }
+}
+
+/// Refuses staged control entries that are not UTF-8 text.
+///
+/// The control repository stores JSON and other text records. Reading the
+/// staged object through `GitOutput::stdout` would be unsafe because that field
+/// is a lossy UTF-8 projection; the raw bytes are the only authoritative input
+/// for this boundary. NUL is rejected separately because UTF-16LE ASCII text is
+/// technically valid UTF-8 with an embedded NUL after Git emits it, and that is
+/// the concrete encoding that bypassed the prior scanner.
+fn refuse_non_text_control_entries(scope: &GitScope) -> Result<(), HarnessError> {
+    let listed = run(scope, ["diff", "--cached", "--name-only", "-z"])?;
+    let names = std::str::from_utf8(&listed.stdout_bytes).map_err(|_| HarnessError::Control {
+        reason: "staged control path list is not valid UTF-8".to_owned(),
+        code: ErrorCode::PolicyControlEncoding,
+    })?;
+    for relative in names.split('\0').filter(|name| !name.is_empty()) {
+        // A deletion has no staged blob to inspect.
+        let blob = run(scope, ["show", &format!(":{relative}")])?;
+        if !blob.success() {
+            continue;
+        }
+        let valid_utf8 = std::str::from_utf8(&blob.stdout_bytes).is_ok();
+        let has_nul = blob.stdout_bytes.contains(&0);
+        if !valid_utf8 || has_nul {
+            let reason = if valid_utf8 {
+                "contains embedded NUL bytes"
+            } else {
+                "is not valid UTF-8"
+            };
+            return Err(HarnessError::Control {
+                reason: format!("staged control entry `{relative}` {reason}"),
+                code: ErrorCode::PolicyControlEncoding,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Writes the project document and commits it, given an already-created

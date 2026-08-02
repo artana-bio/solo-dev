@@ -475,6 +475,110 @@ fn the_transient_lock_never_enters_control_history() {
 }
 
 #[test]
+fn a_utf16_control_blob_is_refused_before_it_reaches_git_history() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before = control.head().unwrap();
+    let token = "ghp_utf16-token-must-not-reach-history";
+
+    // UTF-16LE is the concrete bypass: Git stores these bytes, while the old
+    // GitOutput projection decoded them lossily and the scanner never saw the
+    // token as contiguous text.
+    let contents = format!(
+        r#"{{"note":"{token}"}}
+"#
+    );
+    let utf16le: Vec<u8> = contents.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(fixture.control.join("cards/utf16.json"), utf16le).unwrap();
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    assert_eq!(output.status.code(), Some(5), "encoding refusal expected");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("CH-POLICY-CONTROL-ENCODING"),
+        "the refusal must identify the policy: {rendered}"
+    );
+    assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.control)
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .unwrap()
+            .success(),
+        "a refusal must leave no staged Git object behind"
+    );
+    let history = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.control)
+        .args(["log", "--all", "-p"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&history.stdout).contains(token),
+        "the credential must not be durable: {}",
+        String::from_utf8_lossy(&history.stdout)
+    );
+}
+
+#[test]
+fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before = control.head().unwrap();
+
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/invalid.json"),
+        b"{\"note\":\"\xff\"}\n",
+    )
+    .unwrap();
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    assert_eq!(output.status.code(), Some(5), "encoding refusal expected");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("CH-POLICY-CONTROL-ENCODING"),
+        "the refusal must identify the policy: {rendered}"
+    );
+    assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+}
+
+#[test]
 fn status_reports_a_worktree_belonging_to_a_different_project() {
     // The hazard `CHANGE_HARNESS_CONTROL` introduces: a variable exported for
     // one project drives a command meant for another, and the command succeeds
