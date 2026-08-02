@@ -218,52 +218,55 @@ fn the_recorded_verdict_survives_the_sequence_that_used_to_lose_it() {
     assert_eq!(recorded[0]["decision"], "changes_requested");
 }
 
-// The relaxation above drops exactly one question. These are the two it must
-// not drop. Written because the first version of it wrapped the whole check in
-// `if decision == approved`, which stopped asking all three.
+// The relaxation above drops what a non-approval outlives and keeps what it
+// does not. Written because the first version of it wrapped the whole check in
+// `if decision == approved`, which stopped asking every question — including
+// the one about the card the verdict was measured against.
 
 #[test]
-fn blocked_against_a_revoked_handoff_is_refused() {
-    // Revocation is the implementer withdrawing the delivery — not the branch
-    // moving under a delivery that still stands. A verdict filed against it
-    // would put a review in the record naming a handoff nobody was offering.
-    let (workspace, _) = under_review();
+fn blocked_against_a_revoked_handoff_is_still_recordable() {
+    // Deliberate, and the argument is at `binding_staleness`. `handoff revoke`
+    // belongs to the delivery side and `review_pending -> active` is a
+    // permitted transition, so an implementer who could make revocation fatal
+    // to a verdict could suppress an adverse review by revoking before the
+    // reviewer files — the exact failure this file exists to document.
+    //
+    // Revision 1 of F-030 required the opposite and its own review round
+    // rejected it. This test is here so that reinstating the refusal has to
+    // argue with a test rather than pass quietly.
+    let (workspace, reviewed) = under_review();
     revoke_the_handoff(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
 
-    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(envelope["status"], "success");
     assert_eq!(
-        error_code(&output),
-        "CH-POLICY-STALE-HANDOFF",
-        "the staleness check must be what refuses this, not the transition \
-         table reaching it by accident"
-    );
-    let message = error_message(&output);
-    assert!(
-        message.contains("revoked"),
-        "the refusal must say the handoff was withdrawn: {message}"
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the verdict names the candidate the reviewer actually read"
     );
 }
 
 #[test]
-fn no_verdict_is_recorded_against_a_revoked_handoff() {
-    // The refusal has to leave the record empty. Asserting the exit code alone
-    // would pass even if the review were written and the error raised after.
+fn the_verdict_against_a_revoked_handoff_reaches_the_record() {
+    // The exit code alone would pass even if the verdict were accepted and
+    // then dropped. What matters is that the findings are queryable afterwards
+    // — that is the whole reason the refusal was rejected.
     let (workspace, _) = under_review();
     revoke_the_handoff(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
 
     let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
     let recorded = inspected["data"]["reviews"]
         .as_array()
         .expect("the review history");
-    assert!(
-        recorded.is_empty(),
-        "a refused verdict must not reach the record: {recorded:?}"
+    assert_eq!(recorded.len(), 1, "the verdict is in the record");
+    assert_eq!(recorded[0]["decision"], "blocked");
+    assert_eq!(
+        recorded[0]["findings"][0]["location"], "src/a.rs",
+        "and the findings survived with it, rather than as prose in a reason"
     );
 }
 
@@ -318,13 +321,12 @@ fn an_approval_against_a_revoked_handoff_is_still_refused() {
 }
 
 #[test]
-fn a_revoked_handoff_refuses_a_verdict_even_after_the_branch_moves() {
-    // The two conditions together. The moved branch is the one a non-approval
-    // is allowed to outlive; the revocation is not, and the presence of the
-    // first must not excuse the second.
+fn a_revised_card_refuses_a_verdict_even_when_the_handoff_was_revoked() {
+    // The questions that are dropped must not drag down the one that is kept.
+    // Revoking and revising together still refuses, and for the revision.
     let (workspace, _) = under_review();
     revoke_the_handoff(&workspace);
-    move_the_branch(&workspace);
+    revise_the_card(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
     let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
@@ -333,7 +335,7 @@ fn a_revoked_handoff_refuses_a_verdict_even_after_the_branch_moves() {
     assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
     let message = error_message(&output);
     assert!(
-        message.contains("revoked"),
-        "revocation is reported ahead of the branch having moved: {message}"
+        message.contains("card digest"),
+        "the surviving question is the one about the card: {message}"
     );
 }

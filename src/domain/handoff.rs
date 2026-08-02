@@ -367,27 +367,35 @@ impl HandoffRecord {
             .or_else(|| self.dependency_binding_staleness(dependencies))
     }
 
-    /// Every question [`staleness`](Self::staleness) asks except whether the
-    /// branch still holds the commit that was handed off.
+    /// Whether what this handoff was *bound to* has changed underneath it.
     ///
-    /// A verdict that found problems is a true statement about the candidate
-    /// the reviewer read, and it stays true when the branch moves — so the
-    /// review path skips the candidate question for a non-approval. It skips
-    /// only that one. A handoff that was revoked was withdrawn from review
-    /// altogether, and a card revised underneath a handoff changed what the
-    /// reviewer was measuring against; neither is a statement that survives,
-    /// and both still refuse here.
+    /// [`staleness`](Self::staleness) asks four questions. This asks the two
+    /// about bindings, and deliberately not the two about standing.
     ///
-    /// The two entry points are composed from the same parts in the same order
-    /// so that whichever reason applies, it is the reason either one reports.
+    /// The candidate question is dropped because a verdict that found problems
+    /// is a true statement about the commit the reviewer read, and it stays
+    /// true when the branch moves. The revocation question is dropped for a
+    /// harder reason: `handoff revoke` belongs to the delivery side, and
+    /// `review_pending → active` is a permitted transition, so an
+    /// implementer who can make revocation fatal to a verdict can suppress an
+    /// adverse review by revoking before the reviewer files. A record naming a
+    /// revoked handoff is at least queryable, and
+    /// [`is_current_for`](Self::is_current_for) already reports it stale;
+    /// findings refused at the door are simply gone.
+    ///
+    /// What remains is what the reviewer was measuring *against*. A card
+    /// revised out from under a handoff, or a dependency that moved, changes
+    /// the criteria rather than the delivery, and no verdict outlives that.
+    ///
+    /// Both entry points are composed from the same components in the same
+    /// order, so whichever reason applies is the reason either one reports.
     #[must_use]
-    pub fn staleness_ignoring_candidate(
+    pub fn binding_staleness(
         &self,
         card_digest: &Digest,
         dependencies: &[DependencyStanding],
     ) -> Option<String> {
-        self.revocation_staleness()
-            .or_else(|| self.card_binding_staleness(card_digest))
+        self.card_binding_staleness(card_digest)
             .or_else(|| self.dependency_binding_staleness(dependencies))
     }
 
@@ -577,47 +585,50 @@ mod tests {
     }
 
     #[test]
-    fn ignoring_the_candidate_still_asks_every_other_question() {
+    fn binding_staleness_asks_about_the_bindings_and_nothing_else() {
         let card = Digest::of_bytes(b"card");
         let revised = Digest::of_bytes(b"revised");
 
-        // The branch moving is the one thing it stops asking about.
         assert!(
             handoff()
-                .staleness_ignoring_candidate(&card, DEPENDENCIES_NOT_CHECKED)
+                .binding_staleness(&card, DEPENDENCIES_NOT_CHECKED)
                 .is_none()
         );
 
+        // Neither of the two questions about standing. Both are dropped on
+        // purpose and the argument is on the method; the point here is that
+        // dropping them is a property of the code, not an accident of a
+        // fixture that happens never to be revoked.
         let revoked = HandoffRecord {
             status: HandoffStatus::Revoked,
             ..handoff()
         };
-        assert_eq!(
+        assert!(
             revoked
-                .staleness_ignoring_candidate(&card, DEPENDENCIES_NOT_CHECKED)
-                .as_deref(),
-            Some("the handoff was revoked"),
-            "a withdrawn handoff is not something any verdict outlives"
+                .binding_staleness(&card, DEPENDENCIES_NOT_CHECKED)
+                .is_none(),
+            "revocation is a delivery-side control and must not silence a reviewer"
         );
 
+        // Both of the questions about what the reviewer measured against.
         let rebound = handoff()
-            .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
+            .binding_staleness(&revised, DEPENDENCIES_NOT_CHECKED)
             .expect("a card revised underneath the handoff is still staleness");
         assert!(rebound.contains("card is now"), "{rebound}");
 
         let dependency = handoff()
-            .staleness_ignoring_candidate(&card, &standing(Some(&"e".repeat(40)), true))
+            .binding_staleness(&card, &standing(Some(&"e".repeat(40)), true))
             .expect("the dependency question is still asked when it is asked at all");
         assert!(dependency.contains("dependency"), "{dependency}");
     }
 
     #[test]
     fn both_entry_points_report_the_same_reason_in_the_same_order() {
-        // The two are composed from one set of parts precisely so that a
-        // caller dropping the candidate question cannot silently reorder the
-        // rest. With a moved branch *and* a revised card, the whole check
-        // reports the candidate first, and the narrower one reports the card
-        // rather than falling silent.
+        // The two are composed from one set of components precisely so that
+        // the narrower one cannot silently reorder what it keeps. With a moved
+        // branch *and* a revised card, the whole check reports the candidate
+        // first, and the narrower one reports the card rather than falling
+        // silent.
         let record = handoff();
         let revised = Digest::of_bytes(b"revised");
 
@@ -627,11 +638,12 @@ mod tests {
         assert!(whole.contains("branch is now"), "{whole}");
 
         let narrower = record
-            .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
+            .binding_staleness(&revised, DEPENDENCIES_NOT_CHECKED)
             .unwrap();
         assert!(narrower.contains("card is now"), "{narrower}");
 
-        // And revocation still precedes both in either entry point.
+        // Revocation still precedes everything in the whole check, and is
+        // still absent from the narrower one, with both bindings also stale.
         let revoked = HandoffRecord {
             status: HandoffStatus::Revoked,
             ..handoff()
@@ -642,12 +654,10 @@ mod tests {
                 .as_deref(),
             Some("the handoff was revoked")
         );
-        assert_eq!(
-            revoked
-                .staleness_ignoring_candidate(&revised, DEPENDENCIES_NOT_CHECKED)
-                .as_deref(),
-            Some("the handoff was revoked")
-        );
+        let narrower = revoked
+            .binding_staleness(&revised, DEPENDENCIES_NOT_CHECKED)
+            .expect("the card binding still answers");
+        assert!(narrower.contains("card is now"), "{narrower}");
     }
 
     #[test]

@@ -501,8 +501,8 @@ const fn state_for(decision: Decision) -> CardState {
 enum HandoffScope {
     /// Every question, including the branch head. What an approval answers.
     Whole,
-    /// Every question except the branch head. What a non-approval answers.
-    ExceptCandidate,
+    /// Only what the handoff was bound to. What a non-approval answers.
+    Bindings,
 }
 
 /// Refuses a review whose handoff no longer stands.
@@ -518,11 +518,13 @@ enum HandoffScope {
 /// dependency question is asked where it decides something — of the review, at
 /// integration.
 ///
-/// [`HandoffScope::ExceptCandidate`] drops one more question, and only that
-/// one: whether the branch still holds what was handed off. It needs no
-/// worktree to answer the rest, which is why the lease is resolved only for
-/// [`HandoffScope::Whole`] — a revoked handoff refuses a verdict whether or not
-/// the card still holds a lease.
+/// [`HandoffScope::Bindings`] asks only what the reviewer was measuring
+/// against, and the argument for each question it drops is at
+/// [`HandoffRecord::binding_staleness`]. It needs no worktree to answer what
+/// remains, which is why the lease is resolved only for
+/// [`HandoffScope::Whole`] — the previous early return on a card holding no
+/// lease skipped the card-digest question too, and there is no reason it
+/// should.
 fn require_current_handoff(
     control: &ControlRepository,
     card_id: &CardId,
@@ -531,9 +533,7 @@ fn require_current_handoff(
     scope: HandoffScope,
 ) -> Result<(), HarnessError> {
     let staleness = match scope {
-        HandoffScope::ExceptCandidate => {
-            handoff.staleness_ignoring_candidate(card_digest, DEPENDENCIES_NOT_CHECKED)
-        }
+        HandoffScope::Bindings => handoff.binding_staleness(card_digest, DEPENDENCIES_NOT_CHECKED),
         HandoffScope::Whole => {
             let Some(lease) = held_lease(control, card_id)? else {
                 return Ok(());
@@ -590,16 +590,15 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             // survive only as prose inside a `handoff revoke --reason`.
             //
             // That relaxation was first written as an `if` around the whole
-            // call, which dropped two questions it had no argument for: a
-            // `blocked` verdict could then be filed against a handoff that had
-            // been revoked, and the refusal for a card revised underneath a
-            // handoff fell through to the transition table, which names a
-            // state change rather than the reason. The scope is the fix — the
-            // candidate question is the only one a non-approval outlives.
+            // call, which dropped the card-digest question too — so a card
+            // revised out from under a handoff fell through to the transition
+            // table, which names a state change rather than the reason. The
+            // scope is the fix: a non-approval stops asking about the delivery
+            // and still answers for what it was measured against.
             let scope = if verdict.decision == Decision::Approved {
                 HandoffScope::Whole
             } else {
-                HandoffScope::ExceptCandidate
+                HandoffScope::Bindings
             };
             require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;
 
