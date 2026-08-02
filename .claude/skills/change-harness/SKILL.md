@@ -50,19 +50,27 @@ one and the harness will usually refuse you later, at a worse moment.
    implementation is a suspect, not a witness.
 7. **Check whether another session already owns the ground you are about to
    cover — and know how far that check reaches.** `integration ready
-   --cycle-id <id>` reports every card in *that* cycle with its current
-   state, not only the ones ready to integrate; an active or
-   `review_pending` card there is someone's work in progress. `cycle status`
-   is not this check: its `card_ids` lists every card ever activated,
-   abandoned ones included, with no state attached. Two sessions racing the
-   same *file* inside one cycle is caught at activation
-   (`CH-POLICY-OWNERSHIP-OVERLAP`) — **only inside one cycle.** Two active
-   cycles can each activate a card claiming the same file with nothing
-   refusing either, there is no command that lists which other cycles exist,
-   and two sessions racing the same *issue* in different files is never
-   caught by anything. Look first, know the check is narrower than it
-   sounds, and ask whether another cycle might be open before assuming
-   there is only one.
+   --cycle-id <id>` reports every *activated* card in that cycle with its
+   current state, not only the ones ready to integrate — a card left in
+   `draft` after a failed activation will not appear; an active or
+   `review_pending` card that does is someone's work in progress. `cycle
+   status` is not this check: its `card_ids` lists every card ever
+   activated, abandoned ones included, with no state attached.
+
+   Two cards claiming the same *file* in one cycle are refused at
+   activation (`CH-POLICY-OWNERSHIP-OVERLAP`). Two claiming the same ground
+   through *different* files are refused too, if both say so:
+   `exclusive_resources: ["issue:42"]` on both cards is checked exactly
+   like a file path (`CH-POLICY-RESOURCE-CONFLICT`) — declaring the issue or
+   ticket a card is for is what makes that catchable, and nothing catches
+   it if neither card declares it.
+
+   None of this reaches past the current cycle. Two active cycles can each
+   claim the same file or the same resource string with nothing refusing
+   either, and there is no command that lists which other cycles exist.
+   Look first, declare the resource you are working if you have one, and
+   ask whether another cycle might be open before assuming there is only
+   one.
 8. **A claim about state you did not just read is not a fact.** Writing a
    decision-register row, a defect entry, or a review finding based on what
    you remember from an adjacent worktree or an earlier turn is how a false
