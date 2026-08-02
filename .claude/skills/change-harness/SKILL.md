@@ -25,8 +25,11 @@ one and the harness will usually refuse you later, at a worse moment.
    the path. Forgetting the test file you obviously must edit is the classic
    case.
 2. **`delivered_sha` is the exact commit you delivered.** The harness refuses a
-   handoff whose branch head disagrees. Never write "the branch" or a stale
-   SHA.
+   handoff whose branch head disagrees. Never write "the branch," a stale
+   SHA, or a full hash reconstructed from memory of a short one — run
+   `git rev-parse HEAD` in the worktree at the moment you write it. A
+   hand-expanded guess is indistinguishable from a fabricated one until the
+   harness refuses it.
 3. **One actor, one role.** The reviewer is a different actor, in a separate
    task or agent thread that starts cold — not a later turn of the
    conversation that wrote the code. Step 7 says exactly what that thread may
@@ -41,7 +44,39 @@ one and the harness will usually refuse you later, at a worse moment.
    harness manages.
 6. **A review is evidence only if it tried to break something.** Record what
    you tried that failed. Approving because the diff "looks right" is the
-   failure mode this tool exists to prevent.
+   failure mode this tool exists to prevent — and it applies to you before
+   you hand off, not only to the reviewer after. Mutate what you wrote and
+   confirm the test actually fails; a test written immediately after its own
+   implementation is a suspect, not a witness.
+7. **Check whether another session already owns the ground you are about to
+   cover — and know how far that check reaches.** `integration ready
+   --cycle-id <id>` reports every *activated* card in that cycle with its
+   current state, not only the ones ready to integrate — a card left in
+   `draft` after a failed activation will not appear; an active or
+   `review_pending` card that does is someone's work in progress. `cycle
+   status` is not this check: its `card_ids` lists every card ever
+   activated, abandoned ones included, with no state attached.
+
+   Two cards claiming the same *file* in one cycle are refused at
+   activation (`CH-POLICY-OWNERSHIP-OVERLAP`). Two claiming the same ground
+   through *different* files are refused too, if both say so:
+   `exclusive_resources: ["issue:42"]` on both cards is checked exactly
+   like a file path (`CH-POLICY-RESOURCE-CONFLICT`) — declaring the issue or
+   ticket a card is for is what makes that catchable, and nothing catches
+   it if neither card declares it.
+
+   None of this reaches past the current cycle. Two active cycles can each
+   claim the same file or the same resource string with nothing refusing
+   either, and there is no command that lists which other cycles exist.
+   Look first, declare the resource you are working if you have one, and
+   ask whether another cycle might be open before assuming there is only
+   one.
+8. **A claim about state you did not just read is not a fact.** Writing a
+   decision-register row, a defect entry, or a review finding based on what
+   you remember from an adjacent worktree or an earlier turn is how a false
+   statement gets recorded while you are in the middle of correcting a false
+   statement. Read the file you are describing, in the tree you are
+   describing, before you write the sentence.
 
 ## Setup
 
@@ -128,6 +163,15 @@ recorded inconsistency — documented here as it is, not as it should be:
 | `integration review` | `--reviewer-actor-id` |
 | `acceptance record` | `--acceptance-owner` |
 
+Neither `--actor` determines the reviewer. `review begin`'s is genuinely
+used — it is the actor recorded on the `review.begun` event. `review
+record`'s is accepted and then read nowhere at all: the `review.recorded`
+event's actor is the verdict's own `reviewer_actor_id`, not the flag. Self-
+review is refused by comparing that field against the handoff's `--actor`
+(from `handoff create`, a different flag on a different command); `review
+record`'s own `--actor` plays no part in it and could be omitted from this
+table without losing anything true.
+
 `integration preflight` takes no actor at all. `work verify` and the
 read-only status commands (`cycle status`, `card status`, `gate list`) accept
 an optional `--actor` that defaults to `operator` — you may omit it.
@@ -151,9 +195,12 @@ Exit 1 is deliberately unassigned so an uncategorized panic stays
 distinguishable from every classified outcome.
 
 Every mutating command accepts `--dry-run` (the one exception:
-`project recover --resume` has no dry-run form). It runs the real checks
-against real state and changes nothing. A dry run that would refuse tells you
-so with the same error the real command would give.
+`project recover --resume` has no dry-run form). Most run the real checks
+against real state and change nothing, so a dry run that would refuse tells
+you so with the same error the real command would give. `handoff create` is
+a known exception: its preview does not check feature-gate evidence, so
+`--dry-run` can succeed where the real command refuses with
+`CH-GATE-EVIDENCE-STALE` over a missing or stale receipt.
 
 ## The lifecycle
 
@@ -222,13 +269,23 @@ change-harness cycle create --cycle-id C-001 --objective "One-line objective"
 change-harness cycle activate --cycle-id C-001
 ```
 
-Activation freezes the baseline to the authority's current head. Every card in
-the cycle builds from that exact commit.
+Activation freezes the cycle's baseline to the authority's current head.
+Every card in the cycle is meant to build from that exact commit — this is a
+rule, not a refusal. `base_sha` is validated only as a well-formed
+40-character commit id; nothing cross-checks it against the cycle's frozen
+baseline, and a card naming a later commit activates and starts without
+complaint.
 
 ### 3. Author and activate the card
 
 The card is the contract. Write the draft YAML completely — the deserializer
-rejects unknown fields, so use exactly these keys:
+rejects any key it does not know. Not every key below is required: `non_goals`
+and `depends_on` are shown but default to empty, same as `contract_reads`,
+`contract_changes`, `exclusive_resources`, and `generated_artifacts`, which
+are valid keys not shown here at all. `card_id`, `cycle_id`, `title`, `goal`,
+`risk`, `change_kind`, `base_sha`, `write_scope`, `named_gates`, `acceptance`,
+`review_policy`, and `rollback_strategy` are the ones actually required.
+Declare `exclusive_resources` when ground rule 7 calls for it.
 
 ```yaml
 card_id: F-001
@@ -239,7 +296,7 @@ goal: >
 non_goals:
   - What this card deliberately does not do.
 risk: low            # low | medium | high | critical
-change_kind: feature # feature | fix
+change_kind: feature # a free string, not an enum — feature | fix by convention
 base_sha: <the cycle baseline, 40 hex>
 depends_on: []       # other card ids this builds on, if any
 write_scope:
@@ -271,12 +328,22 @@ afterward use `card revise --card-id F-001 --draft new.yaml --reason "..."`,
 which supersedes the revision, invalidates existing approvals, and returns the
 card to `ready` — run `work resume` to step it back to work.
 
+Base the new draft on the card's *current* revision, not the file you first
+wrote. The control repository stores each revision separately
+(`cards/<id>/rN.json`), and `draft.json` is permanently revision 1 — `card
+status --card-id F-001` reports which `N` is current. Editing `draft.json` to
+build revision 3 silently reverts every field revision 2 already changed;
+nothing in the CLI catches this today, so diff every stored revision before
+submitting if you did not author the one you are building on.
+
 Scope authoring guidance: paths are matched exactly or by glob. Both sides of a
 rename are checked. Include every test and doc file the change needs; a scope
 you have to revise later costs a re-handoff and a fresh review.
 
-`risk: high` and `risk: critical` require the eventual review verdict to
-declare `human_reviewer: true` — enforced, not advisory.
+`risk: high` and `risk: critical` require an *approving* review verdict to
+declare `human_reviewer: true` — enforced, not advisory. `changes_requested`
+and `blocked` verdicts do not require it: the gate is on what may approve a
+high-risk card, not on every word said about one along the way.
 
 ### 4. Work in the allocated worktree
 
@@ -368,6 +435,13 @@ practice, not an attested one, and nothing here can tell whether you really
 opened a new thread. Honor it anyway; independent review bound to exact
 commits is the entire product.
 
+**Decide your stopping rule before round one, and write it down.** Nothing in
+this tool bounds how many review rounds a card goes through — this is a rule,
+not a refusal. "Land unless the next review finds an exploitable bypass,"
+decided before you start, is one you can hold yourself to under pressure.
+Deciding it after round three, once you are tired of finding things, is not
+the same rule.
+
 ```bash
 change-harness review begin  --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
@@ -375,17 +449,21 @@ change-harness review record --card-id F-001 --verdict verdict.yaml --actor revi
 
 Review discipline: verify claims by breaking things — apply the mutation a
 test claims to catch and confirm it fails at the assertion that matters; drive
-the real binary against the real behavior. Then write:
+the real binary against the real behavior. The same applies to documentation:
+a decision-register row or defect-log entry is a claim about what the code
+does, and rereading it only checks that it reads well — reproduce the
+scenario it describes against the actual code before you trust the sentence.
+Then write:
 
 ```yaml
 reviewer_actor_id: reviewer-b
-decision: approved         # approved | changes_requested | blocked
-human_reviewer: true       # required when card risk is high or critical
+decision: changes_requested # approved | changes_requested | blocked
+human_reviewer: true        # required to approve a high/critical card, not for changes_requested or blocked
 findings:
   - severity: medium       # critical | high | medium | low
     location: src/thing.rs
     detail: What is wrong, concretely.
-    disposition: open      # open | resolved | accepted_risk | out_of_scope
+    disposition: open      # open | still_open | resolved | accepted_risk | out_of_scope
 gate_adequacy:
   gates_observe_acceptance: true
   unobserved_behaviors: []
@@ -399,8 +477,17 @@ Rules the harness enforces:
   clean approval; `changes_requested` requires at least one finding.
 - A **re-review may not silently drop a superseded review's open findings** —
   each must reappear at the same `location` with an explicit disposition.
-- An approval goes **stale** if the candidate changes or the card is revised;
-  staleness is reported, and integration refuses stale members.
+  `still_open` is for the common case that is neither settled nor new: worked
+  on, not yet closed. It accounts for the prior finding without claiming it
+  is resolved, and still blocks an approval exactly as `open` does.
+- An approval goes **stale** if the candidate changes or the card is revised.
+  A third, narrower condition covers dependencies: not any change to a
+  dependency's standing, but specifically when the commit this card recorded
+  as incorporated is no longer contained in what the dependency currently
+  stands approved at, or when a declared dependency has no recorded binding
+  at all. A dependency merely losing its own approval does not by itself
+  stale this one. Staleness is reported, and integration refuses stale
+  members.
 
 After `changes_requested`: `work resume --card-id F-001 --actor implementer-a`
 (the card cannot hand off from `changes_requested` directly), fix, re-run
@@ -425,9 +512,10 @@ leaves out are named in `warnings` with the reason — read them, silence is
 never the signal. `preflight` simulates the whole merge without touching a
 ref. `merge` combines in a disposable worktree. `land` builds the landing
 commit — baseline as first parent, integration head as second, moving no
-branch. `verify` reruns every member-named integration gate *against the
-landing commit*, because a gate that passed on an isolated candidate proves
-nothing about the combined tree.
+branch. `verify` reruns the union of every member's `feature`, `review`, and
+`integration` named gates *against the landing commit* — not only the ones
+named under `integration:` — because a gate that passed on an isolated
+candidate proves nothing about the combined tree.
 
 ### 9. Accept, promote, archive
 
@@ -456,13 +544,16 @@ worktrees; `close` refuses to delete anything that would become unreachable.
 | Handoff refuses a dirty worktree | Uncommitted or untracked files | Commit them, or add gate outputs to the project's `.gitignore` |
 | Handoff refuses the SHA | Branch head ≠ `delivered_sha` | Re-read HEAD, fix the declaration |
 | An approval is reported stale | Candidate or card changed after the review | New handoff, fresh review — the old approval is not deleted, it just no longer applies |
+| Stale specifically over a dependency | The dependency's standing approval no longer contains what this card recorded as incorporated, or has no recorded binding | A new handoff alone recomputes the binding; if the candidate does not yet build on the dependency's current commit, incorporate it first, then hand off and review again |
 | Lock held by another command | Concurrent mutation | Wait; `project status` diagnoses a stale holder; **never delete a lock file by hand** |
 | Exit 9 from anything | An operation was interrupted mid-mutation | `project status`, then `project recover` |
 
 ## Recovery
 
 Mutating commands journal every step before performing it, so an interruption
-is attributable rather than guessed at. `project recover` reports; its
+is attributable rather than guessed at — `backup create` is the exception; it
+writes bundle files directly and is not journaled, so an interruption there is
+not something `project recover` can attribute. `project recover` reports; its
 `--resume` completes only an interrupted promotion (the one operation it can
 safely finish) and refuses anything else by name — disposition of other
 partials is an operator decision.
@@ -481,14 +572,14 @@ registers the checkout and builds the two repositories the harness owns
 around it.
 
 Four paths, three of them new, and **all of them absolute**. `--repository .`
-is refused (`expected an absolute path, found `.``); your working directory is
-never consulted, so it makes no difference whether you run this from inside
-the project or anywhere else.
+is refused (`` expected an absolute path, found `.` ``); your working
+directory is never consulted, so it makes no difference whether you run this
+from inside the project or anywhere else.
 
 | Flag | What it points at |
 | --- | --- |
 | `--repository` | The project you already cloned. Must exist, be a Git repository, and have at least one commit on the protected branch. |
-| `--control` | **New.** Cards, reviews, receipts, integration records. Must be absent or empty. |
+| `--control` | **New**, usually. Cards, reviews, receipts, integration records. An empty or absent directory initializes fresh; one already bound to an identical configuration is accepted as a no-op (see "Init is a one-time registration," below); one bound to a different configuration, or holding files nobody checked, is refused. |
 | `--authority` | **New.** The bare repository that owns the protected branch. |
 | `--worktree-root` | **New**, optional. Where card worktrees are allocated; defaults to `<the control's parent>/<project-id>-worktrees`. |
 
@@ -501,10 +592,11 @@ change-harness project init \
   --worktree-root    /abs/path/to/example-worktrees
 ```
 
-Nothing is created inside the repository being governed. Control and authority
-are siblings, not subdirectories, and the candidate gains exactly one thing: a
-remote named `harness-authority`. An existing remote of that name is never
-repointed.
+Nothing is created inside the repository being governed — that nesting is
+refused. Control and authority are meant to be siblings, but nothing stops
+either from being nested inside the *other*; the check only guards the
+candidate. The candidate gains exactly one thing: a remote named `harness-authority`. An
+existing remote of that name is never repointed.
 
 ### Where the baseline comes from, and when
 
@@ -520,9 +612,14 @@ There is no confirmation step for this; the sequence is the record. If you
 want the newer commit as your baseline, promote it through the harness, or
 initialize after it exists.
 
-An authority that already exists and is compatible is adopted unchanged, and
-then *it* supplies the baseline rather than the candidate. The candidate's
-protected branch is still resolved and checked — initialization validates it
+An authority that already exists, is compatible, and already holds the
+protected branch is adopted unchanged, and then *it* supplies the baseline
+rather than the candidate. A compatible authority that exists but does not
+yet hold that branch — an empty bare repository, say — is not left empty:
+init seeds it from the candidate, the same as a brand new one. "Compatible"
+and "already has the branch" are two different conditions, and only meeting
+both skips the seed. The candidate's protected branch is still resolved and
+checked either way — initialization validates it
 in every case and refuses a repository that has no commit on it — it is
 simply not what the authority gets seeded from.
 
