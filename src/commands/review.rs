@@ -496,7 +496,16 @@ const fn state_for(decision: Decision) -> CardState {
     }
 }
 
-/// Refuses a review whose handoff no longer describes the branch.
+/// How much of the handoff a verdict has to still be current against.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HandoffScope {
+    /// Every question, including the branch head. What an approval answers.
+    Whole,
+    /// Only what the handoff was bound to. What a non-approval answers.
+    Bindings,
+}
+
+/// Refuses a review whose handoff no longer stands.
 ///
 /// A review recorded against a superseded handoff would approve code nobody
 /// looked at, which is the same failure `SPIKE-001` F-1 found one stage earlier.
@@ -508,18 +517,32 @@ const fn state_for(decision: Decision) -> CardState {
 /// verdict the schema offers, discarded because a transition refused it. The
 /// dependency question is asked where it decides something — of the review, at
 /// integration.
-/// Only an approval requires it; see the call site.
+///
+/// [`HandoffScope::Bindings`] asks only what the reviewer was measuring
+/// against, and the argument for each question it drops is at
+/// [`HandoffRecord::binding_staleness`]. It needs no worktree to answer what
+/// remains, which is why the lease is resolved only for
+/// [`HandoffScope::Whole`] — the previous early return on a card holding no
+/// lease skipped the card-digest question too, and there is no reason it
+/// should.
 fn require_current_handoff(
     control: &ControlRepository,
     card_id: &CardId,
     handoff: &crate::domain::handoff::HandoffRecord,
     card_digest: &crate::domain::digest::Digest,
+    scope: HandoffScope,
 ) -> Result<(), HarnessError> {
-    let Some(lease) = held_lease(control, card_id)? else {
-        return Ok(());
+    let staleness = match scope {
+        HandoffScope::Bindings => handoff.binding_staleness(card_digest, DEPENDENCIES_NOT_CHECKED),
+        HandoffScope::Whole => {
+            let Some(lease) = held_lease(control, card_id)? else {
+                return Ok(());
+            };
+            let head = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
+            handoff.staleness(&head, card_digest, DEPENDENCIES_NOT_CHECKED)
+        }
     };
-    let head = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
-    if let Some(reason) = handoff.staleness(&head, card_digest, DEPENDENCIES_NOT_CHECKED) {
+    if let Some(reason) = staleness {
         return Err(HarnessError::Control {
             reason: format!("cannot review a superseded handoff: {reason}"),
             code: ErrorCode::PolicyStaleHandoff,
@@ -550,23 +573,34 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     code: ErrorCode::PreconditionNotFound,
                 })?;
 
-            // Only an approval. A verdict that found problems is a true
-            // statement about the candidate it was reached against, and it
-            // stays true when the branch moves; refusing to file it destroys
-            // the reviewer's work to protect an invariant that only approvals
-            // carry. The comment on the function below already makes this
-            // argument for dependency staleness — "a verdict the schema
-            // offers, discarded because a transition refused it" — and it
-            // applies one step over, to the candidate itself.
+            // Only an approval answers the candidate question. A verdict that
+            // found problems is a true statement about the candidate it was
+            // reached against, and it stays true when the branch moves;
+            // refusing to file it destroys the reviewer's work to protect an
+            // invariant that only approvals carry. The comment on the function
+            // above already makes this argument for dependency staleness — "a
+            // verdict the schema offers, discarded because a transition
+            // refused it" — and it applies one step over, to the candidate
+            // itself.
             //
             // Found by making the mistake four times on one card: each time a
             // reviewer's findings were fixed before the verdict was filed, the
             // branch moved, and the refusal below meant the verdict could
             // never be recorded at all. Three of that card's review rounds
             // survive only as prose inside a `handoff revoke --reason`.
-            if verdict.decision == Decision::Approved {
-                require_current_handoff(control, &card_id, &handoff, &state.current_digest)?;
-            }
+            //
+            // That relaxation was first written as an `if` around the whole
+            // call, which dropped the card-digest question too — so a card
+            // revised out from under a handoff fell through to the transition
+            // table, which names a state change rather than the reason. The
+            // scope is the fix: a non-approval stops asking about the delivery
+            // and still answers for what it was measured against.
+            let scope = if verdict.decision == Decision::Approved {
+                HandoffScope::Whole
+            } else {
+                HandoffScope::Bindings
+            };
+            require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;
 
             let next_state = state_for(verdict.decision);
             state.state.check_transition(next_state)?;
