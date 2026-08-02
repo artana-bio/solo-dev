@@ -28,6 +28,8 @@ const MAX_DIAGNOSTIC_LEN: usize = 512;
 pub struct GitOutput {
     /// Exit code, or `None` when the process was terminated by a signal.
     pub code: Option<i32>,
+    /// Captured standard output without decoding, for byte-exact Git data.
+    pub stdout_bytes: Vec<u8>,
     /// Captured standard output, lossily decoded.
     pub stdout: String,
     /// Captured standard error, lossily decoded.
@@ -273,6 +275,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_with_config_and_environment(scope, overrides, &[], args)
+}
+
+/// Runs Git with explicit `-c` overrides and a narrowly controlled environment.
+///
+/// Ambient redirecting variables are removed exactly as they are for ordinary
+/// invocations. The supplied entries are then restored deliberately for
+/// workflows that need Git's isolated index/object locations; callers must not
+/// pass operator-controlled environment wholesale.
+///
+/// # Errors
+///
+/// Returns [`HarnessError::GitUnavailable`] when Git cannot be spawned.
+pub fn run_with_config_and_environment<I, S>(
+    scope: &GitScope,
+    overrides: &[OsString],
+    environment: &[(&OsStr, &OsStr)],
+    args: I,
+) -> Result<GitOutput, HarnessError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new("git");
     command.args(scope.prefix());
     for value in overrides {
@@ -286,11 +311,16 @@ where
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_OPTIONAL_LOCKS", "0");
     strip_ambient_overrides(&mut command);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
 
     let output = command.output().map_err(HarnessError::GitUnavailable)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(GitOutput {
         code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout_bytes: output.stdout,
+        stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }

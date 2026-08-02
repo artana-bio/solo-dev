@@ -5,6 +5,7 @@
 //! candidate actor cannot rewrite the policy that judges it.
 
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io::Write as _,
     path::{Path, PathBuf},
@@ -14,7 +15,7 @@ use crate::{
     config::ProjectConfig,
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
-    git::command::{GitScope, run, run_ok, run_with_config_ok},
+    git::command::{GitScope, run, run_ok, run_with_config_and_environment, run_with_config_ok},
 };
 
 /// Path of the project document inside the control repository.
@@ -322,9 +323,43 @@ impl ControlRepository {
             });
         }
 
-        // Validate the bytes in every entry this commit is allowed to stage
-        // before `git add` can write any blob into the object database.
-        refuse_non_text_control_files(&self.root)?;
+        // `git add` must apply the repository's real clean filters so the bytes
+        // we validate are exactly the bytes that would be committed. It runs
+        // against a copied index and a quarantined object database; a refusal
+        // therefore cannot leave a rejected blob in the durable repository.
+        let quarantine = tempfile::tempdir_in(self.root.join(".git")).map_err(|source| {
+            HarnessError::ControlIo {
+                path: self.root.join(".git"),
+                source,
+            }
+        })?;
+        let quarantine_objects = quarantine.path().join("objects");
+        fs::create_dir_all(&quarantine_objects).map_err(|source| HarnessError::ControlIo {
+            path: quarantine_objects.clone(),
+            source,
+        })?;
+        let durable_index = self.root.join(".git/index");
+        let quarantine_index = quarantine.path().join("index");
+        if durable_index.exists() {
+            fs::copy(&durable_index, &quarantine_index).map_err(|source| {
+                HarnessError::ControlIo {
+                    path: durable_index.clone(),
+                    source,
+                }
+            })?;
+        }
+        let durable_objects = self.root.join(".git/objects");
+        let quarantine_environment = [
+            (OsStr::new("GIT_INDEX_FILE"), quarantine_index.as_os_str()),
+            (
+                OsStr::new("GIT_OBJECT_DIRECTORY"),
+                quarantine_objects.as_os_str(),
+            ),
+            (
+                OsStr::new("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+                durable_objects.as_os_str(),
+            ),
+        ];
 
         // `--all` within each named path, so a deletion inside one is staged as
         // well as an addition. Paths absent from disk are dropped first: `git
@@ -338,15 +373,30 @@ impl ControlRepository {
         if !present.is_empty() {
             let mut stage: Vec<&str> = vec!["add", "--all", "--"];
             stage.extend_from_slice(&present);
-            run_ok(&self.scope(), stage)?;
+            run_with_config_and_environment(&self.scope(), &[], &quarantine_environment, stage)?
+                .require_success()?;
         }
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
         // worktree permanently dirty; asking `is_clean` would send every commit
         // into `git commit` with nothing staged, which fails.
-        if run(&self.scope(), ["diff", "--cached", "--quiet"])?.success() {
+        let staged = run_with_config_and_environment(
+            &self.scope(),
+            &[],
+            &quarantine_environment,
+            ["diff", "--cached", "--quiet"],
+        )?;
+        if staged.success() {
             return Ok(None);
         }
+        refuse_non_text_control_entries(&self.scope(), &quarantine_environment)?;
+        promote_quarantine_objects(&quarantine_objects, &durable_objects)?;
+        fs::rename(&quarantine_index, &durable_index).map_err(|source| {
+            HarnessError::ControlIo {
+                path: durable_index.clone(),
+                source,
+            }
+        })?;
         // This remains an invocation-level defence as well as the local
         // configuration set during initialization. An existing control
         // repository can have those local settings removed, and `project init`
@@ -381,85 +431,44 @@ impl ControlRepository {
     }
 }
 
-/// Refuses control entries that are not UTF-8 text before Git stages them.
+/// Refuses the exact bytes Git staged for the intended control entries.
 ///
 /// The control repository stores JSON and other text records. NUL is rejected
 /// separately because UTF-16LE ASCII text is technically valid UTF-8 with an
 /// embedded NUL, and that is the concrete encoding that bypassed the prior
-/// scanner. The caller supplies only [`CONTROL_TRACKED_PATHS`], preserving the
-/// existing intended-entry boundary without touching Git's object database.
-fn refuse_non_text_control_files(root: &Path) -> Result<(), HarnessError> {
-    for relative in CONTROL_TRACKED_PATHS {
-        let path = root.join(relative);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => refuse_non_text_control_path(&path, relative)?,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(HarnessError::ControlIo { path, source });
-            }
+/// scanner. Git is invoked with the existing [`CONTROL_TRACKED_PATHS`] path
+/// boundary, while its index and newly created objects remain quarantined until
+/// this check passes.
+fn refuse_non_text_control_entries(
+    scope: &GitScope,
+    environment: &[(&OsStr, &OsStr)],
+) -> Result<(), HarnessError> {
+    let paths = run_with_config_and_environment(
+        scope,
+        &[],
+        environment,
+        ["diff", "--cached", "--name-only", "-z"],
+    )?
+    .require_success()?;
+    for raw_path in paths.stdout_bytes.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw_path).map_err(|_| HarnessError::Control {
+            reason: "a staged control path is not valid UTF-8".to_owned(),
+            code: ErrorCode::PolicyControlEncoding,
+        })?;
+        let spec = format!(":{relative}");
+        let blob = run_with_config_and_environment(scope, &[], environment, ["show", &spec])?;
+        if blob.success() {
+            refuse_non_text_control_bytes(relative, &blob.stdout_bytes)?;
         }
     }
     Ok(())
 }
 
-fn refuse_non_text_control_path(path: &Path, relative: &str) -> Result<(), HarnessError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| HarnessError::ControlIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let file_type = metadata.file_type();
-
-    if file_type.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(path)
-            .map_err(|source| HarnessError::ControlIo {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .collect::<Result<_, _>>()
-            .map_err(|source| HarnessError::ControlIo {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| HarnessError::Control {
-                    reason: "a tracked control path is not valid UTF-8".to_owned(),
-                    code: ErrorCode::PolicyControlEncoding,
-                })?;
-            refuse_non_text_control_path(&entry.path(), &format!("{relative}/{name}"))?;
-        }
-        return Ok(());
-    }
-
-    let contents = if file_type.is_symlink() {
-        let target = fs::read_link(path).map_err(|source| HarnessError::ControlIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        target
-            .to_str()
-            .ok_or_else(|| HarnessError::Control {
-                reason: format!("control entry `{relative}` is not valid UTF-8"),
-                code: ErrorCode::PolicyControlEncoding,
-            })?
-            .as_bytes()
-            .to_vec()
-    } else if file_type.is_file() {
-        fs::read(path).map_err(|source| HarnessError::ControlIo {
-            path: path.to_path_buf(),
-            source,
-        })?
-    } else {
-        return Err(HarnessError::Control {
-            reason: format!("control entry `{relative}` is not a regular file"),
-            code: ErrorCode::PolicyControlEncoding,
-        });
-    };
-
-    let valid_utf8 = std::str::from_utf8(&contents).is_ok();
+fn refuse_non_text_control_bytes(relative: &str, contents: &[u8]) -> Result<(), HarnessError> {
+    let valid_utf8 = std::str::from_utf8(contents).is_ok();
     let has_nul = contents.contains(&0);
     if !valid_utf8 || has_nul {
         let reason = if valid_utf8 {
@@ -471,6 +480,70 @@ fn refuse_non_text_control_path(path: &Path, relative: &str) -> Result<(), Harne
             reason: format!("control entry `{relative}` {reason}"),
             code: ErrorCode::PolicyControlEncoding,
         });
+    }
+    Ok(())
+}
+
+fn promote_quarantine_objects(source: &Path, destination: &Path) -> Result<(), HarnessError> {
+    if !source.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination).map_err(|source_error| HarnessError::ControlIo {
+        path: destination.to_path_buf(),
+        source: source_error,
+    })?;
+    promote_quarantine_tree(source, destination)
+}
+
+fn promote_quarantine_tree(source: &Path, destination: &Path) -> Result<(), HarnessError> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|source_error| HarnessError::ControlIo {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    if metadata.file_type().is_dir() {
+        fs::create_dir_all(destination).map_err(|source_error| HarnessError::ControlIo {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+        let entries = fs::read_dir(source).map_err(|source_error| HarnessError::ControlIo {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source_error| HarnessError::ControlIo {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+            promote_quarantine_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if !metadata.file_type().is_file() {
+        return Err(HarnessError::ControlIo {
+            path: source.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "quarantine object is not a regular file",
+            ),
+        });
+    }
+    if destination.exists() {
+        fs::remove_file(source).map_err(|source_error| HarnessError::ControlIo {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source_error| HarnessError::ControlIo {
+                path: parent.to_path_buf(),
+                source: source_error,
+            })?;
+        }
+        fs::rename(source, destination).map_err(|source_error| HarnessError::ControlIo {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
     }
     Ok(())
 }

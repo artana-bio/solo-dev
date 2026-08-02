@@ -2,8 +2,9 @@
 
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use change_harness::{
@@ -581,6 +582,9 @@ fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
         b"{\"note\":\"\xff\"}\n",
     )
     .unwrap();
+    let invalid_bytes = fs::read(fixture.control.join("cards/invalid.json")).unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, &invalid_bytes);
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
 
     let output = Fixture::run(&[
         "cycle".into(),
@@ -605,6 +609,102 @@ fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
         "the refusal must identify the policy: {rendered}"
     );
     assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "the rejected blob must not enter Git's object database"
+    );
+}
+
+#[test]
+fn a_clean_filter_cannot_create_a_non_text_control_blob() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before = control.head().unwrap();
+
+    // The worktree bytes are valid UTF-8, but the configured clean filter
+    // replaces them with one invalid byte at the Git staging boundary.
+    fs::create_dir_all(fixture.control.join(".git/info")).unwrap();
+    fs::write(
+        fixture.control.join(".git/info/attributes"),
+        "cards/** filter=inject\n",
+    )
+    .unwrap();
+    git(
+        &fixture.control,
+        &["config", "filter.inject.clean", r"printf '\377'"],
+    );
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/filtered.json"),
+        b"{\"note\":\"valid worktree bytes\"}\n",
+    )
+    .unwrap();
+    let transformed_blob = git_hash_object(&fixture.control, &[0xff]);
+    assert!(!git_has_object(&fixture.control, &transformed_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    assert_eq!(output.status.code(), Some(5), "encoding refusal expected");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("CH-POLICY-CONTROL-ENCODING"),
+        "the refusal must identify the policy: {rendered}"
+    );
+    assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert!(
+        !git_has_object(&fixture.control, &transformed_blob),
+        "filter output must not enter Git's durable object database"
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.control)
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .unwrap()
+            .success(),
+        "a refusal must leave no staged Git object behind"
+    );
+}
+
+fn git_hash_object(repo: &Path, bytes: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn git_has_object(repo: &Path, object: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", object])
+        .status()
+        .unwrap()
+        .success()
 }
 
 #[test]
