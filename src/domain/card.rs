@@ -166,7 +166,30 @@ impl CardState {
             Self::Draft => &[Self::Ready, Self::Abandoned],
             Self::Ready => &[Self::Leased, Self::Abandoned],
             Self::Leased => &[Self::Active, Self::Abandoned],
-            Self::Active => &[Self::HandedOff, Self::Blocked, Self::Abandoned],
+            // `ChangesRequested` and `Blocked` for one reason, stated at
+            // `ReviewPending` below and reaching one stage further than it was
+            // written for: a reviewer who has begun may still file, and a
+            // verdict the schema offers must not be discarded because a
+            // transition refused it.
+            //
+            // A card arrives here from `review_pending` when the delivery side
+            // revokes the handoff. Without `ChangesRequested` that revocation
+            // decides the verdict: `blocked` filed and `changes_requested` did
+            // not, which is an asymmetry nothing justifies, and it handed the
+            // implementer a way to discard an adverse review by revoking
+            // first. Found by review round 2 of `F-030` (RV-000055), after
+            // round 1 caught the same suppression route through the staleness
+            // check and the fix closed only half of it.
+            //
+            // This opens no route around review. `review record` refuses a
+            // card with no handoff, so the only way to reach `changes_requested`
+            // is still a verdict somebody recorded.
+            Self::Active => &[
+                Self::HandedOff,
+                Self::ChangesRequested,
+                Self::Blocked,
+                Self::Abandoned,
+            ],
             // A handoff can be revoked, returning the card to work.
             Self::HandedOff => &[Self::ReviewPending, Self::Active, Self::Abandoned],
             // `Blocked` because a reviewer may conclude the card needs a
@@ -1022,6 +1045,10 @@ rollback_strategy: revert
             (CardState::ReviewPending, CardState::ChangesRequested),
             (CardState::ChangesRequested, CardState::Active),
             (CardState::HandedOff, CardState::Active),
+            // Reachable when the handoff is revoked while a review is open;
+            // the reviewer may still file what they found.
+            (CardState::Active, CardState::ChangesRequested),
+            (CardState::Active, CardState::Blocked),
             (CardState::Approved, CardState::Active),
             (CardState::Approved, CardState::Integrating),
             (CardState::Integrating, CardState::Accepted),

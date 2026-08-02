@@ -19,8 +19,9 @@ use std::fs;
 
 use support::Workspace;
 
-/// A card handed off and under review, plus the candidate that was handed off.
-fn under_review() -> (Workspace, String) {
+/// A card handed off, plus the candidate that was handed off. No review has
+/// begun yet — `under_review` below adds that.
+fn handed_off() -> (Workspace, String) {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -56,6 +57,13 @@ fn under_review() -> (Workspace, String) {
         "--declaration",
         &declaration.display().to_string(),
     ]);
+    (workspace, reviewed)
+}
+
+/// The same, with a review actually begun. What every test but the
+/// review-begin gap test wants.
+fn under_review() -> (Workspace, String) {
+    let (workspace, reviewed) = handed_off();
     workspace.review(&["begin", "--card-id", "F-001"]);
     (workspace, reviewed)
 }
@@ -82,6 +90,43 @@ fn error_code(output: &std::process::Output) -> String {
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("an error envelope");
     envelope["error"]["code"].as_str().unwrap().to_owned()
+}
+
+fn error_message(output: &std::process::Output) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    envelope["error"]["message"].as_str().unwrap().to_owned()
+}
+
+/// Withdraws the handoff, the way an implementer pulling a delivery back does.
+fn revoke_the_handoff(workspace: &Workspace) {
+    workspace.handoff(&[
+        "revoke",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "withdrawn before the verdict was filed",
+    ]);
+}
+
+/// Revises the card underneath the handoff, changing what it was measured
+/// against.
+fn revise_the_card(workspace: &Workspace) {
+    let body = format!(
+        "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001 against changed requirements\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [\"src/**\"]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works differently now]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        base = workspace.authority_head(),
+    );
+    let path = workspace.root.join("F-001-r2.yaml");
+    fs::write(&path, body).unwrap();
+    workspace.card(&[
+        "revise",
+        "--card-id",
+        "F-001",
+        "--draft",
+        &path.display().to_string(),
+        "--reason",
+        "the requirements changed underneath the handoff",
+    ]);
 }
 
 #[test]
@@ -179,4 +224,237 @@ fn the_recorded_verdict_survives_the_sequence_that_used_to_lose_it() {
         "and it still names what was actually reviewed"
     );
     assert_eq!(recorded[0]["decision"], "changes_requested");
+}
+
+// The relaxation above drops what a non-approval outlives and keeps what it
+// does not. Written because the first version of it wrapped the whole check in
+// `if decision == approved`, which stopped asking every question — including
+// the one about the card the verdict was measured against.
+
+#[test]
+fn blocked_against_a_revoked_handoff_is_still_recordable() {
+    // Deliberate, and the argument is at `binding_staleness`. `handoff revoke`
+    // belongs to the delivery side and `review_pending -> active` is a
+    // permitted transition, so an implementer who could make revocation fatal
+    // to a verdict could suppress an adverse review by revoking before the
+    // reviewer files — the exact failure this file exists to document.
+    //
+    // Revision 1 of F-030 required the opposite and its own review round
+    // rejected it. This test is here so that reinstating the refusal has to
+    // argue with a test rather than pass quietly.
+    let (workspace, reviewed) = under_review();
+    revoke_the_handoff(&workspace);
+
+    let path = verdict_file(&workspace, "blocked");
+    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the verdict names the candidate the reviewer actually read"
+    );
+}
+
+#[test]
+fn changes_requested_against_a_revoked_handoff_is_still_recordable() {
+    // Review round 2's finding (RV-000055). Revision 2 of this card closed the
+    // suppression route for `blocked` and left it open for this verdict: the
+    // staleness check passed and `active -> changes_requested` was then refused
+    // by the transition table, so the review was never written. Whichever
+    // verdict the reviewer reached, revoking must not decide it for them.
+    let (workspace, reviewed) = under_review();
+    revoke_the_handoff(&workspace);
+
+    let path = verdict_file(&workspace, "changes_requested");
+    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["data"]["review"]["decision"], "changes_requested");
+    assert_eq!(
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the verdict names the candidate the reviewer actually read"
+    );
+
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let recorded = inspected["data"]["reviews"]
+        .as_array()
+        .expect("the review history");
+    assert_eq!(recorded.len(), 1, "the verdict is in the record");
+    assert_eq!(
+        recorded[0]["findings"][0]["location"], "src/a.rs",
+        "and the findings came with it"
+    );
+}
+
+#[test]
+fn an_active_card_with_no_handoff_at_all_cannot_be_reviewed() {
+    // The only guard the new transition leans on, and it is narrower than it
+    // sounds: it establishes that a card nobody handed off cannot be reviewed,
+    // and nothing more. A *revoked* handoff satisfies it — see the test below,
+    // which says so plainly rather than letting this one's name imply
+    // otherwise. Review round 3 (RV-000056) caught exactly that overclaim.
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let path = verdict_file(&workspace, "changes_requested");
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a card nobody handed off has nothing to review"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no handoff"),
+        "refused for the absent handoff: {}",
+        envelope["error"]["message"]
+    );
+}
+
+#[test]
+fn recording_a_verdict_does_not_yet_require_that_a_review_began() {
+    // A known gap, stated rather than discovered. `review record` has never
+    // checked that `review begin` happened: a handoff that was created and then
+    // revoked, with no review round at any point, is enough to file a verdict.
+    //
+    // On the protected branch this already succeeds for `blocked`; permitting
+    // `active -> changes_requested` widens it to the second verdict. Closing it
+    // needs a durable signal that a review began for the current handoff, which
+    // is a lifecycle question rather than a staleness one and is filed as its
+    // own card. It is not an authority bypass — `check_independence` still
+    // refuses a reviewer who is the handoff actor.
+    //
+    // This test asserts the behaviour as it is so that closing the gap is a
+    // deliberate edit here, not a surprise failure somewhere else.
+    for decision in ["blocked", "changes_requested"] {
+        let (workspace, _) = handed_off();
+        workspace.handoff(&[
+            "revoke",
+            "--card-id",
+            "F-001",
+            "--reason",
+            "withdrawn before any review began",
+        ]);
+
+        let path = verdict_file(&workspace, decision);
+        let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+        assert_eq!(
+            envelope["status"], "success",
+            "{decision} is recordable with no review round: this is the gap"
+        );
+
+        let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+        assert_eq!(
+            inspected["data"]["reviews"].as_array().unwrap().len(),
+            1,
+            "and it reaches the record"
+        );
+    }
+}
+
+#[test]
+fn the_verdict_against_a_revoked_handoff_reaches_the_record() {
+    // The exit code alone would pass even if the verdict were accepted and
+    // then dropped. What matters is that the findings are queryable afterwards
+    // — that is the whole reason the refusal was rejected.
+    let (workspace, _) = under_review();
+    revoke_the_handoff(&workspace);
+
+    let path = verdict_file(&workspace, "blocked");
+    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let recorded = inspected["data"]["reviews"]
+        .as_array()
+        .expect("the review history");
+    assert_eq!(recorded.len(), 1, "the verdict is in the record");
+    assert_eq!(recorded[0]["decision"], "blocked");
+    assert_eq!(
+        recorded[0]["findings"][0]["location"], "src/a.rs",
+        "and the findings survived with it, rather than as prose in a reason"
+    );
+}
+
+#[test]
+fn a_non_approval_against_a_revised_card_is_refused_for_the_true_reason() {
+    // `card revise` returns the card to `ready`, from which the transition
+    // table refuses `blocked` anyway — so this case was never a hole in the
+    // record. What it was is a refusal that named the wrong thing: the
+    // operator was told a card cannot move from `ready` to `blocked`, when
+    // what actually happened is that the card was revised out from under the
+    // handoff the reviewer was holding. This asserts the accurate one.
+    let (workspace, _) = under_review();
+    revise_the_card(&workspace);
+
+    let path = verdict_file(&workspace, "blocked");
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        error_code(&output),
+        "CH-POLICY-STALE-HANDOFF",
+        "not CH-POLICY-INVALID-TRANSITION, which is the state machine \
+         answering a question nobody asked"
+    );
+    let message = error_message(&output);
+    assert!(
+        message.contains("card digest"),
+        "the refusal must name the binding that broke: {message}"
+    );
+}
+
+#[test]
+fn an_approval_against_a_revoked_handoff_is_still_refused() {
+    // Unchanged by this card, and asserted so that narrowing the scope for
+    // non-approvals cannot quietly narrow it for approvals too.
+    let (workspace, _) = under_review();
+    revoke_the_handoff(&workspace);
+
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, body).unwrap();
+
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
+}
+
+#[test]
+fn a_revised_card_refuses_a_verdict_even_when_the_handoff_was_revoked() {
+    // The questions that are dropped must not drag down the one that is kept.
+    // Revoking and revising together still refuses, and for the revision.
+    let (workspace, _) = under_review();
+    revoke_the_handoff(&workspace);
+    revise_the_card(&workspace);
+
+    let path = verdict_file(&workspace, "blocked");
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
+    let message = error_message(&output);
+    assert!(
+        message.contains("card digest"),
+        "the surviving question is the one about the card: {message}"
+    );
 }
