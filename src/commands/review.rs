@@ -14,7 +14,10 @@ use crate::{
         transaction::with_transaction,
         work::held_lease,
     },
-    control::{event_store::EventDraft, repository::ControlRepository},
+    control::{
+        event_store::{EventDraft, EventStore},
+        repository::ControlRepository,
+    },
     domain::{
         card::CardState,
         clock::Clock,
@@ -471,15 +474,17 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 /// was never called here at all. It now asks exactly what `run_record` asks,
 /// with the same `HandoffScope` split by decision.
 ///
-/// Order matters here, not just presence: `run_record` checks staleness
-/// before independence — the staleness call below runs inside the
-/// transaction well ahead of `ReviewRecord::validate`'s call to
-/// `check_independence` — so a verdict that is both a self-review and stale
-/// is refused as stale first. The independence check pre-existed this fix
-/// and ran first; moved it after staleness so a case failing both reasons
-/// reports the same one in both forms, which is the entire point of a
-/// preview. Caught by review round 1 of this exact card, on the fixture
-/// where a revoked handoff is also a self-review.
+/// Order matters here, not just presence, and this now checks three things
+/// in the same order `run_record` does: whether a review round ever opened
+/// for this handoff, then staleness, then independence. A verdict that is
+/// both a self-review and stale is refused as stale first — the independence
+/// check pre-existed the staleness fix and ran first; moved it after
+/// staleness so a case failing both reasons reports the same one in both
+/// forms, which is the entire point of a preview. Caught by review round 1
+/// of this exact card, on the fixture where a revoked handoff is also a
+/// self-review. The review-begun check runs ahead of both because it asks
+/// the most basic question: whether there is a review to be stale or
+/// self-reviewing about at all.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
@@ -491,6 +496,7 @@ fn preview_record(
         reason: format!("card {card_id} has no handoff"),
         code: ErrorCode::PreconditionNotFound,
     })?;
+    require_review_begun(&EventStore::new(&control), card_id, &handoff.handoff_id)?;
     let scope = if verdict.decision == Decision::Approved {
         HandoffScope::Whole
     } else {
@@ -576,6 +582,42 @@ fn require_current_handoff(
     Ok(())
 }
 
+/// Refuses a verdict recorded against a handoff no review round ever opened.
+///
+/// `review begin` emits a `review.begun` event tagged with the exact handoff
+/// it opened review for. That event is append-only control history, which is
+/// why this asks it rather than the card's current state: `handoff revoke`
+/// overwrites the card state to `active` regardless of whether a review had
+/// begun, so the state alone cannot answer whether one ever did. Without
+/// this, `handoff create` followed immediately by `handoff revoke` left a
+/// verdict recordable with no review round at any point — reachable through
+/// `blocked` and `changes_requested`, both of which `active` admits directly.
+/// An approval cannot reach this gap the same way: `Approved` is only
+/// admitted from `review_pending`, so the transition table already refuses
+/// it; this still checks first so the reason it refuses is accurate rather
+/// than incidental.
+fn require_review_begun(
+    events: &EventStore<'_>,
+    card_id: &CardId,
+    handoff_id: &str,
+) -> Result<(), HarnessError> {
+    let began = events.for_card(card_id)?.iter().any(|event| {
+        event.event_type == "review.begun"
+            && event
+                .metadata
+                .get("handoff_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(handoff_id)
+    });
+    if began {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!("card {card_id} has no review round open for handoff {handoff_id}"),
+        code: ErrorCode::PolicyReviewNotBegun,
+    })
+}
+
 fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let verdict = read_verdict(&args.verdict)?;
@@ -597,6 +639,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
+            require_review_begun(events, &card_id, &handoff.handoff_id)?;
 
             // Only an approval answers the candidate question. A verdict that
             // found problems is a true statement about the candidate it was

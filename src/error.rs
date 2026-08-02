@@ -166,6 +166,8 @@ pub enum ErrorCode {
     PolicyIncompleteReview,
     /// The handoff under review no longer describes the branch.
     PolicyStaleHandoff,
+    /// A verdict was recorded against a handoff no review round ever opened.
+    PolicyReviewNotBegun,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -350,7 +352,8 @@ impl ErrorCode {
             | Self::PolicyRiskReview
             | Self::PolicyOpenFindings
             | Self::PolicyIncompleteReview
-            | Self::PolicyStaleHandoff => ExitCategory::Policy,
+            | Self::PolicyStaleHandoff
+            | Self::PolicyReviewNotBegun => ExitCategory::Policy,
             Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
                 ExitCategory::Gate
             }
@@ -447,6 +450,7 @@ impl ErrorCode {
             Self::PolicyOpenFindings => "OPEN-FINDINGS",
             Self::PolicyIncompleteReview => "INCOMPLETE-REVIEW",
             Self::PolicyStaleHandoff => "STALE-HANDOFF",
+            Self::PolicyReviewNotBegun => "REVIEW-NOT-BEGUN",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -654,6 +658,9 @@ impl ErrorCode {
             }
             Self::PolicyStaleHandoff => {
                 "Create a fresh handoff for the current candidate before reviewing it."
+            }
+            Self::PolicyReviewNotBegun => {
+                "Run `review begin` for this handoff before recording a verdict against it."
             }
             _ => "Resolve the reported policy violation.",
         }
