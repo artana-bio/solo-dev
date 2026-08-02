@@ -462,16 +462,41 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 }
 
 /// Reports what `review record` would write, without writing it.
+///
+/// Tier 3 defect 24: a preview that skips a check the real command enforces
+/// is worse than no preview — it tells an operator a command will succeed
+/// when it will not, and the operator then runs the real one having been
+/// told it is safe. This one skipped the staleness question entirely for
+/// every decision, approvals included, because `require_current_handoff`
+/// was never called here at all. It now asks exactly what `run_record` asks,
+/// with the same `HandoffScope` split by decision.
+///
+/// Order matters here, not just presence: `run_record` checks staleness
+/// before independence — the staleness call below runs inside the
+/// transaction well ahead of `ReviewRecord::validate`'s call to
+/// `check_independence` — so a verdict that is both a self-review and stale
+/// is refused as stale first. The independence check pre-existed this fix
+/// and ran first; moved it after staleness so a case failing both reasons
+/// reports the same one in both forms, which is the entire point of a
+/// preview. Caught by review round 1 of this exact card, on the fixture
+/// where a revoked handoff is also a self-review.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
     verdict: &Verdict,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
+    let (_, state) = load_card(&control, card_id)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
         code: ErrorCode::PreconditionNotFound,
     })?;
+    let scope = if verdict.decision == Decision::Approved {
+        HandoffScope::Whole
+    } else {
+        HandoffScope::Bindings
+    };
+    require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
     Ok(CommandOutcome::new(
         "review.record",
