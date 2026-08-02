@@ -47,6 +47,23 @@ pub enum Decision {
 }
 
 impl Decision {
+    /// What this decision did to the candidate, as a past-tense verb phrase.
+    ///
+    /// For messages that say what a review concluded about a candidate it can
+    /// no longer speak for. The staleness message used to open "review
+    /// approved candidate ..." whatever the decision was, which was harmless
+    /// while only approvals survived to be reported — and became the ordinary
+    /// output of `review inspect` once `F-028` let a non-approval outlive the
+    /// branch it was reached against.
+    #[must_use]
+    pub const fn reached_on(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "requested changes to",
+            Self::Blocked => "blocked",
+        }
+    }
+
     /// Its stable serialized name.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -251,7 +268,8 @@ impl ReviewRecord {
     ) -> Option<String> {
         if self.candidate_sha != candidate_sha {
             return Some(format!(
-                "review approved candidate {} but the branch is now {candidate_sha}",
+                "review {} candidate {} but the branch is now {candidate_sha}",
+                self.decision.reached_on(),
                 self.candidate_sha
             ));
         }
@@ -632,6 +650,39 @@ mod tests {
             &Digest::of_bytes(b"revised"),
             DEPENDENCIES_NOT_CHECKED
         ));
+    }
+
+    #[test]
+    fn staleness_says_what_the_review_actually_decided() {
+        // The message opened "review approved candidate ..." for every
+        // decision. Harmless while only approvals outlived their candidate —
+        // and `F-028` made a superseded `changes_requested` the ordinary
+        // output of `review inspect`, so the common case was a record stating
+        // the opposite of the verdict beside it.
+        let card = Digest::of_bytes(b"card");
+        let moved = "c".repeat(40);
+
+        for (decision, expected, forbidden) in [
+            (Decision::Approved, "approved candidate", "requested"),
+            (
+                Decision::ChangesRequested,
+                "requested changes to candidate",
+                "approved",
+            ),
+            (Decision::Blocked, "blocked candidate", "approved"),
+        ] {
+            let message = review(decision, vec![])
+                .staleness(&moved, &card, DEPENDENCIES_NOT_CHECKED)
+                .expect("a moved branch is stale");
+            assert!(
+                message.contains(expected),
+                "{decision:?} should say `{expected}`: {message}"
+            );
+            assert!(
+                !message.contains(forbidden),
+                "{decision:?} must not claim `{forbidden}`: {message}"
+            );
+        }
     }
 
     #[test]
