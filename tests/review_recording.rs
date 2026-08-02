@@ -326,20 +326,19 @@ fn an_active_card_with_no_handoff_at_all_cannot_be_reviewed() {
 }
 
 #[test]
-fn recording_a_verdict_does_not_yet_require_that_a_review_began() {
-    // A known gap, stated rather than discovered. `review record` has never
-    // checked that `review begin` happened: a handoff that was created and then
-    // revoked, with no review round at any point, is enough to file a verdict.
+fn recording_a_verdict_now_requires_that_a_review_began() {
+    // Closes the gap `recording_a_verdict_does_not_yet_require...` used to
+    // pin deliberately: `review record` previously never checked that
+    // `review begin` happened, so a handoff created and then revoked with no
+    // review round at any point was enough to file a verdict. Reachable
+    // through `blocked` and `changes_requested`, both of which `active`
+    // admits directly.
     //
-    // On the protected branch this already succeeds for `blocked`; permitting
-    // `active -> changes_requested` widens it to the second verdict. Closing it
-    // needs a durable signal that a review began for the current handoff, which
-    // is a lifecycle question rather than a staleness one and is filed as its
-    // own card. It is not an authority bypass — `check_independence` still
-    // refuses a reviewer who is the handoff actor.
-    //
-    // This test asserts the behaviour as it is so that closing the gap is a
-    // deliberate edit here, not a surprise failure somewhere else.
+    // The signal is a `review.begun` event tagged with the exact handoff id,
+    // which survives the state overwrite `handoff revoke` performs — the
+    // card's current state alone cannot answer whether a review ever began.
+    // Not an authority bypass: `check_independence` already refused a
+    // reviewer who is the handoff actor, unrelated to this.
     for decision in ["blocked", "changes_requested"] {
         let (workspace, _) = handed_off();
         workspace.handoff(&[
@@ -351,19 +350,94 @@ fn recording_a_verdict_does_not_yet_require_that_a_review_began() {
         ]);
 
         let path = verdict_file(&workspace, decision);
-        let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+        let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
         assert_eq!(
-            envelope["status"], "success",
-            "{decision} is recordable with no review round: this is the gap"
+            output.status.code(),
+            Some(5),
+            "{decision} must now be refused with no review round open"
         );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["error"]["code"], "CH-POLICY-REVIEW-NOT-BEGUN");
 
         let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
-        assert_eq!(
-            inspected["data"]["reviews"].as_array().unwrap().len(),
-            1,
-            "and it reaches the record"
+        assert!(
+            inspected["data"]["reviews"].as_array().unwrap().is_empty(),
+            "{decision}: a refused verdict must not reach the record"
         );
     }
+}
+
+#[test]
+fn an_approval_against_a_revoked_never_reviewed_handoff_still_reports_stale() {
+    // Review round 1 of this exact card: the new review-not-begun check
+    // originally ran unconditionally, ahead of staleness, for every
+    // decision. An approval can never legitimately reach this gap — Approved
+    // is only admitted from review_pending, which review begin is what
+    // reaches — but running the check anyway silently swapped the reported
+    // reason for the one case where both apply: revoked AND never reviewed.
+    // F-030 already established that an approval against a revoked handoff
+    // must report CH-POLICY-STALE-HANDOFF; this asserts that guarantee holds
+    // even when review never began at all, in both the real command and its
+    // dry-run preview.
+    let (workspace, _) = handed_off();
+    workspace.handoff(&[
+        "revoke",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "withdrawn before any review began",
+    ]);
+
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, body).unwrap();
+    let path = path.display().to_string();
+
+    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let preview = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--dry-run",
+    ]);
+    assert_eq!(error_code(&real), "CH-POLICY-STALE-HANDOFF");
+    assert_eq!(
+        error_code(&preview),
+        error_code(&real),
+        "the preview must refuse for the same reason as the real command"
+    );
+}
+
+#[test]
+fn a_dry_run_previews_the_review_not_begun_refusal() {
+    // Dry-run parity for the new check, in the same fixture as above.
+    let (workspace, _) = handed_off();
+    workspace.handoff(&[
+        "revoke",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "withdrawn before any review began",
+    ]);
+    let path = verdict_file(&workspace, "blocked");
+    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let preview = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--dry-run",
+    ]);
+    let real_env: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    let preview_env: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview_env["error"]["code"], real_env["error"]["code"],
+        "the preview must refuse for the same reason as the real command"
+    );
+    assert_eq!(real_env["error"]["code"], "CH-POLICY-REVIEW-NOT-BEGUN");
 }
 
 #[test]
