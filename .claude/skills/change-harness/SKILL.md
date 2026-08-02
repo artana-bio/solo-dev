@@ -163,6 +163,13 @@ recorded inconsistency — documented here as it is, not as it should be:
 | `integration review` | `--reviewer-actor-id` |
 | `acceptance record` | `--acceptance-owner` |
 
+`review begin`'s and `review record`'s own `--actor` are the generic
+"who ran this command" identity, same as every other row — they are
+**not** how the reviewer is identified. Self-review is refused by comparing
+the verdict's `reviewer_actor_id` against the handoff's `--actor` (from
+`handoff create`), two different flags on two different commands compared
+to each other; `review record`'s own `--actor` plays no part in it.
+
 `integration preflight` takes no actor at all. `work verify` and the
 read-only status commands (`cycle status`, `card status`, `gate list`) accept
 an optional `--actor` that defaults to `operator` — you may omit it.
@@ -263,7 +270,12 @@ the cycle builds from that exact commit.
 ### 3. Author and activate the card
 
 The card is the contract. Write the draft YAML completely — the deserializer
-rejects unknown fields, so use exactly these keys:
+rejects any key it does not know and requires every key below; it does not
+reject the ones left out of this example. `contract_reads`,
+`contract_changes`, `exclusive_resources`, and `generated_artifacts` are also
+valid keys, default to empty when omitted, and are not shown here for that
+reason — not because they do not exist. Declare `exclusive_resources` when
+ground rule 7 calls for it.
 
 ```yaml
 card_id: F-001
@@ -274,7 +286,7 @@ goal: >
 non_goals:
   - What this card deliberately does not do.
 risk: low            # low | medium | high | critical
-change_kind: feature # feature | fix
+change_kind: feature # a free string, not an enum — feature | fix by convention
 base_sha: <the cycle baseline, 40 hex>
 depends_on: []       # other card ids this builds on, if any
 write_scope:
@@ -439,7 +451,7 @@ findings:
   - severity: medium       # critical | high | medium | low
     location: src/thing.rs
     detail: What is wrong, concretely.
-    disposition: open      # open | resolved | accepted_risk | out_of_scope
+    disposition: open      # open | still_open | resolved | accepted_risk | out_of_scope
 gate_adequacy:
   gates_observe_acceptance: true
   unobserved_behaviors: []
@@ -453,6 +465,9 @@ Rules the harness enforces:
   clean approval; `changes_requested` requires at least one finding.
 - A **re-review may not silently drop a superseded review's open findings** —
   each must reappear at the same `location` with an explicit disposition.
+  `still_open` is for the common case that is neither settled nor new: worked
+  on, not yet closed. It accounts for the prior finding without claiming it
+  is resolved, and still blocks an approval exactly as `open` does.
 - An approval goes **stale** if the candidate changes or the card is revised;
   staleness is reported, and integration refuses stale members.
 
