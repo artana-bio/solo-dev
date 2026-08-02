@@ -49,10 +49,14 @@ one and the harness will usually refuse you later, at a worse moment.
    confirm the test actually fails; a test written immediately after its own
    implementation is a suspect, not a witness.
 7. **Check whether another session already owns the ground you are about to
-   cover.** `cycle status --cycle-id <id>` lists active cards before you
-   author a new one. Two sessions racing the same *file* is caught at
-   activation (`CH-POLICY-OWNERSHIP-OVERLAP`); two sessions racing the same
-   *issue* in different files is not caught by anything. Look first.
+   cover.** `integration ready --cycle-id <id>` reports every card in the
+   cycle with its current state, not only the ones ready to integrate — an
+   active or `review_pending` card there is someone's work in progress.
+   `cycle status` is not this check: its `card_ids` lists every card ever
+   activated, abandoned ones included, with no state attached. Two sessions
+   racing the same *file* is caught at activation
+   (`CH-POLICY-OWNERSHIP-OVERLAP`); two sessions racing the same *issue* in
+   different files is not caught by anything. Look first.
 8. **A claim about state you did not just read is not a fact.** Writing a
    decision-register row, a defect entry, or a review finding based on what
    you remember from an adjacent worktree or an earlier turn is how a false
