@@ -496,10 +496,10 @@ fn preview_record(
         reason: format!("card {card_id} has no handoff"),
         code: ErrorCode::PreconditionNotFound,
     })?;
-    require_review_begun(&EventStore::new(&control), card_id, &handoff.handoff_id)?;
     let scope = if verdict.decision == Decision::Approved {
         HandoffScope::Whole
     } else {
+        require_review_begun(&EventStore::new(&control), card_id, &handoff.handoff_id)?;
         HandoffScope::Bindings
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
@@ -592,10 +592,15 @@ fn require_current_handoff(
 /// this, `handoff create` followed immediately by `handoff revoke` left a
 /// verdict recordable with no review round at any point — reachable through
 /// `blocked` and `changes_requested`, both of which `active` admits directly.
-/// An approval cannot reach this gap the same way: `Approved` is only
-/// admitted from `review_pending`, so the transition table already refuses
-/// it; this still checks first so the reason it refuses is accurate rather
-/// than incidental.
+/// Called only for a non-approval. An approval cannot reach this gap the
+/// same way — `Approved` is only admitted from `review_pending`, which
+/// `review begin` is what reaches — and calling this unconditionally would
+/// change what an approval against a revoked, never-reviewed handoff
+/// reports: staleness (`CH-POLICY-STALE-HANDOFF`) already refuses that case
+/// correctly, and review round 1 found that running this check first there
+/// silently swapped the reported reason. A non-approval has no such
+/// structural guard, since `active` admits both `Blocked` and
+/// `ChangesRequested` directly.
 fn require_review_begun(
     events: &EventStore<'_>,
     card_id: &CardId,
@@ -639,7 +644,6 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
-            require_review_begun(events, &card_id, &handoff.handoff_id)?;
 
             // Only an approval answers the candidate question. A verdict that
             // found problems is a true statement about the candidate it was
@@ -666,6 +670,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let scope = if verdict.decision == Decision::Approved {
                 HandoffScope::Whole
             } else {
+                // An approval can never reach this gap: `Approved` is only
+                // admitted from `review_pending`, which `review begin` is
+                // what reaches. A non-approval has no such guarantee — both
+                // `active` successors it can land on are reachable directly
+                // from a handoff that was revoked before any review began.
+                require_review_begun(events, &card_id, &handoff.handoff_id)?;
                 HandoffScope::Bindings
             };
             require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;

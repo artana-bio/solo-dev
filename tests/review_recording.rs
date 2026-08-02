@@ -368,6 +368,49 @@ fn recording_a_verdict_now_requires_that_a_review_began() {
 }
 
 #[test]
+fn an_approval_against_a_revoked_never_reviewed_handoff_still_reports_stale() {
+    // Review round 1 of this exact card: the new review-not-begun check
+    // originally ran unconditionally, ahead of staleness, for every
+    // decision. An approval can never legitimately reach this gap — Approved
+    // is only admitted from review_pending, which review begin is what
+    // reaches — but running the check anyway silently swapped the reported
+    // reason for the one case where both apply: revoked AND never reviewed.
+    // F-030 already established that an approval against a revoked handoff
+    // must report CH-POLICY-STALE-HANDOFF; this asserts that guarantee holds
+    // even when review never began at all, in both the real command and its
+    // dry-run preview.
+    let (workspace, _) = handed_off();
+    workspace.handoff(&[
+        "revoke",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "withdrawn before any review began",
+    ]);
+
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, body).unwrap();
+    let path = path.display().to_string();
+
+    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let preview = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--dry-run",
+    ]);
+    assert_eq!(error_code(&real), "CH-POLICY-STALE-HANDOFF");
+    assert_eq!(
+        error_code(&preview),
+        error_code(&real),
+        "the preview must refuse for the same reason as the real command"
+    );
+}
+
+#[test]
 fn a_dry_run_previews_the_review_not_begun_refusal() {
     // Dry-run parity for the new check, in the same fixture as above.
     let (workspace, _) = handed_off();

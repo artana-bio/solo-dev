@@ -207,7 +207,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 80] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -280,6 +280,7 @@ impl ErrorCode {
         Self::PolicyOpenFindings,
         Self::PolicyIncompleteReview,
         Self::PolicyStaleHandoff,
+        Self::PolicyReviewNotBegun,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
