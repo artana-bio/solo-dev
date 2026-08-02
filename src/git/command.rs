@@ -28,8 +28,6 @@ const MAX_DIAGNOSTIC_LEN: usize = 512;
 pub struct GitOutput {
     /// Exit code, or `None` when the process was terminated by a signal.
     pub code: Option<i32>,
-    /// Standard output exactly as Git emitted it.
-    pub stdout_bytes: Vec<u8>,
     /// Captured standard output, lossily decoded.
     pub stdout: String,
     /// Captured standard error, lossily decoded.
@@ -292,7 +290,6 @@ where
     let output = command.output().map_err(HarnessError::GitUnavailable)?;
     Ok(GitOutput {
         code: output.status.code(),
-        stdout_bytes: output.stdout.clone(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })

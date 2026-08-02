@@ -322,6 +322,10 @@ impl ControlRepository {
             });
         }
 
+        // Validate the bytes in every entry this commit is allowed to stage
+        // before `git add` can write any blob into the object database.
+        refuse_non_text_control_files(&self.root)?;
+
         // `--all` within each named path, so a deletion inside one is staged as
         // well as an addition. Paths absent from disk are dropped first: `git
         // add` treats a pathspec matching nothing as a fatal error, and most of
@@ -335,14 +339,6 @@ impl ControlRepository {
             let mut stage: Vec<&str> = vec!["add", "--all", "--"];
             stage.extend_from_slice(&present);
             run_ok(&self.scope(), stage)?;
-        }
-        if let Err(refusal) = refuse_non_text_control_entries(&self.scope()) {
-            // The check runs after staging because the index is the exact
-            // object Git will commit. Reset only the index on refusal so the
-            // bad worktree content remains visible and the control repository
-            // can recover without carrying a rejected blob forward.
-            let _ = run(&self.scope(), ["reset", "-q"]);
-            return Err(refusal);
         }
         // Whether anything is *staged*, not whether the worktree is clean.
         // Staging is selective now, so residue outside the allowlist leaves the
@@ -385,39 +381,96 @@ impl ControlRepository {
     }
 }
 
-/// Refuses staged control entries that are not UTF-8 text.
+/// Refuses control entries that are not UTF-8 text before Git stages them.
 ///
-/// The control repository stores JSON and other text records. Reading the
-/// staged object through `GitOutput::stdout` would be unsafe because that field
-/// is a lossy UTF-8 projection; the raw bytes are the only authoritative input
-/// for this boundary. NUL is rejected separately because UTF-16LE ASCII text is
-/// technically valid UTF-8 with an embedded NUL after Git emits it, and that is
-/// the concrete encoding that bypassed the prior scanner.
-fn refuse_non_text_control_entries(scope: &GitScope) -> Result<(), HarnessError> {
-    let listed = run(scope, ["diff", "--cached", "--name-only", "-z"])?;
-    let names = std::str::from_utf8(&listed.stdout_bytes).map_err(|_| HarnessError::Control {
-        reason: "staged control path list is not valid UTF-8".to_owned(),
-        code: ErrorCode::PolicyControlEncoding,
+/// The control repository stores JSON and other text records. NUL is rejected
+/// separately because UTF-16LE ASCII text is technically valid UTF-8 with an
+/// embedded NUL, and that is the concrete encoding that bypassed the prior
+/// scanner. The caller supplies only [`CONTROL_TRACKED_PATHS`], preserving the
+/// existing intended-entry boundary without touching Git's object database.
+fn refuse_non_text_control_files(root: &Path) -> Result<(), HarnessError> {
+    for relative in CONTROL_TRACKED_PATHS {
+        let path = root.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => refuse_non_text_control_path(&path, relative)?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(HarnessError::ControlIo { path, source });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refuse_non_text_control_path(path: &Path, relative: &str) -> Result<(), HarnessError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| HarnessError::ControlIo {
+        path: path.to_path_buf(),
+        source,
     })?;
-    for relative in names.split('\0').filter(|name| !name.is_empty()) {
-        // A deletion has no staged blob to inspect.
-        let blob = run(scope, ["show", &format!(":{relative}")])?;
-        if !blob.success() {
-            continue;
+    let file_type = metadata.file_type();
+
+    if file_type.is_dir() {
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .map_err(|source| HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .collect::<Result<_, _>>()
+            .map_err(|source| HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| HarnessError::Control {
+                    reason: "a tracked control path is not valid UTF-8".to_owned(),
+                    code: ErrorCode::PolicyControlEncoding,
+                })?;
+            refuse_non_text_control_path(&entry.path(), &format!("{relative}/{name}"))?;
         }
-        let valid_utf8 = std::str::from_utf8(&blob.stdout_bytes).is_ok();
-        let has_nul = blob.stdout_bytes.contains(&0);
-        if !valid_utf8 || has_nul {
-            let reason = if valid_utf8 {
-                "contains embedded NUL bytes"
-            } else {
-                "is not valid UTF-8"
-            };
-            return Err(HarnessError::Control {
-                reason: format!("staged control entry `{relative}` {reason}"),
+        return Ok(());
+    }
+
+    let contents = if file_type.is_symlink() {
+        let target = fs::read_link(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        target
+            .to_str()
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!("control entry `{relative}` is not valid UTF-8"),
                 code: ErrorCode::PolicyControlEncoding,
-            });
-        }
+            })?
+            .as_bytes()
+            .to_vec()
+    } else if file_type.is_file() {
+        fs::read(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?
+    } else {
+        return Err(HarnessError::Control {
+            reason: format!("control entry `{relative}` is not a regular file"),
+            code: ErrorCode::PolicyControlEncoding,
+        });
+    };
+
+    let valid_utf8 = std::str::from_utf8(&contents).is_ok();
+    let has_nul = contents.contains(&0);
+    if !valid_utf8 || has_nul {
+        let reason = if valid_utf8 {
+            "contains embedded NUL bytes"
+        } else {
+            "is not valid UTF-8"
+        };
+        return Err(HarnessError::Control {
+            reason: format!("control entry `{relative}` {reason}"),
+            code: ErrorCode::PolicyControlEncoding,
+        });
     }
     Ok(())
 }

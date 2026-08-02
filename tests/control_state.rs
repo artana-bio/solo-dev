@@ -492,6 +492,25 @@ fn a_utf16_control_blob_is_refused_before_it_reaches_git_history() {
     let utf16le: Vec<u8> = contents.encode_utf16().flat_map(u16::to_le_bytes).collect();
     fs::create_dir_all(fixture.control.join("cards")).unwrap();
     fs::write(fixture.control.join("cards/utf16.json"), utf16le).unwrap();
+    let would_be_blob = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.control)
+        .args(["hash-object", "cards/utf16.json"])
+        .output()
+        .unwrap();
+    assert!(would_be_blob.status.success());
+    let would_be_blob = String::from_utf8_lossy(&would_be_blob.stdout)
+        .trim()
+        .to_owned();
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.control)
+            .args(["cat-file", "-e", &would_be_blob])
+            .status()
+            .unwrap()
+            .success()
+    );
 
     let output = Fixture::run(&[
         "cycle".into(),
@@ -516,6 +535,16 @@ fn a_utf16_control_blob_is_refused_before_it_reaches_git_history() {
         "the refusal must identify the policy: {rendered}"
     );
     assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.control)
+            .args(["cat-file", "-e", &would_be_blob])
+            .status()
+            .unwrap()
+            .success(),
+        "the rejected blob must not enter Git's object database"
+    );
     assert!(
         Command::new("git")
             .arg("-C")
