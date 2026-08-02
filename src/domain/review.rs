@@ -1032,6 +1032,22 @@ mod tests {
             .check_supersedes(&first)
             .expect("two entries answer for two findings");
         assert_eq!(split.open_findings().len(), 1, "and one is still open");
+
+        // Round 2 of this card's own review: supplying two entries and
+        // asserting they are accepted does not show the second was needed.
+        // Restoring existential accounting left this green until the negative
+        // half was added.
+        for lone in [Disposition::Resolved, Disposition::StillOpen] {
+            let single = re_review(
+                Decision::ChangesRequested,
+                vec![finding_at("src/a.rs:10", lone)],
+            );
+            let message = single.check_supersedes(&first).unwrap_err().to_string();
+            assert!(
+                message.contains("1 of 2 accounted for"),
+                "one {lone:?} entry cannot answer for two findings: {message}"
+            );
+        }
     }
 
     #[test]

@@ -515,6 +515,19 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
     );
     assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
 
+    // Which refusal it is matters. Round 2 of this card's own review dropped
+    // `StillOpen` from `blocks_approval` and this test stayed green: with the
+    // prior carried finding no longer counting as open, the invented-carry
+    // check refused the approval instead — a different rule, reaching the same
+    // error code. The code alone cannot tell them apart, so assert the reason.
+    let envelope: Value = serde_json::from_slice(&refused.stdout).expect("an error envelope");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("cannot approve with open findings"),
+        "the approval must be refused for the open finding, not by some other \
+         rule that happens to share the code: {message}"
+    );
+
     // The fixture has to be able to succeed, or the refusal proves nothing:
     // the same approval with the finding actually settled goes through.
     let settled = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class is closed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
