@@ -682,6 +682,61 @@ fn a_clean_filter_cannot_create_a_non_text_control_blob() {
     );
 }
 
+#[test]
+fn a_preexisting_index_lock_preserves_the_durable_index_during_promotion() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before = control.head().unwrap();
+    let durable_index = fixture.control.join(".git/index");
+    let before_index = fs::read(&durable_index).unwrap();
+    let index_lock = fixture.control.join(".git/index.lock");
+    fs::write(&index_lock, b"another writer owns this lock").unwrap();
+
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    let valid_bytes = b"{\"note\":\"must stay quarantined\"}\n";
+    fs::write(fixture.control.join("cards/locked.json"), valid_bytes).unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, valid_bytes);
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "an existing index lock must refuse"
+    );
+    assert_eq!(control.head().unwrap(), before, "HEAD must not advance");
+    assert_eq!(fs::read(&durable_index).unwrap(), before_index);
+    assert_eq!(
+        fs::read(&index_lock).unwrap(),
+        b"another writer owns this lock"
+    );
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "a lock refusal must not promote quarantine objects"
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.control)
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .unwrap()
+            .success(),
+        "a lock refusal must leave the durable index unstaged"
+    );
+}
+
 fn git_hash_object(repo: &Path, bytes: &[u8]) -> String {
     let mut child = Command::new("git")
         .arg("-C")

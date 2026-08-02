@@ -6,7 +6,7 @@
 
 use std::{
     ffi::OsStr,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
 };
@@ -339,6 +339,8 @@ impl ControlRepository {
             source,
         })?;
         let durable_index = self.root.join(".git/index");
+        let durable_index_lock = self.root.join(".git/index.lock");
+        let mut index_lock = DurableIndexLock::acquire(&durable_index_lock)?;
         let quarantine_index = quarantine.path().join("index");
         if durable_index.exists() {
             fs::copy(&durable_index, &quarantine_index).map_err(|source| {
@@ -390,13 +392,12 @@ impl ControlRepository {
             return Ok(None);
         }
         refuse_non_text_control_entries(&self.scope(), &quarantine_environment)?;
-        promote_quarantine_objects(&quarantine_objects, &durable_objects)?;
-        fs::rename(&quarantine_index, &durable_index).map_err(|source| {
-            HarnessError::ControlIo {
-                path: durable_index.clone(),
-                source,
-            }
-        })?;
+        index_lock.write_from(&quarantine_index)?;
+        let promoted_objects = promote_quarantine_objects(&quarantine_objects, &durable_objects)?;
+        if let Err(error) = index_lock.install(&durable_index) {
+            rollback_promoted_objects(&promoted_objects)?;
+            return Err(error);
+        }
         // This remains an invocation-level defence as well as the local
         // configuration set during initialization. An existing control
         // repository can have those local settings removed, and `project init`
@@ -484,18 +485,100 @@ fn refuse_non_text_control_bytes(relative: &str, contents: &[u8]) -> Result<(), 
     Ok(())
 }
 
-fn promote_quarantine_objects(source: &Path, destination: &Path) -> Result<(), HarnessError> {
+/// An exclusively-created Git index lock held for the duration of promotion.
+///
+/// The file is created before quarantine staging, so a pre-existing lock fails
+/// the operation before any durable object or index mutation. Dropping an
+/// uninstalled lock removes only the path this operation created.
+struct DurableIndexLock {
+    path: PathBuf,
+    file: Option<File>,
+    installed: bool,
+}
+
+impl DurableIndexLock {
+    fn acquire(path: &Path) -> Result<Self, HarnessError> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|source| HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            installed: false,
+        })
+    }
+
+    fn write_from(&mut self, source: &Path) -> Result<(), HarnessError> {
+        let contents = fs::read(source).map_err(|source_error| HarnessError::ControlIo {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+        let file = self.file.as_mut().expect("index lock file is held");
+        file.write_all(&contents)
+            .map_err(|source_error| HarnessError::ControlIo {
+                path: self.path.clone(),
+                source: source_error,
+            })?;
+        file.sync_all()
+            .map_err(|source_error| HarnessError::ControlIo {
+                path: self.path.clone(),
+                source: source_error,
+            })
+    }
+
+    fn install(mut self, destination: &Path) -> Result<(), HarnessError> {
+        if let Some(file) = self.file.take() {
+            file.sync_all().map_err(|source| HarnessError::ControlIo {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        fs::rename(&self.path, destination).map_err(|source| HarnessError::ControlIo {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        self.installed = true;
+        Ok(())
+    }
+}
+
+impl Drop for DurableIndexLock {
+    fn drop(&mut self) {
+        if !self.installed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn promote_quarantine_objects(
+    source: &Path,
+    destination: &Path,
+) -> Result<Vec<PathBuf>, HarnessError> {
     if !source.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     fs::create_dir_all(destination).map_err(|source_error| HarnessError::ControlIo {
         path: destination.to_path_buf(),
         source: source_error,
     })?;
-    promote_quarantine_tree(source, destination)
+    let mut promoted = Vec::new();
+    if let Err(error) = promote_quarantine_tree(source, destination, &mut promoted) {
+        rollback_promoted_objects(&promoted)?;
+        return Err(error);
+    }
+    Ok(promoted)
 }
 
-fn promote_quarantine_tree(source: &Path, destination: &Path) -> Result<(), HarnessError> {
+fn promote_quarantine_tree(
+    source: &Path,
+    destination: &Path,
+    promoted: &mut Vec<PathBuf>,
+) -> Result<(), HarnessError> {
     let metadata =
         fs::symlink_metadata(source).map_err(|source_error| HarnessError::ControlIo {
             path: source.to_path_buf(),
@@ -515,7 +598,11 @@ fn promote_quarantine_tree(source: &Path, destination: &Path) -> Result<(), Harn
                 path: source.to_path_buf(),
                 source: source_error,
             })?;
-            promote_quarantine_tree(&entry.path(), &destination.join(entry.file_name()))?;
+            promote_quarantine_tree(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                promoted,
+            )?;
         }
         return Ok(());
     }
@@ -544,6 +631,19 @@ fn promote_quarantine_tree(source: &Path, destination: &Path) -> Result<(), Harn
             path: destination.to_path_buf(),
             source: source_error,
         })?;
+        promoted.push(destination.to_path_buf());
+    }
+    Ok(())
+}
+
+fn rollback_promoted_objects(paths: &[PathBuf]) -> Result<(), HarnessError> {
+    for path in paths.iter().rev() {
+        if path.exists() {
+            fs::remove_file(path).map_err(|source| HarnessError::ControlIo {
+                path: path.clone(),
+                source,
+            })?;
+        }
     }
     Ok(())
 }
