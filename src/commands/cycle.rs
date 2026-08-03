@@ -29,6 +29,8 @@ pub enum CycleCommand {
     Create(CreateArgs),
     /// Freeze the cycle baseline and open it for cards.
     Activate(ActivateArgs),
+    /// Freeze the current card membership without stopping existing cards.
+    Seal(SealArgs),
     /// Declare a set of cards that must land together.
     DeclareGroup(DeclareGroupArgs),
     /// Report a cycle's derived status.
@@ -50,6 +52,7 @@ impl CycleCommand {
         match self {
             Self::Create(..) => "cycle.create",
             Self::Activate(..) => "cycle.activate",
+            Self::Seal(..) => "cycle.seal",
             Self::DeclareGroup(..) => "cycle.declare-group",
             Self::Status(..) => "cycle.status",
             Self::List(..) => "cycle.list",
@@ -94,6 +97,19 @@ pub struct ActivateArgs {
     #[command(flatten)]
     pub common: CommonArgs,
     /// The cycle to activate.
+    #[arg(long)]
+    pub cycle_id: String,
+    /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `cycle seal`.
+#[derive(Debug, Args)]
+pub struct SealArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The active cycle whose current membership will be frozen.
     #[arg(long)]
     pub cycle_id: String,
     /// Report planned mutations without performing them.
@@ -162,6 +178,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
     match command {
         CycleCommand::Create(args) => run_create(args, clock),
         CycleCommand::Activate(args) => run_activate(args, clock),
+        CycleCommand::Seal(args) => run_seal(args, clock),
         CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
         CycleCommand::Status(args) => run_status(args),
         CycleCommand::List(args) => run_list(args),
@@ -371,6 +388,101 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
                     "cycle_id": cycle_id.to_string(),
                     "status": CycleStatus::Active.name(),
                     "baseline_sha": baseline,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Freezes an active cycle's membership while allowing its existing cards to
+/// finish normal work and review. The event carries the complete immutable
+/// seal snapshot; the record's existing baseline and ordered members are not
+/// reinterpreted or migrated.
+fn run_seal(args: &SealArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+
+    if args.dry_run {
+        let control = ControlRepository::open(&args.common.control)?;
+        let cycle = load(&control, &cycle_id)?;
+        cycle.status.check_transition(CycleStatus::Sealed)?;
+        let baseline = cycle
+            .baseline_sha
+            .clone()
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!("cycle {cycle_id} cannot seal without a frozen baseline"),
+                code: ErrorCode::PolicyInvalidCycle,
+            })?;
+        return Ok(CommandOutcome::new(
+            "cycle.seal",
+            format!("Dry run: would seal cycle {cycle_id}; nothing was changed"),
+            serde_json::json!({
+                "dry_run": true,
+                "cycle_id": cycle_id.to_string(),
+                "status": CycleStatus::Sealed.name(),
+                "baseline_sha": baseline,
+                "card_ids": cycle.card_ids,
+            }),
+        ));
+    }
+
+    with_transaction(
+        &args.common.control,
+        "cycle.seal",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let mut cycle = load(control, &cycle_id)?;
+            let previous = cycle.status;
+            previous.check_transition(CycleStatus::Sealed)?;
+            let baseline = cycle
+                .baseline_sha
+                .clone()
+                .ok_or_else(|| HarnessError::Control {
+                    reason: format!("cycle {cycle_id} cannot seal without a frozen baseline"),
+                    code: ErrorCode::PolicyInvalidCycle,
+                })?;
+            let card_ids = cycle.card_ids.clone();
+            let config = control.project()?;
+
+            cycle.status = CycleStatus::Sealed;
+            store(control, &cycle)?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("cycle.sealed", &args.common.actor)
+                    .cycle(cycle_id.clone())
+                    .transition(Some(previous.name()), CycleStatus::Sealed.name())
+                    .head(baseline.clone())
+                    .meta("baseline_sha", serde_json::json!(baseline))
+                    .meta(
+                        "card_ids",
+                        serde_json::json!(
+                            card_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                        ),
+                    ),
+                clock,
+            )?;
+            control.commit(expected, &format!("cycle: seal {cycle_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "cycle.seal",
+                format!(
+                    "Sealed cycle {cycle_id}\nfrozen members: {}",
+                    if card_ids.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        card_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+                serde_json::json!({
+                    "cycle_id": cycle_id.to_string(),
+                    "status": CycleStatus::Sealed.name(),
+                    "baseline_sha": baseline,
+                    "card_ids": card_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 }),
             )
             .with_project(config.project_id.clone()))

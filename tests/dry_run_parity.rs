@@ -333,6 +333,23 @@ fn cycle_activate_previews_a_repeat_activation_refusal() {
 }
 
 #[test]
+fn cycle_seal_previews_a_repeat_seal_refusal_without_mutation() {
+    let workspace = active_cycle();
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+    let before = workspace.control_head();
+    assert_parity(
+        "cycle seal",
+        &workspace.cycle_raw(&["seal", "--cycle-id", "C-001"]),
+        &workspace.cycle_raw(&["seal", "--cycle-id", "C-001", "--dry-run"]),
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "refused previews must not mutate"
+    );
+}
+
+#[test]
 fn card_activate_previews_an_overlapping_scope_refusal() {
     let workspace = active_cycle();
     workspace.activate_card("F-001", &["src/**"]);

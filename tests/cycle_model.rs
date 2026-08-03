@@ -16,6 +16,18 @@ use change_harness::{
 use serde_json::Value;
 use support::Workspace;
 
+/// Creates a draft card without activating it, so cycle-membership tests can
+/// distinguish a preserved draft from an admitted member.
+fn create_draft_card(workspace: &Workspace, card_id: &str) {
+    let body = format!(
+        "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {}\nwrite_scope:\n  include: [\"src/{card_id}/**\"]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        workspace.authority_head(),
+    );
+    let path = workspace.root.join(format!("{card_id}.yaml"));
+    std::fs::write(&path, body).unwrap();
+    workspace.card(&["create", "--draft", &path.display().to_string()]);
+}
+
 #[test]
 fn create_records_a_draft_cycle_without_freezing_a_baseline() {
     let workspace = Workspace::initialized();
@@ -155,6 +167,91 @@ fn activation_freezes_one_exact_authority_baseline() {
         "the baseline must come from the authority, not the candidate"
     );
     assert_eq!(envelope["data"]["status"], "active");
+}
+
+#[test]
+fn sealing_freezes_membership_but_existing_members_can_keep_working() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Freeze one bounded set",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    create_draft_card(&workspace, "F-002");
+
+    let baseline = workspace.authority_head();
+    let sealed = workspace.cycle_json(&["seal", "--cycle-id", "C-001"]);
+    assert_eq!(sealed["data"]["status"], "sealed");
+    assert_eq!(sealed["data"]["baseline_sha"], baseline);
+    assert_eq!(sealed["data"]["card_ids"], serde_json::json!(["F-001"]));
+
+    let status = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(status["data"]["status"], "sealed");
+    assert_eq!(status["data"]["stored_status"], "sealed");
+    assert_eq!(status["data"]["card_ids"], serde_json::json!(["F-001"]));
+
+    let control = ControlRepository::open(&workspace.control).unwrap();
+    let cycle_id: CycleId = "C-001".parse().unwrap();
+    let events = EventStore::new(&control);
+    let sealed_event = events
+        .for_cycle(&cycle_id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "cycle.sealed")
+        .expect("seal event");
+    assert_eq!(sealed_event.previous_state.as_deref(), Some("active"));
+    assert_eq!(sealed_event.next_state.as_deref(), Some("sealed"));
+    assert_eq!(sealed_event.head_sha.as_deref(), Some(baseline.as_str()));
+    assert_eq!(sealed_event.metadata["baseline_sha"], baseline);
+    assert_eq!(
+        sealed_event.metadata["card_ids"],
+        serde_json::json!(["F-001"])
+    );
+
+    let activation = workspace.card_raw(&["activate", "--card-id", "F-002"]);
+    assert_eq!(activation.status.code(), Some(5));
+    let envelope: Value = serde_json::from_slice(&activation.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(
+        workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["card_ids"],
+        serde_json::json!(["F-001"]),
+        "a rejected activation cannot grow a sealed cycle"
+    );
+
+    workspace.work(&["start", "--card-id", "F-001"]);
+}
+
+#[test]
+fn only_active_cycles_can_be_sealed() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "A draft is not sealable",
+    ]);
+    let draft = workspace.cycle_raw(&["seal", "--cycle-id", "C-001"]);
+    assert_eq!(draft.status.code(), Some(5));
+    let draft_envelope: Value = serde_json::from_slice(&draft.stdout).unwrap();
+    assert_eq!(
+        draft_envelope["error"]["code"],
+        "CH-POLICY-INVALID-TRANSITION"
+    );
+
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+    let repeated = workspace.cycle_raw(&["seal", "--cycle-id", "C-001"]);
+    assert_eq!(repeated.status.code(), Some(5));
+    let repeated_envelope: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(
+        repeated_envelope["error"]["code"],
+        "CH-POLICY-INVALID-TRANSITION"
+    );
 }
 
 #[test]

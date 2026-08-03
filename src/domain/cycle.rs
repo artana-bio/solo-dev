@@ -32,6 +32,8 @@ pub enum CycleStatus {
     Draft,
     /// Baseline frozen; cards may be declared and worked.
     Active,
+    /// Card membership is frozen; existing cards may continue through work and review.
+    Sealed,
     /// Candidates are being combined.
     Integrating,
     /// The landing commit was accepted.
@@ -71,6 +73,7 @@ impl CycleStatus {
         match self {
             Self::Draft => "draft",
             Self::Active => "active",
+            Self::Sealed => "sealed",
             Self::Integrating => "integrating",
             Self::Accepted => "accepted",
             Self::Landed => "landed",
@@ -89,7 +92,13 @@ impl CycleStatus {
     pub fn successors(self) -> &'static [Self] {
         match self {
             Self::Draft => &[Self::Active, Self::Abandoned],
-            Self::Active => &[Self::Integrating, Self::Blocked, Self::Abandoned],
+            Self::Active => &[
+                Self::Sealed,
+                Self::Integrating,
+                Self::Blocked,
+                Self::Abandoned,
+            ],
+            Self::Sealed => &[Self::Integrating, Self::Blocked, Self::Abandoned],
             Self::Integrating => &[Self::Accepted, Self::Blocked, Self::Abandoned],
             Self::Accepted => &[Self::Landed, Self::Abandoned],
             Self::Landed => &[Self::Closed],
@@ -312,6 +321,7 @@ pub fn parse_status(name: &str) -> Option<CycleStatus> {
     Some(match name {
         "draft" => CycleStatus::Draft,
         "active" => CycleStatus::Active,
+        "sealed" => CycleStatus::Sealed,
         "integrating" => CycleStatus::Integrating,
         "accepted" => CycleStatus::Accepted,
         "landed" => CycleStatus::Landed,
@@ -349,6 +359,8 @@ mod tests {
     fn the_documented_transitions_are_permitted() {
         for (from, to) in [
             (CycleStatus::Draft, CycleStatus::Active),
+            (CycleStatus::Active, CycleStatus::Sealed),
+            (CycleStatus::Sealed, CycleStatus::Integrating),
             (CycleStatus::Active, CycleStatus::Integrating),
             (CycleStatus::Integrating, CycleStatus::Accepted),
             (CycleStatus::Accepted, CycleStatus::Landed),
@@ -399,6 +411,7 @@ mod tests {
     fn only_an_active_cycle_accepts_cards() {
         for status in [
             CycleStatus::Draft,
+            CycleStatus::Sealed,
             CycleStatus::Integrating,
             CycleStatus::Accepted,
             CycleStatus::Landed,

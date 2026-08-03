@@ -139,6 +139,17 @@ change-harness cycle activate --cycle-id C-001
 Activation freezes the authority baseline. Use that exact SHA as the card's
 base unless a fresh, explicit dependency workflow says otherwise.
 
+When the cycle's card set is complete, freeze that membership before preparing
+an integration:
+
+```bash
+change-harness cycle seal --cycle-id C-001
+```
+
+Sealing prevents new card activation in the cycle but does not stop existing
+cards from being worked, handed off, or reviewed. It is not authorization to
+integrate or promote.
+
 ### 3. Write a bounded card
 
 A card is a contract. It needs one observable outcome, a narrow scope, named
