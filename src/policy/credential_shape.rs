@@ -4,6 +4,17 @@
 
 const GITHUB_TOKEN_PREFIX: &[u8] = b"ghp_";
 const GITHUB_TOKEN_TAIL_LENGTH: usize = 36;
+const RSA_PRIVATE_KEY_PEM_HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
+
+/// Returns whether `contents` contains the exact RSA private-key PEM header as
+/// its own trimmed line. Inline prose that merely quotes the header is not the
+/// governed credential shape.
+#[must_use]
+pub(crate) fn contains_rsa_private_key_pem_header_line(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim() == RSA_PRIVATE_KEY_PEM_HEADER)
+}
 
 /// Returns whether `contents` contains a standalone `ghp_` value with the
 /// governed 36-character ASCII-alphanumeric tail.

@@ -19,7 +19,8 @@ use crate::{
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_and_environment, run_with_config_ok},
     policy::credential_shape::{
-        contains_standalone_github_token_shape, contains_underscore_delimited_github_token_shape,
+        contains_rsa_private_key_pem_header_line, contains_standalone_github_token_shape,
+        contains_underscore_delimited_github_token_shape,
     },
 };
 
@@ -610,16 +611,20 @@ fn inspect_complete_json_control_entry(
 
 fn contains_github_token_in_json_tree(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::String(text) => contains_standalone_github_token_shape(text.as_bytes()),
+        serde_json::Value::String(text) => contains_json_sensitive_shape(text),
         serde_json::Value::Array(values) => values.iter().any(contains_github_token_in_json_tree),
         serde_json::Value::Object(fields) => fields.iter().any(|(name, value)| {
-            contains_standalone_github_token_shape(name.as_bytes())
-                || contains_github_token_in_json_tree(value)
+            contains_json_sensitive_shape(name) || contains_github_token_in_json_tree(value)
         }),
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
             false
         }
     }
+}
+
+fn contains_json_sensitive_shape(text: &str) -> bool {
+    contains_standalone_github_token_shape(text.as_bytes())
+        || contains_rsa_private_key_pem_header_line(text)
 }
 
 fn json_inspection_refusal(relative: &str, recursion_limited: bool) -> HarnessError {
