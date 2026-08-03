@@ -16,7 +16,7 @@ use crate::{
         repository::ControlRepository,
     },
     domain::clock::Clock,
-    error::HarnessError,
+    error::{ErrorCode, HarnessError},
 };
 
 /// Records named boundaries within one operation.
@@ -123,6 +123,7 @@ where
     let journal = Journal::new(&control);
     journal.require_settled()?;
     control.validate_hygiene()?;
+    let before_control = control.snapshot_tracked_paths()?;
 
     let expected_head = control.head()?;
     let mut operation = journal.begin(command_name, expected_head.clone(), clock)?;
@@ -142,6 +143,14 @@ where
             Ok(outcome.with_operation(operation.operation_id.clone()))
         }
         Err(error) => {
+            let error = if error.code() == ErrorCode::PolicySensitiveValue {
+                match control.restore_tracked_paths(&before_control) {
+                    Ok(()) => error,
+                    Err(rollback_error) => rollback_error,
+                }
+            } else {
+                error
+            };
             // A failure that left the working tree clean wrote nothing, so it
             // does not need recovery. Recording the difference is what lets
             // `project recover` stay quiet about ordinary rejections.

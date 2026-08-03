@@ -977,6 +977,83 @@ fn an_external_sensitive_json_is_refused_before_cycle_transaction_state() {
 }
 
 #[test]
+fn a_sensitive_cycle_objective_rolls_back_before_failed_clean() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+    let before_objects = file_snapshot(&fixture.control.join(".git/objects"));
+    let before_cycles = file_snapshot(&fixture.control.join("cycles"));
+    let before_events = file_snapshot(&fixture.control.join("events"));
+
+    let args = |objective: &str| {
+        vec![
+            "cycle".into(),
+            "create".into(),
+            "--cycle-id".into(),
+            "C-001".into(),
+            "--objective".into(),
+            objective.to_owned(),
+            "--output".into(),
+            "json".into(),
+            "--control".into(),
+            fixture.control.display().to_string(),
+        ]
+    };
+
+    let refused = Fixture::run(&args(TOKEN));
+    let rendered = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(5), "{rendered}");
+    assert!(refused.stderr.is_empty());
+    assert!(rendered.contains("CH-POLICY-SENSITIVE-VALUE"));
+    assert!(rendered.contains("cycles/C-001.json:objective"));
+    assert!(!rendered.contains(TOKEN));
+    assert_eq!(control.head().unwrap(), before_head);
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join(".git/objects")),
+        before_objects
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("cycles")),
+        before_cycles
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("events")),
+        before_events
+    );
+    let journal = Journal::new(&control);
+    let records = journal.all().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.state == OperationState::FailedClean)
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.state != OperationState::FailedPartial)
+    );
+    assert!(journal.unresolved().unwrap().is_empty());
+
+    let retry = Fixture::run(&args("ordinary"));
+    assert!(
+        retry.status.success(),
+        "ordinary retry should succeed directly: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(fixture.control.join("cycles/C-001.json").exists());
+    assert!(fixture.control.join("events/E-000001.json").exists());
+    assert!(Journal::new(&control).unresolved().unwrap().is_empty());
+}
+
+#[test]
 fn an_rsa_private_key_header_line_is_refused_but_inline_prose_commits() {
     const HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
 

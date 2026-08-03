@@ -89,6 +89,17 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
 
 const MAX_JSON_INSPECTION_BYTES: usize = 4 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct ControlTrackedSnapshot {
+    entries: Vec<ControlTrackedEntry>,
+}
+
+#[derive(Debug)]
+enum ControlTrackedEntry {
+    Directory(PathBuf),
+    File(PathBuf, Vec<u8>),
+}
+
 /// A control repository on disk.
 #[derive(Clone, Debug)]
 pub struct ControlRepository {
@@ -426,6 +437,59 @@ impl ControlRepository {
             .is_empty())
     }
 
+    /// Captures the exact files and directories under the tracked control paths.
+    ///
+    /// This bounded snapshot is used only to undo a commit-time sensitive-value
+    /// refusal after a transaction has authored its intended records.
+    pub(crate) fn snapshot_tracked_paths(&self) -> Result<ControlTrackedSnapshot, HarnessError> {
+        let mut entries = Vec::new();
+        for relative in CONTROL_TRACKED_PATHS {
+            let path = self.path(relative);
+            if path.exists() {
+                snapshot_tracked_tree(&path, PathBuf::from(relative), &mut entries)?;
+            }
+        }
+        Ok(ControlTrackedSnapshot { entries })
+    }
+
+    /// Restores a prior snapshot of the tracked control paths.
+    ///
+    /// Journal files are intentionally outside this bounded restore: the
+    /// transaction records the refusal as `FailedClean` after the authored
+    /// control records have been removed.
+    pub(crate) fn restore_tracked_paths(
+        &self,
+        snapshot: &ControlTrackedSnapshot,
+    ) -> Result<(), HarnessError> {
+        for relative in CONTROL_TRACKED_PATHS {
+            remove_tracked_path(&self.path(relative))?;
+        }
+        for entry in &snapshot.entries {
+            if let ControlTrackedEntry::Directory(relative) = entry {
+                fs::create_dir_all(self.root.join(relative)).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: self.root.join(relative),
+                        source,
+                    }
+                })?;
+            }
+        }
+        for entry in &snapshot.entries {
+            if let ControlTrackedEntry::File(relative, contents) = entry {
+                let path = self.root.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+                }
+                fs::write(&path, contents)
+                    .map_err(|source| HarnessError::ControlIo { path, source })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validates current control worktree content in a quarantine without
     /// promoting its index or objects.
     ///
@@ -721,6 +785,81 @@ fn refuse_non_text_control_bytes(relative: &str, contents: &[u8]) -> Result<(), 
             reason: format!("control entry `{relative}` {reason}"),
             code: ErrorCode::PolicyControlEncoding,
         });
+    }
+    Ok(())
+}
+
+fn snapshot_tracked_tree(
+    path: &Path,
+    relative: PathBuf,
+    entries: &mut Vec<ControlTrackedEntry>,
+) -> Result<(), HarnessError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| HarnessError::ControlIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        entries.push(ControlTrackedEntry::Directory(relative.clone()));
+        let children = fs::read_dir(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        for child in children {
+            let child = child.map_err(|source| HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            snapshot_tracked_tree(&child.path(), relative.join(child.file_name()), entries)?;
+        }
+    } else if metadata.is_file() {
+        let contents = fs::read(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        entries.push(ControlTrackedEntry::File(relative, contents));
+    } else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "tracked control path `{}` is not a file or directory",
+                path.display()
+            ),
+            code: ErrorCode::PolicyControlEncoding,
+        });
+    }
+    Ok(())
+}
+
+fn remove_tracked_path(path: &Path) -> Result<(), HarnessError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.is_dir() {
+        for child in fs::read_dir(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            let child = child.map_err(|source| HarnessError::ControlIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            remove_tracked_path(&child.path())?;
+        }
+        fs::remove_dir(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else {
+        fs::remove_file(path).map_err(|source| HarnessError::ControlIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
     }
     Ok(())
 }
