@@ -16,7 +16,10 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        gate::{load_compatibility_request, receipts_for},
+        gate::{
+            load_compatibility_request, read_integration_compatibility_request, receipts_for,
+            receipts_for_integration_verification,
+        },
         review::reviews_for,
     },
     control::{event_store::EventStore, repository::ControlRepository},
@@ -28,7 +31,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
-    policy::receipt_compatibility::{CompatibilityDecision, evaluate},
+    policy::receipt_compatibility::{IntegrationCompatibilityRequestV1, evaluate},
     runner::receipt::ProvenanceSubject,
 };
 
@@ -301,7 +304,51 @@ fn audit_compatibility(
     control: &ControlRepository,
     cycle: &CycleRecord,
     path: &PathBuf,
-) -> Result<CompatibilityDecision, HarnessError> {
+) -> Result<serde_json::Value, HarnessError> {
+    let raw = std::fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read receipt compatibility request {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let envelope: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!(
+                "receipt compatibility request {} is malformed: {source}",
+                path.display()
+            ),
+            code: ErrorCode::ConfigMalformed,
+        })?;
+    if envelope["expected"]["subject"]["kind"] == "integration" {
+        let request: IntegrationCompatibilityRequestV1 =
+            serde_json::from_value(envelope).map_err(|source| HarnessError::Control {
+                reason: format!(
+                    "integration compatibility request {} is malformed: {source}",
+                    path.display()
+                ),
+                code: ErrorCode::ConfigMalformed,
+            })?;
+        if request.context.cycle_id != cycle.cycle_id {
+            return Err(HarnessError::Control {
+                reason: "integration compatibility request names a different cycle".to_owned(),
+                code: ErrorCode::ConfigInvalidValue,
+            });
+        }
+        let record = crate::commands::integration::load_integration(
+            control,
+            &request.context.integration_id,
+        )?;
+        let (verification, receipts) =
+            receipts_for_integration_verification(control, &request.context.integration_id)?;
+        return serde_json::to_value(read_integration_compatibility_request(
+            path,
+            &record,
+            &verification,
+            &receipts,
+        )?)
+        .map_err(Into::into);
+    }
     let request = load_compatibility_request(path)?;
     let ProvenanceSubject::Card { card_id, .. } = &request.expected.subject else {
         return Err(HarnessError::Control {
@@ -318,7 +365,7 @@ fn audit_compatibility(
             code: ErrorCode::ConfigInvalidValue,
         });
     }
-    Ok(evaluate(&request, &receipts_for(control, card_id)?))
+    serde_json::to_value(evaluate(&request, &receipts_for(control, card_id)?)).map_err(Into::into)
 }
 
 /// Renders the human-readable report.

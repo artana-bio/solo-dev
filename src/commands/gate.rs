@@ -666,6 +666,11 @@ pub fn receipts_for(
 /// A final-integration reuse decision must never search all receipts by gate
 /// name: a same-named receipt outside this verification proves a different
 /// landing state. The verification record is the authoritative inventory.
+///
+/// # Errors
+///
+/// Returns an error when the verification is absent or malformed, a named
+/// receipt cannot be read, or a named receipt belongs to another subject.
 pub fn receipts_for_integration_verification(
     control: &ControlRepository,
     integration_id: &IntegrationId,
@@ -1253,7 +1258,7 @@ fn run_integration_status(
     .with_project(config.project_id))
 }
 
-fn read_integration_compatibility_request(
+pub(crate) fn read_integration_compatibility_request(
     path: &PathBuf,
     record: &crate::domain::integration::IntegrationRecord,
     verification: &crate::domain::integration::VerificationRecord,
