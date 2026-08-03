@@ -757,6 +757,123 @@ fn incomplete_staged_json_is_refused_without_durable_state_or_payload_leak() {
 }
 
 #[test]
+fn a_nested_escaped_github_token_is_refused_before_durability() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    const ESCAPED_TOKEN: &str = "\\u0067hp_0123456789abcdef0123456789abcdef0123";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+
+    let contents = format!(r#"{{"outer":[{{"inner":{{"note":"{ESCAPED_TOKEN}"}}}}]}}"#);
+    assert!(!contents.contains(TOKEN));
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/escaped-nested.json"),
+        contents.as_bytes(),
+    )
+    .unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "decoded escaped token became a durable Git object"
+    );
+    assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(
+        rendered.contains("CH-POLICY-SENSITIVE-VALUE"),
+        "the refusal must identify the existing token policy: {rendered}"
+    );
+    assert!(!rendered.contains(TOKEN));
+    assert_eq!(control.head().unwrap(), before_head);
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index
+    );
+}
+
+#[test]
+fn a_json_recursion_limit_refusal_names_the_path_without_payload_leak() {
+    const PAYLOAD: &str = "recursion-json-control-sentinel";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+
+    let mut contents = String::new();
+    for _ in 0..150 {
+        contents.push('[');
+    }
+    contents.push('"');
+    contents.push_str(PAYLOAD);
+    contents.push('"');
+    for _ in 0..150 {
+        contents.push(']');
+    }
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/recursion-limit.json"),
+        contents.as_bytes(),
+    )
+    .unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+    assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(rendered.contains("CH-POLICY-CONTROL-JSON-INSPECTION"));
+    assert!(rendered.contains("cards/recursion-limit.json"));
+    assert!(rendered.contains("recursion limit"));
+    assert!(!rendered.contains(PAYLOAD));
+    assert_eq!(control.head().unwrap(), before_head);
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index
+    );
+}
+
+#[test]
 fn a_split_index_refusal_does_not_create_or_change_shared_indexes() {
     let fixture = Fixture::new();
     assert!(fixture.init().status.success());

@@ -490,14 +490,16 @@ fn refuse_non_text_control_entries(
         let blob = run_with_config_and_environment(scope, overrides, environment, ["show", &spec])?;
         if blob.success() {
             refuse_non_text_control_bytes(relative, &blob.stdout_bytes)?;
-            if Path::new(relative)
+            let contains_sensitive_value = if Path::new(relative)
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
             {
-                inspect_complete_json_control_entry(relative, &blob.stdout_bytes)?;
-            }
-            if contains_standalone_github_token_shape(&blob.stdout_bytes) {
+                inspect_complete_json_control_entry(relative, &blob.stdout_bytes)?
+            } else {
+                contains_standalone_github_token_shape(&blob.stdout_bytes)
+            };
+            if contains_sensitive_value {
                 return Err(HarnessError::Control {
                     reason: format!("control entry `{relative}` contains a sensitive value"),
                     code: ErrorCode::PolicySensitiveValue,
@@ -514,16 +516,42 @@ fn refuse_non_text_control_entries(
 fn inspect_complete_json_control_entry(
     relative: &str,
     contents: &[u8],
-) -> Result<(), HarnessError> {
-    if contents.len() > MAX_JSON_INSPECTION_BYTES
-        || serde_json::from_slice::<serde_json::Value>(contents).is_err()
-    {
-        return Err(HarnessError::Control {
-            reason: format!("control entry `{relative}` could not be completely inspected as JSON"),
-            code: ErrorCode::PolicyControlJsonInspection,
-        });
+) -> Result<bool, HarnessError> {
+    if contents.len() > MAX_JSON_INSPECTION_BYTES {
+        return Err(json_inspection_refusal(relative, false));
     }
-    Ok(())
+    let tree = serde_json::from_slice::<serde_json::Value>(contents).map_err(|error| {
+        json_inspection_refusal(relative, error.to_string().contains("recursion limit"))
+    })?;
+    Ok(contains_github_token_in_json_tree(&tree))
+}
+
+fn contains_github_token_in_json_tree(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => contains_standalone_github_token_shape(text.as_bytes()),
+        serde_json::Value::Array(values) => values.iter().any(contains_github_token_in_json_tree),
+        serde_json::Value::Object(fields) => fields.iter().any(|(name, value)| {
+            contains_standalone_github_token_shape(name.as_bytes())
+                || contains_github_token_in_json_tree(value)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn json_inspection_refusal(relative: &str, recursion_limited: bool) -> HarnessError {
+    let reason = if recursion_limited {
+        format!(
+            "control entry `{relative}` could not be completely inspected as JSON: recursion limit"
+        )
+    } else {
+        format!("control entry `{relative}` could not be completely inspected as JSON")
+    };
+    HarnessError::Control {
+        reason,
+        code: ErrorCode::PolicyControlJsonInspection,
+    }
 }
 
 fn refuse_non_text_control_bytes(relative: &str, contents: &[u8]) -> Result<(), HarnessError> {
