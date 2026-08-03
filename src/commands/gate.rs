@@ -74,6 +74,8 @@ pub enum GateCommand {
     Reserve(ReserveArgs),
     /// Record the terminal outcome of an exact validation reservation.
     Settle(SettleArgs),
+    /// Explicitly abandon one expired reservation held by this actor.
+    Abandon(AbandonArgs),
     /// Execute a fixed mutation campaign under one exact reservation.
     Mutate(MutateArgs),
     /// Show the deterministic validation stages for an activated card.
@@ -98,6 +100,7 @@ impl GateCommand {
             Self::Run(..) => "gate.run",
             Self::Reserve(..) => "gate.reserve",
             Self::Settle(..) => "gate.settle",
+            Self::Abandon(..) => "gate.abandon",
             Self::Mutate(..) => "gate.mutate",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
@@ -173,6 +176,16 @@ pub struct SettleArgs {
     /// Terminal non-receipt outcome: `failed` or `abandoned`.
     #[arg(long)]
     pub outcome: Option<String>,
+}
+
+/// Arguments accepted by `gate abandon`.
+#[derive(Debug, Args)]
+pub struct AbandonArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The expired reservation being explicitly abandoned.
+    #[arg(long)]
+    pub reservation_id: String,
 }
 
 /// Arguments accepted by `gate preflight`.
@@ -258,6 +271,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::Run(args) => run_gate(args, clock),
         GateCommand::Reserve(args) => run_reserve(args, clock),
         GateCommand::Settle(args) => run_settle(args, clock),
+        GateCommand::Abandon(args) => run_abandon(args, clock),
         GateCommand::Mutate(args) => run_mutate(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
@@ -1147,6 +1161,36 @@ fn next_reservation_id(
     format!("VR-{:06}", highest + 1).parse()
 }
 
+fn newest_matching_reservation(
+    control: &ControlRepository,
+    key: &ValidationReservationKeyV1,
+    key_digest: &Digest,
+) -> Result<Option<ValidationReservationRecord>, HarnessError> {
+    Ok(reservations_for(control)?
+        .into_iter()
+        .filter(|record| record.key_digest == *key_digest && record.key == *key)
+        .max_by_key(|record| record.generation))
+}
+
+fn retry_lineage(
+    control: &ControlRepository,
+    record: Option<&ValidationReservationRecord>,
+    clock: &dyn Clock,
+) -> Result<Option<(u32, ValidationReservationId)>, HarnessError> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let Some(settlement) = settlement_for(control, record)? else {
+        return Ok(None);
+    };
+    if reservation_is_expired(record, clock)
+        && settlement.outcome == ValidationReservationOutcome::Abandoned
+    {
+        return Ok(Some((record.generation + 1, record.reservation_id.clone())));
+    }
+    Ok(None)
+}
+
 fn settlement_for(
     control: &ControlRepository,
     reservation: &ValidationReservationRecord,
@@ -1563,6 +1607,75 @@ fn run_settle(args: &SettleArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     )
 }
 
+fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
+    with_transaction(
+        &args.common.control,
+        "gate.abandon",
+        clock,
+        |control, events, expected, steps| {
+            let config = control.project()?;
+            let reservation = reservations_for(control)?
+                .into_iter()
+                .find(|record| record.reservation_id == reservation_id)
+                .ok_or_else(|| HarnessError::Control {
+                    reason: format!("validation reservation {reservation_id} does not exist"),
+                    code: ErrorCode::PreconditionNotFound,
+                })?;
+            if reservation.holder_actor_id != args.common.actor
+                || settlement_for(control, &reservation)?.is_some()
+                || !reservation_is_expired(&reservation, clock)
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "only the original holder may abandon an expired live reservation {reservation_id}"
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            let settlement = ValidationReservationSettlementRecord {
+                schema: VALIDATION_RESERVATION_SETTLEMENT_SCHEMA.to_owned(),
+                reservation_id: reservation_id.clone(),
+                reservation_key_digest: reservation.key_digest.clone(),
+                holder_actor_id: reservation.holder_actor_id.clone(),
+                settled_by_actor_id: args.common.actor.clone(),
+                settled_at: clock.now(),
+                outcome: ValidationReservationOutcome::Abandoned,
+            };
+            steps.at("reservation-settlement-write")?;
+            control.write_atomic(
+                &ValidationReservationSettlementRecord::relative_path(&reservation_id),
+                &format!("{}\n", serde_json::to_string_pretty(&settlement)?),
+            )?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("validation.reservation_abandoned", &args.common.actor)
+                    .cycle(reservation.key.cycle_id.clone())
+                    .card(
+                        reservation.key.card_id.clone(),
+                        reservation.key.card_revision,
+                        reservation.key.card_digest.clone(),
+                    )
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(reservation_id.to_string()),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("gate: abandon validation reservation {reservation_id}"),
+            )?;
+            Ok(CommandOutcome::new(
+                "gate.abandon",
+                format!("Abandoned expired validation reservation {reservation_id}"),
+                serde_json::json!({ "settlement": settlement }),
+            )
+            .with_project(config.project_id))
+        },
+    )
+}
+
 fn reservation_outcome(
     disposition: &str,
     record: &ValidationReservationRecord,
@@ -1635,21 +1748,24 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
             false,
         )?;
         let key_digest = key.digest()?;
-        if let Some(record) = reservations_for(&control)?
-            .into_iter()
-            .find(|record| record.key_digest == key_digest && record.key == key)
-        {
-            if let Some(settlement) = settlement_for(&control, &record)? {
-                return Ok(settled_reservation_outcome(&record, &settlement, true));
+        let prior = newest_matching_reservation(&control, &key, &key_digest)?;
+        if let Some(record) = &prior {
+            if let Some(settlement) = settlement_for(&control, record)?
+                && retry_lineage(&control, Some(record), clock)?.is_none()
+            {
+                return Ok(settled_reservation_outcome(record, &settlement, true));
             }
-            if reservation_is_expired(&record, clock) {
+            if settlement_for(&control, record)?.is_none() && reservation_is_expired(record, clock)
+            {
                 return Ok(reservation_outcome(
                     "expired_recovery_required",
-                    &record,
+                    record,
                     true,
                 ));
             }
-            return Ok(reservation_outcome("wait_for_reserved_run", &record, true));
+            if settlement_for(&control, record)?.is_none() {
+                return Ok(reservation_outcome("wait_for_reserved_run", record, true));
+            }
         }
         let key = reservation_key(
             &control,
@@ -1672,6 +1788,10 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 now.unix_seconds() + 3600,
             )?,
             recovery_policy: "explicit_recovery_required".to_owned(),
+            generation: retry_lineage(&control, prior.as_ref(), clock)?
+                .map_or(1, |lineage| lineage.0),
+            predecessor_reservation_id: retry_lineage(&control, prior.as_ref(), clock)?
+                .map(|lineage| lineage.1),
         };
         return Ok(reservation_outcome("reserved", &record, true));
     }
@@ -1690,22 +1810,26 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 false,
             )?;
             let key_digest = key.digest()?;
-            if let Some(record) = reservations_for(control)?
-                .into_iter()
-                .find(|record| record.key_digest == key_digest && record.key == key)
-            {
-                if let Some(settlement) = settlement_for(control, &record)? {
-                    return Ok(settled_reservation_outcome(&record, &settlement, false)
+            let prior = newest_matching_reservation(control, &key, &key_digest)?;
+            if let Some(record) = &prior {
+                if let Some(settlement) = settlement_for(control, record)?
+                    && retry_lineage(control, Some(record), clock)?.is_none()
+                {
+                    return Ok(settled_reservation_outcome(record, &settlement, false)
                         .with_project(config.project_id));
                 }
-                if reservation_is_expired(&record, clock) {
+                if settlement_for(control, record)?.is_none()
+                    && reservation_is_expired(record, clock)
+                {
                     return Ok(
-                        reservation_outcome("expired_recovery_required", &record, false)
+                        reservation_outcome("expired_recovery_required", record, false)
                             .with_project(config.project_id),
                     );
                 }
-                return Ok(reservation_outcome("wait_for_reserved_run", &record, false)
-                    .with_project(config.project_id));
+                if settlement_for(control, record)?.is_none() {
+                    return Ok(reservation_outcome("wait_for_reserved_run", record, false)
+                        .with_project(config.project_id));
+                }
             }
             let key = reservation_key(
                 control,
@@ -1728,6 +1852,10 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                     now.unix_seconds() + 3600,
                 )?,
                 recovery_policy: "explicit_recovery_required".to_owned(),
+                generation: retry_lineage(control, prior.as_ref(), clock)?
+                    .map_or(1, |lineage| lineage.0),
+                predecessor_reservation_id: retry_lineage(control, prior.as_ref(), clock)?
+                    .map(|lineage| lineage.1),
             };
             steps.at("reservation-record-write")?;
             control.write_atomic(

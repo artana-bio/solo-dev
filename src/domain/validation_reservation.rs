@@ -94,6 +94,16 @@ pub struct ValidationReservationRecord {
     pub reserved_at: Timestamp,
     pub expires_at: Timestamp,
     pub recovery_policy: String,
+    /// Monotonic retry generation for one otherwise exact reservation key.
+    #[serde(default = "initial_generation")]
+    pub generation: u32,
+    /// Immutable predecessor when an expired abandoned reservation was retried.
+    #[serde(default)]
+    pub predecessor_reservation_id: Option<ValidationReservationId>,
+}
+
+const fn initial_generation() -> u32 {
+    1
 }
 
 impl ValidationReservationRecord {
