@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use tempfile::TempDir;
+
 use crate::{
     config::ProjectConfig,
     domain::clock::Clock,
@@ -89,6 +91,131 @@ const MAX_JSON_INSPECTION_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct ControlRepository {
     root: PathBuf,
+}
+
+/// A staged control view whose index and objects remain outside the durable
+/// repository until the caller explicitly promotes them.
+struct QuarantinedControl<'a> {
+    control: &'a ControlRepository,
+    _directory: TempDir,
+    quarantine_index: PathBuf,
+    quarantine_objects: PathBuf,
+    durable_index: PathBuf,
+    durable_objects: PathBuf,
+    index_lock: DurableIndexLock,
+}
+
+impl<'a> QuarantinedControl<'a> {
+    fn new(control: &'a ControlRepository) -> Result<Self, HarnessError> {
+        let directory = tempfile::tempdir_in(control.root.join(".git")).map_err(|source| {
+            HarnessError::ControlIo {
+                path: control.root.join(".git"),
+                source,
+            }
+        })?;
+        let quarantine_objects = directory.path().join("objects");
+        fs::create_dir_all(&quarantine_objects).map_err(|source| HarnessError::ControlIo {
+            path: quarantine_objects.clone(),
+            source,
+        })?;
+
+        let durable_index = control.root.join(".git/index");
+        let index_lock = DurableIndexLock::acquire(&control.root.join(".git/index.lock"))?;
+        let quarantine_index = directory.path().join("index");
+        if durable_index.exists() {
+            fs::copy(&durable_index, &quarantine_index).map_err(|source| {
+                HarnessError::ControlIo {
+                    path: durable_index.clone(),
+                    source,
+                }
+            })?;
+        }
+        let durable_objects = control.root.join(".git/objects");
+        let quarantine = Self {
+            control,
+            _directory: directory,
+            quarantine_index,
+            quarantine_objects,
+            durable_index,
+            durable_objects,
+            index_lock,
+        };
+        quarantine.materialize_index()?;
+        Ok(quarantine)
+    }
+
+    fn overrides() -> [OsString; 1] {
+        [OsString::from("core.splitIndex=false")]
+    }
+
+    fn environment(&self) -> [(&OsStr, &OsStr); 3] {
+        [
+            (
+                OsStr::new("GIT_INDEX_FILE"),
+                self.quarantine_index.as_os_str(),
+            ),
+            (
+                OsStr::new("GIT_OBJECT_DIRECTORY"),
+                self.quarantine_objects.as_os_str(),
+            ),
+            (
+                OsStr::new("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+                self.durable_objects.as_os_str(),
+            ),
+        ]
+    }
+
+    fn materialize_index(&self) -> Result<(), HarnessError> {
+        if !self.quarantine_index.exists() {
+            return Ok(());
+        }
+        let overrides = Self::overrides();
+        let environment = self.environment();
+        run_with_config_and_environment(
+            &self.control.scope(),
+            &overrides,
+            &environment,
+            ["update-index", "--no-split-index"],
+        )?
+        .require_success()?;
+        Ok(())
+    }
+
+    fn stage(&self) -> Result<(), HarnessError> {
+        let present: Vec<&str> = CONTROL_TRACKED_PATHS
+            .iter()
+            .copied()
+            .filter(|relative| self.control.path(relative).exists())
+            .collect();
+        if present.is_empty() {
+            return Ok(());
+        }
+        let mut stage: Vec<&str> = vec!["add", "--all", "--"];
+        stage.extend_from_slice(&present);
+        let overrides = Self::overrides();
+        let environment = self.environment();
+        run_with_config_and_environment(&self.control.scope(), &overrides, &environment, stage)?
+            .require_success()?;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> Result<bool, HarnessError> {
+        let overrides = Self::overrides();
+        let environment = self.environment();
+        Ok(run_with_config_and_environment(
+            &self.control.scope(),
+            &overrides,
+            &environment,
+            ["diff", "--cached", "--quiet"],
+        )?
+        .success())
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        let overrides = Self::overrides();
+        let environment = self.environment();
+        refuse_non_text_control_entries(&self.control.scope(), &overrides, &environment)
+    }
 }
 
 impl ControlRepository {
@@ -297,6 +424,26 @@ impl ControlRepository {
             .is_empty())
     }
 
+    /// Validates current control worktree content in a quarantine without
+    /// promoting its index or objects.
+    ///
+    /// This is the pre-journal guard. [`Self::commit`] repeats the same
+    /// validation after the command has staged its authoritative writes; that
+    /// commit-time check remains the final authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy or control I/O error when quarantine staging or
+    /// inspection fails.
+    pub fn validate_hygiene(&self) -> Result<(), HarnessError> {
+        let quarantine = QuarantinedControl::new(self)?;
+        quarantine.stage()?;
+        if !quarantine.is_empty()? {
+            quarantine.validate()?;
+        }
+        Ok(())
+    }
+
     /// Commits every pending change, requiring control state not to have moved.
     ///
     /// `expected_head` is a compare-and-swap: the caller states the commit it
@@ -332,94 +479,21 @@ impl ControlRepository {
         // we validate are exactly the bytes that would be committed. It runs
         // against a copied index and a quarantined object database; a refusal
         // therefore cannot leave a rejected blob in the durable repository.
-        let quarantine = tempfile::tempdir_in(self.root.join(".git")).map_err(|source| {
-            HarnessError::ControlIo {
-                path: self.root.join(".git"),
-                source,
-            }
-        })?;
-        let quarantine_objects = quarantine.path().join("objects");
-        fs::create_dir_all(&quarantine_objects).map_err(|source| HarnessError::ControlIo {
-            path: quarantine_objects.clone(),
-            source,
-        })?;
-        let durable_index = self.root.join(".git/index");
-        let durable_index_lock = self.root.join(".git/index.lock");
-        let mut index_lock = DurableIndexLock::acquire(&durable_index_lock)?;
-        let quarantine_index = quarantine.path().join("index");
-        if durable_index.exists() {
-            fs::copy(&durable_index, &quarantine_index).map_err(|source| {
-                HarnessError::ControlIo {
-                    path: durable_index.clone(),
-                    source,
-                }
-            })?;
-        }
-        let durable_objects = self.root.join(".git/objects");
-        let quarantine_environment = [
-            (OsStr::new("GIT_INDEX_FILE"), quarantine_index.as_os_str()),
-            (
-                OsStr::new("GIT_OBJECT_DIRECTORY"),
-                quarantine_objects.as_os_str(),
-            ),
-            (
-                OsStr::new("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
-                durable_objects.as_os_str(),
-            ),
-        ];
-        let quarantine_overrides = [OsString::from("core.splitIndex=false")];
-        if quarantine_index.exists() {
-            // A copied split index can make Git write a new sharedindex file
-            // beside the real repository even when GIT_INDEX_FILE is
-            // quarantined. Materialize a full quarantine index first; this
-            // command writes only the quarantine index path.
-            run_with_config_and_environment(
-                &self.scope(),
-                &quarantine_overrides,
-                &quarantine_environment,
-                ["update-index", "--no-split-index"],
-            )?
-            .require_success()?;
-        }
-
-        // `--all` within each named path, so a deletion inside one is staged as
-        // well as an addition. Paths absent from disk are dropped first: `git
-        // add` treats a pathspec matching nothing as a fatal error, and most of
-        // these do not exist until the lifecycle stage that creates them.
-        let present: Vec<&str> = CONTROL_TRACKED_PATHS
-            .iter()
-            .copied()
-            .filter(|relative| self.path(relative).exists())
-            .collect();
-        if !present.is_empty() {
-            let mut stage: Vec<&str> = vec!["add", "--all", "--"];
-            stage.extend_from_slice(&present);
-            run_with_config_and_environment(
-                &self.scope(),
-                &quarantine_overrides,
-                &quarantine_environment,
-                stage,
-            )?
-            .require_success()?;
-        }
-        // Whether anything is *staged*, not whether the worktree is clean.
-        // Staging is selective now, so residue outside the allowlist leaves the
-        // worktree permanently dirty; asking `is_clean` would send every commit
-        // into `git commit` with nothing staged, which fails.
-        let staged = run_with_config_and_environment(
-            &self.scope(),
-            &quarantine_overrides,
-            &quarantine_environment,
-            ["diff", "--cached", "--quiet"],
-        )?;
-        if staged.success() {
+        let quarantine = QuarantinedControl::new(self)?;
+        quarantine.stage()?;
+        if quarantine.is_empty()? {
             return Ok(None);
         }
-        refuse_non_text_control_entries(
-            &self.scope(),
-            &quarantine_overrides,
-            &quarantine_environment,
-        )?;
+        quarantine.validate()?;
+        let QuarantinedControl {
+            _directory,
+            quarantine_index,
+            quarantine_objects,
+            durable_index,
+            durable_objects,
+            mut index_lock,
+            ..
+        } = quarantine;
         index_lock.write_from(&quarantine_index)?;
         let promoted_objects = promote_quarantine_objects(&quarantine_objects, &durable_objects)?;
         if let Err(error) = index_lock.install(&durable_index) {

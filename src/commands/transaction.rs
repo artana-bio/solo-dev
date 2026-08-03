@@ -122,6 +122,7 @@ where
     let _lock = ProjectLock::acquire(control.root(), command_name, clock)?;
     let journal = Journal::new(&control);
     journal.require_settled()?;
+    control.validate_hygiene()?;
 
     let expected_head = control.head()?;
     let mut operation = journal.begin(command_name, expected_head.clone(), clock)?;

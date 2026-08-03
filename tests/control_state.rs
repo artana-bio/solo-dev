@@ -837,6 +837,95 @@ fn incomplete_staged_json_is_refused_without_durable_state_or_payload_leak() {
 }
 
 #[test]
+fn an_external_sensitive_json_is_refused_before_cycle_transaction_state() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+    let before_objects = file_snapshot(&fixture.control.join(".git/objects"));
+    let before_cycles = file_snapshot(&fixture.control.join("cycles"));
+    let before_events = file_snapshot(&fixture.control.join("events"));
+    let before_journal = file_snapshot(&fixture.control.join("journal"));
+
+    let contents = format!(
+        r#"{{"note":"{TOKEN}"}}
+"#
+    );
+    let external = fixture.control.join("cards/external-sensitive.json");
+    fs::create_dir_all(external.parent().unwrap()).unwrap();
+    fs::write(&external, contents.as_bytes()).unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let args = vec![
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ];
+    let refused = Fixture::run(&args);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    assert_eq!(refused.status.code(), Some(5), "policy refusal expected");
+    assert!(rendered.contains("CH-POLICY-SENSITIVE-VALUE"));
+    assert!(!rendered.contains(TOKEN));
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+    assert_eq!(
+        control.head().unwrap(),
+        before_head,
+        "HEAD must not advance"
+    );
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index,
+        "the durable index must remain unchanged"
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join(".git/objects")),
+        before_objects,
+        "durable objects must remain unchanged"
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("cycles")),
+        before_cycles,
+        "cycle files must not be authored"
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("events")),
+        before_events,
+        "event files must not be authored"
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("journal")),
+        before_journal,
+        "the journal inventory must remain unchanged"
+    );
+
+    fs::remove_file(&external).unwrap();
+    let retry = Fixture::run(&args);
+    assert!(
+        retry.status.success(),
+        "removing only the external file must allow the identical retry: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(fixture.control.join("cycles/C-001.json").exists());
+    assert!(Journal::new(&control).unresolved().unwrap().is_empty());
+}
+
+#[test]
 fn a_nested_escaped_github_token_is_refused_before_durability() {
     const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
     const ESCAPED_TOKEN: &str = "\\u0067hp_0123456789abcdef0123456789abcdef0123";
@@ -1128,6 +1217,34 @@ fn a_preexisting_index_lock_preserves_the_durable_index_during_promotion() {
             .success(),
         "a lock refusal must leave the durable index unstaged"
     );
+}
+
+fn file_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &Path, current: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                visit(root, &path, files);
+            } else if metadata.is_file() {
+                files.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    if root.exists() {
+        visit(root, root, &mut files);
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 fn git_hash_object(repo: &Path, bytes: &[u8]) -> String {
