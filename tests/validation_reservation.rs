@@ -237,3 +237,35 @@ fn a_corrupt_reservation_key_is_refused_without_creating_another_record() {
         1
     );
 }
+
+#[test]
+fn a_changed_project_policy_is_refused_before_it_can_reuse_a_reservation() {
+    let workspace = allocated();
+    reserve(&workspace, "first");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["validation_policy"]["proof_map_required_for"] = serde_json::json!(["low"]);
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+
+    let output = workspace.gate_raw(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.unit",
+        "--actor",
+        "second",
+    ]);
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(
+        fs::read_dir(workspace.control.join("validation-reservations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        1,
+        "a policy mismatch must refuse before it can create or consume another reservation"
+    );
+}
