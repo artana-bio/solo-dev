@@ -99,6 +99,73 @@ fn a_clean_cycle_reports_no_discrepancies() {
 }
 
 #[test]
+fn audit_projects_the_same_frozen_receipt_compatibility_decision_as_status() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Compatibility projection",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+
+    let preflight = workspace.gate_json(&["preflight", "--card-id", "F-001"]);
+    let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
+    let receipt = status["data"]["receipts"][0].clone();
+    let request = serde_json::json!({
+        "plan": {
+            "schema": preflight["data"]["schema"],
+            "card_revision": preflight["data"]["card_revision"],
+            "card_digest": preflight["data"]["card_digest"],
+            "base_sha": preflight["data"]["base_sha"],
+            "risk": preflight["data"]["risk"],
+            "policy_digest": preflight["data"]["policy_digest"],
+            "proof_map_digest": preflight["data"]["proof_map_digest"],
+            "stages": preflight["data"]["stages"],
+            "next_permitted_stage": preflight["data"]["next_permitted_stage"],
+        },
+        "stage": "narrow",
+        "check": preflight["data"]["stages"][0]["checks"][0],
+        "expected": receipt["provenance"],
+    });
+    let request_path = workspace.root.join("compatibility-request.json");
+    fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let status_projection = workspace.gate_json(&[
+        "status",
+        "--card-id",
+        "F-001",
+        "--compatibility-request",
+        request_path.to_str().unwrap(),
+    ]);
+    let audit = Workspace::run(&[
+        "audit".into(),
+        "cycle".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--compatibility-request".into(),
+        request_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        audit.status.success(),
+        "audit failed: {}",
+        String::from_utf8_lossy(&audit.stdout)
+    );
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(
+        audit["data"]["receipt_compatibility"], status_projection["data"]["receipt_compatibility"],
+        "status and audit must expose the exact same read-only compatibility decision"
+    );
+}
+
+#[test]
 fn the_timeline_reconstructs_the_cycle_in_order() {
     let workspace = completed();
     let envelope = audit_json(&workspace, "C-001");

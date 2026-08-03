@@ -10,4 +10,5 @@ pub mod convergence;
 pub mod credential_shape;
 pub mod paths;
 pub mod progressive_validation;
+pub mod receipt_compatibility;
 pub mod verification;

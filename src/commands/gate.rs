@@ -24,7 +24,10 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
-    policy::progressive_validation::{ValidationProgress, plan, progress, stages_before_satisfied},
+    policy::{
+        progressive_validation::{ValidationProgress, plan, progress, stages_before_satisfied},
+        receipt_compatibility::{CompatibilityDecision, CompatibilityRequest, evaluate},
+    },
     runner::{
         environment_fingerprint,
         receipt::{
@@ -109,6 +112,10 @@ pub struct StatusArgs {
     /// The card to report on.
     #[arg(long)]
     pub card_id: String,
+    /// A frozen, privacy-safe compatibility request to evaluate against the
+    /// card's stored receipts. This is read-only and never authorizes work.
+    #[arg(long)]
+    pub compatibility_request: Option<PathBuf>,
 }
 
 /// Arguments shared by registry subcommands.
@@ -1076,6 +1083,11 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let config = control.project()?;
     let (record, _state) = load_card(&control, &card_id)?;
     let receipts = receipts_for(&control, &card_id)?;
+    let compatibility = args
+        .compatibility_request
+        .as_ref()
+        .map(|path| read_compatibility_request(path, &card_id, &receipts))
+        .transpose()?;
 
     let candidate = held_lease(&control, &card_id)?.and_then(|lease| {
         inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD").ok()
@@ -1086,6 +1098,16 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         candidate.as_deref().unwrap_or("no allocation"),
         receipts.len()
     );
+    if let Some(decision) = &compatibility {
+        let _ = write!(
+            text,
+            "\nreceipt compatibility: {}",
+            match decision.disposition {
+                crate::policy::receipt_compatibility::CompatibilityDisposition::CompatibleReuse { .. } => "compatible_reuse",
+                crate::policy::receipt_compatibility::CompatibilityDisposition::RerunRequired { .. } => "rerun_required",
+            }
+        );
+    }
 
     let mut summary = Vec::new();
     for gate_id in &record.named_gates.feature {
@@ -1145,9 +1167,63 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "candidate_sha": candidate,
             "feature_gates": summary,
             "receipts": receipts,
+            "receipt_compatibility": compatibility,
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// Reads one frozen consumer context used only to explain receipt reuse.
+///
+/// The request is deliberately supplied rather than inferred from a prior
+/// receipt: inferring environment, fixture, cache, or trust context from the
+/// evidence being judged would make stale evidence look current.
+pub(crate) fn read_compatibility_request(
+    path: &PathBuf,
+    card_id: &CardId,
+    receipts: &[Receipt],
+) -> Result<CompatibilityDecision, HarnessError> {
+    let request = load_compatibility_request(path)?;
+    let crate::runner::receipt::ProvenanceSubject::Card {
+        card_id: expected_card,
+        ..
+    } = &request.expected.subject
+    else {
+        return Err(HarnessError::Control {
+            reason: "receipt compatibility request for gate status must name a card subject"
+                .to_owned(),
+            code: ErrorCode::ConfigInvalidValue,
+        });
+    };
+    if expected_card != card_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "receipt compatibility request names card {expected_card}, not {card_id}"
+            ),
+            code: ErrorCode::ConfigInvalidValue,
+        });
+    }
+    Ok(evaluate(&request, receipts))
+}
+
+/// Loads the frozen read-only context used by status and audit projections.
+pub(crate) fn load_compatibility_request(
+    path: &PathBuf,
+) -> Result<CompatibilityRequest, HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read receipt compatibility request {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "receipt compatibility request {} is malformed: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })
 }
 
 #[cfg(test)]

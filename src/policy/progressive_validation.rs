@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{ValidationPolicy, ValidationStage},
@@ -19,7 +19,7 @@ use crate::{
 pub const VALIDATION_PLAN_SCHEMA: &str = "harness.validation-plan/v1";
 
 /// One registered check required by a planned stage.
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct PlannedCheck {
     /// Registered gate identifier.
     pub gate_id: String,
@@ -32,7 +32,7 @@ pub struct PlannedCheck {
 }
 
 /// One ordered validation stage.
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct PlannedStage {
     /// Stable stage identifier.
     pub stage: ValidationStage,
@@ -41,7 +41,7 @@ pub struct PlannedStage {
 }
 
 /// The immutable inputs and ordered checks a later execution boundary uses.
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ValidationPlan {
     /// Always [`VALIDATION_PLAN_SCHEMA`].
     pub schema: String,

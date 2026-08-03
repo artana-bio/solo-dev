@@ -8,12 +8,17 @@
 //! commit a receipt refers to that no longer exists, is a *finding* — never a
 //! line quietly left out because it could not be resolved.
 
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
-    commands::{gate::receipts_for, review::reviews_for},
+    commands::{
+        gate::{load_compatibility_request, receipts_for},
+        review::reviews_for,
+    },
     control::{event_store::EventStore, repository::ControlRepository},
     domain::{
         card::CardRecord,
@@ -23,6 +28,8 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
+    policy::receipt_compatibility::{CompatibilityDecision, evaluate},
+    runner::receipt::ProvenanceSubject,
 };
 
 /// Subcommands under `audit`.
@@ -55,6 +62,10 @@ pub struct CycleArgs {
     /// The cycle to report on.
     #[arg(long)]
     pub cycle_id: String,
+    /// A frozen privacy-safe receipt-compatibility request to include in the
+    /// audit. It is evaluated read-only and never changes workflow authority.
+    #[arg(long)]
+    pub compatibility_request: Option<PathBuf>,
 }
 
 /// Something the record says that the objects do not bear out.
@@ -203,6 +214,12 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         }
     })?;
 
+    let compatibility = args
+        .compatibility_request
+        .as_ref()
+        .map(|path| audit_compatibility(&control, &cycle, path))
+        .transpose()?;
+
     // Events carry their own order: identifiers are monotonic, and the store
     // returns them sorted. Sorting by timestamp instead would collapse two
     // events recorded in the same second into an arbitrary order.
@@ -250,6 +267,7 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
             "card_id": event["card_id"],
         })).collect::<Vec<_>>(),
         "cards": cards,
+        "receipt_compatibility": compatibility,
         "protected_branch_transitions": transitions,
         "discrepancies": discrepancies,
     });
@@ -273,6 +291,34 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         ),
         code: ErrorCode::PolicyAuditDiscrepancy,
     })
+}
+
+/// Projects the same exact decision as `gate status` in the durable cycle
+/// audit.  The request must name a card in this cycle; it is never inferred
+/// from the receipt it evaluates, because that would erase incompatible
+/// environment or fixture context.
+fn audit_compatibility(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    path: &PathBuf,
+) -> Result<CompatibilityDecision, HarnessError> {
+    let request = load_compatibility_request(path)?;
+    let ProvenanceSubject::Card { card_id, .. } = &request.expected.subject else {
+        return Err(HarnessError::Control {
+            reason: "receipt compatibility request for audit must name a card subject".to_owned(),
+            code: ErrorCode::ConfigInvalidValue,
+        });
+    };
+    if !cycle.card_ids.contains(card_id) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "receipt compatibility request names card {card_id}, which is not in cycle {}",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::ConfigInvalidValue,
+        });
+    }
+    Ok(evaluate(&request, &receipts_for(control, card_id)?))
 }
 
 /// Renders the human-readable report.

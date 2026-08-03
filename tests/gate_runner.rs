@@ -92,6 +92,49 @@ fn a_passing_gate_produces_a_receipt_bound_to_the_exact_commit() {
 }
 
 #[test]
+fn status_projects_the_exact_reuse_decision_from_a_frozen_request() {
+    let workspace = allocated();
+    workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let preflight = workspace.gate_json(&["preflight", "--card-id", "F-001"]);
+    let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
+    let receipt = status["data"]["receipts"][0].clone();
+    let request = serde_json::json!({
+        "plan": {
+            "schema": preflight["data"]["schema"],
+            "card_revision": preflight["data"]["card_revision"],
+            "card_digest": preflight["data"]["card_digest"],
+            "base_sha": preflight["data"]["base_sha"],
+            "risk": preflight["data"]["risk"],
+            "policy_digest": preflight["data"]["policy_digest"],
+            "proof_map_digest": preflight["data"]["proof_map_digest"],
+            "stages": preflight["data"]["stages"],
+            "next_permitted_stage": preflight["data"]["next_permitted_stage"],
+        },
+        "stage": "narrow",
+        "check": preflight["data"]["stages"][0]["checks"][0],
+        "expected": receipt["provenance"],
+    });
+    let path = workspace.root.join("compatibility-request.json");
+    fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+
+    let projection = workspace.gate_json(&[
+        "status",
+        "--card-id",
+        "F-001",
+        "--compatibility-request",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        projection["data"]["receipt_compatibility"]["disposition"]["kind"], "rerun_required",
+        "a receipt without the complete reusable-provenance extension must remain a truthful rerun requirement: {projection}"
+    );
+    assert_eq!(
+        projection["data"]["receipt_compatibility"]["disposition"]["reasons"][0],
+        "incomplete"
+    );
+}
+
+#[test]
 fn a_failing_gate_refuses_but_still_records_its_receipt() {
     let workspace = Workspace::initialized();
     workspace.register_gate("gate.fails", &["false"]);
