@@ -216,10 +216,23 @@ fn missing_gate_evidence_refuses_handoff() {
     let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
     let path = declaration(&workspace, &head);
 
-    // No gate has been run for this candidate.
-    let output = workspace.handoff_raw(&["create", "--card-id", "F-001", "--declaration", &path]);
-    assert_eq!(output.status.code(), Some(7));
-    assert_eq!(error_code(&output), "CH-GATE-EVIDENCE-STALE");
+    // No gate has been run for this candidate. Preview and real creation must
+    // refuse identically; a successful preview here would be false readiness.
+    for args in [
+        vec![
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &path,
+            "--dry-run",
+        ],
+        vec!["create", "--card-id", "F-001", "--declaration", &path],
+    ] {
+        let output = workspace.handoff_raw(&args);
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(error_code(&output), "CH-GATE-EVIDENCE-STALE");
+    }
 }
 
 #[test]

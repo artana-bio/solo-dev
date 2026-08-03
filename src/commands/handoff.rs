@@ -404,6 +404,10 @@ fn preview_create(
         &head,
         diff,
     )?;
+    // Preview must validate the same feature-gate evidence the real handoff
+    // binds. Otherwise it can report ready immediately before the real command
+    // refuses for a missing or stale receipt.
+    let _receipts = collect_evidence(&control, card_id, &record.named_gates.feature, &head)?;
     Ok(CommandOutcome::new(
         "handoff.create",
         format!("Dry run: would hand off card {card_id} at {head}; nothing was changed"),
