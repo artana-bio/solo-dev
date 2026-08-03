@@ -7,6 +7,41 @@ const GITHUB_TOKEN_TAIL_LENGTH: usize = 36;
 const ANTHROPIC_API_KEY_PREFIX: &[u8] = b"sk-ant-api03-";
 const ANTHROPIC_API_KEY_MIN_TAIL_LENGTH: usize = 20;
 const RSA_PRIVATE_KEY_PEM_HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
+const HTTPS_SCHEME_PREFIX: &[u8] = b"https://";
+
+/// Returns whether an HTTPS authority contains nonempty `user:password@host`
+/// userinfo. Only the maximal ASCII authority run after `https://` is parsed.
+#[must_use]
+pub(crate) fn contains_https_userinfo_password_shape(contents: &[u8]) -> bool {
+    let mut search_from = 0;
+    while let Some(relative_start) = contents[search_from..]
+        .windows(HTTPS_SCHEME_PREFIX.len())
+        .position(|window| window == HTTPS_SCHEME_PREFIX)
+    {
+        let authority_start = search_from + relative_start + HTTPS_SCHEME_PREFIX.len();
+        let authority_length = contents[authority_start..]
+            .iter()
+            .take_while(|byte| is_https_authority_character(**byte))
+            .count();
+        let authority_end = authority_start + authority_length;
+        let authority = &contents[authority_start..authority_end];
+        if contains_nonempty_userinfo_password(authority) {
+            return true;
+        }
+        search_from = authority_end;
+    }
+    false
+}
+
+fn contains_nonempty_userinfo_password(authority: &[u8]) -> bool {
+    let Some(at) = authority.iter().position(|byte| *byte == b'@') else {
+        return false;
+    };
+    let Some(colon) = authority[..at].iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    colon > 0 && colon + 1 < at && at + 1 < authority.len()
+}
 
 /// Returns whether `contents` contains a token beginning with the governed
 /// Anthropic API-key prefix and at least 20 ASCII token characters.
@@ -93,6 +128,10 @@ const fn is_token_character(byte: u8) -> bool {
 
 const fn is_anthropic_token_character(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+const fn is_https_authority_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
 }
 
 #[cfg(test)]

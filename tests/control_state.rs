@@ -1247,6 +1247,95 @@ fn json_key_shape_matrix_preserves_existing_key_checks() {
 }
 
 #[test]
+fn an_https_userinfo_password_is_refused_but_compact_json_like_text_commits() {
+    const SENSITIVE: &str = "https://deploy:hunter2@internal.example/repo.git";
+    const BENIGN: &str =
+        r#"{"note":"{\"url\":\"https://internal.example\",\"owner\":\"ops@example.com\"}"}"#;
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+    let before_objects = file_snapshot(&fixture.control.join(".git/objects"));
+    let before_cycles = file_snapshot(&fixture.control.join("cycles"));
+    let before_events = file_snapshot(&fixture.control.join("events"));
+    let before_journal = file_snapshot(&fixture.control.join("journal"));
+
+    let rows = [
+        (
+            "cards/https-userinfo.json",
+            format!(r#"{{"url":"{SENSITIVE}"}}"#),
+            true,
+        ),
+        ("cards/compact-json-like.json", BENIGN.to_owned(), false),
+    ];
+    let args = vec![
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ];
+
+    for (relative, contents, should_refuse) in rows {
+        let path = fixture.control.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents.as_bytes()).unwrap();
+        let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+        assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+        let output = Fixture::run(&args);
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if should_refuse {
+            assert_eq!(output.status.code(), Some(5), "{rendered}");
+            assert!(rendered.contains("CH-POLICY-SENSITIVE-VALUE"));
+            assert!(!rendered.contains("hunter2"));
+            assert!(!rendered.contains(SENSITIVE));
+            assert!(!git_has_object(&fixture.control, &would_be_blob));
+            assert_eq!(control.head().unwrap(), before_head);
+            assert_eq!(
+                fs::read(fixture.control.join(".git/index")).unwrap(),
+                before_index
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join(".git/objects")),
+                before_objects
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("cycles")),
+                before_cycles
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("events")),
+                before_events
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("journal")),
+                before_journal
+            );
+            fs::remove_file(path).unwrap();
+        } else {
+            assert!(output.status.success(), "{rendered}");
+            assert!(git_has_object(&fixture.control, &would_be_blob));
+            assert_ne!(control.head().unwrap(), before_head);
+            assert!(fixture.control.join("cycles/C-001.json").exists());
+            assert!(Journal::new(&control).unresolved().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
 fn a_nested_escaped_github_token_is_refused_before_durability() {
     const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
     const ESCAPED_TOKEN: &str = "\\u0067hp_0123456789abcdef0123456789abcdef0123";
