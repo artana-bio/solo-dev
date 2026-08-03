@@ -50,9 +50,9 @@ fn expire(workspace: &Workspace, reservation_id: &str) {
     );
 }
 
-fn gate_with_setup_failure(workspace: &Workspace, args: &[&str]) -> Output {
+fn gate_with_post_acquire_failure(workspace: &Workspace, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_change-harness"))
-        .env("CHANGE_HARNESS_FAIL_AT", "validation-execution-setup")
+        .env("CHANGE_HARNESS_FAIL_AT", "governed-execution-after-acquire")
         .args(["gate", args[0], "--output", "json", "--control"])
         .arg(&workspace.control)
         .args(&args[1..])
@@ -159,7 +159,7 @@ fn expired_unsettled_reservations_require_recovery_before_reserve_run_or_mutate(
         "expiry must not create a replacement reservation",
     );
 
-    let run = gate_with_setup_failure(
+    let run = gate_with_post_acquire_failure(
         &workspace,
         &[
             "run",
@@ -173,7 +173,7 @@ fn expired_unsettled_reservations_require_recovery_before_reserve_run_or_mutate(
             "holder",
         ],
     );
-    let mutate = gate_with_setup_failure(
+    let mutate = gate_with_post_acquire_failure(
         &workspace,
         &[
             "mutate",

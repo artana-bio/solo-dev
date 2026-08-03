@@ -92,7 +92,7 @@ fn marker(path: &Path) -> (PathBuf, PathBuf, String) {
 }
 
 #[test]
-fn setup_failure_happens_before_attempt_receipt_settlement_or_subprocess() {
+fn post_acquire_failure_requires_recovery_before_attempt_receipt_settlement_or_subprocess() {
     let (workspace, first_marker, _) = allocated();
     let reservation = workspace.gate_json(&[
         "reserve",
@@ -107,7 +107,7 @@ fn setup_failure_happens_before_attempt_receipt_settlement_or_subprocess() {
         .as_str()
         .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
-        .env("CHANGE_HARNESS_FAIL_AT", "validation-execution-setup")
+        .env("CHANGE_HARNESS_FAIL_AT", "governed-execution-after-acquire")
         .args([
             "gate",
             "run",
@@ -128,6 +128,15 @@ fn setup_failure_happens_before_attempt_receipt_settlement_or_subprocess() {
         .unwrap();
     assert!(!output.status.success());
     assert!(!first_marker.exists());
+    assert!(
+        workspace
+            .control
+            .join(format!(
+                "validation-execution-permits/{reservation_id}.json"
+            ))
+            .exists(),
+        "post-acquire interruption must preserve one explicit recovery permit"
+    );
     assert!(
         workspace.gate_json(&["status", "--card-id", "F-001"])["data"]["receipts"]
             .as_array()

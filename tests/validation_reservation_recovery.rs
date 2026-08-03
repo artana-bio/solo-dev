@@ -72,9 +72,9 @@ fn reserve_process(control: &std::path::Path, actor: &str) -> Output {
         .unwrap()
 }
 
-fn command_with_setup_failure(workspace: &Workspace, args: &[&str]) -> Output {
+fn command_with_post_acquire_failure(workspace: &Workspace, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_change-harness"))
-        .env("CHANGE_HARNESS_FAIL_AT", "validation-execution-setup")
+        .env("CHANGE_HARNESS_FAIL_AT", "governed-execution-after-acquire")
         .args(["gate", args[0], "--output", "json", "--control"])
         .arg(&workspace.control)
         .args(&args[1..])
@@ -173,7 +173,7 @@ fn holder_abandons_only_expired_reservations_and_one_linked_generation_recovers(
         );
     }
 
-    let old_run = command_with_setup_failure(
+    let old_run = command_with_post_acquire_failure(
         &workspace,
         &[
             "run",
@@ -187,7 +187,7 @@ fn holder_abandons_only_expired_reservations_and_one_linked_generation_recovers(
             "holder",
         ],
     );
-    let old_mutate = command_with_setup_failure(
+    let old_mutate = command_with_post_acquire_failure(
         &workspace,
         &[
             "mutate",
