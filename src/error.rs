@@ -150,6 +150,8 @@ pub enum ErrorCode {
     PolicyCandidateOutOfScope,
     /// A staged control entry is not valid control-record text.
     PolicyControlEncoding,
+    /// A staged control entry contains the governed sensitive-value fixture.
+    PolicySensitiveValue,
     /// The gate runner could not execute or supervise a process.
     GateRunnerError,
     /// A named gate failed, timed out, or was signalled.
@@ -209,7 +211,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 81] = [
+    pub const ALL: [Self; 82] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -274,6 +276,7 @@ impl ErrorCode {
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
         Self::PolicyControlEncoding,
+        Self::PolicySensitiveValue,
         Self::GateRunnerError,
         Self::GateFailed,
         Self::GateEvidenceStale,
@@ -351,6 +354,7 @@ impl ErrorCode {
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyControlEncoding
+            | Self::PolicySensitiveValue
             | Self::PolicyIncompleteHandoff
             | Self::PolicyDeliveredShaMismatch
             | Self::PolicySelfReview
@@ -446,6 +450,7 @@ impl ErrorCode {
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::PolicyControlEncoding => "CONTROL-ENCODING",
+            Self::PolicySensitiveValue => "SENSITIVE-VALUE",
             Self::GateRunnerError => "RUNNER-ERROR",
             Self::GateFailed => "FAILED",
             Self::GateEvidenceStale => "EVIDENCE-STALE",
@@ -576,6 +581,9 @@ impl ErrorCode {
             Self::PolicyControlEncoding => {
                 "Rewrite the named control entry as UTF-8 text without embedded NUL bytes, then retry."
             }
+            Self::PolicySensitiveValue => {
+                "Remove the sensitive value from the named control entry, then retry."
+            }
             _ => "Report this as a defect; a record-hygiene code reached the wrong recovery table.",
         }
     }
@@ -653,7 +661,7 @@ impl ErrorCode {
             Self::PolicyCandidateOutOfScope => {
                 "Revert the out-of-scope changes, or revise the card to declare them."
             }
-            Self::PolicyControlEncoding => self.record_recovery(),
+            Self::PolicyControlEncoding | Self::PolicySensitiveValue => self.record_recovery(),
             Self::PolicyIncompleteHandoff => {
                 "Supply every declaration field; an empty list is a claim, an absent one is not."
             }

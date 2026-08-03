@@ -16,6 +16,7 @@ use crate::{
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_and_environment, run_with_config_ok},
+    policy::credential_shape::contains_standalone_github_token_fixture,
 };
 
 /// Path of the project document inside the control repository.
@@ -487,6 +488,12 @@ fn refuse_non_text_control_entries(
         let blob = run_with_config_and_environment(scope, overrides, environment, ["show", &spec])?;
         if blob.success() {
             refuse_non_text_control_bytes(relative, &blob.stdout_bytes)?;
+            if contains_standalone_github_token_fixture(&blob.stdout_bytes) {
+                return Err(HarnessError::Control {
+                    reason: format!("control entry `{relative}` contains a sensitive value"),
+                    code: ErrorCode::PolicySensitiveValue,
+                });
+            }
         }
     }
     Ok(())
