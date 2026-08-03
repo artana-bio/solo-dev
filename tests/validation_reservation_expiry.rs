@@ -28,6 +28,26 @@ fn expire(workspace: &Workspace, reservation_id: &str) {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     reservation["expires_at"] = serde_json::json!("1970-01-01T00:00:00Z");
     fs::write(path, serde_json::to_vec_pretty(&reservation).unwrap()).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["-C", workspace.control.to_str().unwrap(), "add", "-A"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                workspace.control.to_str().unwrap(),
+                "commit",
+                "-m",
+                "expire reservation fixture",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn gate_with_setup_failure(workspace: &Workspace, args: &[&str]) -> Output {

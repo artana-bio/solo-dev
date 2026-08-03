@@ -867,7 +867,11 @@ pub fn receipts_for_integration_verification(
 }
 
 /// Reports what `gate run` would execute, without running it.
-fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, HarnessError> {
+fn preview_run(
+    args: &RunArgs,
+    card_id: &CardId,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let gate = load_gate(&control, &args.gate_id)?;
     // The card and its lease, checked the way the real run checks them. This
@@ -882,7 +886,7 @@ fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, Harne
     let progress = validation_progress(&control, card_id, Some(&candidate))?;
     require_next_gate(&progress, &args.gate_id)?;
     let reservation = requires_execution_reservation(&progress, &args.gate_id)
-        .then(|| live_reservation_for_run(&control, args, card_id))
+        .then(|| live_reservation_for_run(&control, args, card_id, clock))
         .transpose()?;
     Ok(CommandOutcome::new(
         "gate.run",
@@ -1178,10 +1182,15 @@ fn settlement_for(
     Ok(Some(record))
 }
 
+fn reservation_is_expired(reservation: &ValidationReservationRecord, clock: &dyn Clock) -> bool {
+    reservation.expires_at <= clock.now()
+}
+
 fn live_reservation_for_run(
     control: &ControlRepository,
     args: &RunArgs,
     card_id: &CardId,
+    clock: &dyn Clock,
 ) -> Result<ValidationReservationRecord, HarnessError> {
     let reservation_id: ValidationReservationId = args
         .reservation_id
@@ -1210,6 +1219,14 @@ fn live_reservation_for_run(
     if settlement_for(control, &reservation)?.is_some() {
         return Err(HarnessError::Control {
             reason: format!("validation reservation {reservation_id} is already settled"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    if reservation_is_expired(&reservation, clock) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "validation reservation {reservation_id} is expired and requires recovery"
+            ),
             code: ErrorCode::PolicyInvalidTransition,
         });
     }
@@ -1625,6 +1642,13 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
             if let Some(settlement) = settlement_for(&control, &record)? {
                 return Ok(settled_reservation_outcome(&record, &settlement, true));
             }
+            if reservation_is_expired(&record, clock) {
+                return Ok(reservation_outcome(
+                    "expired_recovery_required",
+                    &record,
+                    true,
+                ));
+            }
             return Ok(reservation_outcome("wait_for_reserved_run", &record, true));
         }
         let key = reservation_key(
@@ -1673,6 +1697,12 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 if let Some(settlement) = settlement_for(control, &record)? {
                     return Ok(settled_reservation_outcome(&record, &settlement, false)
                         .with_project(config.project_id));
+                }
+                if reservation_is_expired(&record, clock) {
+                    return Ok(
+                        reservation_outcome("expired_recovery_required", &record, false)
+                            .with_project(config.project_id),
+                    );
                 }
                 return Ok(reservation_outcome("wait_for_reserved_run", &record, false)
                     .with_project(config.project_id));
@@ -1728,6 +1758,7 @@ fn live_campaign_reservation(
     control: &ControlRepository,
     args: &MutateArgs,
     campaign_digest: &Digest,
+    clock: &dyn Clock,
 ) -> Result<ValidationReservationRecord, HarnessError> {
     let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
     let reservation = reservations_for(control)?
@@ -1744,6 +1775,12 @@ fn live_campaign_reservation(
     {
         return Err(HarnessError::Control {
             reason: format!("reservation {reservation_id} is not a live exact campaign permit"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    if reservation_is_expired(&reservation, clock) {
+        return Err(HarnessError::Control {
+            reason: format!("reservation {reservation_id} is expired and requires recovery"),
             code: ErrorCode::PolicyInvalidTransition,
         });
     }
@@ -1775,7 +1812,7 @@ fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         clock,
         |control, events, expected, steps| {
             let config = control.project()?;
-            let reservation = live_campaign_reservation(control, args, &campaign_digest)?;
+            let reservation = live_campaign_reservation(control, args, &campaign_digest, clock)?;
             let lease = held_lease(control, &reservation.key.card_id)?.ok_or_else(|| {
                 HarnessError::Control {
                     reason: format!("card {} holds no lease", reservation.key.card_id),
@@ -1926,7 +1963,7 @@ fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     if args.dry_run {
-        return preview_run(args, &card_id);
+        return preview_run(args, &card_id, clock);
     }
     with_transaction(
         &args.common.control,
@@ -1947,7 +1984,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             let progress = validation_progress(control, &card_id, Some(&evaluated_sha))?;
             require_next_gate(&progress, &args.gate_id)?;
             let reservation = requires_execution_reservation(&progress, &args.gate_id)
-                .then(|| live_reservation_for_run(control, args, &card_id))
+                .then(|| live_reservation_for_run(control, args, &card_id, clock))
                 .transpose()?;
             let worktree_clean = inspect::worktree_state(&scope)?.clean;
             let existing = receipts_for(control, &card_id)?;
