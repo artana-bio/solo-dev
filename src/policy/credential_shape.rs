@@ -4,7 +4,31 @@
 
 const GITHUB_TOKEN_PREFIX: &[u8] = b"ghp_";
 const GITHUB_TOKEN_TAIL_LENGTH: usize = 36;
+const ANTHROPIC_API_KEY_PREFIX: &[u8] = b"sk-ant-api03-";
+const ANTHROPIC_API_KEY_MIN_TAIL_LENGTH: usize = 20;
 const RSA_PRIVATE_KEY_PEM_HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
+
+/// Returns whether `contents` contains a token beginning with the governed
+/// Anthropic API-key prefix and at least 20 ASCII token characters.
+#[must_use]
+pub(crate) fn contains_anthropic_api_key_shape(contents: &[u8]) -> bool {
+    contents
+        .windows(ANTHROPIC_API_KEY_PREFIX.len())
+        .enumerate()
+        .any(|(start, window)| {
+            if !window.starts_with(ANTHROPIC_API_KEY_PREFIX) {
+                return false;
+            }
+            let before = start.checked_sub(1).and_then(|index| contents.get(index));
+            let tail_start = start + ANTHROPIC_API_KEY_PREFIX.len();
+            let tail_length = contents[tail_start..]
+                .iter()
+                .take_while(|byte| is_anthropic_token_character(**byte))
+                .count();
+            tail_length >= ANTHROPIC_API_KEY_MIN_TAIL_LENGTH
+                && !before.is_some_and(|byte| is_anthropic_token_character(*byte))
+        })
+}
 
 /// Returns whether `contents` contains the exact RSA private-key PEM header as
 /// its own trimmed line. Inline prose that merely quotes the header is not the
@@ -59,6 +83,10 @@ pub(crate) fn contains_underscore_delimited_github_token_shape(path: &[u8]) -> b
 
 const fn is_token_character(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+const fn is_anthropic_token_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
 }
 
 #[cfg(test)]

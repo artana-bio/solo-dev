@@ -19,8 +19,8 @@ use crate::{
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_and_environment, run_with_config_ok},
     policy::credential_shape::{
-        contains_rsa_private_key_pem_header_line, contains_standalone_github_token_shape,
-        contains_underscore_delimited_github_token_shape,
+        contains_anthropic_api_key_shape, contains_rsa_private_key_pem_header_line,
+        contains_standalone_github_token_shape, contains_underscore_delimited_github_token_shape,
     },
 };
 
@@ -624,6 +624,7 @@ fn contains_github_token_in_json_tree(value: &serde_json::Value) -> bool {
 
 fn contains_json_sensitive_shape(text: &str) -> bool {
     contains_standalone_github_token_shape(text.as_bytes())
+        || contains_anthropic_api_key_shape(text.as_bytes())
         || contains_rsa_private_key_pem_header_line(text)
 }
 
