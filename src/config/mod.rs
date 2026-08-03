@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::{card::Risk, digest::Digest, ids::ProjectId},
     error::{ErrorCode, HarnessError},
+    policy::actors,
 };
 
 /// Schema identifier for the project file.
@@ -80,13 +81,28 @@ impl FinalAuthorizationPolicy {
                 ErrorCode::ConfigInvalidValue,
             ));
         }
-        let unique: std::collections::BTreeSet<_> = self.authorizer_actor_ids.iter().collect();
-        if unique.len() != self.authorizer_actor_ids.len() {
-            return Err(FieldError::new(
-                "final_authorization_policy.authorizer_actor_ids",
-                "must not contain duplicates",
-                ErrorCode::ConfigInvalidValue,
-            ));
+        for actor_id in &self.authorizer_actor_ids {
+            actors::refuse_unusable("final authorization policy actor", actor_id).map_err(
+                |error| {
+                    FieldError::new(
+                        "final_authorization_policy.authorizer_actor_ids",
+                        error.to_string(),
+                        ErrorCode::ConfigInvalidValue,
+                    )
+                },
+            )?;
+        }
+        for (index, actor_id) in self.authorizer_actor_ids.iter().enumerate() {
+            if self.authorizer_actor_ids[..index]
+                .iter()
+                .any(|prior| actors::same(prior, actor_id))
+            {
+                return Err(FieldError::new(
+                    "final_authorization_policy.authorizer_actor_ids",
+                    "must not contain duplicate actor identifiers after normalization",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
         }
         Ok(())
     }
@@ -395,7 +411,7 @@ pub struct ProjectConfig {
     /// Declared final-cycle authorization policy. Omission preserves the
     /// compatible v1 default while every v2 acceptance pins its digest.
     #[serde(default)]
-    pub final_authorization_policy: FinalAuthorizationPolicy,
+    pub final_authorization_policy: Option<FinalAuthorizationPolicy>,
 }
 
 impl ProjectConfig {
@@ -434,10 +450,9 @@ impl ProjectConfig {
             .validation_policy
             .validate()
             .map_err(FieldError::into_error)?;
-        config
-            .final_authorization_policy
-            .validate()
-            .map_err(FieldError::into_error)?;
+        if let Some(policy) = &config.final_authorization_policy {
+            policy.validate().map_err(FieldError::into_error)?;
+        }
         Ok(config)
     }
 

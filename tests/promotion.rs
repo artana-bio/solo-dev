@@ -241,6 +241,94 @@ fn compatible_owner_alias_records_the_same_final_authorizer() {
 }
 
 #[test]
+fn historical_v1_final_acceptance_remains_promotable_without_a_new_policy() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    let acceptance_path = workspace.control.join("acceptances/ACC-000001.json");
+    let mut acceptance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&acceptance_path).unwrap()).unwrap();
+    acceptance["schema"] = serde_json::json!("harness.acceptance/v1");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("authorizer_actor_id");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy_digest");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("sealed_cycle_digest");
+    fs::write(
+        &acceptance_path,
+        format!("{}\n", serde_json::to_string_pretty(&acceptance).unwrap()),
+    )
+    .unwrap();
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    project
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy");
+    fs::write(
+        &project_path,
+        format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "historic v1 final acceptance"],
+    );
+    let promoted = workspace.integration_json(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(promoted["data"]["status"], "promoted");
+}
+
+#[test]
+fn an_old_unconfigured_project_refuses_new_final_authorization_without_mutation() {
+    let (workspace, id) = reviewed_final();
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    project
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy");
+    fs::write(
+        &project_path,
+        format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(&workspace.control, &["commit", "-q", "-m", "old project"]);
+    let before = workspace.control_head();
+    let refusal = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-NOT-ACCEPTED");
+    assert_eq!(workspace.control_head(), before);
+}
+
+#[test]
 fn final_authorization_dry_run_matches_unconfigured_actor_refusal() {
     let (workspace, id) = reviewed_final();
     let real = workspace.acceptance_raw(&[

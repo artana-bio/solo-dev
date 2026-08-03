@@ -251,10 +251,11 @@ fn validate_final_authorization(
     if !record.final_for_cycle {
         return Ok(None);
     }
-    if !config
-        .final_authorization_policy
-        .authorizes(authorizer_actor_id)
-    {
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| HarnessError::Control {
+        reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a sealed cycle".to_owned(),
+        code: ErrorCode::PolicyNotAccepted,
+    })?;
+    if !policy.authorizes(authorizer_actor_id) {
         return Err(HarnessError::Control {
             reason: format!(
                 "actor {authorizer_actor_id} is not configured to authorize final sealed cycles"
@@ -283,10 +284,7 @@ fn validate_final_authorization(
             code: ErrorCode::PolicyNotAccepted,
         });
     }
-    Ok(Some((
-        config.final_authorization_policy.digest()?,
-        sealed.clone(),
-    )))
+    Ok(Some((policy.digest()?, sealed.clone())))
 }
 
 /// Rechecks the final-cycle authority bindings immediately before promotion.
@@ -300,6 +298,11 @@ pub(crate) fn validate_final_authorization_for_promotion(
     acceptance: &AcceptanceRecord,
 ) -> Result<(), HarnessError> {
     if !record.final_for_cycle {
+        return Ok(());
+    }
+    // Historical v1 records remain promotable under the policy that created
+    // them. Only newly-recorded final acceptances are v2 and pin the policy.
+    if acceptance.schema == ACCEPTANCE_SCHEMA {
         return Ok(());
     }
     if acceptance.schema != ACCEPTANCE_V2_SCHEMA {
@@ -329,9 +332,15 @@ pub(crate) fn validate_final_authorization_for_promotion(
             code: ErrorCode::InternalControlCorrupt,
         });
     };
-    if !config.final_authorization_policy.authorizes(authorizer)
-        || &config.final_authorization_policy.digest()? != recorded_policy
-    {
+    let policy =
+        config
+            .final_authorization_policy
+            .as_ref()
+            .ok_or_else(|| HarnessError::Control {
+                reason: "final authorization policy is no longer configured".to_owned(),
+                code: ErrorCode::PolicyNotAccepted,
+            })?;
+    if !policy.authorizes(authorizer) || &policy.digest()? != recorded_policy {
         return Err(HarnessError::Control {
             reason: format!(
                 "final authorization {} no longer matches the current project policy",

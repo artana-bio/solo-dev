@@ -180,7 +180,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
         default_output: "text".to_owned(),
         host_policy: HostPolicy::default(),
         validation_policy: ValidationPolicy::default(),
-        final_authorization_policy: if args.final_authorizer_actor_ids.is_empty() {
+        final_authorization_policy: Some(if args.final_authorizer_actor_ids.is_empty() {
             FinalAuthorizationPolicy::default()
         } else {
             FinalAuthorizationPolicy {
@@ -188,7 +188,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
                 authorization_unit: "sealed_cycle".to_owned(),
                 authorizer_actor_ids: args.final_authorizer_actor_ids.clone(),
             }
-        },
+        }),
     })
 }
 

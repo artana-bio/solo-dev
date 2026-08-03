@@ -124,6 +124,35 @@ fn a_valid_configuration_passes_and_records_every_path() {
 }
 
 #[test]
+fn old_project_document_without_final_authorization_policy_remains_readable() {
+    let fixture = Fixture::new();
+    let config =
+        ProjectConfig::from_json(&fixture.document()).expect("old document stays readable");
+    assert!(config.final_authorization_policy.is_none());
+}
+
+#[test]
+fn final_authorization_policy_rejects_unusable_and_normalized_duplicate_actor_ids() {
+    let fixture = Fixture::new();
+    for actors in [
+        serde_json::json!(["owner", "OWNER"]),
+        serde_json::json!(["owner", " owner "]),
+        serde_json::json!(["owner", "\u{00c1}lvaro"]),
+        serde_json::json!(["owner", "bad\nactor"]),
+    ] {
+        let mut document: serde_json::Value = serde_json::from_str(&fixture.document()).unwrap();
+        document["final_authorization_policy"] = serde_json::json!({
+            "version": "harness.final-authorization-policy/v1",
+            "authorization_unit": "sealed_cycle",
+            "authorizer_actor_ids": actors,
+        });
+        let error = ProjectConfig::from_json(&serde_json::to_string(&document).unwrap())
+            .expect_err("unusable or duplicate actor ids must refuse");
+        assert_eq!(error.code(), ErrorCode::ConfigInvalidValue);
+    }
+}
+
+#[test]
 fn a_relative_path_fails_and_names_its_field() {
     let fixture = Fixture::new();
     let document = fixture
