@@ -39,6 +39,86 @@ pub enum Risk {
     Critical,
 }
 
+/// The proof an author declares for one independently testable invariant.
+///
+/// This is an immutable claim about what a card must demonstrate. It is not a
+/// test receipt: later workflow stages record whether this declaration was
+/// actually exercised against an exact candidate SHA.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProofMapEntry {
+    /// The behavior that must continue to hold.
+    pub invariant: String,
+    /// The setup required to exercise that behavior.
+    pub precondition: String,
+    /// The observable assertion that decides the result.
+    pub assertion: String,
+    /// A discriminating change that must make the assertion fail.
+    pub mutation: String,
+}
+
+/// A bounded, reviewable declaration of the proof a card needs.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProofMap {
+    /// Proof-map schema, kept explicit so later versions do not reinterpret
+    /// already activated cards.
+    pub schema: String,
+    /// The independently testable claims this card makes.
+    pub entries: Vec<ProofMapEntry>,
+    /// What this proof deliberately does not establish.
+    pub claim_boundary: String,
+}
+
+/// Schema identifier for the first proof-map representation.
+pub const PROOF_MAP_SCHEMA: &str = "harness.proof-map/v1";
+
+impl ProofMap {
+    /// Validates a proof declaration before it is frozen into a card record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a card-policy error when the schema, claim boundary, entries,
+    /// or any required entry field is absent or blank.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        let reject = |reason: String| HarnessError::Control {
+            reason,
+            code: ErrorCode::PolicyInvalidCard,
+        };
+        if self.schema != PROOF_MAP_SCHEMA {
+            return Err(reject(format!(
+                "proof_map.schema must be `{PROOF_MAP_SCHEMA}`, found `{}`",
+                self.schema
+            )));
+        }
+        if self.entries.is_empty() {
+            return Err(reject(
+                "a proof map must declare at least one invariant".to_owned(),
+            ));
+        }
+        if self.claim_boundary.trim().is_empty() {
+            return Err(reject(
+                "a proof map must declare its claim boundary".to_owned(),
+            ));
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            for (field, value) in [
+                ("invariant", &entry.invariant),
+                ("precondition", &entry.precondition),
+                ("assertion", &entry.assertion),
+                ("mutation", &entry.mutation),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(reject(format!(
+                        "proof_map.entries[{index}].{field} must not be empty"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Risk {
     /// Whether Section 15.3 requires a human in the loop.
     #[must_use]
@@ -338,6 +418,9 @@ pub struct CardDraft {
     pub review_policy: String,
     /// How to undo it.
     pub rollback_strategy: String,
+    /// The declared proof for risks whose project policy requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_map: Option<ProofMap>,
 }
 
 /// True when every path described by a generated-artifact source belongs to
@@ -517,6 +600,9 @@ impl CardDraft {
         if self.rollback_strategy.trim().is_empty() {
             return Err(reject("a card must declare a rollback strategy".to_owned()));
         }
+        if let Some(proof_map) = &self.proof_map {
+            proof_map.validate()?;
+        }
         if self.acceptance.behaviors.is_empty() {
             return Err(reject(
                 "a card must declare at least one acceptance behavior; otherwise nothing can be reviewed against it".to_owned(),
@@ -641,6 +727,9 @@ pub struct CardRecord {
     pub review_policy: String,
     /// How to undo it.
     pub rollback_strategy: String,
+    /// The immutable proof declaration supplied by the activated draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_map: Option<ProofMap>,
     /// Who authored it. Declared, not proven.
     pub created_by: String,
     /// When it was authored.
@@ -693,6 +782,7 @@ impl CardRecord {
             generated_artifacts: draft.generated_artifacts.clone(),
             review_policy: draft.review_policy.clone(),
             rollback_strategy: draft.rollback_strategy.clone(),
+            proof_map: draft.proof_map.clone(),
             created_by: created_by.to_owned(),
             created_at,
         })
@@ -790,6 +880,7 @@ mod tests {
             generated_artifacts: vec![],
             review_policy: "independent".to_owned(),
             rollback_strategy: "revert the commit".to_owned(),
+            proof_map: None,
         }
     }
 
@@ -929,6 +1020,24 @@ risk: low
                 "expected `{expected}` in: {error}"
             );
         }
+    }
+
+    #[test]
+    fn an_incomplete_optional_proof_map_is_refused_before_activation() {
+        let mut draft = draft();
+        draft.proof_map = Some(ProofMap {
+            schema: PROOF_MAP_SCHEMA.to_owned(),
+            entries: vec![ProofMapEntry {
+                invariant: "the intended behavior remains true".to_owned(),
+                precondition: "a focused fixture is installed".to_owned(),
+                assertion: String::new(),
+                mutation: "bypass the check".to_owned(),
+            }],
+            claim_boundary: "only the focused behavior".to_owned(),
+        });
+        let error = CardRecord::activate(&draft, 1, "alvaro", stamp()).expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyInvalidCard);
+        assert!(error.to_string().contains("proof_map.entries[0].assertion"));
     }
 
     #[test]
@@ -1080,10 +1189,14 @@ rollback_strategy: revert
     }
 
     #[test]
-    fn an_activated_record_round_trips_and_keeps_its_digest() {
+    fn a_legacy_record_without_a_proof_map_round_trips_and_keeps_its_digest() {
         let record = activated();
         let digest = record.digest().unwrap();
         let encoded = serde_json::to_string_pretty(&record).unwrap();
+        assert!(
+            !encoded.contains("proof_map"),
+            "the additive field must not rewrite legacy canonical bytes"
+        );
         let decoded: CardRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
         assert_eq!(decoded.digest().unwrap(), digest);

@@ -317,8 +317,13 @@ impl Workspace {
             .map(|value| format!("\"{value}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        let proof_map = if risk == "low" {
+            String::new()
+        } else {
+            "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n".to_owned()
+        };
         let body = format!(
-            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n{proof_map}",
             base = self.authority_head(),
         );
         let path = self.root.join(format!("{card_id}.yaml"));
@@ -720,7 +725,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n",
             base = self.authority_head(),
         );
         let path = self.root.join(format!("{card_id}-revised.yaml"));

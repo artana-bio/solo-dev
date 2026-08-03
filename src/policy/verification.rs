@@ -437,6 +437,7 @@ mod tests {
             generated_artifacts: generated.to_vec(),
             review_policy: "independent".to_owned(),
             rollback_strategy: "revert".to_owned(),
+            proof_map: None,
         };
         let stamp = FixedClock::at_unix_seconds(1_785_196_800).unwrap().now();
         CardRecord::activate(&draft, 1, "alvaro", stamp).unwrap()

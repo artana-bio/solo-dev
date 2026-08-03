@@ -4,6 +4,7 @@ mod support;
 
 use std::fs;
 
+use change_harness::domain::card::CardRecord;
 use serde_json::Value;
 use support::Workspace;
 
@@ -57,6 +58,12 @@ rollback_strategy: revert the commit
     )
 }
 
+fn with_proof_map(draft: &str) -> String {
+    format!(
+        "{draft}proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: intended behavior remains true\n      precondition: the focused fixture is installed\n      assertion: the named check observes the behavior\n      mutation: bypassing the behavior makes the check fail\n  claim_boundary: only the named focused behavior\n"
+    )
+}
+
 #[test]
 fn a_valid_draft_validates_without_touching_control() {
     let workspace = with_active_cycle();
@@ -103,6 +110,112 @@ fn activation_produces_an_immutable_revision_with_a_digest() {
     assert_eq!(
         status["data"]["canonical_algorithm"], "harness.canonical-json/v1",
         "a record must name the algorithm its digest was computed under"
+    );
+}
+
+#[test]
+fn medium_risk_requires_a_complete_proof_map_at_activation_in_preview_and_real_modes() {
+    let workspace = with_active_cycle();
+    let path = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: medium"),
+    );
+    workspace.card(&["create", "--draft", &path]);
+
+    for extra in [Vec::<&str>::new(), vec!["--dry-run"]] {
+        let mut arguments = vec!["activate", "--card-id", "F-001"];
+        arguments.extend(extra);
+        let output = workspace.card_raw(&arguments);
+        assert_eq!(output.status.code(), Some(5));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CH-POLICY-INVALID-CARD"));
+    }
+    assert!(
+        !workspace
+            .control_tracked_files()
+            .contains(&"cards/F-001/r1.json".to_owned()),
+        "refusal writes no activated card"
+    );
+}
+
+#[test]
+fn a_complete_proof_map_is_frozen_into_a_medium_risk_card_and_moves_its_digest() {
+    let workspace = with_active_cycle();
+    let valid = with_proof_map(
+        &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: medium"),
+    );
+    let path = write_draft(&workspace, "F-001.yaml", &valid);
+    workspace.card(&["create", "--draft", &path]);
+    let activated = workspace.card_json(&["activate", "--card-id", "F-001"]);
+    let digest = activated["data"]["digest"].as_str().unwrap().to_owned();
+    let record: CardRecord = serde_json::from_str(
+        &std::fs::read_to_string(workspace.control.join("cards/F-001/r1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record.proof_map.as_ref().unwrap().schema,
+        "harness.proof-map/v1"
+    );
+    assert_eq!(
+        record.proof_map.as_ref().unwrap().entries[0].invariant,
+        "intended behavior remains true"
+    );
+
+    let mut only_proof_map_changed = record.clone();
+    only_proof_map_changed
+        .proof_map
+        .as_mut()
+        .unwrap()
+        .claim_boundary = "only a narrower named focused behavior".to_owned();
+    assert_ne!(
+        only_proof_map_changed.digest().unwrap().as_str(),
+        digest,
+        "the immutable card digest must bind the proof map itself"
+    );
+}
+
+#[test]
+fn proof_map_requirement_has_dry_run_and_real_revision_parity() {
+    let workspace = with_active_cycle();
+    let initial = write_draft(
+        &workspace,
+        "F-001.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs"),
+    );
+    workspace.card(&["create", "--draft", &initial]);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+    let before = workspace.control_head();
+    let medium_without_map = write_draft(
+        &workspace,
+        "F-001-r2.yaml",
+        &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: medium"),
+    );
+
+    for extra in [Vec::<&str>::new(), vec!["--dry-run"]] {
+        let mut arguments = vec![
+            "revise",
+            "--card-id",
+            "F-001",
+            "--draft",
+            &medium_without_map,
+            "--reason",
+            "risk reassessed",
+        ];
+        arguments.extend(extra);
+        let output = workspace.card_raw(&arguments);
+        assert_eq!(output.status.code(), Some(5));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CH-POLICY-INVALID-CARD"));
+    }
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "refused revision writes no event"
+    );
+    assert!(
+        !workspace
+            .control_tracked_files()
+            .contains(&"cards/F-001/r2.json".to_owned()),
+        "refused revision creates no replacement record"
     );
 }
 
@@ -337,7 +450,9 @@ fn a_revision_supersedes_and_invalidates_the_previous_digest() {
     let revised = write_draft(
         &workspace,
         "F-001-v2.yaml",
-        &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: medium"),
+        &with_proof_map(
+            &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: medium"),
+        ),
     );
     let envelope = workspace.card_json(&[
         "revise",
@@ -386,7 +501,9 @@ fn the_invalidation_is_recorded_in_the_event_log() {
     let revised = write_draft(
         &workspace,
         "F-001-v2.yaml",
-        &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: high"),
+        &with_proof_map(
+            &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: high"),
+        ),
     );
     workspace.card(&[
         "revise",
@@ -423,8 +540,10 @@ fn revisions_increase_by_exactly_one() {
     workspace.card(&["activate", "--card-id", "F-001"]);
 
     for (index, risk) in ["medium", "high", "critical"].iter().enumerate() {
-        let body = draft_yaml(&workspace, "F-001", "src/a.rs")
-            .replace("risk: low", &format!("risk: {risk}"));
+        let body = with_proof_map(
+            &draft_yaml(&workspace, "F-001", "src/a.rs")
+                .replace("risk: low", &format!("risk: {risk}")),
+        );
         let revised = write_draft(&workspace, &format!("r{index}.yaml"), &body);
         let envelope = workspace.card_json(&[
             "revise",

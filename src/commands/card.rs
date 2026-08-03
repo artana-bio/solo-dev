@@ -12,6 +12,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{gate::require_registered, transaction::with_transaction},
+    config::ValidationPolicy,
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         card::{CARD_DIR, CardDraft, CardRecord, CardState},
@@ -347,6 +348,27 @@ fn require_cycle_baseline(cycle: &CycleRecord, draft: &CardDraft) -> Result<(), 
     Ok(())
 }
 
+/// Enforces the project's declared proof requirement before an immutable card
+/// definition can enter control state. Receipt freshness and gate ordering are
+/// deliberately later concerns owned by progressive-validation children.
+fn require_declared_proof(
+    policy: &ValidationPolicy,
+    record: &CardRecord,
+) -> Result<(), HarnessError> {
+    if policy.requires_proof_map(record.risk) && record.proof_map.is_none() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} has `{}` risk, and validation policy {} requires a proof_map with invariant, precondition, assertion, mutation, and claim boundary",
+                record.card_id,
+                record.risk.name(),
+                policy.version
+            ),
+            code: ErrorCode::PolicyInvalidCard,
+        });
+    }
+    Ok(())
+}
+
 /// Collects the claims of every card already declared in a cycle.
 ///
 /// Only activated cards appear: a draft has claimed nothing yet, and a card
@@ -557,7 +579,9 @@ fn preview_activate(
     draft.validate()?;
     let cycle = cycle_accepting_cards(&control, &draft)?;
     require_cycle_baseline(&cycle, &draft)?;
+    let config = control.project()?;
     let preview = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
+    require_declared_proof(&config.validation_policy, &preview)?;
     require_registered(
         &control,
         preview
@@ -611,6 +635,7 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             let config = control.project()?;
 
             let record = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
+            require_declared_proof(&config.validation_policy, &record)?;
             // A card may only name gates the registry defines (D-008). Checked
             // at activation so an undefined check fails now rather than at the
             // point its evidence was supposed to exist.
@@ -713,30 +738,48 @@ fn write_revision(
     )
 }
 
+/// Reports a policy-equivalent revision without writing a new record.
+fn preview_revise(
+    args: &ReviseArgs,
+    card_id: &CardId,
+    draft: &CardDraft,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let state = state_of(&control, card_id)?.ok_or_else(|| HarnessError::Control {
+        reason: format!("card {card_id} is not activated"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
+    let config = control.project()?;
+    let preview = CardRecord::activate(
+        draft,
+        state.current_revision + 1,
+        &args.common.actor,
+        clock.now(),
+    )?;
+    require_declared_proof(&config.validation_policy, &preview)?;
+    Ok(CommandOutcome::new(
+        "card.revise",
+        format!(
+            "Dry run: would supersede card {card_id} revision {} with revision {}; nothing was changed",
+            state.current_revision,
+            state.current_revision + 1
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "superseded_revision": state.current_revision,
+        }),
+    ))
+}
+
 fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let draft = read_draft(&args.draft)?;
     draft.validate()?;
 
     if args.dry_run {
-        let control = ControlRepository::open(&args.common.control)?;
-        let state = state_of(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
-            reason: format!("card {card_id} is not activated"),
-            code: ErrorCode::PreconditionNotFound,
-        })?;
-        return Ok(CommandOutcome::new(
-            "card.revise",
-            format!(
-                "Dry run: would supersede card {card_id} revision {} with revision {}; nothing was changed",
-                state.current_revision,
-                state.current_revision + 1
-            ),
-            serde_json::json!({
-                "dry_run": true,
-                "card_id": card_id.to_string(),
-                "superseded_revision": state.current_revision,
-            }),
-        ));
+        return preview_revise(args, &card_id, &draft, clock);
     }
 
     with_transaction(
@@ -769,6 +812,7 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 
             let config = control.project()?;
             let record = previous.revise(&draft, &args.common.actor, clock.now())?;
+            require_declared_proof(&config.validation_policy, &record)?;
             // A revision may widen the write scope, so allocation is re-checked
             // rather than assumed to still hold from activation.
             let cycle: CycleRecord =

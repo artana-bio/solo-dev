@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::ids::ProjectId,
+    domain::{card::Risk, ids::ProjectId},
     error::{ErrorCode, HarnessError},
 };
 
@@ -20,6 +20,82 @@ pub const PROJECT_SCHEMA: &str = "harness.project/v1";
 
 /// Default name of the Git remote pointing at the authority repository.
 pub const DEFAULT_AUTHORITY_REMOTE: &str = "harness-authority";
+
+/// The only progressive-validation policy this release understands.
+pub const VALIDATION_POLICY_V1: &str = "harness.validation-policy/v1";
+
+/// Project-wide rules that decide which risks require a declared proof map.
+///
+/// The policy is versioned because every activated card binds this project
+/// document through its cycle digest. Later policy versions must not quietly
+/// reinterpret an existing card.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationPolicy {
+    /// Stable identifier for the policy semantics.
+    pub version: String,
+    /// Risks that cannot activate or revise without a complete proof map.
+    pub proof_map_required_for: Vec<Risk>,
+}
+
+impl Default for ValidationPolicy {
+    fn default() -> Self {
+        Self {
+            version: VALIDATION_POLICY_V1.to_owned(),
+            proof_map_required_for: vec![Risk::Medium, Risk::High, Risk::Critical],
+        }
+    }
+}
+
+impl ValidationPolicy {
+    /// Rejects an unrecognized or ambiguous policy before it can authorize a
+    /// card definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error when the version is unknown or the risk list is
+    /// empty or duplicates a risk.
+    pub fn validate(&self) -> Result<(), FieldError> {
+        if self.version != VALIDATION_POLICY_V1 {
+            return Err(FieldError::new(
+                "validation_policy.version",
+                format!(
+                    "expected `{VALIDATION_POLICY_V1}`, found `{}`",
+                    self.version
+                ),
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        if self.proof_map_required_for.is_empty() {
+            return Err(FieldError::new(
+                "validation_policy.proof_map_required_for",
+                "must name at least one risk; omit validation_policy to use the compatible default",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        for risk in [Risk::Low, Risk::Medium, Risk::High, Risk::Critical] {
+            let count = self
+                .proof_map_required_for
+                .iter()
+                .filter(|configured| **configured == risk)
+                .count();
+            if count > 1 {
+                return Err(FieldError::new(
+                    "validation_policy.proof_map_required_for",
+                    format!("names `{}` more than once", risk.name()),
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a card at `risk` must carry a complete immutable proof map.
+    #[must_use]
+    pub fn requires_proof_map(&self, risk: Risk) -> bool {
+        self.proof_map_required_for.contains(&risk)
+    }
+}
 
 /// Which configured field a failure refers to.
 ///
@@ -105,6 +181,10 @@ pub struct ProjectConfig {
     pub default_output: String,
     /// Host constraints.
     pub host_policy: HostPolicy,
+    /// Progressive-validation proof requirements. Omission preserves legacy
+    /// project documents with the shipped v1 policy.
+    #[serde(default)]
+    pub validation_policy: ValidationPolicy,
 }
 
 impl ProjectConfig {
@@ -139,6 +219,10 @@ impl ProjectConfig {
             )
             .into_error());
         }
+        config
+            .validation_policy
+            .validate()
+            .map_err(FieldError::into_error)?;
         Ok(config)
     }
 
@@ -201,6 +285,33 @@ mod tests {
         assert_eq!(config.project_id.as_str(), "example");
         assert_eq!(config.protected_branch, "main");
         assert_eq!(config.host_policy.supported_os, vec!["macos"]);
+        assert_eq!(
+            config.validation_policy,
+            ValidationPolicy::default(),
+            "omitting the additive field preserves legacy project records"
+        );
+    }
+
+    #[test]
+    fn validation_policy_refuses_unknown_versions_and_duplicate_risks() {
+        let unknown = valid_document().replace(
+            "\"host_policy\": {",
+            "\"validation_policy\": {\"version\": \"harness.validation-policy/v99\", \"proof_map_required_for\": [\"medium\"]},\n  \"host_policy\": {",
+        );
+        let error = ProjectConfig::from_json(&unknown).expect_err("unknown policy must refuse");
+        assert_eq!(error.code(), ErrorCode::ConfigInvalidValue);
+        assert_eq!(error.details()["field"], "validation_policy.version");
+
+        let duplicate = valid_document().replace(
+            "\"host_policy\": {",
+            "\"validation_policy\": {\"version\": \"harness.validation-policy/v1\", \"proof_map_required_for\": [\"medium\", \"medium\"]},\n  \"host_policy\": {",
+        );
+        let error = ProjectConfig::from_json(&duplicate).expect_err("duplicate risk must refuse");
+        assert_eq!(error.code(), ErrorCode::ConfigInvalidValue);
+        assert_eq!(
+            error.details()["field"],
+            "validation_policy.proof_map_required_for"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{integration::ResumeOutcome, transaction::with_transaction},
     config::{
-        DEFAULT_AUTHORITY_REMOTE, HostPolicy, PROJECT_SCHEMA, ProjectConfig,
+        DEFAULT_AUTHORITY_REMOTE, HostPolicy, PROJECT_SCHEMA, ProjectConfig, ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -174,6 +174,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
         worktree_root,
         default_output: "text".to_owned(),
         host_policy: HostPolicy::default(),
+        validation_policy: ValidationPolicy::default(),
     })
 }
 
