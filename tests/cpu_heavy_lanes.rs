@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::Value;
 use support::Workspace;
 
 fn gate(workspace: &Workspace, gate_id: &str, marker: &Path, sleep_seconds: f64) {
@@ -51,6 +52,16 @@ fn run_process(control: &Path, card_id: &str, gate_id: &str, reservation_id: &st
         ])
         .output()
         .unwrap()
+}
+
+/// Only the bounded, administrative project-lock refusal is retryable here.
+/// A policy or execution failure must stay visible to the test immediately.
+fn is_project_lock_refusal(stdout: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|envelope| envelope["error"]["code"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("CH-POLICY-LOCK-HELD")
 }
 
 fn wait_for(path: &Path) {
@@ -167,7 +178,10 @@ fn two_cpu_heavy_lanes_are_durable_and_release_before_a_third_execution_starts()
             "gate.ordinary",
             &ordinary_reservation,
         );
-        if output.status.success() || Instant::now() >= ordinary_deadline {
+        if output.status.success()
+            || !is_project_lock_refusal(&output.stdout)
+            || Instant::now() >= ordinary_deadline
+        {
             break output;
         }
         thread::sleep(Duration::from_millis(10));
@@ -194,4 +208,15 @@ fn two_cpu_heavy_lanes_are_durable_and_release_before_a_third_execution_starts()
             .success()
     );
     assert!(third_marker.exists());
+}
+
+#[test]
+fn only_the_project_lock_refusal_is_retryable() {
+    assert!(is_project_lock_refusal(
+        br#"{"error":{"code":"CH-POLICY-LOCK-HELD"}}"#
+    ));
+    assert!(!is_project_lock_refusal(
+        br#"{"error":{"code":"CH-POLICY-INVALID-TRANSITION"}}"#
+    ));
+    assert!(!is_project_lock_refusal(b"not a command envelope"));
 }
