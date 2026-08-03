@@ -694,6 +694,69 @@ fn a_recognized_github_token_in_staged_utf8_is_refused_without_becoming_durable(
 }
 
 #[test]
+fn incomplete_staged_json_is_refused_without_durable_state_or_payload_leak() {
+    const PAYLOAD: &str = "malformed-json-control-sentinel";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+
+    let contents = format!(r#"{{"note":"{PAYLOAD}"}} trailing"#);
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/incomplete.json"),
+        contents.as_bytes(),
+    )
+    .unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "incompletely inspected JSON became a durable Git object"
+    );
+    assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(
+        rendered.contains("CH-POLICY-CONTROL-JSON-INSPECTION"),
+        "the refusal must identify incomplete JSON inspection: {rendered}"
+    );
+    assert!(
+        !rendered.contains(PAYLOAD),
+        "the refusal must not echo the rejected JSON payload: {rendered}"
+    );
+    assert_eq!(
+        control.head().unwrap(),
+        before_head,
+        "HEAD must not advance"
+    );
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index,
+        "the durable index must remain byte-identical"
+    );
+}
+
+#[test]
 fn a_split_index_refusal_does_not_create_or_change_shared_indexes() {
     let fixture = Fixture::new();
     assert!(fixture.init().status.success());

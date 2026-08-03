@@ -150,6 +150,8 @@ pub enum ErrorCode {
     PolicyCandidateOutOfScope,
     /// A staged control entry is not valid control-record text.
     PolicyControlEncoding,
+    /// A staged JSON control entry could not be completely inspected.
+    PolicyControlJsonInspection,
     /// A staged control entry contains the governed sensitive-value shape.
     PolicySensitiveValue,
     /// The gate runner could not execute or supervise a process.
@@ -211,7 +213,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 83] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -276,6 +278,7 @@ impl ErrorCode {
         Self::PolicyLocatorMismatch,
         Self::PolicyCandidateOutOfScope,
         Self::PolicyControlEncoding,
+        Self::PolicyControlJsonInspection,
         Self::PolicySensitiveValue,
         Self::GateRunnerError,
         Self::GateFailed,
@@ -354,6 +357,7 @@ impl ErrorCode {
             | Self::PolicyLocatorMismatch
             | Self::PolicyCandidateOutOfScope
             | Self::PolicyControlEncoding
+            | Self::PolicyControlJsonInspection
             | Self::PolicySensitiveValue
             | Self::PolicyIncompleteHandoff
             | Self::PolicyDeliveredShaMismatch
@@ -450,6 +454,7 @@ impl ErrorCode {
             Self::PolicyLocatorMismatch => "LOCATOR-MISMATCH",
             Self::PolicyCandidateOutOfScope => "CANDIDATE-OUT-OF-SCOPE",
             Self::PolicyControlEncoding => "CONTROL-ENCODING",
+            Self::PolicyControlJsonInspection => "CONTROL-JSON-INSPECTION",
             Self::PolicySensitiveValue => "SENSITIVE-VALUE",
             Self::GateRunnerError => "RUNNER-ERROR",
             Self::GateFailed => "FAILED",
@@ -485,6 +490,14 @@ impl ErrorCode {
     /// reasonable function length.
     #[must_use]
     pub const fn recovery(self) -> &'static str {
+        if matches!(
+            self,
+            Self::PolicyControlEncoding
+                | Self::PolicyControlJsonInspection
+                | Self::PolicySensitiveValue
+        ) {
+            return self.record_recovery();
+        }
         match self.category() {
             ExitCategory::Usage => self.usage_recovery(),
             ExitCategory::Configuration => self.config_recovery(),
@@ -581,6 +594,9 @@ impl ErrorCode {
             Self::PolicyControlEncoding => {
                 "Rewrite the named control entry as UTF-8 text without embedded NUL bytes, then retry."
             }
+            Self::PolicyControlJsonInspection => {
+                "Rewrite the named control entry as complete JSON no larger than 4 MiB, then retry."
+            }
             Self::PolicySensitiveValue => {
                 "Remove the sensitive value from the named control entry, then retry."
             }
@@ -661,7 +677,6 @@ impl ErrorCode {
             Self::PolicyCandidateOutOfScope => {
                 "Revert the out-of-scope changes, or revise the card to declare them."
             }
-            Self::PolicyControlEncoding | Self::PolicySensitiveValue => self.record_recovery(),
             Self::PolicyIncompleteHandoff => {
                 "Supply every declaration field; an empty list is a claim, an absent one is not."
             }

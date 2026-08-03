@@ -81,6 +81,8 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
     "archives",
 ];
 
+const MAX_JSON_INSPECTION_BYTES: usize = 4 * 1024 * 1024;
+
 /// A control repository on disk.
 #[derive(Clone, Debug)]
 pub struct ControlRepository {
@@ -488,6 +490,13 @@ fn refuse_non_text_control_entries(
         let blob = run_with_config_and_environment(scope, overrides, environment, ["show", &spec])?;
         if blob.success() {
             refuse_non_text_control_bytes(relative, &blob.stdout_bytes)?;
+            if Path::new(relative)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                inspect_complete_json_control_entry(relative, &blob.stdout_bytes)?;
+            }
             if contains_standalone_github_token_shape(&blob.stdout_bytes) {
                 return Err(HarnessError::Control {
                     reason: format!("control entry `{relative}` contains a sensitive value"),
@@ -495,6 +504,24 @@ fn refuse_non_text_control_entries(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Requires a complete, bounded parse before a JSON control entry can cross the
+/// quarantine boundary. `serde_json`'s default recursion limit remains enabled;
+/// exceeding it is an incomplete inspection and therefore a refusal.
+fn inspect_complete_json_control_entry(
+    relative: &str,
+    contents: &[u8],
+) -> Result<(), HarnessError> {
+    if contents.len() > MAX_JSON_INSPECTION_BYTES
+        || serde_json::from_slice::<serde_json::Value>(contents).is_err()
+    {
+        return Err(HarnessError::Control {
+            reason: format!("control entry `{relative}` could not be completely inspected as JSON"),
+            code: ErrorCode::PolicyControlJsonInspection,
+        });
     }
     Ok(())
 }
