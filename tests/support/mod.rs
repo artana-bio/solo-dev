@@ -324,7 +324,16 @@ impl Workspace {
 
     /// Creates and activates a card claiming the given paths.
     pub fn activate_card(&self, card_id: &str, include: &[&str]) {
-        self.activate_card_with_base(card_id, include, &self.authority_head());
+        self.activate_card_with_base(card_id, include, &self.cycle_baseline());
+    }
+
+    /// The frozen cycle baseline is the only valid implicit card base. The
+    /// authority branch may move while a cycle stays active.
+    fn cycle_baseline(&self) -> String {
+        self.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["baseline_sha"]
+            .as_str()
+            .expect("active fixture cycle has a frozen baseline")
+            .to_owned()
     }
 
     /// Creates and activates a card naming explicit feature gates.
@@ -338,7 +347,7 @@ impl Workspace {
         };
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [{gates}]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
             inc = list(include),
             gates = list(gates),
         );
@@ -362,7 +371,7 @@ impl Workspace {
         };
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n{proof_map}",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
         );
         let path = self.root.join(format!("{card_id}.yaml"));
         fs::write(&path, body).unwrap();
@@ -381,7 +390,7 @@ impl Workspace {
         };
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: [{exc}]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
             inc = list(include),
             exc = list(exclude),
         );
@@ -585,7 +594,7 @@ impl Workspace {
         };
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [{feat}]\n  review: []\n  integration: [{integ}]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
             inc = list(include),
             feat = list(feature),
             integ = list(integration),
@@ -607,7 +616,7 @@ impl Workspace {
         };
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\ndepends_on: [{deps}]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
             inc = list(include),
             deps = list(depends_on),
         );
@@ -764,7 +773,7 @@ impl Workspace {
             .join(", ");
         let body = format!(
             "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n",
-            base = self.authority_head(),
+            base = self.cycle_baseline(),
         );
         let path = self.root.join(format!("{card_id}-revised.yaml"));
         fs::write(&path, body).unwrap();
