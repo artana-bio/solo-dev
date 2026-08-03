@@ -93,7 +93,14 @@ fn main() -> ExitCode {
 
     match execute(cli) {
         Ok(execution) => {
-            println!("{}", execution.stdout);
+            // The command's state change is already committed when its result
+            // is rendered. A downstream consumer may have closed stdout; do
+            // not turn that completed operation into a panic (exit 101) that
+            // invites an unsafe retry. The result is simply unavailable to
+            // that consumer, while the authoritative control state remains
+            // queryable.
+            let mut stdout = io::stdout().lock();
+            let _ = writeln!(stdout, "{}", execution.stdout);
             // Advisories go to stderr so a piped stdout carries only the
             // result, in text and JSON alike. In JSON mode they are also
             // inside the envelope.

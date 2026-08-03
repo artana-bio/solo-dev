@@ -210,6 +210,51 @@ fn a_warning_that_cannot_be_printed_leaves_the_exit_status_alone() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn a_result_that_cannot_be_printed_does_not_turn_a_committed_activation_into_a_panic() {
+    // The result is emitted after `card activate` has committed. A consumer
+    // which has stopped reading stdout must not make that completed mutation
+    // look like a process crash (exit 101), because a caller could then retry
+    // an activation that already landed.
+    let workspace = opened();
+    draft_with_scope(&workspace, "F-001", &["src/policy/actors.rs".to_owned()]);
+
+    // A pipe with no reader is required to create a stable EPIPE. Closing
+    // descriptor 1 instead can cause a later file open to reuse it.
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "card",
+            "activate",
+            "--output",
+            "json",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--card-id",
+            "F-001",
+        ])
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the CLI should start");
+    let output = child.wait_with_output().expect("the CLI should finish");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a broken result pipe must not turn completed work into exit 101: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "ready",
+        "the activation that could not be printed stands"
+    );
+}
+
 /// Drives a card to a recorded review carrying the given open finding
 /// locations, leaving it ready for the next round.
 fn review_round(
