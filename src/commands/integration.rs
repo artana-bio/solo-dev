@@ -29,7 +29,7 @@ use crate::{
         card::{CardRecord, CardState},
         clock::Clock,
         cycle::CycleRecord,
-        digest::CANONICAL_ALGORITHM,
+        digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, IntegrationId},
         integration::{
             INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember, IntegrationMode,
@@ -51,7 +51,10 @@ use crate::{
     policy::actors,
     runner::{
         environment_fingerprint,
-        receipt::{LOG_DIR, RECEIPT_SCHEMA, Receipt},
+        receipt::{
+            LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject,
+            RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
+        },
         run_attempt,
     },
 };
@@ -1911,6 +1914,39 @@ fn verify_landing(
                 attempt: 1,
                 passed: attempt.passed(),
                 worktree_clean: Some(worktree_clean),
+                provenance: Some(ReceiptProvenanceV1 {
+                    schema: RECEIPT_PROVENANCE_SCHEMA.to_owned(),
+                    subject: ProvenanceSubject::Integration {
+                        landing_sha: landing_sha.to_owned(),
+                        base_sha: record.baseline_sha.clone(),
+                        cycle_id: record.cycle_id.clone(),
+                        integration_id: record.integration_id.clone(),
+                        integration_digest: record.substantive_digest()?,
+                    },
+                    gate_definition_digest: gate.digest()?,
+                    argv_digest: Digest::of_canonical(&gate.argv)?,
+                    policy_digest: Digest::of_canonical(&config.validation_policy)?,
+                    proof_map: ProofMapBinding::NotApplicable,
+                    dimensions: std::collections::BTreeMap::from([
+                        (
+                            ProvenanceDimension::Environment,
+                            Digest::of_canonical(&gate.environment)?,
+                        ),
+                        (
+                            ProvenanceDimension::Configuration,
+                            Digest::of_canonical(config)?,
+                        ),
+                    ]),
+                    freshness_dependencies: std::collections::BTreeMap::from([
+                        ("integration".to_owned(), record.substantive_digest()?),
+                        ("gate".to_owned(), gate.digest()?),
+                        (
+                            "policy".to_owned(),
+                            Digest::of_canonical(&config.validation_policy)?,
+                        ),
+                    ]),
+                    lineage: Vec::new(),
+                }),
             });
         }
         let clean = integration_worktree::is_clean(&path)?;

@@ -4,7 +4,7 @@
 //! project policy, and cards may only name them. Registration is therefore a
 //! deliberate act with its own command, not a side effect of authoring a card.
 
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf};
 
 use clap::{Args, Subcommand};
 
@@ -14,18 +14,24 @@ use crate::{
     commands::{card::load_card, transaction::with_transaction, work::held_lease},
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
+        card::CardRecord,
         clock::Clock,
         cycle::CycleRecord,
         digest::Digest,
         gate::{GATE_DIR, GateDefinition, NetworkPolicy},
         ids::{CardId, ReceiptId},
+        lease::LeaseRecord,
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
     policy::progressive_validation::{ValidationProgress, plan, progress, stages_before_satisfied},
     runner::{
         environment_fingerprint,
-        receipt::{LOG_DIR, RECEIPT_DIR, RECEIPT_SCHEMA, Receipt, evidence_is_acceptable},
+        receipt::{
+            LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject, RECEIPT_DIR,
+            RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
+            evidence_is_acceptable,
+        },
         run_attempt,
     },
 };
@@ -702,13 +708,105 @@ fn next_attempt_number(
         + 1
 }
 
+/// Builds the partial, privacy-safe provenance a normal card gate can know.
+///
+/// Inputs, fixtures, cache policy, trust mode, and actual toolchain identity
+/// are intentionally absent until the runtime can bind them honestly.  #57
+/// consequently returns rerun-required instead of treating this partial
+/// record as compatible reuse evidence.
+struct CardProvenanceContext<'a> {
+    config: &'a crate::config::ProjectConfig,
+    record: &'a CardRecord,
+    card_digest: Digest,
+    card_revision: u32,
+    lease: &'a LeaseRecord,
+    gate: &'a GateDefinition,
+    gate_digest: Digest,
+    evaluated_sha: &'a str,
+}
+
+fn card_receipt_provenance(
+    context: CardProvenanceContext<'_>,
+) -> Result<ReceiptProvenanceV1, HarnessError> {
+    let proof_map = context
+        .record
+        .proof_map
+        .as_ref()
+        .map(Digest::of_canonical)
+        .transpose()?
+        .map_or(ProofMapBinding::NotApplicable, ProofMapBinding::Bound);
+    Ok(ReceiptProvenanceV1 {
+        schema: RECEIPT_PROVENANCE_SCHEMA.to_owned(),
+        subject: ProvenanceSubject::Card {
+            candidate_sha: context.evaluated_sha.to_owned(),
+            base_sha: context.record.base_sha.clone(),
+            cycle_id: context.record.cycle_id.clone(),
+            card_id: context.record.card_id.clone(),
+            card_revision: context.card_revision,
+            card_digest: context.card_digest.clone(),
+            lease_id: context.lease.lease_id.clone(),
+        },
+        gate_definition_digest: context.gate_digest.clone(),
+        argv_digest: Digest::of_canonical(&context.gate.argv)?,
+        policy_digest: Digest::of_canonical(&context.config.validation_policy)?,
+        proof_map,
+        dimensions: BTreeMap::from([
+            (
+                ProvenanceDimension::Environment,
+                Digest::of_canonical(&context.gate.environment)?,
+            ),
+            (
+                ProvenanceDimension::Configuration,
+                Digest::of_canonical(context.config)?,
+            ),
+        ]),
+        freshness_dependencies: BTreeMap::from([
+            ("card".to_owned(), context.card_digest),
+            ("gate".to_owned(), context.gate_digest),
+            ("lease".to_owned(), Digest::of_canonical(context.lease)?),
+            (
+                "policy".to_owned(),
+                Digest::of_canonical(&context.config.validation_policy)?,
+            ),
+        ]),
+        lineage: Vec::new(),
+    })
+}
+
+fn card_run_provenance(
+    context: CardProvenanceContext<'_>,
+    existing: &[Receipt],
+    actor_id: &str,
+    recorded_at: crate::domain::clock::Timestamp,
+) -> Result<ReceiptProvenanceV1, HarnessError> {
+    let gate_id = context.gate.gate_id.clone();
+    let mut provenance = card_receipt_provenance(context)?;
+    if let Some(prior) = existing
+        .iter()
+        .rev()
+        .find(|receipt| receipt.gate_id == gate_id)
+        && let Some(lineage) = provenance.lineage_from_prior(prior, actor_id, recorded_at)?
+    {
+        provenance.lineage.push(lineage);
+    }
+    Ok(provenance)
+}
+
+fn persist_receipt(control: &ControlRepository, receipt: &Receipt) -> Result<(), HarnessError> {
+    control.write_atomic(
+        &Receipt::relative_path(&receipt.receipt_id),
+        &format!("{}\n", serde_json::to_string_pretty(receipt)?),
+    )
+}
+
+// This is the intentionally linear transaction boundary: its order is the
+// safety contract (load → validate → run → record → event → commit).
+#[allow(clippy::too_many_lines)]
 fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
-
     if args.dry_run {
         return preview_run(args, &card_id);
     }
-
     with_transaction(
         &args.common.control,
         "gate.run",
@@ -718,7 +816,6 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             let (record, state) = load_card(control, &card_id)?;
             let gate = load_gate(control, &args.gate_id)?;
             let gate_digest = gate.digest()?;
-
             let lease = held_lease(control, &card_id)?.ok_or_else(|| HarnessError::Control {
                 reason: format!("card {card_id} holds no lease; run `work start` first"),
                 code: ErrorCode::PreconditionNotFound,
@@ -726,16 +823,11 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let scope = GitScope::work_tree(&lease.worktree_path);
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
-            let progress = validation_progress(control, &card_id, Some(&evaluated_sha))?;
-            require_next_gate(&progress, &args.gate_id)?;
-            // A gate run against a dirty worktree is not refused: running gates
-            // while iterating is the normal development loop, and refusing
-            // would make the command useless for the case it exists to serve.
-            // What is refused downstream is treating that run as evidence about
-            // `evaluated_sha`, which it is not. The receipt carries the
-            // distinction so `staleness` can state it plainly.
+            require_next_gate(
+                &validation_progress(control, &card_id, Some(&evaluated_sha))?,
+                &args.gate_id,
+            )?;
             let worktree_clean = inspect::worktree_state(&scope)?.clean;
-
             let existing = receipts_for(control, &card_id)?;
             let attempt = next_attempt_number(
                 &existing,
@@ -752,6 +844,21 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             let finished_at = clock.now();
 
             let receipt_id = next_receipt_id(control)?;
+            let provenance = card_run_provenance(
+                CardProvenanceContext {
+                    config: &config,
+                    record: &record,
+                    card_digest: state.current_digest.clone(),
+                    card_revision: state.current_revision,
+                    lease: &lease,
+                    gate: &gate,
+                    gate_digest: gate_digest.clone(),
+                    evaluated_sha: &evaluated_sha,
+                },
+                &existing,
+                &args.common.actor,
+                finished_at,
+            )?;
             let receipt = Receipt {
                 schema: RECEIPT_SCHEMA.to_owned(),
                 receipt_id: receipt_id.clone(),
@@ -777,12 +884,10 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
                 attempt,
                 passed: outcome.passed(),
                 worktree_clean: Some(worktree_clean),
+                provenance: Some(provenance),
             };
 
-            control.write_atomic(
-                &Receipt::relative_path(&receipt_id),
-                &format!("{}\n", serde_json::to_string_pretty(&receipt)?),
-            )?;
+            persist_receipt(control, &receipt)?;
 
             // Both outcomes are recorded, per invariant 7.4.1. A failing gate
             // that left no trace would let a later run present itself as the
@@ -1086,6 +1191,7 @@ mod progressive_tests {
             attempt: 1,
             passed: true,
             worktree_clean: Some(true),
+            provenance: None,
         }
     }
 

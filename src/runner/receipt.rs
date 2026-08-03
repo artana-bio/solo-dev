@@ -16,11 +16,29 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     clock::Timestamp,
     digest::Digest,
-    ids::{CardId, CycleId, IntegrationId, ProjectId, ReceiptId},
+    ids::{CardId, CycleId, IntegrationId, LeaseId, ProjectId, ReceiptId},
 };
+use crate::error::{ErrorCode, HarnessError};
 
 /// Schema identifier for a receipt.
 pub const RECEIPT_SCHEMA: &str = "harness.receipt/v1";
+
+/// Schema identifier for the optional, privacy-safe provenance extension.
+///
+/// Receipts predate this extension, so the extension intentionally has its
+/// own schema instead of changing [`RECEIPT_SCHEMA`].  Old receipts remain
+/// readable but cannot become reusable evidence merely because they parse.
+pub const RECEIPT_PROVENANCE_SCHEMA: &str = "harness.receipt-provenance/v1";
+
+const REUSE_DIMENSIONS: [ProvenanceDimension; 7] = [
+    ProvenanceDimension::Environment,
+    ProvenanceDimension::Configuration,
+    ProvenanceDimension::Toolchain,
+    ProvenanceDimension::Inputs,
+    ProvenanceDimension::Fixtures,
+    ProvenanceDimension::Cache,
+    ProvenanceDimension::TrustMode,
+];
 
 /// Directory holding receipts, relative to the control repository.
 pub const RECEIPT_DIR: &str = "receipts";
@@ -45,6 +63,463 @@ pub enum Termination {
     Signal,
     /// The runner could not execute or supervise the process.
     RunnerError,
+}
+
+/// A bounded, digest-only dimension that can make validation evidence stale.
+///
+/// The names are deliberately an enum rather than caller-provided strings:
+/// accepting arbitrary names would let a producer make a receipt appear
+/// complete while quietly omitting a dimension a consumer needs.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceDimension {
+    /// Exact candidate or landing state.
+    Candidate,
+    /// Frozen base state.
+    Base,
+    /// Activated card definition.
+    Card,
+    /// Registered gate definition.
+    Gate,
+    /// Exclusive work assignment.
+    Assignment,
+    /// Validation policy or proof policy.
+    Policy,
+    /// Integration definition.
+    Integration,
+    /// The gate execution environment.
+    Environment,
+    /// Project and gate configuration.
+    Configuration,
+    /// Compiler, interpreter, and other toolchain identity.
+    Toolchain,
+    /// Declared execution inputs.
+    Inputs,
+    /// Declared fixtures and mocks.
+    Fixtures,
+    /// Cache policy and compatible cache identity.
+    Cache,
+    /// Declared trust boundary or execution mode.
+    TrustMode,
+}
+
+impl ProvenanceDimension {
+    /// Stable machine-readable name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Base => "base",
+            Self::Card => "card",
+            Self::Gate => "gate",
+            Self::Assignment => "assignment",
+            Self::Policy => "policy",
+            Self::Integration => "integration",
+            Self::Environment => "environment",
+            Self::Configuration => "configuration",
+            Self::Toolchain => "toolchain",
+            Self::Inputs => "inputs",
+            Self::Fixtures => "fixtures",
+            Self::Cache => "cache",
+            Self::TrustMode => "trust_mode",
+        }
+    }
+}
+
+/// Whether a proof map is bound to the receipt's exact validation policy.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "digest")]
+pub enum ProofMapBinding {
+    /// A card's declared proof map was bound to this run.
+    Bound(Digest),
+    /// No proof map applies to this receipt's subject.
+    NotApplicable,
+}
+
+/// The receipt subject repeated in the provenance record.
+///
+/// This repetition is intentional.  The receipt's top-level fields make old
+/// records readable; the typed subject makes a later reuse decision prove all
+/// identity bindings in one versioned object.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ProvenanceSubject {
+    /// A gate run for one exact activated card and assignment.
+    Card {
+        /// Candidate commit the gate evaluated.
+        candidate_sha: String,
+        /// Frozen base for that card.
+        base_sha: String,
+        /// Card's cycle.
+        cycle_id: CycleId,
+        /// Card identity.
+        card_id: CardId,
+        /// Activated card revision.
+        card_revision: u32,
+        /// Exact activated card definition.
+        card_digest: Digest,
+        /// Exact lease/assignment identity.
+        lease_id: LeaseId,
+    },
+    /// A combined gate run for one exact integration landing.
+    Integration {
+        /// Landing commit the gate evaluated.
+        landing_sha: String,
+        /// Frozen integration baseline.
+        base_sha: String,
+        /// Integration's cycle.
+        cycle_id: CycleId,
+        /// Integration identity.
+        integration_id: IntegrationId,
+        /// Exact substantive integration state.
+        integration_digest: Digest,
+    },
+}
+
+/// Why one new receipt records a relationship to a prior receipt.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptLineageKind {
+    /// Same identity, later execution attempt.
+    Supersedes,
+    /// A declared freshness dimension changed.
+    Invalidates,
+}
+
+/// One immutable, privacy-safe lineage fact carried by a successor receipt.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptLineageFact {
+    /// Whether this is a retry or an invalidation.
+    pub kind: ReceiptLineageKind,
+    /// Receipt whose evidence is no longer the newest applicable fact.
+    pub prior_receipt_id: ReceiptId,
+    /// Canonical digest of the prior receipt bytes.
+    pub prior_receipt_digest: Digest,
+    /// The exact state dimension that is unchanged or changed.
+    pub dimension: ProvenanceDimension,
+    /// Prior value for an invalidation; equal to `current_digest` for a retry.
+    pub prior_digest: Digest,
+    /// Current successor value for the named dimension.
+    pub current_digest: Digest,
+    /// Digest of the declared actor; never the actor's raw name.
+    pub actor_digest: Digest,
+    /// When this successor recorded the relationship.
+    pub recorded_at: Timestamp,
+}
+
+/// Versioned, privacy-safe facts needed before a receipt can be reused.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptProvenanceV1 {
+    /// Always [`RECEIPT_PROVENANCE_SCHEMA`].
+    pub schema: String,
+    /// Exact card or integration state evaluated by the receipt.
+    pub subject: ProvenanceSubject,
+    /// Registered gate definition digest.
+    pub gate_definition_digest: Digest,
+    /// Canonical digest of the gate argv only; argv itself is never retained.
+    pub argv_digest: Digest,
+    /// Exact validation policy that selected this check.
+    pub policy_digest: Digest,
+    /// Proof map binding for this validation subject.
+    pub proof_map: ProofMapBinding,
+    /// Required privacy-safe context values.  A missing dimension makes the
+    /// receipt structurally insufficient for reuse rather than guessed safe.
+    pub dimensions: BTreeMap<ProvenanceDimension, Digest>,
+    /// Additional ordered dependencies outside the fixed dimensions.
+    pub freshness_dependencies: BTreeMap<String, Digest>,
+    /// Immutable predecessor relationships observed by this new receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<ReceiptLineageFact>,
+}
+
+impl ReceiptProvenanceV1 {
+    /// Validates the schema and all structural boundaries without deciding
+    /// whether two separate receipts are compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CH-GATE-EVIDENCE-STALE` when the record is malformed or
+    /// contradicts its own lineage contract.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        if self.schema != RECEIPT_PROVENANCE_SCHEMA {
+            return Err(provenance_error(format!(
+                "expected provenance schema `{RECEIPT_PROVENANCE_SCHEMA}`, found an unsupported schema"
+            )));
+        }
+        match &self.subject {
+            ProvenanceSubject::Card {
+                candidate_sha,
+                base_sha,
+                card_revision,
+                ..
+            } => {
+                validate_commit_sha(candidate_sha, "candidate_sha")?;
+                validate_commit_sha(base_sha, "base_sha")?;
+                if *card_revision == 0 {
+                    return Err(provenance_error("card_revision must begin at 1".to_owned()));
+                }
+            }
+            ProvenanceSubject::Integration {
+                landing_sha,
+                base_sha,
+                ..
+            } => {
+                validate_commit_sha(landing_sha, "landing_sha")?;
+                validate_commit_sha(base_sha, "base_sha")?;
+            }
+        }
+        for key in self.freshness_dependencies.keys() {
+            if key.is_empty()
+                || key.len() > 64
+                || !key.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'.'
+                        || byte == b'_'
+                        || byte == b'-'
+                })
+            {
+                return Err(provenance_error(
+                    "freshness dependency names must be bounded stable identifiers".to_owned(),
+                ));
+            }
+        }
+        for fact in &self.lineage {
+            if matches!(fact.kind, ReceiptLineageKind::Supersedes)
+                && fact.prior_digest != fact.current_digest
+            {
+                return Err(provenance_error(
+                    "a supersession fact must retain the same named freshness digest".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// True only when every privacy-safe fixed dimension was captured.
+    ///
+    /// This is a structural check, not the compatibility evaluator in #57.
+    #[must_use]
+    pub fn has_all_reuse_dimensions(&self) -> bool {
+        REUSE_DIMENSIONS
+            .iter()
+            .all(|dimension| self.dimensions.contains_key(dimension))
+    }
+
+    /// Canonical digest used by successor lineage facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical serialization fails.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+
+    /// Derives one immutable relationship to a prior fully-versioned receipt.
+    ///
+    /// It does not mutate or validate the prior receipt. If a prior record
+    /// predates this extension, it remains readable but cannot be represented
+    /// as a trustworthy lineage predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical digesting of the prior or subject fails.
+    pub fn lineage_from_prior(
+        &self,
+        prior: &Receipt,
+        actor_id: &str,
+        recorded_at: Timestamp,
+    ) -> Result<Option<ReceiptLineageFact>, HarnessError> {
+        let Some(previous) = prior.provenance.as_ref() else {
+            return Ok(None);
+        };
+        let actor_digest = Digest::of_bytes(actor_id.as_bytes());
+        let prior_receipt_digest = prior.digest()?;
+        if let Some((dimension, prior_digest, current_digest)) =
+            changed_subject_dimension(&previous.subject, &self.subject)?
+        {
+            return Ok(Some(ReceiptLineageFact {
+                kind: ReceiptLineageKind::Invalidates,
+                prior_receipt_id: prior.receipt_id.clone(),
+                prior_receipt_digest,
+                dimension,
+                prior_digest,
+                current_digest,
+                actor_digest,
+                recorded_at,
+            }));
+        }
+        for (name, current) in &self.freshness_dependencies {
+            let Some(previous_value) = previous.freshness_dependencies.get(name) else {
+                return Ok(Some(ReceiptLineageFact {
+                    kind: ReceiptLineageKind::Invalidates,
+                    prior_receipt_id: prior.receipt_id.clone(),
+                    prior_receipt_digest,
+                    dimension: dependency_dimension(name),
+                    prior_digest: Digest::of_bytes(b"missing"),
+                    current_digest: current.clone(),
+                    actor_digest,
+                    recorded_at,
+                }));
+            };
+            if previous_value != current {
+                return Ok(Some(ReceiptLineageFact {
+                    kind: ReceiptLineageKind::Invalidates,
+                    prior_receipt_id: prior.receipt_id.clone(),
+                    prior_receipt_digest,
+                    dimension: dependency_dimension(name),
+                    prior_digest: previous_value.clone(),
+                    current_digest: current.clone(),
+                    actor_digest,
+                    recorded_at,
+                }));
+            }
+        }
+        let subject_digest = Digest::of_canonical(&self.subject)?;
+        Ok(Some(ReceiptLineageFact {
+            kind: ReceiptLineageKind::Supersedes,
+            prior_receipt_id: prior.receipt_id.clone(),
+            prior_receipt_digest,
+            dimension: ProvenanceDimension::Candidate,
+            prior_digest: subject_digest.clone(),
+            current_digest: subject_digest,
+            actor_digest,
+            recorded_at,
+        }))
+    }
+}
+
+fn changed_subject_dimension(
+    prior: &ProvenanceSubject,
+    current: &ProvenanceSubject,
+) -> Result<Option<(ProvenanceDimension, Digest, Digest)>, HarnessError> {
+    let digest_text = |value: &str| Digest::of_bytes(value.as_bytes());
+    let changed = |dimension, prior, current| Some((dimension, prior, current));
+    match (prior, current) {
+        (
+            ProvenanceSubject::Card {
+                candidate_sha: prior_candidate,
+                base_sha: prior_base,
+                cycle_id: prior_cycle,
+                card_id: prior_card,
+                card_revision: prior_revision,
+                card_digest: prior_card_digest,
+                lease_id: prior_lease,
+            },
+            ProvenanceSubject::Card {
+                candidate_sha: current_candidate,
+                base_sha: current_base,
+                cycle_id: current_cycle,
+                card_id: current_card,
+                card_revision: current_revision,
+                card_digest: current_card_digest,
+                lease_id: current_lease,
+            },
+        ) => Ok(if prior_candidate != current_candidate {
+            changed(
+                ProvenanceDimension::Candidate,
+                digest_text(prior_candidate),
+                digest_text(current_candidate),
+            )
+        } else if prior_base != current_base {
+            changed(
+                ProvenanceDimension::Base,
+                digest_text(prior_base),
+                digest_text(current_base),
+            )
+        } else if prior_cycle != current_cycle
+            || prior_card != current_card
+            || prior_revision != current_revision
+            || prior_card_digest != current_card_digest
+        {
+            changed(
+                ProvenanceDimension::Card,
+                Digest::of_canonical(prior)?,
+                Digest::of_canonical(current)?,
+            )
+        } else if prior_lease != current_lease {
+            changed(
+                ProvenanceDimension::Assignment,
+                Digest::of_canonical(prior_lease)?,
+                Digest::of_canonical(current_lease)?,
+            )
+        } else {
+            None
+        }),
+        (
+            ProvenanceSubject::Integration {
+                landing_sha: prior_landing,
+                base_sha: prior_base,
+                cycle_id: prior_cycle,
+                integration_id: prior_integration,
+                integration_digest: prior_digest,
+            },
+            ProvenanceSubject::Integration {
+                landing_sha: current_landing,
+                base_sha: current_base,
+                cycle_id: current_cycle,
+                integration_id: current_integration,
+                integration_digest: current_digest,
+            },
+        ) => Ok(if prior_landing != current_landing {
+            changed(
+                ProvenanceDimension::Candidate,
+                digest_text(prior_landing),
+                digest_text(current_landing),
+            )
+        } else if prior_base != current_base {
+            changed(
+                ProvenanceDimension::Base,
+                digest_text(prior_base),
+                digest_text(current_base),
+            )
+        } else if prior_cycle != current_cycle
+            || prior_integration != current_integration
+            || prior_digest != current_digest
+        {
+            changed(
+                ProvenanceDimension::Integration,
+                Digest::of_canonical(prior)?,
+                Digest::of_canonical(current)?,
+            )
+        } else {
+            None
+        }),
+        _ => Ok(changed(
+            ProvenanceDimension::Candidate,
+            Digest::of_canonical(prior)?,
+            Digest::of_canonical(current)?,
+        )),
+    }
+}
+
+fn dependency_dimension(name: &str) -> ProvenanceDimension {
+    match name {
+        "card" => ProvenanceDimension::Card,
+        "gate" => ProvenanceDimension::Gate,
+        "lease" => ProvenanceDimension::Assignment,
+        "policy" => ProvenanceDimension::Policy,
+        "integration" => ProvenanceDimension::Integration,
+        _ => ProvenanceDimension::Configuration,
+    }
+}
+
+fn provenance_error(reason: String) -> HarnessError {
+    HarnessError::Control {
+        reason,
+        code: ErrorCode::GateEvidenceStale,
+    }
+}
+
+fn validate_commit_sha(value: &str, field: &str) -> Result<(), HarnessError> {
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(provenance_error(format!(
+            "{field} must be a 40-character Git commit SHA"
+        )));
+    }
+    Ok(())
 }
 
 impl Termination {
@@ -129,9 +604,85 @@ pub struct Receipt {
     /// exactly the one that would have caught the problem.
     #[serde(default)]
     pub worktree_clean: Option<bool>,
+    /// Versioned, privacy-safe provenance added after receipt schema v1.
+    ///
+    /// Omission preserves legacy receipt parsing, but is deliberately
+    /// insufficient for compatible evidence reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ReceiptProvenanceV1>,
 }
 
 impl Receipt {
+    /// Canonical digest of this immutable receipt record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical serialization fails.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+
+    /// Returns complete, structurally valid reuse material, if any.
+    ///
+    /// It intentionally does not compare two receipts or schedule a rerun;
+    /// that decision belongs to #57.  It establishes the strict floor: old,
+    /// incomplete, or malformed provenance cannot be reused accidentally.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CH-GATE-EVIDENCE-STALE` for legacy, incomplete, malformed, or
+    /// contradictory provenance. It deliberately does not compare receipts.
+    pub fn reuse_material(&self) -> Result<&ReceiptProvenanceV1, HarnessError> {
+        let Some(provenance) = self.provenance.as_ref() else {
+            return Err(provenance_error(
+                "receipt predates validation provenance and requires a rerun".to_owned(),
+            ));
+        };
+        provenance.validate()?;
+        if !provenance.has_all_reuse_dimensions() {
+            return Err(provenance_error(
+                "receipt omits privacy-safe validation provenance and requires a rerun".to_owned(),
+            ));
+        }
+        match (&self.card_id, &self.integration_id, &provenance.subject) {
+            (
+                Some(card_id),
+                None,
+                ProvenanceSubject::Card {
+                    candidate_sha,
+                    cycle_id,
+                    card_id: provenance_card_id,
+                    card_digest,
+                    ..
+                },
+            ) if candidate_sha == &self.evaluated_sha
+                && cycle_id == &self.cycle_id
+                && provenance_card_id == card_id
+                && self.card_digest.as_ref() == Some(card_digest) =>
+            {
+                Ok(provenance)
+            }
+            (
+                None,
+                Some(integration_id),
+                ProvenanceSubject::Integration {
+                    landing_sha,
+                    cycle_id,
+                    integration_id: provenance_integration_id,
+                    ..
+                },
+            ) if landing_sha == &self.evaluated_sha
+                && cycle_id == &self.cycle_id
+                && provenance_integration_id == integration_id =>
+            {
+                Ok(provenance)
+            }
+            _ => Err(provenance_error(
+                "receipt provenance subject disagrees with receipt identity and requires a rerun"
+                    .to_owned(),
+            )),
+        }
+    }
     /// What the run was for, as a short human label.
     ///
     /// Every receipt names a subject: a card for a feature gate, an
@@ -251,6 +802,7 @@ mod tests {
             attempt,
             passed,
             worktree_clean: Some(true),
+            provenance: None,
         }
     }
 
@@ -259,6 +811,45 @@ mod tests {
         Receipt {
             worktree_clean: Some(false),
             ..receipt(attempt, passed)
+        }
+    }
+
+    fn complete_provenance() -> ReceiptProvenanceV1 {
+        ReceiptProvenanceV1 {
+            schema: RECEIPT_PROVENANCE_SCHEMA.to_owned(),
+            subject: ProvenanceSubject::Card {
+                candidate_sha: "a".repeat(40),
+                base_sha: "b".repeat(40),
+                cycle_id: "C-001".parse().unwrap(),
+                card_id: "F-001".parse().unwrap(),
+                card_revision: 1,
+                card_digest: Digest::of_bytes(b"card"),
+                lease_id: "L-000001".parse().unwrap(),
+            },
+            gate_definition_digest: Digest::of_bytes(b"gate"),
+            argv_digest: Digest::of_bytes(b"argv"),
+            policy_digest: Digest::of_bytes(b"policy"),
+            proof_map: ProofMapBinding::NotApplicable,
+            dimensions: BTreeMap::from([
+                (ProvenanceDimension::Environment, Digest::of_bytes(b"env")),
+                (
+                    ProvenanceDimension::Configuration,
+                    Digest::of_bytes(b"config"),
+                ),
+                (
+                    ProvenanceDimension::Toolchain,
+                    Digest::of_bytes(b"toolchain"),
+                ),
+                (ProvenanceDimension::Inputs, Digest::of_bytes(b"inputs")),
+                (ProvenanceDimension::Fixtures, Digest::of_bytes(b"fixtures")),
+                (ProvenanceDimension::Cache, Digest::of_bytes(b"cache")),
+                (ProvenanceDimension::TrustMode, Digest::of_bytes(b"trust")),
+            ]),
+            freshness_dependencies: BTreeMap::from([
+                ("card".to_owned(), Digest::of_bytes(b"card")),
+                ("policy".to_owned(), Digest::of_bytes(b"policy")),
+            ]),
+            lineage: Vec::new(),
         }
     }
 
@@ -408,6 +999,172 @@ mod tests {
         let mut value = serde_json::to_value(&record).unwrap();
         value["surprise"] = serde_json::json!(1);
         assert!(serde_json::from_value::<Receipt>(value).is_err());
+    }
+
+    #[test]
+    fn a_legacy_receipt_is_readable_but_cannot_supply_reuse_material() {
+        let legacy = receipt(1, true);
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        let decoded: Receipt = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.provenance, None);
+        let error = decoded.reuse_material().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::GateEvidenceStale);
+        assert!(error.to_string().contains("requires a rerun"));
+    }
+
+    #[test]
+    fn complete_safe_provenance_is_reuse_material_for_its_exact_card_subject() {
+        let mut record = receipt(1, true);
+        record.provenance = Some(complete_provenance());
+        assert!(record.reuse_material().is_ok());
+
+        let digest = record.digest().unwrap();
+        let encoded = serde_json::to_string(&record).unwrap();
+        let decoded: Receipt = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.digest().unwrap(), digest);
+    }
+
+    #[test]
+    fn missing_safe_dimension_or_raw_sensitive_field_refuses_reuse_material() {
+        let mut incomplete = receipt(1, true);
+        let mut provenance = complete_provenance();
+        provenance.dimensions.remove(&ProvenanceDimension::Inputs);
+        incomplete.provenance = Some(provenance);
+        let error = incomplete.reuse_material().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::GateEvidenceStale);
+
+        // The provenance schema has no raw input slot. `deny_unknown_fields`
+        // makes an attempted raw fixture/input a parse refusal, rather than a
+        // quietly retained value that a future audit could expose.
+        let mut value = serde_json::to_value(complete_provenance()).unwrap();
+        value["raw_input"] = serde_json::json!("secret-value-must-not-persist");
+        assert!(serde_json::from_value::<ReceiptProvenanceV1>(value).is_err());
+    }
+
+    #[test]
+    fn provenance_rejects_a_contradictory_subject_and_malformed_sha() {
+        let mut wrong_subject = receipt(1, true);
+        let mut provenance = complete_provenance();
+        if let ProvenanceSubject::Card { card_id, .. } = &mut provenance.subject {
+            *card_id = "F-999".parse().unwrap();
+        }
+        wrong_subject.provenance = Some(provenance);
+        assert_eq!(
+            wrong_subject.reuse_material().unwrap_err().code(),
+            ErrorCode::GateEvidenceStale
+        );
+
+        let mut malformed = complete_provenance();
+        if let ProvenanceSubject::Card { candidate_sha, .. } = &mut malformed.subject {
+            *candidate_sha = "not-a-commit".to_owned();
+        }
+        assert_eq!(
+            malformed.validate().unwrap_err().code(),
+            ErrorCode::GateEvidenceStale
+        );
+    }
+
+    #[test]
+    fn provenance_and_lineage_are_deterministic_and_append_only() {
+        let first = complete_provenance();
+        let mut second = ReceiptProvenanceV1 {
+            dimensions: BTreeMap::new(),
+            freshness_dependencies: BTreeMap::new(),
+            ..first.clone()
+        };
+        for (dimension, digest) in first.dimensions.iter().rev() {
+            second.dimensions.insert(*dimension, digest.clone());
+        }
+        for (name, digest) in first.freshness_dependencies.iter().rev() {
+            second
+                .freshness_dependencies
+                .insert(name.clone(), digest.clone());
+        }
+        assert_eq!(first.digest().unwrap(), second.digest().unwrap());
+
+        let prior = receipt(1, true);
+        let mut successor = receipt(2, true);
+        let mut provenance = complete_provenance();
+        provenance.lineage.push(ReceiptLineageFact {
+            kind: ReceiptLineageKind::Supersedes,
+            prior_receipt_id: prior.receipt_id.clone(),
+            prior_receipt_digest: prior.digest().unwrap(),
+            dimension: ProvenanceDimension::Configuration,
+            prior_digest: Digest::of_bytes(b"same-config"),
+            current_digest: Digest::of_bytes(b"same-config"),
+            actor_digest: Digest::of_bytes(b"actor"),
+            recorded_at: stamp(),
+        });
+        successor.provenance = Some(provenance);
+        assert!(successor.reuse_material().is_ok());
+        assert_eq!(
+            prior.provenance, None,
+            "a successor never rewrites its prior receipt"
+        );
+
+        let mut invalid = complete_provenance();
+        invalid.lineage.push(ReceiptLineageFact {
+            kind: ReceiptLineageKind::Supersedes,
+            prior_receipt_id: "R-000001".parse().unwrap(),
+            prior_receipt_digest: Digest::of_bytes(b"prior"),
+            dimension: ProvenanceDimension::Inputs,
+            prior_digest: Digest::of_bytes(b"old"),
+            current_digest: Digest::of_bytes(b"new"),
+            actor_digest: Digest::of_bytes(b"actor"),
+            recorded_at: stamp(),
+        });
+        assert_eq!(
+            invalid.validate().unwrap_err().code(),
+            ErrorCode::GateEvidenceStale
+        );
+    }
+
+    #[test]
+    fn successor_lineage_distinguishes_retry_from_changed_freshness() {
+        let mut prior = receipt(1, true);
+        prior.provenance = Some(complete_provenance());
+        let retry = complete_provenance()
+            .lineage_from_prior(&prior, "reviewer", stamp())
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.kind, ReceiptLineageKind::Supersedes);
+        assert_eq!(retry.dimension, ProvenanceDimension::Candidate);
+
+        let mut changed = complete_provenance();
+        changed
+            .freshness_dependencies
+            .insert("policy".to_owned(), Digest::of_bytes(b"new-policy"));
+        let invalidation = changed
+            .lineage_from_prior(&prior, "reviewer", stamp())
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalidation.kind, ReceiptLineageKind::Invalidates);
+        assert_eq!(invalidation.dimension, ProvenanceDimension::Policy);
+        assert_ne!(
+            invalidation.prior_digest, invalidation.current_digest,
+            "an invalidation must identify a material state change"
+        );
+
+        let mut revised = complete_provenance();
+        if let ProvenanceSubject::Card {
+            card_revision,
+            card_digest,
+            ..
+        } = &mut revised.subject
+        {
+            *card_revision = 2;
+            *card_digest = Digest::of_bytes(b"revised-card");
+        }
+        let card_change = revised
+            .lineage_from_prior(&prior, "reviewer", stamp())
+            .unwrap()
+            .unwrap();
+        assert_eq!(card_change.kind, ReceiptLineageKind::Invalidates);
+        assert_eq!(
+            card_change.dimension,
+            ProvenanceDimension::Card,
+            "a card revision is not a candidate-SHA change"
+        );
     }
 
     #[test]

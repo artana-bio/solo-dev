@@ -56,6 +56,39 @@ fn a_passing_gate_produces_a_receipt_bound_to_the_exact_commit() {
             .unwrap()
             .starts_with("sha256:")
     );
+
+    let receipt_id = envelope["data"]["receipt_id"].as_str().unwrap();
+    let receipt: Value = serde_json::from_str(&support::capture(
+        &workspace.control,
+        &["show", &format!("HEAD:receipts/{receipt_id}.json")],
+    ))
+    .unwrap();
+    let provenance = &receipt["provenance"];
+    assert_eq!(provenance["schema"], "harness.receipt-provenance/v1");
+    assert_eq!(provenance["subject"]["kind"], "card");
+    assert_eq!(
+        provenance["subject"]["candidate_sha"],
+        receipt["evaluated_sha"]
+    );
+    assert_eq!(provenance["subject"]["card_digest"], receipt["card_digest"]);
+    assert!(
+        provenance["argv_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        provenance["dimensions"]["environment"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        !serde_json::to_string(provenance)
+            .unwrap()
+            .contains("gate.unit"),
+        "provenance records only digests of executable context, never the argv or raw output"
+    );
 }
 
 #[test]
@@ -141,6 +174,16 @@ fn every_attempt_is_recorded_and_numbered() {
         .map(|receipt| receipt["attempt"].as_u64().unwrap())
         .collect();
     assert_eq!(attempts, vec![1, 2, 3]);
+    let lineage = receipts[1]["provenance"]["lineage"].as_array().unwrap();
+    assert_eq!(lineage.len(), 1, "the successor carries one prior fact");
+    assert_eq!(lineage[0]["kind"], "supersedes");
+    assert_eq!(lineage[0]["prior_receipt_id"], receipts[0]["receipt_id"]);
+    assert!(
+        lineage[0]["actor_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
 }
 
 #[test]

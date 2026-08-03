@@ -102,6 +102,18 @@ fn every_final_receipt_evaluates_the_exact_landing_sha() {
             receipt["card_id"].is_null(),
             "a combined run belongs to the integration, not to one card"
         );
+        let provenance = &receipt["provenance"];
+        assert_eq!(provenance["schema"], "harness.receipt-provenance/v1");
+        assert_eq!(provenance["subject"]["kind"], "integration");
+        assert_eq!(provenance["subject"]["landing_sha"], landing);
+        assert_eq!(provenance["subject"]["integration_id"], id.as_str());
+        assert!(
+            provenance["subject"]["integration_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(provenance["subject"]["lease_id"].is_null());
     }
 }
 
