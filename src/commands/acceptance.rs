@@ -218,6 +218,7 @@ fn preview_record(
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
     require_reviewed(&record)?;
+    refuse_existing_acceptance(&control, integration_id)?;
     let authorizer = authorizer(args)?;
     refuse_author_accepting(&control, &record, authorizer)?;
     validate_final_authorization(&control, &config, &record, authorizer)?;
@@ -238,6 +239,26 @@ fn preview_record(
         }),
     )
     .with_project(config.project_id))
+}
+
+/// Refuses a second decision for one integration in both preview and commit
+/// paths. A dry run that reports success for an already decided integration is
+/// not a preview of the real command.
+fn refuse_existing_acceptance(
+    control: &ControlRepository,
+    integration_id: &IntegrationId,
+) -> Result<(), HarnessError> {
+    if let Some(existing) = acceptance_for(control, integration_id)? {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {integration_id} already has acceptance {} (`{}`)",
+                existing.acceptance_id,
+                existing.decision.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    Ok(())
 }
 
 /// Returns the final-cycle bindings a v2 acceptance must pin. Ordinary v1
@@ -471,16 +492,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             require_reviewed(&record)?;
-            if let Some(existing) = acceptance_for(control, &integration_id)? {
-                return Err(HarnessError::Control {
-                    reason: format!(
-                        "integration {integration_id} already has acceptance {} (`{}`)",
-                        existing.acceptance_id,
-                        existing.decision.name()
-                    ),
-                    code: ErrorCode::PolicyInvalidTransition,
-                });
-            }
+            refuse_existing_acceptance(control, &integration_id)?;
 
             let acceptance = build_acceptance(control, &record, args, decision, clock)?;
             let acceptance_id = acceptance.acceptance_id.clone();

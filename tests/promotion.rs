@@ -448,6 +448,43 @@ fn final_authorization_dry_run_matches_unconfigured_actor_refusal() {
     assert_eq!(error_code(&real), error_code(&preview));
 }
 
+#[test]
+fn final_rejected_record_dry_run_matches_second_decision_refusal_without_mutation() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+        "--reject",
+    ]);
+    let before = workspace.control_head();
+    let preview = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+        "--dry-run",
+    ]);
+    let real = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    assert_eq!(preview.status.code(), Some(5));
+    assert_eq!(preview.status.code(), real.status.code());
+    assert_eq!(error_code(&preview), error_code(&real));
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "both second-decision paths are read-only refusals"
+    );
+}
+
 fn error_code(output: &std::process::Output) -> String {
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("an error envelope");
