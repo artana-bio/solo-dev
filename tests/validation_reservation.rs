@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use support::Workspace;
+use support::{Workspace, git};
 
 fn allocated() -> Workspace {
     let workspace = Workspace::initialized();
@@ -105,6 +105,20 @@ fn identical_concurrent_requests_produce_one_durable_winner_and_one_waiter() {
         winner["data"]["reservation"]["holder_actor_id"],
         "the waiter must identify the actor that won the durable reservation"
     );
+    assert_eq!(
+        winner["data"]["schema"],
+        "harness.validation-reservation-decision/v1"
+    );
+    assert_eq!(winner["data"]["reservation"]["key"]["card_id"], "F-001");
+    assert_eq!(
+        winner["data"]["reservation"]["key"]["execution_mode"],
+        "named-gate"
+    );
+    assert!(winner["data"]["reservation"]["expires_at"].is_string());
+    assert_eq!(
+        winner["data"]["reservation"]["recovery_policy"],
+        "explicit_recovery_required"
+    );
     let reservations = fs::read_dir(workspace.control.join("validation-reservations"))
         .unwrap()
         .filter_map(Result::ok)
@@ -155,5 +169,71 @@ fn a_changed_gate_definition_gets_a_distinct_reservation_key() {
     assert_ne!(
         first["data"]["reservation"]["key_digest"], second["data"]["reservation"]["key_digest"],
         "a changed required-check definition must never deduplicate"
+    );
+}
+
+#[test]
+fn a_moved_candidate_gets_a_distinct_reservation_key() {
+    let workspace = allocated();
+    let first = reserve(&workspace, "first");
+    let worktree = workspace.work_json(&["status", "--card-id", "F-001"])["data"]["held_lease"]
+        ["worktree_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(
+        std::path::Path::new(&worktree).join("candidate.txt"),
+        "changed\n",
+    )
+    .unwrap();
+    git(std::path::Path::new(&worktree), &["add", "candidate.txt"]);
+    git(
+        std::path::Path::new(&worktree),
+        &["commit", "-qm", "move candidate"],
+    );
+
+    let second = reserve(&workspace, "second");
+    assert_eq!(second["data"]["disposition"]["kind"], "reserved");
+    assert_ne!(
+        first["data"]["reservation"]["key_digest"], second["data"]["reservation"]["key_digest"],
+        "a different candidate must not consume the earlier reservation"
+    );
+}
+
+#[test]
+fn a_corrupt_reservation_key_is_refused_without_creating_another_record() {
+    let workspace = allocated();
+    let winner = reserve(&workspace, "first");
+    let reservation_id = winner["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap();
+    let path = workspace
+        .control
+        .join(format!("validation-reservations/{reservation_id}.json"));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    record["key_digest"] = serde_json::json!(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let output = workspace.gate_raw(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.unit",
+        "--actor",
+        "second",
+    ]);
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "CH-INTERNAL-CONTROL-CORRUPT");
+    assert_eq!(
+        fs::read_dir(workspace.control.join("validation-reservations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        1
     );
 }
