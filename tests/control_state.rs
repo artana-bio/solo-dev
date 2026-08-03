@@ -1155,6 +1155,98 @@ fn an_anthropic_api_key_shape_is_refused_but_benign_sk_prose_commits() {
 }
 
 #[test]
+fn json_key_shape_matrix_preserves_existing_key_checks() {
+    const ANTHROPIC: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+    const GITHUB: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    const RSA: &str = "-----BEGIN RSA PRIVATE KEY-----";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let rows = [
+        (
+            "cards/anthropic-key.json",
+            format!(r#"{{"{ANTHROPIC}":"ordinary"}}"#),
+            true,
+        ),
+        (
+            "cards/github-key.json",
+            format!(r#"{{"{GITHUB}":"ordinary"}}"#),
+            false,
+        ),
+        (
+            "cards/rsa-key.json",
+            format!(r#"{{"{RSA}":"ordinary"}}"#),
+            false,
+        ),
+    ];
+
+    for (index, (relative, contents, should_commit)) in rows.into_iter().enumerate() {
+        let before_head = control.head().unwrap();
+        let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+        let before_objects = file_snapshot(&fixture.control.join(".git/objects"));
+        let before_cycles = file_snapshot(&fixture.control.join("cycles"));
+        let before_events = file_snapshot(&fixture.control.join("events"));
+        let before_journal = file_snapshot(&fixture.control.join("journal"));
+        let path = fixture.control.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents.as_bytes()).unwrap();
+        let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+        assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+        let output = Fixture::run(&[
+            "cycle".into(),
+            "create".into(),
+            "--output".into(),
+            "json".into(),
+            "--control".into(),
+            fixture.control.display().to_string(),
+            "--cycle-id".into(),
+            format!("C-{:03}", index + 1),
+            "--objective".into(),
+            "ordinary".into(),
+        ]);
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if should_commit {
+            assert!(output.status.success(), "{rendered}");
+            assert!(git_has_object(&fixture.control, &would_be_blob));
+            assert_ne!(control.head().unwrap(), before_head);
+        } else {
+            assert_eq!(output.status.code(), Some(5), "{rendered}");
+            assert!(rendered.contains("CH-POLICY-SENSITIVE-VALUE"));
+            assert!(!git_has_object(&fixture.control, &would_be_blob));
+            assert_eq!(control.head().unwrap(), before_head);
+            assert_eq!(
+                fs::read(fixture.control.join(".git/index")).unwrap(),
+                before_index
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join(".git/objects")),
+                before_objects
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("cycles")),
+                before_cycles
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("events")),
+                before_events
+            );
+            assert_eq!(
+                file_snapshot(&fixture.control.join("journal")),
+                before_journal
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_nested_escaped_github_token_is_refused_before_durability() {
     const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
     const ESCAPED_TOKEN: &str = "\\u0067hp_0123456789abcdef0123456789abcdef0123";
