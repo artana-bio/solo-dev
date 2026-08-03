@@ -115,6 +115,12 @@ prefixed_id!(
     "Identifies one exclusive card-to-actor assignment."
 );
 prefixed_id!(ReceiptId, "R-", 6, "Identifies one named-gate run.");
+prefixed_id!(
+    ValidationReservationId,
+    "VR-",
+    6,
+    "Identifies one durable reservation for an expensive validation run."
+);
 prefixed_id!(ReviewId, "RV-", 6, "Identifies one review record.");
 prefixed_id!(
     IntegrationId,

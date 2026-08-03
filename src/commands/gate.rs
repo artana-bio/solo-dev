@@ -4,7 +4,7 @@
 //! project policy, and cards may only name them. Registration is therefore a
 //! deliberate act with its own command, not a side effect of authoring a card.
 
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf, time::Duration};
 
 use clap::{Args, Subcommand};
 
@@ -19,8 +19,13 @@ use crate::{
         cycle::CycleRecord,
         digest::Digest,
         gate::{GATE_DIR, GateDefinition, NetworkPolicy},
-        ids::{CardId, IntegrationId, ReceiptId},
+        ids::{CardId, IntegrationId, ReceiptId, ValidationReservationId},
         lease::LeaseRecord,
+        validation_reservation::{
+            VALIDATION_RESERVATION_DIR, VALIDATION_RESERVATION_KEY_SCHEMA,
+            VALIDATION_RESERVATION_SCHEMA, ValidationExecutionMode, ValidationReservationKeyV1,
+            ValidationReservationRecord,
+        },
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
@@ -55,6 +60,8 @@ pub enum GateCommand {
     Show(ShowArgs),
     /// Run a named gate against a card's candidate.
     Run(RunArgs),
+    /// Reserve one exact, expensive validation run without executing it.
+    Reserve(ReserveArgs),
     /// Show the deterministic validation stages for an activated card.
     Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
@@ -75,6 +82,7 @@ impl GateCommand {
             Self::List(..) => "gate.list",
             Self::Show(..) => "gate.show",
             Self::Run(..) => "gate.run",
+            Self::Reserve(..) => "gate.reserve",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
         }
@@ -93,6 +101,25 @@ pub struct RunArgs {
     #[arg(long)]
     pub gate_id: String,
     /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `gate reserve`.
+#[derive(Debug, Args)]
+pub struct ReserveArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card whose next required check is being reserved.
+    #[arg(long)]
+    pub card_id: String,
+    /// The exact next permitted gate to reserve.
+    #[arg(long)]
+    pub gate_id: String,
+    /// Reservation mode. This first slice accepts only `named-gate`.
+    #[arg(long, default_value = "named-gate")]
+    pub execution_mode: String,
+    /// Report the authoritative reservation decision without writing it.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -178,6 +205,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::List(args) => run_list(args),
         GateCommand::Show(args) => run_show(args),
         GateCommand::Run(args) => run_gate(args, clock),
+        GateCommand::Reserve(args) => run_reserve(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
     }
@@ -846,6 +874,239 @@ fn persist_receipt(control: &ControlRepository, receipt: &Receipt) -> Result<(),
     control.write_atomic(
         &Receipt::relative_path(&receipt.receipt_id),
         &format!("{}\n", serde_json::to_string_pretty(receipt)?),
+    )
+}
+
+fn reservation_key(
+    control: &ControlRepository,
+    card_id: &CardId,
+    gate_id: &str,
+    execution_mode: ValidationExecutionMode,
+) -> Result<ValidationReservationKeyV1, HarnessError> {
+    let (record, state) = load_card(control, card_id)?;
+    let lease = held_lease(control, card_id)?.ok_or_else(|| HarnessError::Control {
+        reason: format!("card {card_id} holds no lease; run `work start` first"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
+    let candidate_sha =
+        inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
+    let progress = validation_progress(control, card_id, Some(&candidate_sha))?;
+    require_next_gate(&progress, gate_id)?;
+    let current_stage = progress
+        .next_permitted_stage
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no required validation check to reserve"),
+            code: ErrorCode::PolicyInvalidTransition,
+        })?;
+    let check = progress
+        .plan
+        .stages
+        .iter()
+        .find(|entry| entry.stage == current_stage)
+        .and_then(|entry| entry.checks.iter().find(|check| check.gate_id == gate_id))
+        .cloned()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("gate `{gate_id}` is not the next required validation check"),
+            code: ErrorCode::PolicyInvalidTransition,
+        })?;
+    Ok(ValidationReservationKeyV1 {
+        schema: VALIDATION_RESERVATION_KEY_SCHEMA.to_owned(),
+        card_id: card_id.clone(),
+        cycle_id: record.cycle_id.clone(),
+        card_revision: state.current_revision,
+        card_digest: state.current_digest,
+        lease_id: lease.lease_id,
+        candidate_sha,
+        base_sha: record.base_sha,
+        stage: current_stage,
+        check,
+        policy_digest: progress.plan.policy_digest,
+        proof_map_digest: progress.plan.proof_map_digest,
+        execution_mode,
+    })
+}
+
+fn reservations_for(
+    control: &ControlRepository,
+) -> Result<Vec<ValidationReservationRecord>, HarnessError> {
+    let directory = control.path(VALIDATION_RESERVATION_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<_> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory,
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| {
+            let record: ValidationReservationRecord =
+                serde_json::from_str(&fs::read_to_string(path).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: path.clone(),
+                        source,
+                    }
+                })?)
+                .map_err(|source| HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} is malformed: {source}",
+                        path.display()
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?;
+            if record.schema != VALIDATION_RESERVATION_SCHEMA
+                || record.key.schema != VALIDATION_RESERVATION_KEY_SCHEMA
+                || record.key.digest()? != record.key_digest
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} has an invalid immutable key",
+                        path.display()
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                });
+            }
+            Ok(record)
+        })
+        .collect()
+}
+
+fn next_reservation_id(
+    control: &ControlRepository,
+) -> Result<ValidationReservationId, HarnessError> {
+    let highest = reservations_for(control)?
+        .iter()
+        .filter_map(|record| record.reservation_id.as_str().strip_prefix("VR-"))
+        .filter_map(|digits| digits.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("VR-{:06}", highest + 1).parse()
+}
+
+fn reservation_outcome(
+    disposition: &str,
+    record: &ValidationReservationRecord,
+    dry_run: bool,
+) -> CommandOutcome {
+    CommandOutcome::new(
+        "gate.reserve",
+        format!(
+            "{disposition}: validation reservation {}",
+            record.reservation_id
+        ),
+        serde_json::json!({
+            "schema": "harness.validation-reservation-decision/v1",
+            "dry_run": dry_run,
+            "disposition": { "kind": disposition },
+            "reservation": record,
+        }),
+    )
+}
+
+fn run_reserve(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    // A reservation is intentionally tiny, and a simultaneous request should
+    // observe the durable winner rather than leak the project lock's transient
+    // fail-fast implementation detail to an agent. This is not a general lock
+    // queue (#20): after a short bounded retry window the honest lock refusal
+    // still wins.
+    for attempt in 0..20 {
+        match reserve_once(args, clock) {
+            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => return outcome,
+        }
+    }
+    unreachable!("the bounded retry loop always returns")
+}
+
+fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let execution_mode: ValidationExecutionMode = args.execution_mode.parse()?;
+    if args.dry_run {
+        let control = ControlRepository::open(&args.common.control)?;
+        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode)?;
+        let key_digest = key.digest()?;
+        if let Some(record) = reservations_for(&control)?
+            .into_iter()
+            .find(|record| record.key_digest == key_digest && record.key == key)
+        {
+            return Ok(reservation_outcome("wait_for_reserved_run", &record, true));
+        }
+        let now = clock.now();
+        let record = ValidationReservationRecord {
+            schema: VALIDATION_RESERVATION_SCHEMA.to_owned(),
+            reservation_id: next_reservation_id(&control)?,
+            key,
+            key_digest,
+            holder_actor_id: args.common.actor.clone(),
+            reserved_at: now,
+            expires_at: crate::domain::clock::Timestamp::from_unix_seconds(
+                now.unix_seconds() + 3600,
+            )?,
+            recovery_policy: "explicit_recovery_required".to_owned(),
+        };
+        return Ok(reservation_outcome("reserved", &record, true));
+    }
+    with_transaction(
+        &args.common.control,
+        "gate.reserve",
+        clock,
+        |control, events, expected, steps| {
+            let config = control.project()?;
+            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode)?;
+            let key_digest = key.digest()?;
+            if let Some(record) = reservations_for(control)?
+                .into_iter()
+                .find(|record| record.key_digest == key_digest && record.key == key)
+            {
+                return Ok(reservation_outcome("wait_for_reserved_run", &record, false)
+                    .with_project(config.project_id));
+            }
+            let now = clock.now();
+            let record = ValidationReservationRecord {
+                schema: VALIDATION_RESERVATION_SCHEMA.to_owned(),
+                reservation_id: next_reservation_id(control)?,
+                key,
+                key_digest,
+                holder_actor_id: args.common.actor.clone(),
+                reserved_at: now,
+                expires_at: crate::domain::clock::Timestamp::from_unix_seconds(
+                    now.unix_seconds() + 3600,
+                )?,
+                recovery_policy: "explicit_recovery_required".to_owned(),
+            };
+            steps.at("reservation-record-write")?;
+            control.write_atomic(
+                &ValidationReservationRecord::relative_path(&record.reservation_id),
+                &format!("{}\n", serde_json::to_string_pretty(&record)?),
+            )?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("validation.reserved", &args.common.actor)
+                    .cycle(record.key.cycle_id.clone())
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(record.reservation_id.to_string()),
+                    )
+                    .meta("key_digest", serde_json::json!(record.key_digest.as_str())),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("gate: reserve {} for {card_id}", args.gate_id),
+            )?;
+            Ok(reservation_outcome("reserved", &record, false).with_project(config.project_id))
+        },
     )
 }
 
