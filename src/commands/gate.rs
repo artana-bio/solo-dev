@@ -32,7 +32,7 @@ use crate::{
         cycle::CycleRecord,
         digest::Digest,
         gate::{GATE_DIR, GateDefinition, NetworkPolicy},
-        ids::{CardId, IntegrationId, ReceiptId, ValidationReservationId},
+        ids::{CardId, CycleId, IntegrationId, ReceiptId, ValidationReservationId},
         lease::LeaseRecord,
         validation_reservation::{
             CPU_HEAVY_LANE_DIR, CPU_HEAVY_LANE_SCHEMA, CpuHeavyLaneRecord,
@@ -85,6 +85,8 @@ pub enum GateCommand {
     Abandon(AbandonArgs),
     /// Execute a fixed mutation campaign under one exact reservation.
     Mutate(MutateArgs),
+    /// Project one deterministic CPU-heavy validation next action.
+    Schedule(ScheduleArgs),
     /// Show the deterministic validation stages for an activated card.
     Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
@@ -109,6 +111,7 @@ impl GateCommand {
             Self::Settle(..) => "gate.settle",
             Self::Abandon(..) => "gate.abandon",
             Self::Mutate(..) => "gate.mutate",
+            Self::Schedule(..) => "gate.schedule",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
         }
@@ -198,6 +201,26 @@ pub struct AbandonArgs {
     pub reservation_id: String,
 }
 
+/// Arguments accepted by `gate schedule`.
+#[derive(Debug, Args)]
+pub struct ScheduleArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// CPU-heavy reservation whose next action is projected.
+    #[arg(long)]
+    pub reservation_id: String,
+    /// Opaque state revision previously observed by the caller.
+    #[arg(long)]
+    pub state_revision: Option<String>,
+    /// Named suite whose observed duration crossed a budget.
+    #[arg(long)]
+    pub record_budget_crossing: Option<String>,
+    #[arg(long)]
+    pub observed_seconds: Option<u64>,
+    #[arg(long)]
+    pub budget_seconds: Option<u64>,
+}
+
 /// Arguments accepted by `gate preflight`.
 #[derive(Debug, Args)]
 pub struct PreflightArgs {
@@ -283,6 +306,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::Settle(args) => run_settle(args, clock),
         GateCommand::Abandon(args) => run_abandon(args, clock),
         GateCommand::Mutate(args) => run_mutate(args, clock),
+        GateCommand::Schedule(args) => run_schedule(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
     }
@@ -2280,6 +2304,136 @@ fn acquire_cpu_heavy_lane(
         acquired_at,
     };
     Ok(Some(lane))
+}
+
+fn schedule_projection(
+    control: &ControlRepository,
+    reservation_id: &ValidationReservationId,
+) -> Result<serde_json::Value, HarnessError> {
+    let reservation = reservations_for(control)?
+        .into_iter()
+        .find(|record| record.reservation_id == *reservation_id)
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("validation reservation {reservation_id} does not exist"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+    if reservation.key.execution_mode != ValidationExecutionMode::CpuHeavy {
+        return Err(HarnessError::Control {
+            reason: format!("validation reservation {reservation_id} is not CPU-heavy"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let lanes = cpu_heavy_lanes(control)?;
+    let lane_state = serde_json::to_value(&lanes)?;
+    let state_revision = Digest::of_canonical(&serde_json::json!({
+        "reservation_key_digest": reservation.key_digest,
+        "lanes": lane_state,
+    }))?;
+    let occupied = lanes.len() >= 2;
+    let cpu_cards: std::collections::BTreeSet<_> = reservations_for(control)?
+        .into_iter()
+        .filter(|record| record.key.execution_mode == ValidationExecutionMode::CpuHeavy)
+        .map(|record| record.key.card_id)
+        .collect();
+    let cycle: CycleRecord = serde_json::from_str(
+        &control.read(&CycleRecord::relative_path(&reservation.key.cycle_id))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("cycle {} is malformed: {source}", reservation.key.cycle_id),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let independent = cycle.card_ids.iter().any(|card_id| {
+        card_id != &reservation.key.card_id
+            && !cpu_cards.contains(card_id)
+            && held_lease(control, card_id).ok().flatten().is_some()
+    });
+    let recommendation = if occupied {
+        if independent {
+            "start_independent_work"
+        } else {
+            "wait"
+        }
+    } else {
+        "start"
+    };
+    Ok(serde_json::json!({
+        "schema": "harness.cpu-validation-schedule/v1",
+        "state_revision": state_revision,
+        "recommendation": { "kind": recommendation },
+        "blocker": if occupied { serde_json::json!({"kind":"cpu_lanes_occupied"}) } else { serde_json::Value::Null },
+        "release_condition": if occupied { serde_json::json!({"kind":"terminal_lane_settlement"}) } else { serde_json::Value::Null },
+        "reservation": reservation,
+        "receipt_reuse": {
+            "request": {"reservation_key_digest": reservation.key_digest},
+            "disposition": {"kind":"rerun_required"}
+        }
+    }))
+}
+
+fn run_schedule(args: &ScheduleArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
+    if let Some(suite) = &args.record_budget_crossing {
+        let observed = args.observed_seconds.ok_or_else(|| HarnessError::Control {
+            reason: "--observed-seconds is required with --record-budget-crossing".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        })?;
+        let budget = args.budget_seconds.ok_or_else(|| HarnessError::Control {
+            reason: "--budget-seconds is required with --record-budget-crossing".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        })?;
+        return with_transaction(
+            &args.common.control,
+            "gate.schedule.budget",
+            clock,
+            |control, events, expected, _steps| {
+                let config = control.project()?;
+                let projection = schedule_projection(control, &reservation_id)?;
+                let cycle_id: CycleId = projection["reservation"]["key"]["cycle_id"]
+                    .as_str()
+                    .ok_or_else(|| HarnessError::Control {
+                        reason: "schedule projection omitted cycle id".to_owned(),
+                        code: ErrorCode::InternalControlCorrupt,
+                    })?
+                    .parse()?;
+                let duplicate = events.all()?.iter().any(|event| {
+                    event.event_type == "validation.budget_crossed"
+                        && event.metadata.get("suite") == Some(&serde_json::json!(suite))
+                        && event.metadata.get("observed_seconds")
+                            == Some(&serde_json::json!(observed))
+                        && event.metadata.get("budget_seconds") == Some(&serde_json::json!(budget))
+                });
+                if !duplicate {
+                    events.append(
+                        &config.project_id,
+                        EventDraft::new("validation.budget_crossed", &args.common.actor)
+                            .cycle(cycle_id)
+                            .meta("suite", serde_json::json!(suite))
+                            .meta("observed_seconds", serde_json::json!(observed))
+                            .meta("budget_seconds", serde_json::json!(budget))
+                            .meta("action", serde_json::json!("observe_only")),
+                        clock,
+                    )?;
+                    control.commit(expected, "gate: record validation budget crossing")?;
+                }
+                Ok(CommandOutcome::new("gate.schedule", "recorded validation budget observation", serde_json::json!({"budget_event": {"schema":"harness.validation-budget-event/v1", "action":"observe_only", "policy_digest": projection["reservation"]["key"]["policy_digest"], "capacity_changed": serde_json::Value::Null}})).with_project(config.project_id))
+            },
+        );
+    }
+    let control = ControlRepository::open(&args.common.control)?;
+    let projection = schedule_projection(&control, &reservation_id)?;
+    if let Some(revision) = &args.state_revision
+        && projection["state_revision"].as_str() != Some(revision)
+    {
+        return Err(HarnessError::Control {
+            reason: "stale schedule state revision; re-query before acting".to_owned(),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    Ok(CommandOutcome::new(
+        "gate.schedule",
+        "projected CPU-heavy validation next action",
+        projection,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
