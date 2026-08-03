@@ -856,6 +856,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     support::git(&path, &["add", "-A"]);
     support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
     workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.review"]);
     let head = support::capture(&path, &["rev-parse", "HEAD"]);
     let declaration = workspace.root.join("declaration.yaml");
     fs::write(

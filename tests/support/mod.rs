@@ -80,6 +80,7 @@ impl Workspace {
         // Cards may only name registered gates, so the fixtures every test uses
         // must exist before any card is activated.
         workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.review", &["true"]);
         workspace.register_gate("gate.all", &["true"]);
         workspace
     }
@@ -369,8 +370,9 @@ impl Workspace {
         } else {
             "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n".to_owned()
         };
+        let review_gates = if risk == "low" { "[]" } else { "[gate.review]" };
         let body = format!(
-            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n{proof_map}",
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: {risk}\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: {review_gates}\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n{proof_map}",
             base = self.cycle_baseline(),
         );
         let path = self.root.join(format!("{card_id}.yaml"));

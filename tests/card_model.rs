@@ -502,7 +502,9 @@ fn the_invalidation_is_recorded_in_the_event_log() {
         &workspace,
         "F-001-v2.yaml",
         &with_proof_map(
-            &draft_yaml(&workspace, "F-001", "src/a.rs").replace("risk: low", "risk: high"),
+            &draft_yaml(&workspace, "F-001", "src/a.rs")
+                .replace("risk: low", "risk: high")
+                .replace("review: []", "review: [gate.review]"),
         ),
     );
     workspace.card(&[
@@ -542,7 +544,8 @@ fn revisions_increase_by_exactly_one() {
     for (index, risk) in ["medium", "high", "critical"].iter().enumerate() {
         let body = with_proof_map(
             &draft_yaml(&workspace, "F-001", "src/a.rs")
-                .replace("risk: low", &format!("risk: {risk}")),
+                .replace("risk: low", &format!("risk: {risk}"))
+                .replace("review: []", "review: [gate.review]"),
         );
         let revised = write_draft(&workspace, &format!("r{index}.yaml"), &body);
         let envelope = workspace.card_json(&[
