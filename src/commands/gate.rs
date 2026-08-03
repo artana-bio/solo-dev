@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use clap::{Args, Subcommand};
 
 use crate::{
@@ -72,6 +74,8 @@ pub enum GateCommand {
     Reserve(ReserveArgs),
     /// Record the terminal outcome of an exact validation reservation.
     Settle(SettleArgs),
+    /// Execute a fixed mutation campaign under one exact reservation.
+    Mutate(MutateArgs),
     /// Show the deterministic validation stages for an activated card.
     Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
@@ -94,6 +98,7 @@ impl GateCommand {
             Self::Run(..) => "gate.run",
             Self::Reserve(..) => "gate.reserve",
             Self::Settle(..) => "gate.settle",
+            Self::Mutate(..) => "gate.mutate",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
         }
@@ -130,12 +135,28 @@ pub struct ReserveArgs {
     /// The exact next permitted gate to reserve.
     #[arg(long)]
     pub gate_id: String,
-    /// Reservation mode. This first slice accepts only `named-gate`.
+    /// Reservation mode: `named-gate` or `declared-mutations`.
     #[arg(long, default_value = "named-gate")]
     pub execution_mode: String,
+    /// Versioned mutation campaign required by `declared-mutations`.
+    #[arg(long)]
+    pub campaign: Option<PathBuf>,
     /// Report the authoritative reservation decision without writing it.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments accepted by `gate mutate`.
+#[derive(Debug, Args)]
+pub struct MutateArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The live reservation authorizing the campaign.
+    #[arg(long)]
+    pub reservation_id: String,
+    /// The exact declared campaign bound to the reservation.
+    #[arg(long)]
+    pub campaign: PathBuf,
 }
 
 /// Arguments accepted by `gate settle`.
@@ -237,6 +258,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::Run(args) => run_gate(args, clock),
         GateCommand::Reserve(args) => run_reserve(args, clock),
         GateCommand::Settle(args) => run_settle(args, clock),
+        GateCommand::Mutate(args) => run_mutate(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
     }
@@ -249,6 +271,93 @@ fn read_definition(path: &PathBuf) -> Result<GateDefinition, HarnessError> {
         code: ErrorCode::ConfigMalformed,
     })?;
     parse_definition(&raw)
+}
+
+const DECLARED_MUTATION_CAMPAIGN_SCHEMA: &str = "harness.declared-mutation-campaign/v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredMutationCampaign {
+    schema: String,
+    mutations: Vec<DeclaredMutation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredMutation {
+    id: String,
+    path: String,
+    expected_utf8: String,
+    replacement_utf8: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MutationWitness {
+    mutation_id: String,
+    intended_diff_digest: Digest,
+    baseline_digest: Digest,
+    observed_verdict: String,
+    restoration_digest: Digest,
+}
+
+fn read_declared_campaign(path: &Path) -> Result<(DeclaredMutationCampaign, Digest), HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!("cannot read mutation campaign {}: {source}", path.display()),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let campaign: DeclaredMutationCampaign =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!(
+                "mutation campaign {} is malformed: {source}",
+                path.display()
+            ),
+            code: ErrorCode::ConfigMalformed,
+        })?;
+    if campaign.schema != DECLARED_MUTATION_CAMPAIGN_SCHEMA || campaign.mutations.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "mutation campaign must use the supported schema and contain mutations"
+                .to_owned(),
+            code: ErrorCode::ConfigMalformed,
+        });
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for mutation in &campaign.mutations {
+        if mutation.id.is_empty()
+            || mutation.path.is_empty()
+            || mutation.path.starts_with('/')
+            || mutation.path.split('/').any(|part| part == "..")
+            || mutation.expected_utf8 == mutation.replacement_utf8
+            || !ids.insert(mutation.id.clone())
+        {
+            return Err(HarnessError::Control {
+                reason: "mutation campaign declarations must be unique, relative, and reversible"
+                    .to_owned(),
+                code: ErrorCode::ConfigMalformed,
+            });
+        }
+    }
+    let digest = Digest::of_canonical(&campaign)?;
+    Ok((campaign, digest))
+}
+
+fn campaign_digest_for_reservation(
+    mode: ValidationExecutionMode,
+    campaign: Option<&Path>,
+) -> Result<Option<Digest>, HarnessError> {
+    match (mode, campaign) {
+        (ValidationExecutionMode::NamedGate, None) => Ok(None),
+        (ValidationExecutionMode::NamedGate, Some(_)) => Err(HarnessError::Control {
+            reason: "--campaign requires --execution-mode declared-mutations".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        }),
+        (ValidationExecutionMode::DeclaredMutations, Some(path)) => {
+            Ok(Some(read_declared_campaign(path)?.1))
+        }
+        (ValidationExecutionMode::DeclaredMutations, None) => Err(HarnessError::Control {
+            reason: "declared-mutations requires --campaign".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        }),
+    }
 }
 
 /// Parses a gate definition from YAML or JSON.
@@ -918,6 +1027,7 @@ fn reservation_key(
     card_id: &CardId,
     gate_id: &str,
     execution_mode: ValidationExecutionMode,
+    campaign_digest: Option<Digest>,
     require_next: bool,
 ) -> Result<ValidationReservationKeyV1, HarnessError> {
     let (record, state) = load_card(control, card_id)?;
@@ -963,6 +1073,7 @@ fn reservation_key(
         policy_digest: progress.plan.policy_digest,
         proof_map_digest: progress.plan.proof_map_digest,
         execution_mode,
+        campaign_digest,
     })
 }
 
@@ -1107,6 +1218,7 @@ fn live_reservation_for_run(
         card_id,
         &args.gate_id,
         ValidationExecutionMode::NamedGate,
+        None,
         true,
     )?;
     let key_digest = key.digest()?;
@@ -1489,12 +1601,22 @@ fn run_reserve(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     unreachable!("the bounded retry loop always returns")
 }
 
+#[allow(clippy::too_many_lines)]
 fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let execution_mode: ValidationExecutionMode = args.execution_mode.parse()?;
+    let campaign_digest =
+        campaign_digest_for_reservation(execution_mode, args.campaign.as_deref())?;
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode, false)?;
+        let key = reservation_key(
+            &control,
+            &card_id,
+            &args.gate_id,
+            execution_mode,
+            campaign_digest.clone(),
+            false,
+        )?;
         let key_digest = key.digest()?;
         if let Some(record) = reservations_for(&control)?
             .into_iter()
@@ -1505,7 +1627,14 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
             }
             return Ok(reservation_outcome("wait_for_reserved_run", &record, true));
         }
-        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode, true)?;
+        let key = reservation_key(
+            &control,
+            &card_id,
+            &args.gate_id,
+            execution_mode,
+            campaign_digest.clone(),
+            true,
+        )?;
         let key_digest = key.digest()?;
         let now = clock.now();
         let record = ValidationReservationRecord {
@@ -1528,7 +1657,14 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
         clock,
         |control, events, expected, steps| {
             let config = control.project()?;
-            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode, false)?;
+            let key = reservation_key(
+                control,
+                &card_id,
+                &args.gate_id,
+                execution_mode,
+                campaign_digest.clone(),
+                false,
+            )?;
             let key_digest = key.digest()?;
             if let Some(record) = reservations_for(control)?
                 .into_iter()
@@ -1541,7 +1677,14 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 return Ok(reservation_outcome("wait_for_reserved_run", &record, false)
                     .with_project(config.project_id));
             }
-            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode, true)?;
+            let key = reservation_key(
+                control,
+                &card_id,
+                &args.gate_id,
+                execution_mode,
+                campaign_digest.clone(),
+                true,
+            )?;
             let key_digest = key.digest()?;
             let now = clock.now();
             let record = ValidationReservationRecord {
@@ -1577,6 +1720,202 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 &format!("gate: reserve {} for {card_id}", args.gate_id),
             )?;
             Ok(reservation_outcome("reserved", &record, false).with_project(config.project_id))
+        },
+    )
+}
+
+fn live_campaign_reservation(
+    control: &ControlRepository,
+    args: &MutateArgs,
+    campaign_digest: &Digest,
+) -> Result<ValidationReservationRecord, HarnessError> {
+    let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
+    let reservation = reservations_for(control)?
+        .into_iter()
+        .find(|record| record.reservation_id == reservation_id)
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("validation reservation {reservation_id} does not exist"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+    if reservation.holder_actor_id != args.common.actor
+        || settlement_for(control, &reservation)?.is_some()
+        || reservation.key.execution_mode != ValidationExecutionMode::DeclaredMutations
+        || reservation.key.campaign_digest.as_ref() != Some(campaign_digest)
+    {
+        return Err(HarnessError::Control {
+            reason: format!("reservation {reservation_id} is not a live exact campaign permit"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let current = reservation_key(
+        control,
+        &reservation.key.card_id,
+        &reservation.key.check.gate_id,
+        ValidationExecutionMode::DeclaredMutations,
+        Some(campaign_digest.clone()),
+        true,
+    )?;
+    if current != reservation.key || current.digest()? != reservation.key_digest {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "reservation {reservation_id} does not match the current declared mutation campaign key"
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    Ok(reservation)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let (campaign, campaign_digest) = read_declared_campaign(&args.campaign)?;
+    with_transaction(
+        &args.common.control,
+        "gate.mutate",
+        clock,
+        |control, events, expected, steps| {
+            let config = control.project()?;
+            let reservation = live_campaign_reservation(control, args, &campaign_digest)?;
+            let lease = held_lease(control, &reservation.key.card_id)?.ok_or_else(|| {
+                HarnessError::Control {
+                    reason: format!("card {} holds no lease", reservation.key.card_id),
+                    code: ErrorCode::PreconditionNotFound,
+                }
+            })?;
+            let gate = load_gate(control, &reservation.key.check.gate_id)?;
+            steps.at("mutation-execution-setup")?;
+            let execution = DisposableExecution::create(
+                control,
+                &config.repository,
+                &reservation,
+                &lease.worktree_path,
+            )?;
+            let log_root = control.path(LOG_DIR).join(reservation.key.card_id.as_str());
+            let mut witnesses = Vec::new();
+            for (index, mutation) in campaign.mutations.iter().enumerate() {
+                let target = execution.source.join(&mutation.path);
+                let baseline = fs::read(&target).map_err(|source| HarnessError::ControlIo {
+                    path: target.clone(),
+                    source,
+                })?;
+                let baseline_text =
+                    std::str::from_utf8(&baseline).map_err(|_| HarnessError::Control {
+                        reason: format!("mutation target {} is not UTF-8", mutation.path),
+                        code: ErrorCode::PolicyInvalidTransition,
+                    })?;
+                if baseline_text != mutation.expected_utf8 {
+                    return Err(HarnessError::Control {
+                        reason: format!(
+                            "mutation {} does not match the restored baseline",
+                            mutation.id
+                        ),
+                        code: ErrorCode::PolicyInvalidTransition,
+                    });
+                }
+                let baseline_digest = Digest::of_bytes(&baseline);
+                let intended_diff_digest = Digest::of_canonical(mutation)?;
+                fs::write(&target, &mutation.replacement_utf8).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: target.clone(),
+                        source,
+                    }
+                })?;
+                let outcome = run_attempt_with_validation_cache(
+                    &gate,
+                    &execution.source,
+                    &log_root,
+                    u32::try_from(index + 1).map_err(|_| HarnessError::Control {
+                        reason: "mutation campaign has too many entries".to_owned(),
+                        code: ErrorCode::ConfigMalformed,
+                    })?,
+                    clock,
+                    Some(&execution.cache),
+                )?;
+                fs::write(&target, &baseline).map_err(|source| HarnessError::ControlIo {
+                    path: target.clone(),
+                    source,
+                })?;
+                steps.at("mutation-restoration-verify")?;
+                let restoration_digest =
+                    Digest::of_bytes(&fs::read(&target).map_err(|source| {
+                        HarnessError::ControlIo {
+                            path: target.clone(),
+                            source,
+                        }
+                    })?);
+                if restoration_digest != baseline_digest {
+                    return Err(HarnessError::Control {
+                        reason: format!("mutation {} failed to restore its baseline", mutation.id),
+                        code: ErrorCode::PolicyInvalidTransition,
+                    });
+                }
+                if outcome.passed() {
+                    return Err(HarnessError::Control {
+                        reason: format!("mutation {} survived its required gate", mutation.id),
+                        code: ErrorCode::PolicyInvalidTransition,
+                    });
+                }
+                witnesses.push(MutationWitness {
+                    mutation_id: mutation.id.clone(),
+                    intended_diff_digest,
+                    baseline_digest,
+                    observed_verdict: "failed".to_owned(),
+                    restoration_digest,
+                });
+            }
+            let final_baseline_digest = witnesses
+                .last()
+                .map(|w| w.restoration_digest.clone())
+                .ok_or_else(|| HarnessError::Control {
+                    reason: "mutation campaign is empty".to_owned(),
+                    code: ErrorCode::ConfigMalformed,
+                })?;
+            let witness_path = format!(
+                "validation-mutation-witnesses/{}.json",
+                reservation.reservation_id
+            );
+            control.write_atomic(
+                &witness_path,
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": "harness.validation-mutation-witnesses/v1",
+                        "reservation_id": reservation.reservation_id,
+                        "campaign_digest": campaign_digest,
+                        "mutation_witnesses": witnesses,
+                        "final_baseline_digest": final_baseline_digest,
+                    }))?
+                ),
+            )?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("validation.mutation_campaign_completed", &args.common.actor)
+                    .card(
+                        reservation.key.card_id.clone(),
+                        reservation.key.card_revision,
+                        reservation.key.card_digest.clone(),
+                    )
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(reservation.reservation_id.to_string()),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("gate: mutate campaign for {}", reservation.key.card_id),
+            )?;
+            Ok(CommandOutcome::new(
+                "gate.mutate",
+                "completed declared mutation campaign",
+                serde_json::json!({
+                    "reservation_id": reservation.reservation_id,
+                    "campaign_digest": campaign_digest,
+                    "mutation_witnesses": witnesses,
+                    "final_baseline_digest": final_baseline_digest,
+                }),
+            )
+            .with_project(config.project_id))
         },
     )
 }

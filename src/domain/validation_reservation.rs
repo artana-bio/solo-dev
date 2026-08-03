@@ -30,6 +30,8 @@ pub const VALIDATION_RESERVATION_SETTLEMENT_SCHEMA: &str =
 pub enum ValidationExecutionMode {
     /// A registered named gate; execution itself remains a later slice.
     NamedGate,
+    /// A fixed, reviewed campaign of reversible source mutations.
+    DeclaredMutations,
 }
 
 impl std::str::FromStr for ValidationExecutionMode {
@@ -38,10 +40,9 @@ impl std::str::FromStr for ValidationExecutionMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "named-gate" => Ok(Self::NamedGate),
+            "declared-mutations" => Ok(Self::DeclaredMutations),
             _ => Err(crate::error::HarnessError::Control {
-                reason: format!(
-                    "unsupported validation execution mode `{value}`; only `named-gate` is available"
-                ),
+                reason: format!("unsupported validation execution mode `{value}`"),
                 code: crate::error::ErrorCode::UsageInvalidArguments,
             }),
         }
@@ -65,6 +66,9 @@ pub struct ValidationReservationKeyV1 {
     pub policy_digest: Digest,
     pub proof_map_digest: Option<Digest>,
     pub execution_mode: ValidationExecutionMode,
+    /// Canonical digest of the declared mutation campaign, when this is a
+    /// mutation reservation. It is part of the sharing identity.
+    pub campaign_digest: Option<Digest>,
 }
 
 impl ValidationReservationKeyV1 {
@@ -158,6 +162,7 @@ mod tests {
             policy_digest: Digest::of_bytes(b"policy-a"),
             proof_map_digest: None,
             execution_mode: ValidationExecutionMode::NamedGate,
+            campaign_digest: None,
         }
     }
 

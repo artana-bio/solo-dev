@@ -85,6 +85,7 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
     "verifications",
     "validation-reservations",
     "validation-reservation-settlements",
+    "validation-mutation-witnesses",
     "acceptances",
     "archives",
 ];
