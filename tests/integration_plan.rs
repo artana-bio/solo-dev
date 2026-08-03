@@ -326,6 +326,140 @@ fn omitting_card_ids_selects_every_ready_card() {
 }
 
 #[test]
+fn final_prepare_requires_a_sealed_cycle_before_it_changes_state() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let before = workspace.control_head();
+
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-CYCLE-NOT-SEALED");
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "refusal must not record a plan"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "approved"
+    );
+}
+
+#[test]
+fn final_prepare_forbids_card_selection_arguments() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+        "--card-id",
+        "F-001",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(error_code(&output), "CH-USAGE-CONFLICTING-OPTIONS");
+}
+
+#[test]
+fn final_prepare_refuses_a_sealed_cycle_with_an_unaccounted_member() {
+    let workspace = cycle_with(2);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+    let before = workspace.control_head();
+
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-FINAL-CYCLE-INCOMPLETE");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("F-002"),
+        "the refusal must name the unaccounted member"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "refusal must not record a plan"
+    );
+}
+
+#[test]
+fn final_prepare_accounts_for_every_sealed_member_and_records_the_seal_binding() {
+    let workspace = cycle_with(2);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.approve_card("F-002", "src/F-002/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(merge_order(&envelope), ["F-001", "F-002"]);
+    assert_eq!(envelope["data"]["mode"], "batch");
+    assert_eq!(envelope["data"]["final_for_cycle"], true);
+    assert!(
+        envelope["data"]["sealed_cycle_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the exact sealed record must be pinned: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["abandoned_card_ids"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn final_prepare_keeps_an_explicitly_abandoned_member_auditable() {
+    let workspace = cycle_with(2);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.card(&[
+        "abandon",
+        "--card-id",
+        "F-002",
+        "--reason",
+        "superseded by F-001",
+    ]);
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(merge_order(&envelope), ["F-001"]);
+    assert_eq!(envelope["data"]["mode"], "batch");
+    assert_eq!(
+        envelope["data"]["abandoned_card_ids"],
+        serde_json::json!(["F-002"])
+    );
+}
+
+#[test]
 fn dependencies_are_merged_before_their_dependents() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[

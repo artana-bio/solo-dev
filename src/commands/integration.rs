@@ -28,7 +28,7 @@ use crate::{
     domain::{
         card::{CardRecord, CardState},
         clock::Clock,
-        cycle::CycleRecord,
+        cycle::{CycleRecord, CycleStatus},
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, IntegrationId},
         integration::{
@@ -160,6 +160,9 @@ pub struct PrepareArgs {
     /// Whether this integration lands one card or several.
     #[arg(long, value_enum)]
     pub mode: Option<ModeArg>,
+    /// Prepare the complete, auditable integration for a sealed cycle.
+    #[arg(long = "final")]
+    pub final_for_cycle: bool,
     /// Validate and report the plan without recording it.
     #[arg(long)]
     pub dry_run: bool,
@@ -749,6 +752,13 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         .map(|raw| raw.parse())
         .collect::<Result<_, _>>()?;
 
+    if args.final_for_cycle && !requested.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "`--final` selects the complete sealed cycle and cannot be combined with `--card-id`".to_owned(),
+            code: ErrorCode::UsageConflictingOptions,
+        });
+    }
+
     if args.dry_run {
         return preview_prepare(args, &cycle_id, &requested);
     }
@@ -871,6 +881,9 @@ fn build_record(
         baseline_sha,
         expected_main_sha,
         members: plan.members,
+        final_for_cycle: plan.final_for_cycle,
+        sealed_cycle_digest: plan.sealed_cycle_digest,
+        abandoned_card_ids: plan.abandoned_card_ids,
         atomic_groups: plan.atomic_groups,
         integration_head: None,
         integration_tree: None,
@@ -888,6 +901,9 @@ struct Plan {
     members: Vec<IntegrationMember>,
     atomic_groups: Vec<String>,
     mode: IntegrationMode,
+    final_for_cycle: bool,
+    sealed_cycle_digest: Option<Digest>,
+    abandoned_card_ids: Vec<CardId>,
     /// Cards the cycle holds that this plan left out, and why.
     ///
     /// Only ever populated when the coordinator named no cards. `select` then
@@ -898,6 +914,66 @@ struct Plan {
     /// ships fewer cards than the coordinator believes is the same surprise as
     /// one that ships more. Named cards still refuse; see `select`.
     deferred: Vec<(CardId, String)>,
+}
+
+/// Binds a final plan to one sealed membership snapshot and refuses omissions.
+fn final_cycle_binding(
+    cycle: &CycleRecord,
+    assessed: &[Candidacy],
+    selected: &[&Candidacy],
+    requested: bool,
+) -> Result<(bool, Option<Digest>, Vec<CardId>), HarnessError> {
+    if !requested {
+        return Ok((false, None, Vec::new()));
+    }
+    if cycle.status != CycleStatus::Sealed {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {} is `{}`; `integration prepare --final` requires a sealed cycle",
+                cycle.cycle_id,
+                cycle.status.name()
+            ),
+            code: ErrorCode::PolicyCycleNotSealed,
+        });
+    }
+
+    let selected_ids: std::collections::BTreeSet<&CardId> = selected
+        .iter()
+        .map(|candidacy| &candidacy.record.card_id)
+        .collect();
+    let by_id: std::collections::BTreeMap<&CardId, &Candidacy> = assessed
+        .iter()
+        .map(|candidacy| (&candidacy.record.card_id, candidacy))
+        .collect();
+    let mut abandoned_card_ids = Vec::new();
+    for card_id in &cycle.card_ids {
+        let candidacy = by_id.get(card_id).ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "sealed cycle {} is incomplete: card {card_id} was declared but has no activated record",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyFinalCycleIncomplete,
+        })?;
+        if candidacy.state == CardState::Abandoned {
+            abandoned_card_ids.push(card_id.clone());
+            continue;
+        }
+        if !selected_ids.contains(card_id) {
+            let reason = candidacy
+                .blocked_by
+                .as_deref()
+                .unwrap_or("card is not selected");
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "sealed cycle {} is incomplete: card {card_id} cannot be included: {reason}",
+                    cycle.cycle_id
+                ),
+                code: ErrorCode::PolicyFinalCycleIncomplete,
+            });
+        }
+    }
+    abandoned_card_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    Ok((true, Some(Digest::of_canonical(cycle)?), abandoned_card_ids))
 }
 
 /// Validates a selection and derives its plan, changing nothing.
@@ -927,7 +1003,9 @@ fn build_plan(
 
     let assessed = assess(control, cycle)?;
     let selected = select(&assessed, requested)?;
-    if selected.is_empty() {
+    let (final_for_cycle, sealed_cycle_digest, abandoned_card_ids) =
+        final_cycle_binding(cycle, &assessed, &selected, args.final_for_cycle)?;
+    if selected.is_empty() && !args.final_for_cycle {
         return Err(HarnessError::Control {
             reason: format!("cycle {} has no cards ready to integrate", cycle.cycle_id),
             code: ErrorCode::PreconditionNotFound,
@@ -936,7 +1014,17 @@ fn build_plan(
 
     check_dependencies(&selected, &assessed)?;
     let atomic_groups = check_atomic_groups(cycle, &selected)?;
-    let mode = resolve_mode(args.mode, selected.len())?;
+    let mode = if args.final_for_cycle {
+        if matches!(args.mode, Some(ModeArg::Individual)) {
+            return Err(HarnessError::Control {
+                reason: "`--final` always prepares a batch integration and cannot use `--mode individual`".to_owned(),
+                code: ErrorCode::UsageConflictingOptions,
+            });
+        }
+        IntegrationMode::Batch
+    } else {
+        resolve_mode(args.mode, selected.len())?
+    };
     let members = plan_members(control, cycle, &selected)?;
 
     let deferred = if requested.is_empty() {
@@ -957,6 +1045,9 @@ fn build_plan(
         members,
         atomic_groups,
         mode,
+        final_for_cycle,
+        sealed_cycle_digest,
+        abandoned_card_ids,
         deferred,
     })
 }
@@ -1001,6 +1092,9 @@ fn preview_prepare(
             "dry_run": true,
             "cycle_id": cycle_id.to_string(),
             "mode": plan.mode.name(),
+            "final_for_cycle": plan.final_for_cycle,
+            "sealed_cycle_digest": plan.sealed_cycle_digest,
+            "abandoned_card_ids": plan.abandoned_card_ids,
             "merge_order": order,
             "atomic_groups": plan.atomic_groups,
             "deferred": plan.deferred.iter().map(|(card_id, reason)| serde_json::json!({
@@ -1052,6 +1146,9 @@ fn report_integration(
             "cycle_id": record.cycle_id.to_string(),
             "status": record.status.name(),
             "mode": record.mode.name(),
+            "final_for_cycle": record.final_for_cycle,
+            "sealed_cycle_digest": record.sealed_cycle_digest,
+            "abandoned_card_ids": record.abandoned_card_ids,
             "baseline_sha": record.baseline_sha,
             "expected_main_sha": record.expected_main_sha,
             "atomic_groups": record.atomic_groups,

@@ -29,6 +29,11 @@ pub const INTEGRATION_SCHEMA: &str = "harness.integration/v1";
 /// Directory holding integration records, relative to the control repository.
 pub const INTEGRATION_DIR: &str = "integrations";
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Where an integration is in its lifecycle.
 ///
 /// Section 11.3.
@@ -198,6 +203,15 @@ pub struct IntegrationRecord {
     pub expected_main_sha: String,
     /// The selected candidates, in the order they must be merged.
     pub members: Vec<IntegrationMember>,
+    /// Whether this is the one complete integration for a sealed cycle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub final_for_cycle: bool,
+    /// Digest of the exact sealed cycle record this final plan accounted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_cycle_digest: Option<Digest>,
+    /// Sealed members deliberately abandoned instead of selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abandoned_card_ids: Vec<CardId>,
     /// Atomic groups fully represented in this integration.
     pub atomic_groups: Vec<String>,
     /// The merged integration commit, once `integration merge` has built it.
