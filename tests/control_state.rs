@@ -617,13 +617,14 @@ fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
 
 #[test]
 fn a_recognized_github_token_in_staged_utf8_is_refused_without_becoming_durable() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+
     let fixture = Fixture::new();
     assert!(fixture.init().status.success());
     let control = ControlRepository::open(&fixture.control).unwrap();
     let before_head = control.head().unwrap();
     let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
 
-    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
     let contents = format!(
         r#"{{"note":"{TOKEN}"}}
 "#
