@@ -300,10 +300,20 @@ pub(crate) fn validate_final_authorization_for_promotion(
     if !record.final_for_cycle {
         return Ok(());
     }
-    // Historical v1 records remain promotable under the policy that created
-    // them. Only newly-recorded final acceptances are v2 and pin the policy.
+    // Historical v1 records remain promotable only under an old project that
+    // has no v2 final-authorization policy. An explicit v2 policy cannot be
+    // bypassed by rewriting a final record to look historical.
     if acceptance.schema == ACCEPTANCE_SCHEMA {
-        return Ok(());
+        if config.final_authorization_policy.is_none() {
+            return Ok(());
+        }
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final integration {} has a v1 acceptance while an explicit final authorization policy requires v2",
+                record.integration_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
     }
     if acceptance.schema != ACCEPTANCE_V2_SCHEMA {
         return Err(HarnessError::Control {

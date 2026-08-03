@@ -410,7 +410,7 @@ pub struct ProjectConfig {
     pub validation_policy: ValidationPolicy,
     /// Declared final-cycle authorization policy. Omission preserves the
     /// compatible v1 default while every v2 acceptance pins its digest.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_authorization_policy: Option<FinalAuthorizationPolicy>,
 }
 

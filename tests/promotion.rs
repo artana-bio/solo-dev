@@ -68,6 +68,7 @@ fn accepted(count: usize) -> (Workspace, String) {
 /// A reviewed final integration, eligible for the v2 final authorization path.
 fn reviewed_final() -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    configure_final_authorizers(&workspace, &["owner"]);
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "final"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/**"]);
@@ -98,10 +99,14 @@ fn reviewed_final() -> (Workspace, String) {
     (workspace, id)
 }
 
-fn change_final_authorizers(workspace: &Workspace, authorizers: &[&str]) {
+fn configure_final_authorizers(workspace: &Workspace, authorizers: &[&str]) {
     let path = workspace.control.join("project/project.json");
     let mut project: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    project["final_authorization_policy"]["authorizer_actor_ids"] = serde_json::json!(authorizers);
+    project["final_authorization_policy"] = serde_json::json!({
+        "version": "harness.final-authorization-policy/v1",
+        "authorization_unit": "sealed_cycle",
+        "authorizer_actor_ids": authorizers,
+    });
     fs::write(
         &path,
         format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
@@ -110,7 +115,7 @@ fn change_final_authorizers(workspace: &Workspace, authorizers: &[&str]) {
     support::git(&workspace.control, &["add", "-A"]);
     support::git(
         &workspace.control,
-        &["commit", "-q", "-m", "change final policy"],
+        &["commit", "-q", "-m", "configure final policy"],
     );
 }
 
@@ -172,7 +177,7 @@ fn final_authorization_policy_change_refuses_promotion() {
     ]);
     // Keep the original authorizer valid so the refusal proves the pinned
     // policy digest, not merely membership lookup.
-    change_final_authorizers(&workspace, &["owner", "new-owner"]);
+    configure_final_authorizers(&workspace, &["owner", "new-owner"]);
     let rejected = workspace.integration_raw(&[
         "promote",
         "--integration-id",
@@ -299,6 +304,59 @@ fn historical_v1_final_acceptance_remains_promotable_without_a_new_policy() {
 }
 
 #[test]
+fn explicit_v2_policy_refuses_a_final_record_downgraded_to_v1_before_authority_moves() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    let path = workspace.control.join("acceptances/ACC-000001.json");
+    let mut acceptance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    acceptance["schema"] = serde_json::json!("harness.acceptance/v1");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("authorizer_actor_id");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy_digest");
+    acceptance
+        .as_object_mut()
+        .unwrap()
+        .remove("sealed_cycle_digest");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&acceptance).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "downgrade final acceptance"],
+    );
+    let before = support::capture(&workspace.authority, &["rev-parse", "main"]);
+    let refusal = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-NOT-ACCEPTED");
+    assert_eq!(
+        support::capture(&workspace.authority, &["rev-parse", "main"]),
+        before,
+        "a configured v2 policy must refuse before authority mutation"
+    );
+}
+
+#[test]
 fn an_old_unconfigured_project_refuses_new_final_authorization_without_mutation() {
     let (workspace, id) = reviewed_final();
     let project_path = workspace.control.join("project/project.json");
@@ -326,6 +384,46 @@ fn an_old_unconfigured_project_refuses_new_final_authorization_without_mutation(
     assert_eq!(refusal.status.code(), Some(5));
     assert_eq!(error_code(&refusal), "CH-POLICY-NOT-ACCEPTED");
     assert_eq!(workspace.control_head(), before);
+}
+
+#[test]
+fn project_init_requires_explicit_final_authorizers_to_write_a_v2_policy() {
+    let unconfigured = Workspace::initialized();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &fs::read(unconfigured.control.join("project/project.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(raw.get("final_authorization_policy").is_none());
+
+    let configured = Workspace::new();
+    let output = Workspace::run(&[
+        "project".into(),
+        "init".into(),
+        "--project-id".into(),
+        "configured".into(),
+        "--repository".into(),
+        configured.repository.display().to_string(),
+        "--control".into(),
+        configured.control.display().to_string(),
+        "--authority".into(),
+        configured.authority.display().to_string(),
+        "--worktree-root".into(),
+        configured.worktrees.display().to_string(),
+        "--final-authorizer-actor-id".into(),
+        "owner".into(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(configured.control.join("project/project.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        raw["final_authorization_policy"]["authorizer_actor_ids"],
+        serde_json::json!(["owner"])
+    );
 }
 
 #[test]
