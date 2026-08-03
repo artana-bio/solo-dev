@@ -2325,10 +2325,6 @@ fn schedule_projection(
     }
     let lanes = cpu_heavy_lanes(control)?;
     let lane_state = serde_json::to_value(&lanes)?;
-    let state_revision = Digest::of_canonical(&serde_json::json!({
-        "reservation_key_digest": reservation.key_digest,
-        "lanes": lane_state,
-    }))?;
     let occupied = lanes.len() >= 2;
     let cpu_cards: std::collections::BTreeSet<_> = reservations_for(control)?
         .into_iter()
@@ -2342,11 +2338,34 @@ fn schedule_projection(
         reason: format!("cycle {} is malformed: {source}", reservation.key.cycle_id),
         code: ErrorCode::InternalControlCorrupt,
     })?;
-    let independent = cycle.card_ids.iter().any(|card_id| {
-        card_id != &reservation.key.card_id
-            && !cpu_cards.contains(card_id)
-            && held_lease(control, card_id).ok().flatten().is_some()
-    });
+    // A lane recommendation is only usable while its independent alternative
+    // remains eligible.  Bind every candidate's lifecycle and lease facts into
+    // the opaque revision so a coordinator cannot act on an old suggestion.
+    let mut independent_eligibility = Vec::new();
+    for card_id in &cycle.card_ids {
+        if card_id == &reservation.key.card_id || cpu_cards.contains(card_id) {
+            continue;
+        }
+        let (_card, state) = load_card(control, card_id)?;
+        let lease = held_lease(control, card_id)?;
+        let eligible = state.state.name() == "active" && lease.is_some();
+        independent_eligibility.push(serde_json::json!({
+            "card_id": card_id,
+            "card_revision": state.current_revision,
+            "card_digest": state.current_digest,
+            "state": state.state.name(),
+            "lease_id": lease.map(|lease| lease.lease_id),
+            "eligible": eligible,
+        }));
+    }
+    let independent = independent_eligibility
+        .iter()
+        .any(|candidate| candidate["eligible"] == true);
+    let state_revision = Digest::of_canonical(&serde_json::json!({
+        "reservation_key_digest": reservation.key_digest,
+        "lanes": lane_state,
+        "independent_eligibility": independent_eligibility.clone(),
+    }))?;
     let recommendation = if occupied {
         if independent {
             "start_independent_work"
@@ -2362,6 +2381,7 @@ fn schedule_projection(
         "recommendation": { "kind": recommendation },
         "blocker": if occupied { serde_json::json!({"kind":"cpu_lanes_occupied"}) } else { serde_json::Value::Null },
         "release_condition": if occupied { serde_json::json!({"kind":"terminal_lane_settlement"}) } else { serde_json::Value::Null },
+        "independent_work": {"eligible": independent, "candidates": independent_eligibility},
         "reservation": reservation,
         "receipt_reuse": {
             "request": {"reservation_key_digest": reservation.key_digest},
@@ -2395,12 +2415,18 @@ fn run_schedule(args: &ScheduleArgs, clock: &dyn Clock) -> Result<CommandOutcome
                         code: ErrorCode::InternalControlCorrupt,
                     })?
                     .parse()?;
+                let reservation_key_digest = projection["reservation"]["key_digest"].clone();
+                let cpu_profile_digest =
+                    projection["reservation"]["key"]["cpu_profile_digest"].clone();
                 let duplicate = events.all()?.iter().any(|event| {
                     event.event_type == "validation.budget_crossed"
                         && event.metadata.get("suite") == Some(&serde_json::json!(suite))
                         && event.metadata.get("observed_seconds")
                             == Some(&serde_json::json!(observed))
                         && event.metadata.get("budget_seconds") == Some(&serde_json::json!(budget))
+                        && event.metadata.get("reservation_key_digest")
+                            == Some(&reservation_key_digest)
+                        && event.metadata.get("cpu_profile_digest") == Some(&cpu_profile_digest)
                 });
                 if !duplicate {
                     events.append(
@@ -2410,12 +2436,14 @@ fn run_schedule(args: &ScheduleArgs, clock: &dyn Clock) -> Result<CommandOutcome
                             .meta("suite", serde_json::json!(suite))
                             .meta("observed_seconds", serde_json::json!(observed))
                             .meta("budget_seconds", serde_json::json!(budget))
+                            .meta("reservation_key_digest", reservation_key_digest.clone())
+                            .meta("cpu_profile_digest", cpu_profile_digest.clone())
                             .meta("action", serde_json::json!("observe_only")),
                         clock,
                     )?;
                     control.commit(expected, "gate: record validation budget crossing")?;
                 }
-                Ok(CommandOutcome::new("gate.schedule", "recorded validation budget observation", serde_json::json!({"budget_event": {"schema":"harness.validation-budget-event/v1", "action":"observe_only", "policy_digest": projection["reservation"]["key"]["policy_digest"], "capacity_changed": serde_json::Value::Null}})).with_project(config.project_id))
+                Ok(CommandOutcome::new("gate.schedule", "recorded validation budget observation", serde_json::json!({"budget_event": {"schema":"harness.validation-budget-event/v1", "action":"observe_only", "policy_digest": projection["reservation"]["key"]["policy_digest"], "reservation_key_digest": reservation_key_digest, "cpu_profile_digest": cpu_profile_digest, "capacity_changed": serde_json::Value::Null}})).with_project(config.project_id))
             },
         );
     }

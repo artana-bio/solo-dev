@@ -164,6 +164,27 @@ fn schedule_is_fresh_read_only_and_reports_wait_with_independent_work_at_two_cpu
         "without exact compatible provenance, scheduling must not infer reuse"
     );
     assert!(initial["data"]["receipt_reuse"]["request"].is_object());
+    let initial_revision = initial["data"]["state_revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    workspace.work(&[
+        "block",
+        "--card-id",
+        "F-004",
+        "--reason",
+        "independent work is no longer eligible",
+    ]);
+    let blocked: serde_json::Value =
+        serde_json::from_slice(&schedule_raw(&workspace.control, &third, None).stdout).unwrap();
+    assert_eq!(blocked["data"]["recommendation"]["kind"], "wait");
+    assert_ne!(blocked["data"]["state_revision"], initial_revision);
+    let stale_after_eligibility_change =
+        schedule_raw(&workspace.control, &third, Some(&initial_revision));
+    assert!(
+        !stale_after_eligibility_change.status.success(),
+        "an eligibility change must invalidate the prior next-action revision"
+    );
     let stale = schedule_raw(&workspace.control, &third, Some("stale"));
     assert!(
         !stale.status.success(),
@@ -269,6 +290,11 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
     let workspace = Workspace::initialized();
     let marker = workspace.root.join("budget-marker");
     slow_gate(&workspace, "gate.budget", &marker);
+    slow_gate(
+        &workspace,
+        "gate.budget.second",
+        &workspace.root.join("budget-second"),
+    );
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -279,6 +305,8 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates("F-001", &["src/budget/**"], &["gate.budget"]);
     workspace.work(&["start", "--card-id", "F-001"]);
+    workspace.activate_card_with_gates("F-002", &["src/budget-second/**"], &["gate.budget.second"]);
+    workspace.work(&["start", "--card-id", "F-002"]);
     let profile = profile(&workspace);
     let reservation = workspace.gate_json(&[
         "reserve",
@@ -296,10 +324,26 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
         .as_str()
         .unwrap()
         .to_owned();
+    let second_reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-002",
+        "--gate-id",
+        "gate.budget.second",
+        "--execution-mode",
+        "cpu-heavy",
+        "--cpu-profile",
+        &profile,
+        "--actor",
+        "holder",
+    ])["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let before_policy = workspace.control_head();
     // The implementation supplies a small deterministic fixture command; this
     // proof requires its event to be advisory only and never authorize work.
-    let run_budget = || {
+    let run_budget = |reservation_id: &str| {
         Command::new(env!("CARGO_BIN_EXE_change-harness"))
             .args([
                 "gate",
@@ -309,7 +353,7 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
                 "--control",
                 workspace.control.to_str().unwrap(),
                 "--reservation-id",
-                &reservation,
+                reservation_id,
                 "--record-budget-crossing",
                 "validation-suite",
                 "--observed-seconds",
@@ -320,7 +364,7 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
             .output()
             .unwrap()
     };
-    let output = run_budget();
+    let output = run_budget(&reservation);
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
@@ -330,7 +374,7 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
     assert_eq!(value["data"]["budget_event"]["action"], "observe_only");
     assert!(value["data"]["budget_event"]["policy_digest"].is_string());
     assert!(value["data"]["budget_event"]["capacity_changed"].is_null());
-    let repeat = run_budget();
+    let repeat = run_budget(&reservation);
     assert!(repeat.status.success());
     assert_eq!(
         workspace
@@ -339,6 +383,17 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
             .filter(|event| event["event_type"] == "validation.budget_crossed")
             .count(),
         1
+    );
+    let different_reservation = run_budget(&second_reservation);
+    assert!(different_reservation.status.success());
+    assert_eq!(
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "validation.budget_crossed")
+            .count(),
+        2,
+        "the same numeric observation for a distinct reservation must not be deduplicated"
     );
     assert!(
         workspace.control_head() != before_policy,
