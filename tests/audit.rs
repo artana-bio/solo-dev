@@ -9,7 +9,14 @@ mod support;
 
 use std::fs;
 
-use support::Workspace;
+use change_harness::{
+    domain::{
+        digest::Digest,
+        integration::{IntegrationRecord, VerificationRecord},
+    },
+    runner::receipt::{ProvenanceDimension, Receipt},
+};
+use support::{Workspace, git};
 
 fn error_code(output: &std::process::Output) -> String {
     let envelope: serde_json::Value =
@@ -42,6 +49,12 @@ fn audit_json(workspace: &Workspace, cycle: &str) -> serde_json::Value {
 
 /// A cycle carried all the way to a promoted, archived integration.
 fn completed() -> Workspace {
+    completed_with_id().0
+}
+
+/// A completed integration whose immutable records can be queried by an
+/// integration-level compatibility request.
+fn completed_with_id() -> (Workspace, String) {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -82,7 +95,119 @@ fn completed() -> Workspace {
         "owner",
     ]);
     workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
-    workspace
+    (workspace, id)
+}
+
+/// Completes only the privacy-safe dimensions that the current runner cannot
+/// yet collect. This is deliberately test-fixture data: production receipts
+/// remain incomplete and must produce `rerun_required` until #56's remaining
+/// collection slices land.
+fn complete_fixture_provenance(receipt: &mut Receipt) {
+    let provenance = receipt
+        .provenance
+        .as_mut()
+        .expect("the receipt provenance extension is present");
+    for (dimension, value) in [
+        (ProvenanceDimension::Toolchain, b"test-toolchain".as_slice()),
+        (ProvenanceDimension::Inputs, b"test-inputs".as_slice()),
+        (ProvenanceDimension::Fixtures, b"test-fixtures".as_slice()),
+        (ProvenanceDimension::Cache, b"test-cache-policy".as_slice()),
+        (
+            ProvenanceDimension::TrustMode,
+            b"test-trust-mode".as_slice(),
+        ),
+    ] {
+        provenance
+            .dimensions
+            .insert(dimension, Digest::of_bytes(value));
+    }
+}
+
+fn complete_integration_request(workspace: &Workspace, integration_id: &str) -> serde_json::Value {
+    let integration: IntegrationRecord = serde_json::from_str(
+        &fs::read_to_string(
+            workspace
+                .control
+                .join(format!("integrations/{integration_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let verification: VerificationRecord = serde_json::from_str(
+        &fs::read_to_string(
+            workspace
+                .control
+                .join(format!("verifications/{integration_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let receipt_id = verification
+        .receipt_ids
+        .first()
+        .expect("verified integration must pin a final gate receipt");
+    let receipt_path = workspace
+        .control
+        .join(format!("receipts/{receipt_id}.json"));
+    let mut receipt: Receipt =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    complete_fixture_provenance(&mut receipt);
+    fs::write(
+        &receipt_path,
+        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+    )
+    .unwrap();
+    git(&workspace.control, &["add", "receipts"]);
+    git(
+        &workspace.control,
+        &["commit", "-qm", "complete fixture provenance"],
+    );
+
+    let expected = receipt.provenance.expect("fixture provenance");
+    serde_json::json!({
+        "schema": "harness.receipt-compatibility/v1",
+        "context": {
+            "integration_id": integration_id,
+            "cycle_id": integration.cycle_id,
+            "landing_sha": integration.landing_sha,
+            "baseline_sha": integration.baseline_sha,
+            "integration_digest": integration.substantive_digest().unwrap(),
+            "verification_digest": verification.digest().unwrap(),
+            "policy_digest": expected.policy_digest,
+        },
+        "stage": "final_integration",
+        "check": {
+            "gate_id": receipt.gate_id,
+            "gate_digest": receipt.gate_digest,
+            "receipt_schema": receipt.schema,
+            "max_attempts": 1,
+        },
+        "expected": expected,
+    })
+}
+
+fn integration_audit_projection(
+    workspace: &Workspace,
+    request_path: &std::path::Path,
+) -> serde_json::Value {
+    let output = Workspace::run(&[
+        "audit".into(),
+        "cycle".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--compatibility-request".into(),
+        request_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        output.status.success(),
+        "audit failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 #[test]
@@ -162,6 +287,58 @@ fn audit_projects_the_same_frozen_receipt_compatibility_decision_as_status() {
     assert_eq!(
         audit["data"]["receipt_compatibility"], status_projection["data"]["receipt_compatibility"],
         "status and audit must expose the exact same read-only compatibility decision"
+    );
+}
+
+#[test]
+fn integration_status_and_audit_share_the_exact_verified_receipt_decision() {
+    let (workspace, integration_id) = completed_with_id();
+    let request = complete_integration_request(&workspace, &integration_id);
+    let request_path = workspace
+        .root
+        .join("integration-compatibility-request.json");
+    fs::write(&request_path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+
+    let status = workspace.gate_json(&[
+        "status",
+        "--integration-id",
+        request["context"]["integration_id"].as_str().unwrap(),
+        "--compatibility-request",
+        request_path.to_str().unwrap(),
+    ]);
+    let audit = integration_audit_projection(&workspace, &request_path);
+    assert_eq!(
+        status["data"]["receipt_compatibility"], audit["data"]["receipt_compatibility"],
+        "both read paths must expose the exact same verification-pinned decision"
+    );
+    assert_eq!(
+        status["data"]["receipt_compatibility"]["disposition"]["kind"],
+        "compatible_reuse"
+    );
+
+    let mut changed_fixture_request = request;
+    changed_fixture_request["expected"]["dimensions"]["fixtures"] =
+        serde_json::json!(Digest::of_bytes(b"different-fixture"));
+    let changed_fixture_path = workspace.root.join("changed-fixture-request.json");
+    fs::write(
+        &changed_fixture_path,
+        serde_json::to_vec_pretty(&changed_fixture_request).unwrap(),
+    )
+    .unwrap();
+    let stale = workspace.gate_json(&[
+        "status",
+        "--integration-id",
+        integration_id.as_str(),
+        "--compatibility-request",
+        changed_fixture_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        stale["data"]["receipt_compatibility"]["disposition"]["kind"],
+        "rerun_required"
+    );
+    assert_eq!(
+        stale["data"]["receipt_compatibility"]["disposition"]["reasons"],
+        serde_json::json!(["fixtures"])
     );
 }
 
