@@ -54,7 +54,8 @@ pub const CONTROL_AUTHOR_EMAIL: &str = "change-harness@local.invalid";
 /// because both exist for a window on every write, and a crash inside that
 /// window leaves one behind. `harness.lock` alone did not match
 /// `harness.lock.staging.<pid>.<n>`.
-const CONTROL_IGNORE: &str = "harness.lock\nharness.lock.staging.*\n*.tmp\njournal/\nlogs/\n";
+const CONTROL_IGNORE: &str =
+    "harness.lock\nharness.lock.staging.*\n*.tmp\njournal/\nlogs/\nvalidation-executions/\n";
 
 /// Every path the control repository stages.
 ///
@@ -86,6 +87,7 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
     "validation-reservations",
     "validation-reservation-settlements",
     "validation-execution-permits",
+    "cpu-heavy-lanes",
     "validation-mutation-witnesses",
     "acceptances",
     "archives",

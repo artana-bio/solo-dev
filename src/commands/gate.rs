@@ -35,6 +35,7 @@ use crate::{
         ids::{CardId, IntegrationId, ReceiptId, ValidationReservationId},
         lease::LeaseRecord,
         validation_reservation::{
+            CPU_HEAVY_LANE_DIR, CPU_HEAVY_LANE_SCHEMA, CpuHeavyLaneRecord,
             VALIDATION_EXECUTION_PERMIT_SCHEMA, VALIDATION_RESERVATION_DIR,
             VALIDATION_RESERVATION_KEY_SCHEMA, VALIDATION_RESERVATION_SCHEMA,
             VALIDATION_RESERVATION_SETTLEMENT_SCHEMA, ValidationExecutionMode,
@@ -972,7 +973,9 @@ fn preview_run(
     let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
     let progress = validation_progress(&control, card_id, Some(&candidate))?;
     require_next_gate(&progress, &args.gate_id)?;
-    let reservation = requires_execution_reservation(&progress, &args.gate_id)
+    let reservation = args
+        .reservation_id
+        .is_some()
         .then(|| live_reservation_for_run(&control, args, card_id, clock))
         .transpose()?;
     Ok(CommandOutcome::new(
@@ -1353,9 +1356,9 @@ fn live_reservation_for_run(
         control,
         card_id,
         &args.gate_id,
-        ValidationExecutionMode::NamedGate,
+        reservation.key.execution_mode,
         None,
-        None,
+        reservation.key.cpu_profile_digest.clone(),
         true,
     )?;
     let key_digest = key.digest()?;
@@ -1368,14 +1371,6 @@ fn live_reservation_for_run(
         });
     }
     Ok(reservation)
-}
-
-fn requires_execution_reservation(progress: &ValidationProgress, gate_id: &str) -> bool {
-    progress
-        .plan
-        .stages
-        .iter()
-        .any(|stage| stage.checks.iter().any(|check| check.gate_id == gate_id))
 }
 
 struct DisposableExecution {
@@ -2217,6 +2212,77 @@ fn execution_permit_for(
     Ok(Some(permit))
 }
 
+fn cpu_heavy_lanes(control: &ControlRepository) -> Result<Vec<CpuHeavyLaneRecord>, HarnessError> {
+    let directory = control.path(CPU_HEAVY_LANE_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<_> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory,
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| {
+            let lane: CpuHeavyLaneRecord =
+                serde_json::from_str(&fs::read_to_string(path).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: path.clone(),
+                        source,
+                    }
+                })?)
+                .map_err(|source| HarnessError::Control {
+                    reason: format!("CPU-heavy lane {} is malformed: {source}", path.display()),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?;
+            if lane.schema != CPU_HEAVY_LANE_SCHEMA || !(1..=2).contains(&lane.lane_id) {
+                return Err(HarnessError::Control {
+                    reason: format!("CPU-heavy lane {} has an invalid identity", path.display()),
+                    code: ErrorCode::InternalControlCorrupt,
+                });
+            }
+            Ok(lane)
+        })
+        .collect()
+}
+
+fn acquire_cpu_heavy_lane(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+    actor_id: &str,
+    acquired_at: crate::domain::clock::Timestamp,
+) -> Result<Option<CpuHeavyLaneRecord>, HarnessError> {
+    if reservation.key.execution_mode != ValidationExecutionMode::CpuHeavy {
+        return Ok(None);
+    }
+    let lanes = cpu_heavy_lanes(control)?;
+    let lane_id = (1..=2)
+        .find(|lane_id| lanes.iter().all(|lane| lane.lane_id != *lane_id))
+        .ok_or_else(|| HarnessError::Control {
+            reason: "all two CPU-heavy validation lanes are occupied; wait for a terminal settlement or recovery".to_owned(),
+            code: ErrorCode::PolicyInvalidTransition,
+        })?;
+    let lane = CpuHeavyLaneRecord {
+        schema: CPU_HEAVY_LANE_SCHEMA.to_owned(),
+        lane_id,
+        reservation_id: reservation.reservation_id.clone(),
+        reservation_key_digest: reservation.key_digest.clone(),
+        holder_actor_id: actor_id.to_owned(),
+        acquired_at,
+    };
+    Ok(Some(lane))
+}
+
+#[allow(clippy::too_many_lines)]
 fn acquire_governed_gate_execution(
     args: &RunArgs,
     card_id: &CardId,
@@ -2258,14 +2324,24 @@ fn acquire_governed_gate_execution(
                 &evaluated_sha,
                 &gate_digest,
             );
+            let acquired_at = clock.now();
+            let lane =
+                acquire_cpu_heavy_lane(control, &reservation, &args.common.actor, acquired_at)?;
             let permit = ValidationExecutionPermitRecord {
                 schema: VALIDATION_EXECUTION_PERMIT_SCHEMA.to_owned(),
                 reservation_id: reservation.reservation_id.clone(),
                 reservation_key_digest: reservation.key_digest.clone(),
                 holder_actor_id: args.common.actor.clone(),
-                acquired_at: clock.now(),
+                acquired_at,
+                cpu_lane_id: lane.as_ref().map(|lane| lane.lane_id),
             };
             steps.at("execution-permit-write")?;
+            if let Some(lane) = &lane {
+                control.write_atomic(
+                    &CpuHeavyLaneRecord::relative_path(lane.lane_id),
+                    &format!("{}\n", serde_json::to_string_pretty(lane)?),
+                )?;
+            }
             control.write_atomic(
                 &ValidationExecutionPermitRecord::relative_path(&reservation.reservation_id),
                 &format!("{}\n", serde_json::to_string_pretty(&permit)?),
@@ -2355,6 +2431,30 @@ fn settle_governed_gate_execution(
                     code: ErrorCode::PolicyInvalidTransition,
                 });
             }
+            if let Some(lane_id) = permit.cpu_lane_id {
+                let lane = cpu_heavy_lanes(control)?
+                    .into_iter()
+                    .find(|lane| lane.lane_id == lane_id)
+                    .ok_or_else(|| HarnessError::Control {
+                        reason: format!(
+                            "CPU-heavy execution permit {} has no durable lane",
+                            execution.reservation.reservation_id
+                        ),
+                        code: ErrorCode::InternalControlCorrupt,
+                    })?;
+                if lane.reservation_id != execution.reservation.reservation_id
+                    || lane.reservation_key_digest != execution.reservation.key_digest
+                    || lane.holder_actor_id != args.common.actor
+                {
+                    return Err(HarnessError::Control {
+                        reason: format!(
+                            "CPU-heavy lane {lane_id} does not match execution permit {}",
+                            execution.reservation.reservation_id
+                        ),
+                        code: ErrorCode::InternalControlCorrupt,
+                    });
+                }
+            }
             if settlement_for(control, &execution.reservation)?.is_some() {
                 return Err(HarnessError::Control {
                     reason: format!(
@@ -2373,9 +2473,9 @@ fn settle_governed_gate_execution(
                 control,
                 &execution.record.card_id,
                 &execution.gate.gate_id,
-                ValidationExecutionMode::NamedGate,
+                execution.reservation.key.execution_mode,
                 None,
-                None,
+                execution.reservation.key.cpu_profile_digest.clone(),
                 true,
             )?;
             if current_key != execution.reservation.key
@@ -2468,6 +2568,13 @@ fn settle_governed_gate_execution(
                 )),
                 source,
             })?;
+            if let Some(lane_id) = permit.cpu_lane_id {
+                let lane_path = control.path(&CpuHeavyLaneRecord::relative_path(lane_id));
+                fs::remove_file(&lane_path).map_err(|source| HarnessError::ControlIo {
+                    path: lane_path,
+                    source,
+                })?;
+            }
             events.append(
                 &execution.config.project_id,
                 EventDraft::new("validation.execution_settled", &args.common.actor)
@@ -2612,7 +2719,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
     let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
     let progress = validation_progress(&control, &card_id, Some(&candidate))?;
     require_next_gate(&progress, &args.gate_id)?;
-    if requires_execution_reservation(&progress, &args.gate_id) {
+    if args.reservation_id.is_some() {
         return run_governed_gate(args, &card_id, clock);
     }
     run_gate_locked(args, clock)
@@ -2644,7 +2751,9 @@ fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
             let progress = validation_progress(control, &card_id, Some(&evaluated_sha))?;
             require_next_gate(&progress, &args.gate_id)?;
-            let reservation = requires_execution_reservation(&progress, &args.gate_id)
+            let reservation = args
+                .reservation_id
+                .is_some()
                 .then(|| live_reservation_for_run(control, args, &card_id, clock))
                 .transpose()?;
             let worktree_clean = inspect::worktree_state(&scope)?.clean;

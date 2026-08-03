@@ -26,6 +26,8 @@ pub const VALIDATION_RESERVATION_SETTLEMENT_DIR: &str = "validation-reservation-
 /// terminal settlement. Its presence is the recovery-visible fact that a
 /// subprocess may be running or was interrupted after acquire.
 pub const VALIDATION_EXECUTION_PERMIT_DIR: &str = "validation-execution-permits";
+/// Directory holding the two live CPU-heavy capacity claims.
+pub const CPU_HEAVY_LANE_DIR: &str = "cpu-heavy-lanes";
 /// Schema for a governed execution permit.
 pub const VALIDATION_EXECUTION_PERMIT_SCHEMA: &str = "harness.validation-execution-permit/v1";
 /// Schema for a terminal reservation settlement.
@@ -178,6 +180,31 @@ pub struct ValidationExecutionPermitRecord {
     pub holder_actor_id: String,
     /// Durable acquire time.
     pub acquired_at: Timestamp,
+    /// The bounded CPU lane held for this execution, when applicable.
+    #[serde(default)]
+    pub cpu_lane_id: Option<u8>,
+}
+
+/// One durable claim on one of the two CPU-heavy execution lanes.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuHeavyLaneRecord {
+    pub schema: String,
+    pub lane_id: u8,
+    pub reservation_id: ValidationReservationId,
+    pub reservation_key_digest: Digest,
+    pub holder_actor_id: String,
+    pub acquired_at: Timestamp,
+}
+
+/// Schema for a CPU-heavy lane claim.
+pub const CPU_HEAVY_LANE_SCHEMA: &str = "harness.cpu-heavy-lane/v1";
+
+impl CpuHeavyLaneRecord {
+    #[must_use]
+    pub fn relative_path(lane_id: u8) -> String {
+        format!("{CPU_HEAVY_LANE_DIR}/{lane_id}.json")
+    }
 }
 
 impl ValidationExecutionPermitRecord {
