@@ -446,6 +446,18 @@ mod tests {
             error.details()["field"],
             "validation_policy.stage_requirements.low"
         );
+
+        // #29 may eventually offer a versioned learning suggestion, but it
+        // cannot become a back door that changes #30's required stages. There
+        // is deliberately no suggestion field in the executable policy.
+        let suggestion = valid_document().replace(
+            "\"host_policy\": {",
+            "\"validation_policy\": {\"version\": \"harness.validation-policy/v1\", \"proof_map_required_for\": [\"medium\"], \"pattern_suggestion\": {\"required_stages\": [\"final_integration\"]}},\n  \"host_policy\": {",
+        );
+        assert!(
+            ProjectConfig::from_json(&suggestion).is_err(),
+            "a learning suggestion must not silently alter the executable policy"
+        );
     }
 
     #[test]
