@@ -22,7 +22,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
-    policy::progressive_validation::{ValidationPlan, plan},
+    policy::progressive_validation::{ValidationProgress, plan, progress, stages_before_satisfied},
     runner::{
         environment_fingerprint,
         receipt::{LOG_DIR, RECEIPT_DIR, RECEIPT_SCHEMA, Receipt, evidence_is_acceptable},
@@ -441,14 +441,21 @@ fn run_show(args: &ShowArgs) -> Result<CommandOutcome, HarnessError> {
     .with_project(config.project_id.clone()))
 }
 
-/// Builds the same read-only plan every caller must use before attempting
-/// progressive validation. Gate execution order is enforced by #55; this
-/// command only exposes the authoritative frozen inputs and order.
-fn run_preflight(args: &PreflightArgs) -> Result<CommandOutcome, HarnessError> {
-    let card_id: CardId = args.card_id.parse()?;
-    let control = ControlRepository::open(&args.common.control)?;
+/// Builds the one authoritative progression projection used by preview, real
+/// execution, handoff, and integration. Keeping the checks here avoids a
+/// report that says one thing while a mutating boundary accepts another.
+///
+/// # Errors
+///
+/// Returns a refusal when frozen card/cycle/policy inputs are invalid or the
+/// plan cannot be built from the registered gate definitions.
+pub fn validation_progress(
+    control: &ControlRepository,
+    card_id: &CardId,
+    candidate_sha: Option<&str>,
+) -> Result<ValidationProgress, HarnessError> {
     let config = control.project()?;
-    let (record, state) = load_card(&control, &card_id)?;
+    let (record, state) = load_card(control, card_id)?;
     let recomputed_card_digest = record.digest()?;
     if recomputed_card_digest != state.current_digest {
         return Err(HarnessError::Control {
@@ -497,9 +504,26 @@ fn run_preflight(args: &PreflightArgs) -> Result<CommandOutcome, HarnessError> {
         recomputed_card_digest,
         &config.validation_policy,
         policy_digest,
-        &all_gates(&control)?,
+        &all_gates(control)?,
     )?;
-    Ok(render_preflight(&card_id, &config.project_id, plan))
+    Ok(progress(
+        plan,
+        candidate_sha,
+        &receipts_for(control, card_id)?,
+    ))
+}
+
+/// Builds the same read-only plan every caller must use before attempting
+/// progressive validation.
+fn run_preflight(args: &PreflightArgs) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let candidate = held_lease(&control, &card_id)?.and_then(|lease| {
+        inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD").ok()
+    });
+    let progress = validation_progress(&control, &card_id, candidate.as_deref())?;
+    Ok(render_preflight(&card_id, &config.project_id, progress))
 }
 
 /// Renders a plan without adding another source of truth beside the structured
@@ -507,14 +531,16 @@ fn run_preflight(args: &PreflightArgs) -> Result<CommandOutcome, HarnessError> {
 fn render_preflight(
     card_id: &CardId,
     project_id: &crate::domain::ids::ProjectId,
-    plan: ValidationPlan,
+    progress: ValidationProgress,
 ) -> CommandOutcome {
+    let plan = &progress.plan;
     let mut text = format!(
         "Validation preflight for {card_id} r{}\nbase: {}\nrisk: {}\nnext permitted stage: {}",
         plan.card_revision,
         plan.base_sha,
         plan.risk,
-        plan.next_permitted_stage
+        progress
+            .next_permitted_stage
             .map_or("complete", |stage| stage.name())
     );
     for stage in &plan.stages {
@@ -538,7 +564,7 @@ fn render_preflight(
     CommandOutcome::new(
         "gate.preflight",
         text,
-        serde_json::to_value(plan).expect("plan is serializable"),
+        serde_json::to_value(progress).expect("plan is serializable"),
     )
     .with_project(project_id.clone())
 }
@@ -628,6 +654,9 @@ fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, Harne
         reason: format!("card {card_id} holds no lease; run `work start` first"),
         code: ErrorCode::PreconditionNotFound,
     })?;
+    let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
+    let progress = validation_progress(&control, card_id, Some(&candidate))?;
+    require_next_gate(&progress, &args.gate_id)?;
     Ok(CommandOutcome::new(
         "gate.run",
         format!(
@@ -646,12 +675,14 @@ fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, Harne
     ))
 }
 
-/// Counts prior attempts for this exact gate definition and commit.
+/// Counts prior attempts for this exact card revision, gate definition, and
+/// commit.
 ///
 /// Numbering continues across runs so a retry is visible as a retry rather than
 /// as a fresh first attempt. Section 14.2.
 fn next_attempt_number(
     existing: &[Receipt],
+    card_digest: &crate::domain::digest::Digest,
     gate_id: &str,
     evaluated_sha: &str,
     gate_digest: &crate::domain::digest::Digest,
@@ -660,7 +691,8 @@ fn next_attempt_number(
         existing
             .iter()
             .filter(|receipt| {
-                receipt.gate_id == gate_id
+                receipt.card_digest.as_ref() == Some(card_digest)
+                    && receipt.gate_id == gate_id
                     && receipt.evaluated_sha == evaluated_sha
                     && receipt.gate_digest == *gate_digest
             })
@@ -694,6 +726,8 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let scope = GitScope::work_tree(&lease.worktree_path);
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
+            let progress = validation_progress(control, &card_id, Some(&evaluated_sha))?;
+            require_next_gate(&progress, &args.gate_id)?;
             // A gate run against a dirty worktree is not refused: running gates
             // while iterating is the normal development loop, and refusing
             // would make the command useless for the case it exists to serve.
@@ -703,8 +737,13 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             let worktree_clean = inspect::worktree_state(&scope)?.clean;
 
             let existing = receipts_for(control, &card_id)?;
-            let attempt =
-                next_attempt_number(&existing, &gate.gate_id, &evaluated_sha, &gate_digest);
+            let attempt = next_attempt_number(
+                &existing,
+                &state.current_digest,
+                &gate.gate_id,
+                &evaluated_sha,
+                &gate_digest,
+            );
 
             let started_at = clock.now();
             let log_root = control.path(LOG_DIR).join(card_id.as_str());
@@ -774,6 +813,114 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             report_run(&receipt, &config.project_id)
         },
     )
+}
+
+/// Refuses attempts to skip the frozen order. Final-integration checks are
+/// deliberately not runnable against one card: they are owned by combined
+/// verification after a landing SHA exists.
+///
+/// # Errors
+///
+/// Returns a transition refusal when this card declares the requested gate but
+/// it is not the one permitted by the current exact evidence.
+pub fn require_next_gate(
+    progress: &ValidationProgress,
+    requested_gate: &str,
+) -> Result<(), HarnessError> {
+    let requested_stage = progress.plan.stages.iter().find_map(|stage| {
+        stage
+            .checks
+            .iter()
+            .any(|check| check.gate_id == requested_gate)
+            .then_some(stage.stage)
+    });
+    // A registered gate outside this card's declared progressive proof may be
+    // run while developing. It produces a receipt, but cannot stand in for a
+    // required named check; preserving that existing capability avoids making
+    // the ladder a second generic gate-runner.
+    let Some(requested_stage) = requested_stage else {
+        return Ok(());
+    };
+    if requested_stage == crate::config::ValidationStage::FinalIntegration {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "gate `{requested_gate}` belongs to final integration; prepare the approved candidate and let combined integration verification run it on the landing SHA"
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    if progress.next_permitted_gate.as_deref() != Some(requested_gate) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "gate `{requested_gate}` is not the next permitted check; next permitted gate is `{}` at `{}`: {}",
+                progress.next_permitted_gate.as_deref().unwrap_or("none"),
+                progress
+                    .next_permitted_stage
+                    .map_or("complete", |stage| stage.name()),
+                progress
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("all required per-card checks are complete")
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    Ok(())
+}
+
+/// Requires the narrow proof before a handoff can bind candidate evidence.
+///
+/// # Errors
+///
+/// Returns a refusal when plan inputs are invalid or a narrow-stage receipt is
+/// missing, stale, dirty, or failed.
+pub fn require_before_handoff(
+    control: &ControlRepository,
+    card_id: &CardId,
+    candidate_sha: &str,
+) -> Result<ValidationProgress, HarnessError> {
+    let progress = validation_progress(control, card_id, Some(candidate_sha))?;
+    if !stages_before_satisfied(&progress, crate::config::ValidationStage::Handoff) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "narrow proof is not current before handoff: {}",
+                progress
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("run the next permitted narrow gate")
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(progress)
+}
+
+/// Requires every pre-integration stage. Final-integration checks remain
+/// intentionally unsatisfied until combined verification owns the landing SHA.
+///
+/// # Errors
+///
+/// Returns a refusal when plan inputs are invalid or a required pre-integration
+/// receipt is missing, stale, dirty, or failed.
+pub fn require_before_integration(
+    control: &ControlRepository,
+    card_id: &CardId,
+    candidate_sha: &str,
+) -> Result<ValidationProgress, HarnessError> {
+    let progress = validation_progress(control, card_id, Some(candidate_sha))?;
+    if !stages_before_satisfied(&progress, crate::config::ValidationStage::FinalIntegration) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "required validation before integration is not current: {}",
+                progress
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("run the next permitted gate")
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(progress)
 }
 
 /// Turns a committed receipt into the command's outcome.
@@ -896,4 +1043,69 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+#[cfg(test)]
+mod progressive_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::*;
+    use crate::{
+        domain::{
+            clock::FixedClock,
+            digest::Digest,
+            ids::{CardId, CycleId, ProjectId, ReceiptId},
+        },
+        runner::receipt::Termination,
+    };
+
+    fn receipt(card_digest: Digest) -> Receipt {
+        let timestamp = FixedClock::at_unix_seconds(1_785_196_800).unwrap().now();
+        Receipt {
+            schema: RECEIPT_SCHEMA.to_owned(),
+            receipt_id: "R-000001".parse::<ReceiptId>().unwrap(),
+            project_id: "example".parse::<ProjectId>().unwrap(),
+            cycle_id: "C-001".parse::<CycleId>().unwrap(),
+            card_id: Some("F-001".parse::<CardId>().unwrap()),
+            card_digest: Some(card_digest),
+            integration_id: None,
+            evaluated_sha: "a".repeat(40),
+            gate_id: "gate.unit".to_owned(),
+            gate_digest: Digest::of_bytes(b"gate"),
+            harness_version: "test".to_owned(),
+            environment_fingerprint: "test".to_owned(),
+            started_at: timestamp,
+            finished_at: timestamp,
+            duration_ms: 0,
+            exit_code: Some(0),
+            termination: Termination::Completed,
+            stdout_digest: Digest::of_bytes(b""),
+            stderr_digest: Digest::of_bytes(b""),
+            artifact_digests: BTreeMap::new(),
+            log_location: PathBuf::from("/tmp/gate"),
+            attempt: 1,
+            passed: true,
+            worktree_clean: Some(true),
+        }
+    }
+
+    #[test]
+    fn a_new_card_revision_starts_gate_attempt_numbering_at_one() {
+        let old_digest = Digest::of_bytes(b"old card revision");
+        let new_digest = Digest::of_bytes(b"new card revision");
+        let gate_digest = Digest::of_bytes(b"gate");
+        let existing = vec![receipt(old_digest)];
+
+        assert_eq!(
+            next_attempt_number(
+                &existing,
+                &new_digest,
+                "gate.unit",
+                &"a".repeat(40),
+                &gate_digest,
+            ),
+            1,
+            "a stale prior card revision cannot consume the retry budget of the new revision"
+        );
+    }
 }

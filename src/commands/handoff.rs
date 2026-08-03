@@ -9,7 +9,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
-        gate::{load_gate, receipts_for},
+        gate::{load_gate, receipts_for, require_before_handoff},
         review::dependency_standings,
         transaction::with_transaction,
         work::held_lease,
@@ -343,9 +343,11 @@ fn read_declaration(path: &PathBuf) -> Result<ActorDeclaration, HarnessError> {
 fn collect_evidence(
     control: &ControlRepository,
     card_id: &CardId,
+    card_digest: &crate::domain::digest::Digest,
     gates: &[String],
     candidate_sha: &str,
 ) -> Result<Vec<EvidenceEntry>, HarnessError> {
+    require_before_handoff(control, card_id, candidate_sha)?;
     let receipts = receipts_for(control, card_id)?;
     let mut evidence = Vec::new();
 
@@ -355,7 +357,9 @@ fn collect_evidence(
         let current: Vec<_> = receipts
             .iter()
             .filter(|receipt| {
-                receipt.gate_id == *gate_id && receipt.is_current_for(candidate_sha, &gate_digest)
+                receipt.card_digest.as_ref() == Some(card_digest)
+                    && receipt.gate_id == *gate_id
+                    && receipt.is_current_for(candidate_sha, &gate_digest)
             })
             .cloned()
             .collect();
@@ -407,7 +411,13 @@ fn preview_create(
     // Preview must validate the same feature-gate evidence the real handoff
     // binds. Otherwise it can report ready immediately before the real command
     // refuses for a missing or stale receipt.
-    let _receipts = collect_evidence(&control, card_id, &record.named_gates.feature, &head)?;
+    let _receipts = collect_evidence(
+        &control,
+        card_id,
+        &state.current_digest,
+        &record.named_gates.feature,
+        &head,
+    )?;
     Ok(CommandOutcome::new(
         "handoff.create",
         format!("Dry run: would hand off card {card_id} at {head}; nothing was changed"),
@@ -596,6 +606,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let receipts = collect_evidence(
                 control,
                 &card_id,
+                &state.current_digest,
                 &record.named_gates.feature,
                 &candidate_sha,
             )?;

@@ -18,7 +18,7 @@ use crate::{
     commands::{
         acceptance::acceptance_for,
         card::load_card,
-        gate::{load_gate, next_receipt_id, receipts_for},
+        gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
         handoff::latest_handoff,
         review::{current_approval, dependency_standings, reviews_for},
         transaction::{Steps, with_transaction},
@@ -322,7 +322,7 @@ fn assess(
         };
 
         let reviews = reviews_for(control, card_id)?;
-        let blocked_by = match (&handoff, &approval) {
+        let mut blocked_by = match (&handoff, &approval) {
             (None, _) => Some("card has no handoff".to_owned()),
             (Some(handoff), None) => Some(
                 // Section 15.2: an approval is void once the candidate SHA, the
@@ -367,6 +367,13 @@ fn assess(
             ),
             (Some(_), Some(_)) => None,
         };
+
+        if blocked_by.is_none()
+            && let Some(candidate) = candidate.as_deref()
+            && let Err(error) = require_before_integration(control, card_id, candidate)
+        {
+            blocked_by = Some(error.to_string());
+        }
 
         assessed.push(Candidacy {
             record,

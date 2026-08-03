@@ -61,6 +61,55 @@ fn stage_names(plan: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn error_code(output: &std::process::Output) -> String {
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("error envelope");
+    envelope["error"]["code"].as_str().unwrap().to_owned()
+}
+
+fn start_committed_candidate(workspace: &Workspace, card_id: &str, path: &str) {
+    workspace.work(&["start", "--card-id", card_id]);
+    let worktree = workspace.worktrees.join(card_id);
+    let file = worktree.join(path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "// candidate\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: candidate"]);
+}
+
+fn handoff_and_approve(workspace: &Workspace, card_id: &str) {
+    let worktree = workspace.worktrees.join(card_id);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: scoped change\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        card_id,
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", card_id]);
+    let verdict = workspace.root.join(format!("{card_id}-verdict.yaml"));
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct proof\nresidual_risks: []\n",
+    )
+    .unwrap();
+    workspace.review(&[
+        "record",
+        "--card-id",
+        card_id,
+        "--verdict",
+        &verdict.display().to_string(),
+    ]);
+}
+
 #[test]
 fn low_risk_preflight_is_deterministic_and_names_only_narrow_then_final_stages() {
     let workspace = active_cycle();
@@ -233,4 +282,92 @@ fn stale_base_or_project_policy_refuses_before_a_plan_is_returned() {
     let output = stale_policy.gate_raw(&["preflight", "--card-id", "F-001"]);
     assert_eq!(output.status.code(), Some(5));
     assert!(String::from_utf8_lossy(&output.stdout).contains("CH-POLICY-INVALID-CYCLE"));
+}
+
+#[test]
+fn progressive_execution_allows_only_the_next_gate_and_reserves_final_for_integration() {
+    let workspace = active_cycle();
+    workspace.register_gate("gate.review", &["true"]);
+    activate(
+        &workspace,
+        "F-001",
+        CardSpec {
+            risk: "medium",
+            include: "src/progressive.rs",
+            feature: "gate.unit",
+            review: "gate.review",
+            integration: "gate.all",
+            proof_map: true,
+        },
+    );
+    start_committed_candidate(&workspace, "F-001", "src/progressive.rs");
+
+    // A later handoff gate may not leap over the narrow proof. Preview and
+    // real use the same evaluator and therefore refuse identically.
+    for args in [
+        vec![
+            "run",
+            "--card-id",
+            "F-001",
+            "--gate-id",
+            "gate.review",
+            "--dry-run",
+        ],
+        vec!["run", "--card-id", "F-001", "--gate-id", "gate.review"],
+    ] {
+        let output = workspace.gate_raw(&args);
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    }
+
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let after_narrow = workspace.gate_json(&["preflight", "--card-id", "F-001"]);
+    assert_eq!(after_narrow["data"]["next_permitted_stage"], "handoff");
+    assert_eq!(after_narrow["data"]["next_permitted_gate"], "gate.review");
+
+    // The full/integration check cannot be scheduled on an individual card.
+    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.all"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.review"]);
+    let final_only = workspace.gate_json(&["preflight", "--card-id", "F-001"]);
+    assert_eq!(
+        final_only["data"]["next_permitted_stage"],
+        "final_integration"
+    );
+    assert_eq!(final_only["data"]["next_permitted_gate"], "gate.all");
+}
+
+#[test]
+fn an_approved_card_cannot_schedule_final_integration_until_handoff_evidence_is_current() {
+    let workspace = active_cycle();
+    workspace.register_gate("gate.review", &["true"]);
+    activate(
+        &workspace,
+        "F-001",
+        CardSpec {
+            risk: "medium",
+            include: "src/integration.rs",
+            feature: "gate.unit",
+            review: "gate.review",
+            integration: "gate.all",
+            proof_map: true,
+        },
+    );
+    start_committed_candidate(&workspace, "F-001", "src/integration.rs");
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    handoff_and_approve(&workspace, "F-001");
+
+    let ready = workspace.integration_json(&["ready", "--cycle-id", "C-001"]);
+    assert!(ready["data"]["ready"].as_array().unwrap().is_empty());
+    let waiting = &ready["data"]["not_ready"][0];
+    assert_eq!(waiting["card_id"], "F-001");
+    assert!(
+        waiting["reason"]
+            .as_str()
+            .unwrap()
+            .contains("required validation before integration"),
+        "final integration must be blocked by the missing handoff gate: {waiting}"
+    );
 }
