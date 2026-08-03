@@ -80,7 +80,6 @@ impl Workspace {
         // Cards may only name registered gates, so the fixtures every test uses
         // must exist before any card is activated.
         workspace.register_gate("gate.unit", &["true"]);
-        workspace.register_gate("gate.review", &["true"]);
         workspace.register_gate("gate.all", &["true"]);
         workspace
     }
@@ -360,6 +359,12 @@ impl Workspace {
 
     /// Creates and activates a card at a named risk level.
     pub fn activate_card_with_risk(&self, card_id: &str, include: &[&str], risk: &str) {
+        if risk != "low" {
+            // Elevated-risk fixtures declare a handoff-stage check. Keep this
+            // registration local: tests that exercise gate revisions own the
+            // registry themselves.
+            self.register_gate("gate.review", &["true"]);
+        }
         let inc = include
             .iter()
             .map(|value| format!("\"{value}\""))
