@@ -1283,6 +1283,7 @@ pub(crate) fn read_integration_compatibility_request(
         || request.context.integration_digest != record.substantive_digest()?
         || request.context.verification_digest != verification.digest()?
         || request.context.policy_digest != Digest::of_canonical(&config.validation_policy)?
+        || request.check.receipt_schema != RECEIPT_SCHEMA
         || request.check.gate_digest != gate.digest()?
         || request.check.max_attempts != gate.retry_policy.max_attempts
         || request.expected.gate_definition_digest != gate.digest()?
