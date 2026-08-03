@@ -36,6 +36,106 @@ fn create_records_a_draft_cycle_without_freezing_a_baseline() {
 }
 
 #[test]
+fn list_is_empty_without_mutating_the_control_head() {
+    let workspace = Workspace::initialized();
+    let before = ControlRepository::open(&workspace.control)
+        .unwrap()
+        .head()
+        .unwrap();
+
+    let list = workspace.cycle_json(&["list"]);
+
+    assert_eq!(list["command"], "cycle.list");
+    assert_eq!(list["data"], serde_json::json!({ "cycles": [] }));
+    assert_eq!(
+        ControlRepository::open(&workspace.control)
+            .unwrap()
+            .head()
+            .unwrap(),
+        before,
+        "listing is read-only"
+    );
+}
+
+#[test]
+fn list_derives_status_sorts_by_cycle_id_and_exposes_only_summary_fields() {
+    let workspace = Workspace::initialized();
+    // Creation order must not leak into the list's authority order.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-010",
+        "--objective",
+        "Later identifier",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-010"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "Earlier identifier",
+    ]);
+
+    // Membership is control-record state; this test needs no unrelated card
+    // lifecycle to prove the list's compact summary contract.
+    let member_path = workspace.control.join("cycles/C-010.json");
+    let mut member: Value =
+        serde_json::from_str(&std::fs::read_to_string(&member_path).unwrap()).unwrap();
+    member["card_ids"] = serde_json::json!(["F-010"]);
+    std::fs::write(&member_path, serde_json::to_string_pretty(&member).unwrap()).unwrap();
+
+    let list = workspace.cycle_json(&["list"]);
+    assert_eq!(
+        list["data"],
+        serde_json::json!({
+            "cycles": [
+                {
+                    "cycle_id": "C-002",
+                    "status": "draft",
+                    "baseline_frozen": false,
+                    "member_count": 0,
+                },
+                {
+                    "cycle_id": "C-010",
+                    "status": "active",
+                    "baseline_frozen": true,
+                    "member_count": 1,
+                },
+            ]
+        })
+    );
+}
+
+#[test]
+fn list_refuses_a_malformed_cycle_record_without_partial_success() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Valid record must not produce a partial list",
+    ]);
+    std::fs::write(workspace.control.join("cycles/C-999.json"), "not JSON\n").unwrap();
+    std::fs::write(
+        workspace.control.join("cycles/ignore.txt"),
+        "not a record\n",
+    )
+    .unwrap();
+
+    let output = workspace.cycle_raw(&["list"]);
+    assert_eq!(output.status.code(), Some(10));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["command"], "cycle.list");
+    assert_eq!(envelope["error"]["code"], "CH-INTERNAL-CONTROL-CORRUPT");
+    assert!(
+        envelope.get("data").is_none(),
+        "errors never report a partial list"
+    );
+}
+
+#[test]
 fn activation_freezes_one_exact_authority_baseline() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[

@@ -1,6 +1,6 @@
 //! Cycle lifecycle commands.
 
-use std::{fmt::Write as _, path::PathBuf};
+use std::{fmt::Write as _, fs, path::PathBuf};
 
 use clap::{Args, Subcommand};
 
@@ -33,6 +33,8 @@ pub enum CycleCommand {
     DeclareGroup(DeclareGroupArgs),
     /// Report a cycle's derived status.
     Status(StatusArgs),
+    /// List every cycle in authoritative identifier order.
+    List(ListArgs),
     /// Abandon a cycle that will not be landed.
     Abandon(AbandonArgs),
 }
@@ -50,6 +52,7 @@ impl CycleCommand {
             Self::Activate(..) => "cycle.activate",
             Self::DeclareGroup(..) => "cycle.declare-group",
             Self::Status(..) => "cycle.status",
+            Self::List(..) => "cycle.list",
             Self::Abandon(..) => "cycle.abandon",
         }
     }
@@ -127,6 +130,13 @@ pub struct StatusArgs {
     pub cycle_id: String,
 }
 
+/// Arguments accepted by `cycle list`.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
 /// Arguments accepted by `cycle abandon`.
 #[derive(Debug, Args)]
 pub struct AbandonArgs {
@@ -154,6 +164,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
         CycleCommand::Activate(args) => run_activate(args, clock),
         CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
         CycleCommand::Status(args) => run_status(args),
+        CycleCommand::List(args) => run_list(args),
         CycleCommand::Abandon(args) => run_abandon(args, clock),
     }
 }
@@ -449,6 +460,98 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         ));
     }
     Ok(outcome)
+}
+
+/// Lists every valid cycle record, with status derived from its own events.
+///
+/// The records are deliberately read as one all-or-nothing control-plane
+/// snapshot. Returning a partial list while silently skipping one malformed
+/// record would make an agent believe that a cycle was absent when the control
+/// authority was actually damaged.
+fn run_list(args: &ListArgs) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let directory = control.path(crate::domain::cycle::CYCLE_DIR);
+    let mut cycles = Vec::new();
+
+    if directory.exists() {
+        let entries = fs::read_dir(&directory).map_err(|source| HarnessError::ControlIo {
+            path: directory.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| HarnessError::ControlIo {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|source| HarnessError::ControlIo {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_file()
+                || path.extension().is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(control.root())
+                .expect("cycle entry is rooted in the control repository")
+                .to_string_lossy()
+                .into_owned();
+            let raw = control.read(&relative)?;
+            let cycle: CycleRecord =
+                serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+                    reason: format!("cycle record `{relative}` is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?;
+            cycle.validate().map_err(|source| HarnessError::Control {
+                reason: format!("cycle record `{relative}` is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+
+            let events = EventStore::new(&control);
+            let status = derived_status(&events, &cycle.cycle_id)?;
+            cycles.push((cycle, status));
+        }
+    }
+
+    cycles.sort_by(|(left, _), (right, _)| left.cycle_id.cmp(&right.cycle_id));
+    let data_cycles: Vec<serde_json::Value> = cycles
+        .iter()
+        .map(|(cycle, status)| {
+            serde_json::json!({
+                "cycle_id": cycle.cycle_id.to_string(),
+                "status": status.name(),
+                "baseline_frozen": cycle.baseline_sha.is_some(),
+                "member_count": cycle.card_ids.len(),
+            })
+        })
+        .collect();
+    let text = if cycles.is_empty() {
+        "No cycles".to_owned()
+    } else {
+        let lines = cycles.iter().map(|(cycle, status)| {
+            format!(
+                "{}: {} (baseline frozen: {}, members: {})",
+                cycle.cycle_id,
+                status.name(),
+                cycle.baseline_sha.is_some(),
+                cycle.card_ids.len()
+            )
+        });
+        format!("Cycles\n{}", lines.collect::<Vec<_>>().join("\n"))
+    };
+
+    Ok(CommandOutcome::new(
+        "cycle.list",
+        text,
+        serde_json::json!({ "cycles": data_cycles }),
+    )
+    .with_project(config.project_id))
 }
 
 /// Declares an atomic group over cards already in the cycle.
