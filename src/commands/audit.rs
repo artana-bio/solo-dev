@@ -227,8 +227,8 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
     // returns them sorted. Sorting by timestamp instead would collapse two
     // events recorded in the same second into an arbitrary order.
     let store = EventStore::new(&control);
-    let events: Vec<serde_json::Value> = store
-        .for_cycle(&cycle_id)?
+    let raw_events = store.for_cycle(&cycle_id)?;
+    let events: Vec<serde_json::Value> = raw_events
         .iter()
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()?;
@@ -256,6 +256,7 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
     }
 
     let transitions = promotions(&events);
+    let exceptions = audit_exceptions(&control, &raw_events, &config, &mut discrepancies)?;
     let report = serde_json::json!({
         "cycle_id": cycle_id.to_string(),
         "objective": cycle.objective,
@@ -268,10 +269,12 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
             "type": event["event_type"],
             "actor_id": event["actor_id"],
             "card_id": event["card_id"],
+            "metadata": event["metadata"],
         })).collect::<Vec<_>>(),
         "cards": cards,
         "receipt_compatibility": compatibility,
         "protected_branch_transitions": transitions,
+        "exceptions": exceptions,
         "discrepancies": discrepancies,
     });
 
@@ -294,6 +297,175 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         ),
         code: ErrorCode::PolicyAuditDiscrepancy,
     })
+}
+
+/// Projects exception events while treating malformed or policy-mismatched
+/// events as audit findings.  The command never silently drops an event that
+/// could otherwise make an authorization look clear when it was not.
+#[allow(clippy::too_many_lines)]
+fn audit_exceptions(
+    control: &ControlRepository,
+    events: &[crate::control::event_store::Event],
+    config: &crate::config::ProjectConfig,
+    found: &mut Vec<Discrepancy>,
+) -> Result<Vec<serde_json::Value>, HarnessError> {
+    let current_policy = config
+        .final_authorization_policy
+        .as_ref()
+        .map(crate::config::FinalAuthorizationPolicy::digest)
+        .transpose()?
+        .map(|digest| digest.as_str().to_owned());
+    let authorizes = |actor_id: &str| {
+        config
+            .final_authorization_policy
+            .as_ref()
+            .is_some_and(|policy| policy.authorizes(actor_id))
+    };
+    let raised_ids: std::collections::BTreeMap<String, String> = events
+        .iter()
+        .filter(|event| event.event_type == "integration.exception_raised")
+        .filter_map(|event| {
+            event
+                .metadata
+                .get("integration_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|integration_id| (event.event_id.to_string(), integration_id.to_owned()))
+        })
+        .collect();
+    let mut resolved_ids = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "integration.exception_raised" | "integration.exception_resolved"
+        )
+    }) {
+        let metadata = &event.metadata;
+        let integration_id = metadata
+            .get("integration_id")
+            .and_then(serde_json::Value::as_str);
+        let malformed = match event.event_type.as_str() {
+            "integration.exception_raised" => {
+                let policy = metadata
+                    .get("policy_digest")
+                    .and_then(serde_json::Value::as_str);
+                integration_id.is_none()
+                    || metadata
+                        .get("trigger")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || metadata
+                        .get("evidence_refs")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none()
+                    || metadata
+                        .get("integration_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || metadata
+                        .get("sealed_cycle_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || policy != current_policy.as_deref()
+                    || !exception_bindings_match(control, config, metadata)
+            }
+            "integration.exception_resolved" => {
+                let target = metadata
+                    .get("exception_event_id")
+                    .and_then(serde_json::Value::as_str);
+                let duplicate =
+                    target.is_some_and(|target| !resolved_ids.insert(target.to_owned()));
+                integration_id.is_none()
+                    || metadata
+                        .get("policy_digest")
+                        .and_then(serde_json::Value::as_str)
+                        != current_policy.as_deref()
+                    || metadata
+                        .get("integration_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || metadata
+                        .get("sealed_cycle_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || !exception_bindings_match(control, config, metadata)
+                    || metadata
+                        .get("resolution")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("continue")
+                    || !authorizes(&event.actor_id)
+                    || !target.is_some_and(|target| {
+                        raised_ids.get(target).is_some_and(|raised_integration| {
+                            Some(raised_integration.as_str()) == integration_id
+                        })
+                    })
+                    || duplicate
+            }
+            _ => false,
+        };
+        if malformed {
+            found.push(Discrepancy {
+                subject: format!("exception event {}", event.event_id),
+                claim: "well-formed exception fact under current final authorization policy"
+                    .to_owned(),
+                found: "missing required binding or policy digest mismatch".to_owned(),
+            });
+        }
+        result.push(serde_json::json!({
+            "event_id":event.event_id,
+            "type":event.event_type,
+            "actor_id":event.actor_id,
+            "at":event.occurred_at,
+            "integration_id":integration_id,
+            "metadata":metadata,
+            "valid":!malformed,
+        }));
+    }
+    Ok(result)
+}
+
+/// Verifies the immutable event digests against the integration that the event
+/// names.  Audit returns a discrepancy for any failure instead of trusting a
+/// hand-edited event as workflow authority.
+fn exception_bindings_match(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> bool {
+    let Some(integration_id) = metadata
+        .get("integration_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse().ok())
+    else {
+        return false;
+    };
+    let Ok(record) = crate::commands::integration::load_integration(control, &integration_id)
+    else {
+        return false;
+    };
+    let Some(policy) = config.final_authorization_policy.as_ref() else {
+        return false;
+    };
+    let (Ok(policy_digest), Ok(integration_digest)) =
+        (policy.digest(), record.substantive_digest())
+    else {
+        return false;
+    };
+    metadata
+        .get("policy_digest")
+        .and_then(serde_json::Value::as_str)
+        == Some(policy_digest.as_str())
+        && metadata
+            .get("integration_digest")
+            .and_then(serde_json::Value::as_str)
+            == Some(integration_digest.as_str())
+        && metadata
+            .get("sealed_cycle_digest")
+            .and_then(serde_json::Value::as_str)
+            == record
+                .sealed_cycle_digest
+                .as_ref()
+                .map(crate::domain::digest::Digest::as_str)
 }
 
 /// Projects the same exact decision as `gate status` in the durable cycle

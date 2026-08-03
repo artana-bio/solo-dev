@@ -84,6 +84,18 @@ pub enum IntegrationCommand {
     Inspect(InspectArgs),
     /// Produce a read-only decision packet for one complete sealed cycle.
     DecisionPacket(InspectArgs),
+    /// Raise or resolve a declared human-decision exception.
+    #[command(subcommand)]
+    Exception(ExceptionCommand),
+}
+
+/// Subcommands under `integration exception`.
+#[derive(Debug, Subcommand)]
+pub enum ExceptionCommand {
+    /// Raise a declared human-decision exception for a reviewed final integration.
+    Raise(ExceptionRaiseArgs),
+    /// Resolve one pending exception with the configured final authorizer.
+    Resolve(ExceptionResolveArgs),
 }
 
 impl IntegrationCommand {
@@ -106,6 +118,8 @@ impl IntegrationCommand {
             Self::Abandon(..) => "integration.abandon",
             Self::Inspect(..) => "integration.inspect",
             Self::DecisionPacket(..) => "integration.decision-packet",
+            Self::Exception(ExceptionCommand::Raise(..)) => "integration.exception.raise",
+            Self::Exception(ExceptionCommand::Resolve(..)) => "integration.exception.resolve",
         }
     }
 }
@@ -200,6 +214,52 @@ pub struct InspectArgs {
     pub integration_id: String,
 }
 
+/// Arguments accepted by `integration exception raise`.
+#[derive(Debug, Args)]
+pub struct ExceptionRaiseArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: std::path::PathBuf,
+    /// The reviewed final integration requiring a decision.
+    #[arg(long)]
+    pub integration_id: String,
+    /// Declared actor raising the exception.
+    #[arg(long)]
+    pub actor_id: String,
+    /// One configured exception trigger.
+    #[arg(long)]
+    pub trigger: String,
+    /// Privacy-safe evidence locator. Repeat for more than one.
+    #[arg(long = "evidence-ref", required = true)]
+    pub evidence_refs: Vec<String>,
+    /// Report the exact outcome without recording it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `integration exception resolve`.
+#[derive(Debug, Args)]
+pub struct ExceptionResolveArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: std::path::PathBuf,
+    /// The final integration carrying the exception.
+    #[arg(long)]
+    pub integration_id: String,
+    /// The immutable raised event to resolve.
+    #[arg(long)]
+    pub exception_event_id: String,
+    /// Configured final authorizer making the decision.
+    #[arg(long)]
+    pub authorizer_actor_id: String,
+    /// The only non-terminal resolution shipped by this slice.
+    #[arg(long, default_value = "continue")]
+    pub resolution: String,
+    /// Report the exact outcome without recording it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes an `integration` subcommand.
 ///
 /// # Errors
@@ -221,6 +281,12 @@ pub fn execute(
         IntegrationCommand::Abandon(args) => run_abandon(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
         IntegrationCommand::DecisionPacket(args) => run_decision_packet(args),
+        IntegrationCommand::Exception(ExceptionCommand::Raise(args)) => {
+            run_exception_raise(args, clock)
+        }
+        IntegrationCommand::Exception(ExceptionCommand::Resolve(args)) => {
+            run_exception_resolve(args, clock)
+        }
     }
 }
 
@@ -1266,7 +1332,8 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
     }
     cards.sort_by(|left, right| left["card_id"].as_str().cmp(&right["card_id"].as_str()));
 
-    let (landing, verification, review, next_action) = match record.status {
+    let exceptions = exception_projection(&control, &config, &record)?;
+    let (landing, verification, review, mut next_action) = match record.status {
         IntegrationStatus::Prepared
             if record.integration_head.is_none() && record.landing_sha.is_none() =>
         {
@@ -1289,7 +1356,7 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
             serde_json::Value::Null,
             "integration.land",
         ),
-        IntegrationStatus::Verified | IntegrationStatus::Reviewed => {
+        IntegrationStatus::Verified | IntegrationStatus::Reviewed | IntegrationStatus::Accepted => {
             let Some(landing_sha) = record.landing_sha.as_ref() else {
                 return Err(HarnessError::Control {
                     reason: format!(
@@ -1311,12 +1378,17 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
             (
                 serde_json::json!({"state":"built","sha":landing_sha,"tree":record.integration_tree}),
                 serde_json::json!({"landing_sha":verified.landing_sha,"landing_tree":verified.landing_tree,"receipt_ids":verified.receipt_ids,"verified_by":verified.verified_by}),
-                if record.status == IntegrationStatus::Reviewed {
+                if matches!(
+                    record.status,
+                    IntegrationStatus::Reviewed | IntegrationStatus::Accepted
+                ) {
                     serde_json::json!({"state":"recorded"})
                 } else {
                     serde_json::json!({"state":"not_recorded"})
                 },
-                if record.status == IntegrationStatus::Reviewed {
+                if record.status == IntegrationStatus::Accepted {
+                    "integration.promote"
+                } else if record.status == IntegrationStatus::Reviewed {
                     "acceptance.record"
                 } else {
                     "integration.review"
@@ -1334,6 +1406,10 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
         }
     };
 
+    if exceptions["state"] == "pending" {
+        next_action = "integration.exception.resolve";
+    }
+
     let data = serde_json::json!({
         "packet_schema":"harness.decision-packet/v1",
         "packet_version":1,
@@ -1347,7 +1423,7 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
         "review":review,
         "residual_risks":[],
         "final_rollback":"not_recorded",
-        "exceptions":{"state":"not_implemented","items":[]},
+        "exceptions":exceptions,
         "decision_readiness":{"current":record.status.name(),"next_permitted_action":next_action,"is_authorization":false}
     });
     Ok(CommandOutcome::new(
@@ -1355,6 +1431,518 @@ fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessErro
         format!("Decision packet for {integration_id}\ncycle: {}\nnext action: {next_action}\nThis packet is not authorization.", record.cycle_id),
         data,
     ).with_project(config.project_id))
+}
+
+/// The immutable facts of one raised exception, projected from the event log.
+#[derive(Clone, Debug)]
+pub(crate) struct RaisedException {
+    pub event_id: String,
+    pub trigger: String,
+    pub evidence_refs: Vec<String>,
+    pub raiser_actor_id: String,
+    pub raised_at: String,
+    pub policy_digest: String,
+    pub integration_digest: String,
+    pub sealed_cycle_digest: String,
+    pub resolution: Option<ExceptionResolution>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExceptionResolution {
+    pub event_id: String,
+    pub authorizer_actor_id: String,
+    pub resolved_at: String,
+}
+
+/// Reads the append-only exception facts for a final integration and refuses
+/// malformed or mismatched facts rather than treating them as absent.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn exceptions_for(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<Vec<RaisedException>, HarnessError> {
+    // Exception authority exists only for the new final-cycle path.  Ordinary
+    // v1 integrations must retain their historical acceptance/promotion
+    // behaviour even when a project later opts into final authorization.
+    if !record.final_for_cycle {
+        return Ok(Vec::new());
+    }
+    let events =
+        crate::control::event_store::EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let has_exception_fact = events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "integration.exception_raised" | "integration.exception_resolved"
+        ) && event
+            .metadata
+            .get("integration_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(record.integration_id.as_str())
+    });
+    if !has_exception_fact {
+        return Ok(Vec::new());
+    }
+    let expected_integration_digest = record.substantive_digest()?.as_str().to_owned();
+    let policy =
+        config
+            .final_authorization_policy
+            .as_ref()
+            .ok_or_else(|| HarnessError::Control {
+                reason: "final authorization policy is not configured for exception validation"
+                    .to_owned(),
+                code: ErrorCode::PolicyNotAccepted,
+            })?;
+    let expected_policy_digest = policy.digest()?.as_str().to_owned();
+    let expected_seal = record
+        .sealed_cycle_digest
+        .as_ref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "final integration {} has no sealed cycle digest",
+                record.integration_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        })?
+        .as_str()
+        .to_owned();
+    let mut raised = Vec::new();
+    let mut resolutions = std::collections::BTreeMap::new();
+    for event in &events {
+        let names_integration = event
+            .metadata
+            .get("integration_id")
+            .and_then(serde_json::Value::as_str);
+        if names_integration != Some(record.integration_id.as_str()) {
+            continue;
+        }
+        if event.event_type == "integration.exception_raised" {
+            let required = |key: &str| -> Result<String, HarnessError> {
+                event
+                    .metadata
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| HarnessError::Control {
+                        reason: format!("exception event {} has no valid `{key}`", event.event_id),
+                        code: ErrorCode::InternalControlCorrupt,
+                    })
+            };
+            let integration_digest = required("integration_digest")?;
+            let sealed_cycle_digest = required("sealed_cycle_digest")?;
+            let policy_digest = required("policy_digest")?;
+            if integration_digest != expected_integration_digest
+                || sealed_cycle_digest != expected_seal
+                || policy_digest != expected_policy_digest
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "exception event {} no longer binds final integration {}",
+                        event.event_id, record.integration_id
+                    ),
+                    code: ErrorCode::PolicyNotAccepted,
+                });
+            }
+            let evidence_refs = event
+                .metadata
+                .get("evidence_refs")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| HarnessError::Control {
+                    reason: format!(
+                        "exception event {} has no valid evidence_refs",
+                        event.event_id
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| HarnessError::Control {
+                            reason: format!(
+                                "exception event {} has a non-string evidence reference",
+                                event.event_id
+                            ),
+                            code: ErrorCode::InternalControlCorrupt,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if evidence_refs.is_empty() {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "exception event {} has no evidence references",
+                        event.event_id
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                });
+            }
+            raised.push(RaisedException {
+                event_id: event.event_id.to_string(),
+                trigger: required("trigger")?,
+                evidence_refs,
+                raiser_actor_id: event.actor_id.clone(),
+                raised_at: event.occurred_at.to_string(),
+                policy_digest,
+                integration_digest,
+                sealed_cycle_digest,
+                resolution: None,
+            });
+        } else if event.event_type == "integration.exception_resolved" {
+            // A malformed, mismatched, outsider, unknown-target, or duplicate
+            // resolution is not authority.  It is preserved for audit, while
+            // the original raised event remains pending and continues to gate
+            // acceptance/promotion fail-closed.
+            let target = event
+                .metadata
+                .get("exception_event_id")
+                .and_then(serde_json::Value::as_str);
+            let valid = target.is_some()
+                && event
+                    .metadata
+                    .get("resolution")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("continue")
+                && event
+                    .metadata
+                    .get("policy_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_policy_digest.as_str())
+                && event
+                    .metadata
+                    .get("integration_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_integration_digest.as_str())
+                && event
+                    .metadata
+                    .get("sealed_cycle_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_seal.as_str())
+                && policy.authorizes(&event.actor_id)
+                && target.is_some_and(|id| raised.iter().any(|item| item.event_id == id))
+                && target.is_some_and(|id| !resolutions.contains_key(id));
+            if valid {
+                let target = target.expect("checked above");
+                resolutions.insert(
+                    target.to_owned(),
+                    ExceptionResolution {
+                        event_id: event.event_id.to_string(),
+                        authorizer_actor_id: event.actor_id.clone(),
+                        resolved_at: event.occurred_at.to_string(),
+                    },
+                );
+            }
+        }
+    }
+    for exception in &mut raised {
+        exception.resolution = resolutions.remove(&exception.event_id);
+    }
+    Ok(raised)
+}
+
+pub(crate) fn require_no_pending_exception(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    if let Some(exception) = exceptions_for(control, config, record)?
+        .into_iter()
+        .find(|item| item.resolution.is_none())
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {} is waiting for exception {} ({})",
+                record.integration_id, exception.event_id, exception.trigger
+            ),
+            code: ErrorCode::PolicyExceptionPending,
+        });
+    }
+    Ok(())
+}
+
+fn exception_projection(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<serde_json::Value, HarnessError> {
+    let exceptions = exceptions_for(control, config, record)?;
+    let pending = exceptions.iter().any(|item| item.resolution.is_none());
+    let resolved_next_action = if record.status == IntegrationStatus::Accepted {
+        "integration.promote"
+    } else {
+        "acceptance.record"
+    };
+    Ok(serde_json::json!({
+        "state": if pending { "pending" } else if exceptions.is_empty() { "none" } else { "resolved" },
+        "items": exceptions.into_iter().map(|item| serde_json::json!({
+            "event_id":item.event_id,
+            "trigger":item.trigger,
+            "evidence_refs":item.evidence_refs,
+            "raiser_actor_id":item.raiser_actor_id,
+            "raised_at":item.raised_at,
+            "policy_digest":item.policy_digest,
+            "integration_digest":item.integration_digest,
+            "sealed_cycle_digest":item.sealed_cycle_digest,
+            "state":if item.resolution.is_none(){"pending"}else{"resolved"},
+            "resolution":item.resolution.as_ref().map(|resolution|serde_json::json!({"event_id":resolution.event_id,"authorizer_actor_id":resolution.authorizer_actor_id,"resolved_at":resolution.resolved_at,"disposition":"continue"})),
+            "next_action":if item.resolution.is_none(){"integration.exception.resolve or integration.abandon --reason exception:<event-id>"}else{resolved_next_action},
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn exception_bindings(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+) -> Result<
+    (
+        crate::domain::digest::Digest,
+        crate::domain::digest::Digest,
+        crate::domain::digest::Digest,
+    ),
+    HarnessError,
+> {
+    if !record.final_for_cycle
+        || !matches!(
+            record.status,
+            IntegrationStatus::Reviewed | IntegrationStatus::Accepted
+        )
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "exceptions may be raised only for reviewed or accepted final integrations; {} is `{}`",
+                record.integration_id,
+                record.status.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let policy =
+        config
+            .final_authorization_policy
+            .as_ref()
+            .ok_or_else(|| HarnessError::Control {
+                reason: "final authorization policy does not declare exception triggers".to_owned(),
+                code: ErrorCode::PolicyNotAccepted,
+            })?;
+    let cycle = load_cycle(control, &record.cycle_id)?;
+    let seal = record
+        .sealed_cycle_digest
+        .as_ref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "final integration {} has no sealed cycle digest",
+                record.integration_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+    let actual = Digest::of_canonical(&cycle)?;
+    if cycle.status != CycleStatus::Sealed || &actual != seal {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final integration {} no longer binds its sealed cycle",
+                record.integration_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    Ok((policy.digest()?, record.substantive_digest()?, seal.clone()))
+}
+
+fn validate_exception_authorizer(
+    config: &crate::config::ProjectConfig,
+    authorizer: &str,
+) -> Result<(), HarnessError> {
+    let policy =
+        config
+            .final_authorization_policy
+            .as_ref()
+            .ok_or_else(|| HarnessError::Control {
+                reason: "final authorization policy is not configured".to_owned(),
+                code: ErrorCode::PolicyNotAccepted,
+            })?;
+    if policy.authorizes(authorizer) {
+        Ok(())
+    } else {
+        Err(HarnessError::Control {
+            reason: format!(
+                "actor {authorizer} is not configured to resolve final integration exceptions"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        })
+    }
+}
+
+fn run_exception_raise(
+    args: &ExceptionRaiseArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+    let trigger = crate::config::ExceptionTrigger::parse(&args.trigger)?;
+    if args
+        .evidence_refs
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(HarnessError::Control {
+            reason: "exception evidence references must be non-empty".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+    let validate = |control: &ControlRepository| -> Result<
+        (
+            crate::config::ProjectConfig,
+            IntegrationRecord,
+            crate::domain::digest::Digest,
+            crate::domain::digest::Digest,
+            crate::domain::digest::Digest,
+        ),
+        HarnessError,
+    > {
+        let config = control.project()?;
+        let record = load_integration(control, &integration_id)?;
+        let (policy_digest, integration_digest, seal) =
+            exception_bindings(control, &config, &record)?;
+        let policy = config
+            .final_authorization_policy
+            .as_ref()
+            .expect("checked above");
+        if !policy.enables_exception(trigger) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "exception trigger `{}` is not enabled by final authorization policy",
+                    trigger.name()
+                ),
+                code: ErrorCode::PolicyNotAccepted,
+            });
+        }
+        require_no_pending_exception(control, &config, &record)?;
+        Ok((config, record, policy_digest, integration_digest, seal))
+    };
+    if args.dry_run {
+        let control = ControlRepository::open(&args.control)?;
+        let (config, _record, _, _, _) = validate(&control)?;
+        return Ok(CommandOutcome::new("integration.exception.raise", format!("Dry run: would raise `{}` for {integration_id}\\nnothing was changed", trigger.name()), serde_json::json!({"dry_run":true,"integration_id":integration_id.to_string(),"trigger":trigger.name(),"evidence_refs":args.evidence_refs})).with_project(config.project_id));
+    }
+    with_transaction(
+        &args.control,
+        "integration.exception.raise",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (config, record, policy_digest, integration_digest, seal) = validate(control)?;
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new("integration.exception_raised", &args.actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(record.landing_sha.clone().unwrap_or_default())
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta("trigger", serde_json::json!(trigger.name()))
+                    .meta("evidence_refs", serde_json::json!(args.evidence_refs))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str()))
+                    .meta(
+                        "integration_digest",
+                        serde_json::json!(integration_digest.as_str()),
+                    )
+                    .meta("sealed_cycle_digest", serde_json::json!(seal.as_str())),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("integration: raise exception {integration_id}"),
+            )?;
+            Ok(CommandOutcome::new("integration.exception.raise", format!("Raised exception {} for {integration_id}; acceptance and promotion are blocked until it is resolved or the integration is abandoned", event.event_id), serde_json::json!({"integration_id":integration_id.to_string(),"exception_event_id":event.event_id.to_string(),"trigger":trigger.name(),"status":"pending"})).with_project(config.project_id))
+        },
+    )
+}
+
+fn run_exception_resolve(
+    args: &ExceptionResolveArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+    if args.resolution != "continue" {
+        return Err(HarnessError::Control { reason: "only exception resolution `continue` is supported; use integration abandon --reason exception:<event-id> to stop".to_owned(), code: ErrorCode::UsageInvalidArguments });
+    }
+    let validate = |control: &ControlRepository| -> Result<
+        (
+            crate::config::ProjectConfig,
+            IntegrationRecord,
+            RaisedException,
+        ),
+        HarnessError,
+    > {
+        let config = control.project()?;
+        let record = load_integration(control, &integration_id)?;
+        exception_bindings(control, &config, &record)?;
+        validate_exception_authorizer(&config, &args.authorizer_actor_id)?;
+        let exception = exceptions_for(control, &config, &record)?
+            .into_iter()
+            .find(|item| item.event_id == args.exception_event_id)
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "exception {} does not belong to integration {integration_id}",
+                    args.exception_event_id
+                ),
+                code: ErrorCode::PreconditionNotFound,
+            })?;
+        if exception.resolution.is_some() {
+            return Err(HarnessError::Control {
+                reason: format!("exception {} is already resolved", args.exception_event_id),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+        Ok((config, record, exception))
+    };
+    if args.dry_run {
+        let control = ControlRepository::open(&args.control)?;
+        let (config, _, _) = validate(&control)?;
+        return Ok(CommandOutcome::new("integration.exception.resolve", format!("Dry run: would resolve exception {} with `continue`\\nnothing was changed", args.exception_event_id), serde_json::json!({"dry_run":true,"integration_id":integration_id.to_string(),"exception_event_id":args.exception_event_id,"resolution":"continue"})).with_project(config.project_id));
+    }
+    with_transaction(
+        &args.control,
+        "integration.exception.resolve",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (config, record, _) = validate(control)?;
+            let (policy_digest, integration_digest, sealed_cycle_digest) =
+                exception_bindings(control, &config, &record)?;
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new("integration.exception_resolved", &args.authorizer_actor_id)
+                    .cycle(record.cycle_id.clone())
+                    .head(record.landing_sha.clone().unwrap_or_default())
+                    .meta(
+                        "integration_id",
+                        serde_json::json!(integration_id.to_string()),
+                    )
+                    .meta(
+                        "exception_event_id",
+                        serde_json::json!(args.exception_event_id),
+                    )
+                    .meta("resolution", serde_json::json!("continue"))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str()))
+                    .meta(
+                        "integration_digest",
+                        serde_json::json!(integration_digest.as_str()),
+                    )
+                    .meta(
+                        "sealed_cycle_digest",
+                        serde_json::json!(sealed_cycle_digest.as_str()),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("integration: resolve exception {integration_id}"),
+            )?;
+            Ok(CommandOutcome::new("integration.exception.resolve", format!("Resolved exception {} with `continue`; this does not authorize {integration_id}", args.exception_event_id), serde_json::json!({"integration_id":integration_id.to_string(),"exception_event_id":args.exception_event_id,"resolution_event_id":event.event_id.to_string(),"resolution":"continue","status":"resolved","authorization":"not_recorded"})).with_project(config.project_id))
+        },
+    )
 }
 
 /// Simulates the merge sequence without touching a ref, index, or worktree.
@@ -2830,6 +3418,7 @@ fn check_promotion(
         });
     }
     validate_final_authorization_for_promotion(control, config, record, &acceptance)?;
+    require_no_pending_exception(control, config, record)?;
     // Acceptance recorded a digest of the integration it authorized, and until
     // now nothing compared it to anything. Append a member after acceptance and
     // promotion landed it: never verified, never accepted, not in the tree the

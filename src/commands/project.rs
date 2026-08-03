@@ -185,6 +185,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
                 version: crate::config::FINAL_AUTHORIZATION_POLICY_V1.to_owned(),
                 authorization_unit: "sealed_cycle".to_owned(),
                 authorizer_actor_ids: args.final_authorizer_actor_ids.clone(),
+                exception_triggers: vec![],
             }
         }),
     })

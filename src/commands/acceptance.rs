@@ -13,7 +13,10 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
-        integration::{load_cycle, load_integration, load_verification, member_implementers},
+        integration::{
+            load_cycle, load_integration, load_verification, member_implementers,
+            require_no_pending_exception,
+        },
         transaction::with_transaction,
     },
     control::{event_store::EventDraft, repository::ControlRepository},
@@ -218,6 +221,7 @@ fn preview_record(
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
     require_reviewed(&record)?;
+    require_no_pending_exception(&control, &config, &record)?;
     refuse_existing_acceptance(&control, integration_id)?;
     let authorizer = authorizer(args)?;
     refuse_author_accepting(&control, &record, authorizer)?;
@@ -492,6 +496,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
             require_reviewed(&record)?;
+            require_no_pending_exception(control, &config, &record)?;
             refuse_existing_acceptance(control, &integration_id)?;
 
             let acceptance = build_acceptance(control, &record, args, decision, clock)?;

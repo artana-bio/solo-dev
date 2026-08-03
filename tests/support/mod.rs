@@ -487,6 +487,19 @@ impl Workspace {
 
     /// Runs an `integration` subcommand, returning the raw output.
     pub fn integration_raw(&self, args: &[&str]) -> Output {
+        if args.first() == Some(&"exception") {
+            let mut full = vec![
+                "integration".to_owned(),
+                "exception".to_owned(),
+                "--output".to_owned(),
+                "json".to_owned(),
+                args[1].to_owned(),
+                "--control".to_owned(),
+                self.control.display().to_string(),
+            ];
+            full.extend(args[2..].iter().map(|arg| (*arg).to_owned()));
+            return Self::run(&full);
+        }
         let mut full = vec![
             "integration".to_owned(),
             args[0].to_owned(),

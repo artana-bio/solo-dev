@@ -96,6 +96,8 @@ pub enum ErrorCode {
     PolicyFinalCycleIncomplete,
     /// A decision packet was requested for an ordinary rather than final integration.
     PolicyDecisionPacketFinalOnly,
+    /// A reviewed final integration has an unresolved exception decision.
+    PolicyExceptionPending,
     /// The project uses a capability no shipped work package implements yet.
     PolicyUnsupportedUntilWp540,
     /// A declared cycle invariant was neither confirmed nor refused.
@@ -224,7 +226,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 87] = [
+    pub const ALL: [Self; 88] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -264,6 +266,7 @@ impl ErrorCode {
         Self::PolicyCycleNotSealed,
         Self::PolicyFinalCycleIncomplete,
         Self::PolicyDecisionPacketFinalOnly,
+        Self::PolicyExceptionPending,
         Self::PolicyUnsupportedUntilWp540,
         Self::PolicyInvariantUnaddressed,
         Self::PolicySameActor,
@@ -358,6 +361,7 @@ impl ErrorCode {
             | Self::PolicyCycleNotSealed
             | Self::PolicyFinalCycleIncomplete
             | Self::PolicyDecisionPacketFinalOnly
+            | Self::PolicyExceptionPending
             | Self::PolicyUnsupportedUntilWp540
             | Self::PolicyInvariantUnaddressed
             | Self::PolicySameActor
@@ -449,6 +453,7 @@ impl ErrorCode {
             Self::PolicyCycleNotSealed => "CYCLE-NOT-SEALED",
             Self::PolicyFinalCycleIncomplete => "FINAL-CYCLE-INCOMPLETE",
             Self::PolicyDecisionPacketFinalOnly => "DECISION-PACKET-FINAL-ONLY",
+            Self::PolicyExceptionPending => "EXCEPTION-PENDING",
             Self::PolicyUnsupportedUntilWp540 => "UNSUPPORTED-UNTIL-WP-540",
             Self::PolicyInvariantUnaddressed => "INVARIANT-UNADDRESSED",
             Self::PolicySameActor => "SAME-ACTOR",

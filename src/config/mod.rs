@@ -30,12 +30,62 @@ pub const VALIDATION_POLICY_V1: &str = "harness.validation-policy/v1";
 /// than provider-verified; this policy makes the declaration auditable.
 pub const FINAL_AUTHORIZATION_POLICY_V1: &str = "harness.final-authorization-policy/v1";
 
+/// A human decision that can halt a reviewed final integration.
+///
+/// These names are deliberately closed.  The harness never infers that an
+/// exception exists from a failed check or a conversation; a configured actor
+/// must raise one of these declared reasons with evidence.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExceptionTrigger {
+    PolicyChange,
+    ExternalEffect,
+    CriticalResidualRisk,
+    AmbiguousRollback,
+    ConvergenceBudgetExhausted,
+}
+
+impl ExceptionTrigger {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PolicyChange => "policy_change",
+            Self::ExternalEffect => "external_effect",
+            Self::CriticalResidualRisk => "critical_residual_risk",
+            Self::AmbiguousRollback => "ambiguous_rollback",
+            Self::ConvergenceBudgetExhausted => "convergence_budget_exhausted",
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns a configuration error when `value` is not a shipped trigger.
+    pub fn parse(value: &str) -> Result<Self, HarnessError> {
+        match value {
+            "policy_change" => Ok(Self::PolicyChange),
+            "external_effect" => Ok(Self::ExternalEffect),
+            "critical_residual_risk" => Ok(Self::CriticalResidualRisk),
+            "ambiguous_rollback" => Ok(Self::AmbiguousRollback),
+            "convergence_budget_exhausted" => Ok(Self::ConvergenceBudgetExhausted),
+            _ => Err(HarnessError::Config {
+                field: "final_authorization_policy.exception_triggers".to_owned(),
+                reason: format!("unsupported exception trigger `{value}`"),
+                code: ErrorCode::ConfigInvalidValue,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FinalAuthorizationPolicy {
     pub version: String,
     pub authorization_unit: String,
     pub authorizer_actor_ids: Vec<String>,
+    /// Explicitly delegated reasons that may halt a final integration.  Empty
+    /// preserves the v1 behaviour: no exception command is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exception_triggers: Vec<ExceptionTrigger>,
 }
 
 impl Default for FinalAuthorizationPolicy {
@@ -44,6 +94,7 @@ impl Default for FinalAuthorizationPolicy {
             version: FINAL_AUTHORIZATION_POLICY_V1.to_owned(),
             authorization_unit: "sealed_cycle".to_owned(),
             authorizer_actor_ids: vec!["owner".to_owned()],
+            exception_triggers: vec![],
         }
     }
 }
@@ -104,6 +155,15 @@ impl FinalAuthorizationPolicy {
                 ));
             }
         }
+        for (index, trigger) in self.exception_triggers.iter().enumerate() {
+            if self.exception_triggers[..index].contains(trigger) {
+                return Err(FieldError::new(
+                    "final_authorization_policy.exception_triggers",
+                    "must not contain duplicate exception triggers",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -121,6 +181,11 @@ impl FinalAuthorizationPolicy {
         self.authorizer_actor_ids
             .iter()
             .any(|configured| configured == actor_id)
+    }
+
+    #[must_use]
+    pub fn enables_exception(&self, trigger: ExceptionTrigger) -> bool {
+        self.exception_triggers.contains(&trigger)
     }
 }
 
