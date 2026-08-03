@@ -180,3 +180,67 @@ fn interruption_after_durable_acquire_leaves_one_explicit_recovery_permit() {
         "a second runner must refuse while recovery owns the permit"
     );
 }
+
+#[test]
+fn candidate_change_during_execution_refuses_settlement_and_preserves_permit() {
+    let w = Workspace::initialized();
+    let marker = w.root.join("marker");
+    slow_gate(&w, "gate.a", &marker);
+    w.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Settlement must revalidate",
+    ]);
+    w.cycle(&["activate", "--cycle-id", "C-001"]);
+    w.activate_card_with_gates("F-001", &["src/a/**"], &["gate.a"]);
+    w.work(&["start", "--card-id", "F-001"]);
+    let reservation = reserve(&w, "F-001", "gate.a");
+    let control = w.control.clone();
+    let running = thread::spawn({
+        let reservation = reservation.clone();
+        move || run(&control, "F-001", "gate.a", &reservation)
+    });
+    wait(&marker);
+    let worktree =
+        w.work_json(&["status", "--card-id", "F-001"])["data"]["held_lease"]["worktree_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    fs::write(
+        Path::new(&worktree).join("candidate-change.txt"),
+        "changed\n",
+    )
+    .unwrap();
+    support::git(Path::new(&worktree), &["add", "candidate-change.txt"]);
+    support::git(
+        Path::new(&worktree),
+        &["commit", "-qm", "change during governed run"],
+    );
+
+    let output = running.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        w.control
+            .join(format!("validation-execution-permits/{reservation}.json"))
+            .exists(),
+        "stale settlement must retain the permit for explicit recovery"
+    );
+    assert!(
+        !w.control
+            .join(format!(
+                "validation-reservation-settlements/{reservation}.json"
+            ))
+            .exists(),
+        "stale settlement must not write a terminal fact"
+    );
+    assert_eq!(
+        w.gate_json(&["status", "--card-id", "F-001"])["data"]["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "stale settlement must not attach a receipt to changed state"
+    );
+}

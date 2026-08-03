@@ -2364,6 +2364,31 @@ fn settle_governed_gate_execution(
                     code: ErrorCode::PolicyInvalidTransition,
                 });
             }
+            // The global lock was intentionally released while the subprocess
+            // ran. Recompute the authoritative key at the terminal boundary:
+            // a candidate, card, lease, gate, stage, or policy change must
+            // leave the permit recoverable rather than attaching a receipt to
+            // state that no longer matches the execution we performed.
+            let current_key = reservation_key(
+                control,
+                &execution.record.card_id,
+                &execution.gate.gate_id,
+                ValidationExecutionMode::NamedGate,
+                None,
+                None,
+                true,
+            )?;
+            if current_key != execution.reservation.key
+                || current_key.digest()? != execution.reservation.key_digest
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} no longer matches current state at settlement",
+                        execution.reservation.reservation_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
             let receipt_id = next_receipt_id(control)?;
             let finished_at = clock.now();
             let mut provenance = card_run_provenance(
