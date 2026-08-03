@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{card::Risk, ids::ProjectId},
+    domain::{card::Risk, digest::Digest, ids::ProjectId},
     error::{ErrorCode, HarnessError},
 };
 
@@ -23,6 +23,90 @@ pub const DEFAULT_AUTHORITY_REMOTE: &str = "harness-authority";
 
 /// The only progressive-validation policy this release understands.
 pub const VALIDATION_POLICY_V1: &str = "harness.validation-policy/v1";
+
+/// The versioned policy that names the declared actor(s) permitted to make the
+/// one final authorization of a sealed cycle. Identity remains declared rather
+/// than provider-verified; this policy makes the declaration auditable.
+pub const FINAL_AUTHORIZATION_POLICY_V1: &str = "harness.final-authorization-policy/v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalAuthorizationPolicy {
+    pub version: String,
+    pub authorization_unit: String,
+    pub authorizer_actor_ids: Vec<String>,
+}
+
+impl Default for FinalAuthorizationPolicy {
+    fn default() -> Self {
+        Self {
+            version: FINAL_AUTHORIZATION_POLICY_V1.to_owned(),
+            authorization_unit: "sealed_cycle".to_owned(),
+            authorizer_actor_ids: vec!["owner".to_owned()],
+        }
+    }
+}
+
+impl FinalAuthorizationPolicy {
+    /// Validates the policy values this release can enforce.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error when the policy is unsupported or ambiguous.
+    pub fn validate(&self) -> Result<(), FieldError> {
+        if self.version != FINAL_AUTHORIZATION_POLICY_V1 {
+            return Err(FieldError::new(
+                "final_authorization_policy.version",
+                "must name the shipped v1 final-authorization policy",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        if self.authorization_unit != "sealed_cycle" {
+            return Err(FieldError::new(
+                "final_authorization_policy.authorization_unit",
+                "must be `sealed_cycle`",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        if self.authorizer_actor_ids.is_empty()
+            || self
+                .authorizer_actor_ids
+                .iter()
+                .any(|id| id.trim().is_empty())
+        {
+            return Err(FieldError::new(
+                "final_authorization_policy.authorizer_actor_ids",
+                "must name at least one non-empty declared actor",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        let unique: std::collections::BTreeSet<_> = self.authorizer_actor_ids.iter().collect();
+        if unique.len() != self.authorizer_actor_ids.len() {
+            return Err(FieldError::new(
+                "final_authorization_policy.authorizer_actor_ids",
+                "must not contain duplicates",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical digest a v2 authorization pins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical serialization fails.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+
+    #[must_use]
+    pub fn authorizes(&self, actor_id: &str) -> bool {
+        self.authorizer_actor_ids
+            .iter()
+            .any(|configured| configured == actor_id)
+    }
+}
 
 /// An ordered point in the progressive-validation ladder.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -308,6 +392,10 @@ pub struct ProjectConfig {
     /// project documents with the shipped v1 policy.
     #[serde(default)]
     pub validation_policy: ValidationPolicy,
+    /// Declared final-cycle authorization policy. Omission preserves the
+    /// compatible v1 default while every v2 acceptance pins its digest.
+    #[serde(default)]
+    pub final_authorization_policy: FinalAuthorizationPolicy,
 }
 
 impl ProjectConfig {
@@ -344,6 +432,10 @@ impl ProjectConfig {
         }
         config
             .validation_policy
+            .validate()
+            .map_err(FieldError::into_error)?;
+        config
+            .final_authorization_policy
             .validate()
             .map_err(FieldError::into_error)?;
         Ok(config)

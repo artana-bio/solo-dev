@@ -9,7 +9,8 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{integration::ResumeOutcome, transaction::with_transaction},
     config::{
-        DEFAULT_AUTHORITY_REMOTE, HostPolicy, PROJECT_SCHEMA, ProjectConfig, ValidationPolicy,
+        DEFAULT_AUTHORITY_REMOTE, FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA,
+        ProjectConfig, ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -100,6 +101,10 @@ pub struct InitArgs {
     /// Validate and report planned mutations without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Declared actor permitted to make the final authorization of a sealed
+    /// cycle. Repeat for more than one declared authorizer.
+    #[arg(long = "final-authorizer-actor-id")]
+    pub final_authorizer_actor_ids: Vec<String>,
 }
 
 /// Arguments accepted by `project validate`.
@@ -175,6 +180,15 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
         default_output: "text".to_owned(),
         host_policy: HostPolicy::default(),
         validation_policy: ValidationPolicy::default(),
+        final_authorization_policy: if args.final_authorizer_actor_ids.is_empty() {
+            FinalAuthorizationPolicy::default()
+        } else {
+            FinalAuthorizationPolicy {
+                version: crate::config::FINAL_AUTHORIZATION_POLICY_V1.to_owned(),
+                authorization_unit: "sealed_cycle".to_owned(),
+                authorizer_actor_ids: args.final_authorizer_actor_ids.clone(),
+            }
+        },
     })
 }
 

@@ -19,6 +19,8 @@ use crate::{
 
 /// Schema identifier for an acceptance record.
 pub const ACCEPTANCE_SCHEMA: &str = "harness.acceptance/v1";
+/// Additive schema for a final sealed-cycle authorization.
+pub const ACCEPTANCE_V2_SCHEMA: &str = "harness.acceptance/v2";
 
 /// Directory holding acceptance records, relative to the control repository.
 pub const ACCEPTANCE_DIR: &str = "acceptances";
@@ -71,6 +73,17 @@ pub struct AcceptanceRecord {
     pub receipt_ids: Vec<String>,
     /// Who accepted it. Declared, not proven; see D-013.
     pub acceptance_owner: String,
+    /// Declared configured authorizer for v2 final-cycle acceptance.  Kept
+    /// separate from the compatible v1 owner spelling so historical records
+    /// remain readable without reinterpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorizer_actor_id: Option<String>,
+    /// Digest of the final authorization policy in force when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_authorization_policy_digest: Option<Digest>,
+    /// Digest of the sealed cycle the authorization applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_cycle_digest: Option<Digest>,
     /// The conclusion.
     pub decision: AcceptanceDecision,
     /// Risks accepted along with the change.
@@ -144,6 +157,9 @@ mod tests {
             integration_record_digest: Digest::of_bytes(b"integration"),
             receipt_ids: vec!["R-000001".to_owned()],
             acceptance_owner: "owner".to_owned(),
+            authorizer_actor_id: None,
+            final_authorization_policy_digest: None,
+            sealed_cycle_digest: None,
             decision,
             residual_risks: Vec::new(),
             rollback_reference: "revert the landing commit".to_owned(),

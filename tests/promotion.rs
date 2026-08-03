@@ -65,6 +65,203 @@ fn accepted(count: usize) -> (Workspace, String) {
     (workspace, id)
 }
 
+/// A reviewed final integration, eligible for the v2 final authorization path.
+fn reviewed_final() -> (Workspace, String) {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "final"]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.approve_card("F-001", "src/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    (workspace, id)
+}
+
+fn change_final_authorizers(workspace: &Workspace, authorizers: &[&str]) {
+    let path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    project["final_authorization_policy"]["authorizer_actor_ids"] = serde_json::json!(authorizers);
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "change final policy"],
+    );
+}
+
+#[test]
+fn final_authorization_binds_policy_and_allows_a_declared_release_agent_to_promote() {
+    let (workspace, id) = reviewed_final();
+    let acceptance = workspace.acceptance_json(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    assert_eq!(acceptance["data"]["authorizer_actor_id"], "owner");
+    assert!(acceptance["data"]["acceptance_owner"].is_string());
+    let promoted = workspace.integration_json(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(promoted["data"]["status"], "promoted");
+}
+
+#[test]
+fn final_authorization_refuses_unconfigured_or_self_authorizer_without_mutation() {
+    let (workspace, id) = reviewed_final();
+    let before = workspace.control_head();
+    let wrong = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "not-owner",
+    ]);
+    assert_eq!(wrong.status.code(), Some(5));
+    assert_eq!(workspace.control_head(), before);
+    let self_auth = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "operator",
+    ]);
+    assert_eq!(self_auth.status.code(), Some(5));
+    assert_eq!(workspace.control_head(), before);
+}
+
+#[test]
+fn final_authorization_policy_change_refuses_promotion() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    // Keep the original authorizer valid so the refusal proves the pinned
+    // policy digest, not merely membership lookup.
+    change_final_authorizers(&workspace, &["owner", "new-owner"]);
+    let rejected = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(rejected.status.code(), Some(5));
+    assert_eq!(error_code(&rejected), "CH-POLICY-NOT-ACCEPTED");
+}
+
+#[test]
+fn final_authorization_refuses_promotion_after_the_substantive_plan_changes() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    let path = workspace.control.join(format!("integrations/{id}.json"));
+    let mut integration: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    integration["prepared_by"] = serde_json::json!("tampered-coordinator");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&integration).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "tamper final integration"],
+    );
+    let rejected = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(rejected.status.code(), Some(5));
+    assert_eq!(error_code(&rejected), "CH-POLICY-NOT-ACCEPTED");
+}
+
+#[test]
+fn compatible_owner_alias_records_the_same_final_authorizer() {
+    let (workspace, id) = reviewed_final();
+    let accepted = workspace.acceptance_json(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(accepted["data"]["authorizer_actor_id"], "owner");
+    let duplicate = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    assert_eq!(duplicate.status.code(), Some(5));
+}
+
+#[test]
+fn final_authorization_dry_run_matches_unconfigured_actor_refusal() {
+    let (workspace, id) = reviewed_final();
+    let real = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "not-owner",
+    ]);
+    let preview = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "not-owner",
+        "--dry-run",
+    ]);
+    assert_eq!(real.status.code(), preview.status.code());
+    assert_eq!(error_code(&real), error_code(&preview));
+}
+
 fn error_code(output: &std::process::Output) -> String {
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("an error envelope");

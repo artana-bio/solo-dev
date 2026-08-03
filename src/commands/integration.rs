@@ -16,7 +16,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        acceptance::acceptance_for,
+        acceptance::{acceptance_for, validate_final_authorization_for_promotion},
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
         handoff::latest_handoff,
@@ -225,7 +225,7 @@ pub fn execute(
 }
 
 /// Reads a cycle record.
-fn load_cycle(
+pub(crate) fn load_cycle(
     control: &ControlRepository,
     cycle_id: &CycleId,
 ) -> Result<CycleRecord, HarnessError> {
@@ -2829,6 +2829,7 @@ fn check_promotion(
             code: ErrorCode::PolicyNotAccepted,
         });
     }
+    validate_final_authorization_for_promotion(control, config, record, &acceptance)?;
     // Acceptance recorded a digest of the integration it authorized, and until
     // now nothing compared it to anything. Append a member after acceptance and
     // promotion landed it: never verified, never accepted, not in the tree the

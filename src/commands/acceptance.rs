@@ -13,12 +13,15 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{load_card, store_card_state},
-        integration::{load_integration, load_verification, member_implementers},
+        integration::{load_cycle, load_integration, load_verification, member_implementers},
         transaction::with_transaction,
     },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
-        acceptance::{ACCEPTANCE_DIR, ACCEPTANCE_SCHEMA, AcceptanceDecision, AcceptanceRecord},
+        acceptance::{
+            ACCEPTANCE_DIR, ACCEPTANCE_SCHEMA, ACCEPTANCE_V2_SCHEMA, AcceptanceDecision,
+            AcceptanceRecord,
+        },
         card::CardState,
         clock::Clock,
         digest::CANONICAL_ALGORITHM,
@@ -62,9 +65,13 @@ pub struct RecordArgs {
     /// The integration being decided.
     #[arg(long)]
     pub integration_id: String,
-    /// Who is taking responsibility. Declared, not proven; see D-013.
+    /// Declared configured authorizer for a final sealed cycle. Identity is
+    /// declared, not proven; see D-013.
+    #[arg(long, conflicts_with = "acceptance_owner")]
+    pub authorizer_actor_id: Option<String>,
+    /// Compatible legacy spelling for `--authorizer-actor-id`.
     #[arg(long)]
-    pub acceptance_owner: String,
+    pub acceptance_owner: Option<String>,
     /// Refuse the integration instead of accepting it.
     #[arg(long, conflicts_with = "accept")]
     pub reject: bool,
@@ -190,6 +197,16 @@ const fn decision_of(args: &RecordArgs) -> AcceptanceDecision {
     }
 }
 
+fn authorizer(args: &RecordArgs) -> Result<&str, HarnessError> {
+    args.authorizer_actor_id
+        .as_deref()
+        .or(args.acceptance_owner.as_deref())
+        .ok_or_else(|| HarnessError::Control {
+            reason: "acceptance record requires --authorizer-actor-id (or compatible --acceptance-owner)".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        })
+}
+
 /// Validates the decision against stored state and reports it, recording
 /// nothing.
 fn preview_record(
@@ -201,23 +218,143 @@ fn preview_record(
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
     require_reviewed(&record)?;
-    refuse_author_accepting(&control, &record, &args.acceptance_owner)?;
+    let authorizer = authorizer(args)?;
+    refuse_author_accepting(&control, &record, authorizer)?;
+    validate_final_authorization(&control, &config, &record, authorizer)?;
 
     Ok(CommandOutcome::new(
         "acceptance.record",
         format!(
             "Dry run: would record `{}` for {integration_id} by {}\nnothing was changed",
             decision.name(),
-            args.acceptance_owner
+            authorizer
         ),
         serde_json::json!({
             "dry_run": true,
             "integration_id": integration_id.to_string(),
             "decision": decision.name(),
-            "acceptance_owner": args.acceptance_owner,
+            "acceptance_owner": authorizer,
+            "authorizer_actor_id": authorizer,
         }),
     )
     .with_project(config.project_id))
+}
+
+/// Returns the final-cycle bindings a v2 acceptance must pin. Ordinary v1
+/// integrations deliberately stay on their legacy acceptance path.
+fn validate_final_authorization(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+    authorizer_actor_id: &str,
+) -> Result<Option<(crate::domain::digest::Digest, crate::domain::digest::Digest)>, HarnessError> {
+    if !record.final_for_cycle {
+        return Ok(None);
+    }
+    if !config
+        .final_authorization_policy
+        .authorizes(authorizer_actor_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {authorizer_actor_id} is not configured to authorize final sealed cycles"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    let cycle = load_cycle(control, &record.cycle_id)?;
+    let sealed = record
+        .sealed_cycle_digest
+        .as_ref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "final integration {} has no sealed cycle digest",
+                record.integration_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+    let actual = crate::domain::digest::Digest::of_canonical(&cycle)?;
+    if cycle.status != crate::domain::cycle::CycleStatus::Sealed || &actual != sealed {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final integration {} no longer binds its sealed cycle",
+                record.integration_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    Ok(Some((
+        config.final_authorization_policy.digest()?,
+        sealed.clone(),
+    )))
+}
+
+/// Rechecks the final-cycle authority bindings immediately before promotion.
+/// This is intentionally separate from recording: a changed project policy or
+/// resealed/tampered cycle must invalidate an older v2 authorization rather
+/// than relying on the old record's existence.
+pub(crate) fn validate_final_authorization_for_promotion(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    record: &IntegrationRecord,
+    acceptance: &AcceptanceRecord,
+) -> Result<(), HarnessError> {
+    if !record.final_for_cycle {
+        return Ok(());
+    }
+    if acceptance.schema != ACCEPTANCE_V2_SCHEMA {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final integration {} requires a v2 final authorization",
+                record.integration_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    let Some(authorizer) = acceptance.authorizer_actor_id.as_deref() else {
+        return Err(HarnessError::Control {
+            reason: "v2 final authorization has no authorizer_actor_id".to_owned(),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+    let Some(recorded_policy) = acceptance.final_authorization_policy_digest.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: "v2 final authorization has no policy digest".to_owned(),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+    let Some(recorded_seal) = acceptance.sealed_cycle_digest.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: "v2 final authorization has no sealed cycle digest".to_owned(),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+    if !config.final_authorization_policy.authorizes(authorizer)
+        || &config.final_authorization_policy.digest()? != recorded_policy
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final authorization {} no longer matches the current project policy",
+                acceptance.acceptance_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    let cycle = load_cycle(control, &record.cycle_id)?;
+    let current_seal = crate::domain::digest::Digest::of_canonical(&cycle)?;
+    if cycle.status != crate::domain::cycle::CycleStatus::Sealed
+        || record.sealed_cycle_digest.as_ref() != Some(recorded_seal)
+        || &current_seal != recorded_seal
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "final authorization {} no longer matches its sealed cycle",
+                acceptance.acceptance_id
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+    Ok(())
 }
 
 /// Refuses an acceptance recorded by someone who implemented a member card.
@@ -256,7 +393,10 @@ fn build_acceptance(
     clock: &dyn Clock,
 ) -> Result<AcceptanceRecord, HarnessError> {
     let verification = load_verification(control, &record.integration_id)?;
-    refuse_author_accepting(control, record, &args.acceptance_owner)?;
+    let authorizer = authorizer(args)?;
+    refuse_author_accepting(control, record, authorizer)?;
+    let final_bindings =
+        validate_final_authorization(control, &control.project()?, record, authorizer)?;
 
     let Some(landing_sha) = record.landing_sha.clone() else {
         return Err(HarnessError::Control {
@@ -269,13 +409,22 @@ fn build_acceptance(
     };
 
     Ok(AcceptanceRecord {
-        schema: ACCEPTANCE_SCHEMA.to_owned(),
+        schema: if final_bindings.is_some() {
+            ACCEPTANCE_V2_SCHEMA.to_owned()
+        } else {
+            ACCEPTANCE_SCHEMA.to_owned()
+        },
         acceptance_id: next_acceptance_id(control)?,
         integration_id: record.integration_id.clone(),
         landing_sha: landing_sha.clone(),
         integration_record_digest: record.substantive_digest()?,
         receipt_ids: verification.receipt_ids.clone(),
-        acceptance_owner: args.acceptance_owner.clone(),
+        acceptance_owner: authorizer.to_owned(),
+        authorizer_actor_id: final_bindings.as_ref().map(|_| authorizer.to_owned()),
+        final_authorization_policy_digest: final_bindings
+            .as_ref()
+            .map(|(policy, _)| policy.clone()),
+        sealed_cycle_digest: final_bindings.map(|(_, sealed)| sealed),
         decision,
         residual_risks: args.residual_risks.clone(),
         rollback_reference: args.rollback_reference.clone().unwrap_or_else(|| {
@@ -341,7 +490,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 
             events.append(
                 &config.project_id,
-                EventDraft::new("acceptance.recorded", &args.acceptance_owner)
+                EventDraft::new("acceptance.recorded", authorizer(args)?)
                     .cycle(record.cycle_id.clone())
                     .head(landing_sha.clone())
                     .transition(
@@ -426,6 +575,9 @@ fn report_acceptance(
             "decision": acceptance.decision.name(),
             "authorizes_promotion": acceptance.decision.authorizes_promotion(),
             "acceptance_owner": acceptance.acceptance_owner,
+            "authorizer_actor_id": acceptance.authorizer_actor_id,
+            "final_authorization_policy_digest": acceptance.final_authorization_policy_digest.as_ref().map(crate::domain::digest::Digest::as_str),
+            "sealed_cycle_digest": acceptance.sealed_cycle_digest.as_ref().map(crate::domain::digest::Digest::as_str),
             "receipt_ids": acceptance.receipt_ids,
             "residual_risks": acceptance.residual_risks,
             "rollback_reference": acceptance.rollback_reference,
