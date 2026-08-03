@@ -26,7 +26,10 @@ use crate::{
     git::{command::GitScope, inspect},
     policy::{
         progressive_validation::{ValidationProgress, plan, progress, stages_before_satisfied},
-        receipt_compatibility::{CompatibilityDecision, CompatibilityRequest, evaluate},
+        receipt_compatibility::{
+            CompatibilityDecision, CompatibilityRequest, IntegrationCompatibilityDecision,
+            IntegrationCompatibilityRequestV1, evaluate, evaluate_integration,
+        },
     },
     runner::{
         environment_fingerprint,
@@ -111,7 +114,10 @@ pub struct StatusArgs {
     pub common: CommonArgs,
     /// The card to report on.
     #[arg(long)]
-    pub card_id: String,
+    pub card_id: Option<String>,
+    /// The final integration to report. Mutually exclusive with `--card-id`.
+    #[arg(long)]
+    pub integration_id: Option<String>,
     /// A frozen, privacy-safe compatibility request to evaluate against the
     /// card's stored receipts. This is read-only and never authorizes work.
     #[arg(long)]
@@ -1110,7 +1116,20 @@ fn report_run(
 }
 
 fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
-    let card_id: CardId = args.card_id.parse()?;
+    match (&args.card_id, &args.integration_id) {
+        (None, Some(integration_id)) => {
+            return run_integration_status(args, &integration_id.parse()?);
+        }
+        (Some(_), None) => {}
+        _ => {
+            return Err(HarnessError::Control {
+                reason: "gate status requires exactly one of --card-id or --integration-id"
+                    .to_owned(),
+                code: ErrorCode::UsageConflictingOptions,
+            });
+        }
+    }
+    let card_id: CardId = args.card_id.as_deref().expect("checked above").parse()?;
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, _state) = load_card(&control, &card_id)?;
@@ -1205,6 +1224,54 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     .with_project(config.project_id.clone()))
 }
 
+fn run_integration_status(
+    args: &StatusArgs,
+    integration_id: &IntegrationId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let record = crate::commands::integration::load_integration(&control, integration_id)?;
+    let (verification, receipts) = receipts_for_integration_verification(&control, integration_id)?;
+    let compatibility = args
+        .compatibility_request
+        .as_ref()
+        .map(|path| read_integration_compatibility_request(path, &record, &verification, &receipts))
+        .transpose()?;
+    Ok(CommandOutcome::new(
+        "gate.status",
+        format!(
+            "Integration {integration_id}\nverification receipts: {}",
+            receipts.len()
+        ),
+        serde_json::json!({
+            "integration_id": integration_id.to_string(),
+            "verification_digest": verification.digest()?,
+            "receipts": receipts,
+            "receipt_compatibility": compatibility,
+        }),
+    )
+    .with_project(config.project_id))
+}
+
+fn read_integration_compatibility_request(
+    path: &PathBuf,
+    record: &crate::domain::integration::IntegrationRecord,
+    verification: &crate::domain::integration::VerificationRecord,
+    receipts: &[Receipt],
+) -> Result<IntegrationCompatibilityDecision, HarnessError> {
+    let request: IntegrationCompatibilityRequestV1 = load_json_request(path)?;
+    if request.context.integration_id != record.integration_id
+        || request.context.cycle_id != record.cycle_id
+        || record.landing_sha.as_deref() != Some(request.context.landing_sha.as_str())
+        || request.context.baseline_sha != record.baseline_sha
+        || request.context.integration_digest != record.substantive_digest()?
+        || request.context.verification_digest != verification.digest()?
+    {
+        return Err(HarnessError::Control { reason: "integration compatibility request is stale for the current integration or verification".to_owned(), code: ErrorCode::GateEvidenceStale });
+    }
+    Ok(evaluate_integration(&request, receipts))
+}
+
 /// Reads one frozen consumer context used only to explain receipt reuse.
 ///
 /// The request is deliberately supplied rather than inferred from a prior
@@ -1242,6 +1309,10 @@ pub(crate) fn read_compatibility_request(
 pub(crate) fn load_compatibility_request(
     path: &PathBuf,
 ) -> Result<CompatibilityRequest, HarnessError> {
+    load_json_request(path)
+}
+
+fn load_json_request<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, HarnessError> {
     let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
         reason: format!(
             "cannot read receipt compatibility request {}: {source}",
