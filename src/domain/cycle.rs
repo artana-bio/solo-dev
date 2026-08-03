@@ -98,7 +98,10 @@ impl CycleStatus {
                 Self::Blocked,
                 Self::Abandoned,
             ],
-            Self::Sealed => &[Self::Integrating, Self::Blocked, Self::Abandoned],
+            // This first sealing slice deliberately makes no integration or
+            // escalation promise. A sealed cycle can be abandoned, but a
+            // later slice must define any further forward transition.
+            Self::Sealed => &[Self::Abandoned],
             Self::Integrating => &[Self::Accepted, Self::Blocked, Self::Abandoned],
             Self::Accepted => &[Self::Landed, Self::Abandoned],
             Self::Landed => &[Self::Closed],
@@ -360,7 +363,7 @@ mod tests {
         for (from, to) in [
             (CycleStatus::Draft, CycleStatus::Active),
             (CycleStatus::Active, CycleStatus::Sealed),
-            (CycleStatus::Sealed, CycleStatus::Integrating),
+            (CycleStatus::Sealed, CycleStatus::Abandoned),
             (CycleStatus::Active, CycleStatus::Integrating),
             (CycleStatus::Integrating, CycleStatus::Accepted),
             (CycleStatus::Accepted, CycleStatus::Landed),
