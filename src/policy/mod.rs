@@ -9,4 +9,5 @@ pub mod allocation;
 pub mod convergence;
 pub mod credential_shape;
 pub mod paths;
+pub mod progressive_validation;
 pub mod verification;

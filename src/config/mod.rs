@@ -24,6 +24,117 @@ pub const DEFAULT_AUTHORITY_REMOTE: &str = "harness-authority";
 /// The only progressive-validation policy this release understands.
 pub const VALIDATION_POLICY_V1: &str = "harness.validation-policy/v1";
 
+/// An ordered point in the progressive-validation ladder.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationStage {
+    /// Cheap, card-local checks before handoff.
+    Narrow,
+    /// Checks required to make a handoff reviewable.
+    Handoff,
+    /// Checks only meaningful on the integrated result.
+    FinalIntegration,
+}
+
+impl ValidationStage {
+    /// Stable stage name for text output and policy diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Handoff => "handoff",
+            Self::FinalIntegration => "final_integration",
+        }
+    }
+
+    const fn order(self) -> u8 {
+        match self {
+            Self::Narrow => 0,
+            Self::Handoff => 1,
+            Self::FinalIntegration => 2,
+        }
+    }
+}
+
+/// Required validation stages by card risk.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskStageRequirements {
+    /// Low-risk cards still need a narrow proof and final integration check.
+    pub low: Vec<ValidationStage>,
+    /// Medium-risk work also needs a handoff-stage check.
+    pub medium: Vec<ValidationStage>,
+    /// High-risk work receives the full declared ladder.
+    pub high: Vec<ValidationStage>,
+    /// Critical work receives the full declared ladder; human assurance is
+    /// separately governed by the review policy.
+    pub critical: Vec<ValidationStage>,
+}
+
+impl Default for RiskStageRequirements {
+    fn default() -> Self {
+        Self {
+            low: vec![ValidationStage::Narrow, ValidationStage::FinalIntegration],
+            medium: vec![
+                ValidationStage::Narrow,
+                ValidationStage::Handoff,
+                ValidationStage::FinalIntegration,
+            ],
+            high: vec![
+                ValidationStage::Narrow,
+                ValidationStage::Handoff,
+                ValidationStage::FinalIntegration,
+            ],
+            critical: vec![
+                ValidationStage::Narrow,
+                ValidationStage::Handoff,
+                ValidationStage::FinalIntegration,
+            ],
+        }
+    }
+}
+
+impl RiskStageRequirements {
+    /// Required stages for one risk tier.
+    #[must_use]
+    pub fn for_risk(&self, risk: Risk) -> &[ValidationStage] {
+        match risk {
+            Risk::Low => &self.low,
+            Risk::Medium => &self.medium,
+            Risk::High => &self.high,
+            Risk::Critical => &self.critical,
+        }
+    }
+
+    fn validate(&self) -> Result<(), FieldError> {
+        for (field, stages) in [
+            ("low", &self.low),
+            ("medium", &self.medium),
+            ("high", &self.high),
+            ("critical", &self.critical),
+        ] {
+            if stages.is_empty() {
+                return Err(FieldError::new(
+                    format!("validation_policy.stage_requirements.{field}"),
+                    "must contain at least one ordered validation stage",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+            if stages
+                .windows(2)
+                .any(|pair| pair[0].order() >= pair[1].order())
+            {
+                return Err(FieldError::new(
+                    format!("validation_policy.stage_requirements.{field}"),
+                    "must list each stage at most once in narrow, handoff, final_integration order",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Project-wide rules that decide which risks require a declared proof map.
 ///
 /// The policy is versioned because every activated card binds this project
@@ -36,6 +147,10 @@ pub struct ValidationPolicy {
     pub version: String,
     /// Risks that cannot activate or revise without a complete proof map.
     pub proof_map_required_for: Vec<Risk>,
+    /// Ordered stages each risk tier must declare. Omission preserves legacy
+    /// project records with the shipped v1 ladder.
+    #[serde(default)]
+    pub stage_requirements: RiskStageRequirements,
 }
 
 impl Default for ValidationPolicy {
@@ -43,6 +158,7 @@ impl Default for ValidationPolicy {
         Self {
             version: VALIDATION_POLICY_V1.to_owned(),
             proof_map_required_for: vec![Risk::Medium, Risk::High, Risk::Critical],
+            stage_requirements: RiskStageRequirements::default(),
         }
     }
 }
@@ -87,6 +203,7 @@ impl ValidationPolicy {
                 ));
             }
         }
+        self.stage_requirements.validate()?;
         Ok(())
     }
 
@@ -94,6 +211,12 @@ impl ValidationPolicy {
     #[must_use]
     pub fn requires_proof_map(&self, risk: Risk) -> bool {
         self.proof_map_required_for.contains(&risk)
+    }
+
+    /// The ordered stages a card at `risk` must declare.
+    #[must_use]
+    pub fn required_stages(&self, risk: Risk) -> &[ValidationStage] {
+        self.stage_requirements.for_risk(risk)
     }
 }
 
@@ -311,6 +434,17 @@ mod tests {
         assert_eq!(
             error.details()["field"],
             "validation_policy.proof_map_required_for"
+        );
+
+        let unordered = valid_document().replace(
+            "\"host_policy\": {",
+            "\"validation_policy\": {\"version\": \"harness.validation-policy/v1\", \"proof_map_required_for\": [\"medium\"], \"stage_requirements\": {\"low\": [\"final_integration\", \"narrow\"], \"medium\": [\"narrow\"], \"high\": [\"narrow\"], \"critical\": [\"narrow\"]}},\n  \"host_policy\": {",
+        );
+        let error = ProjectConfig::from_json(&unordered).expect_err("unordered stages must refuse");
+        assert_eq!(error.code(), ErrorCode::ConfigInvalidValue);
+        assert_eq!(
+            error.details()["field"],
+            "validation_policy.stage_requirements.low"
         );
     }
 

@@ -1024,20 +1024,47 @@ risk: low
 
     #[test]
     fn an_incomplete_optional_proof_map_is_refused_before_activation() {
-        let mut draft = draft();
-        draft.proof_map = Some(ProofMap {
+        let complete = ProofMap {
             schema: PROOF_MAP_SCHEMA.to_owned(),
             entries: vec![ProofMapEntry {
                 invariant: "the intended behavior remains true".to_owned(),
                 precondition: "a focused fixture is installed".to_owned(),
-                assertion: String::new(),
+                assertion: "the check sees the behavior".to_owned(),
                 mutation: "bypass the check".to_owned(),
             }],
             claim_boundary: "only the focused behavior".to_owned(),
-        });
-        let error = CardRecord::activate(&draft, 1, "alvaro", stamp()).expect_err("must refuse");
-        assert_eq!(error.code(), ErrorCode::PolicyInvalidCard);
-        assert!(error.to_string().contains("proof_map.entries[0].assertion"));
+        };
+        for (field, mutate) in [
+            (
+                "invariant",
+                (|map: &mut ProofMap| map.entries[0].invariant = String::new())
+                    as fn(&mut ProofMap),
+            ),
+            ("precondition", |map: &mut ProofMap| {
+                map.entries[0].precondition = String::new();
+            }),
+            ("assertion", |map: &mut ProofMap| {
+                map.entries[0].assertion = String::new();
+            }),
+            ("mutation", |map: &mut ProofMap| {
+                map.entries[0].mutation = String::new();
+            }),
+            ("claim boundary", |map: &mut ProofMap| {
+                map.claim_boundary = String::new();
+            }),
+        ] {
+            let mut draft = draft();
+            let mut incomplete = complete.clone();
+            mutate(&mut incomplete);
+            draft.proof_map = Some(incomplete);
+            let error =
+                CardRecord::activate(&draft, 1, "alvaro", stamp()).expect_err("must refuse");
+            assert_eq!(error.code(), ErrorCode::PolicyInvalidCard);
+            assert!(
+                error.to_string().contains(field),
+                "expected `{field}` in: {error}"
+            );
+        }
     }
 
     #[test]

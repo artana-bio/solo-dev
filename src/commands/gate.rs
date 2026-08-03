@@ -15,11 +15,14 @@ use crate::{
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         clock::Clock,
+        cycle::CycleRecord,
+        digest::Digest,
         gate::{GATE_DIR, GateDefinition, NetworkPolicy},
         ids::{CardId, ReceiptId},
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
+    policy::progressive_validation::{ValidationPlan, plan},
     runner::{
         environment_fingerprint,
         receipt::{LOG_DIR, RECEIPT_DIR, RECEIPT_SCHEMA, Receipt, evidence_is_acceptable},
@@ -40,6 +43,8 @@ pub enum GateCommand {
     Show(ShowArgs),
     /// Run a named gate against a card's candidate.
     Run(RunArgs),
+    /// Show the deterministic validation stages for an activated card.
+    Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
     Status(StatusArgs),
 }
@@ -58,6 +63,7 @@ impl GateCommand {
             Self::List(..) => "gate.list",
             Self::Show(..) => "gate.show",
             Self::Run(..) => "gate.run",
+            Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
         }
     }
@@ -77,6 +83,16 @@ pub struct RunArgs {
     /// Report planned mutations without performing them.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments accepted by `gate preflight`.
+#[derive(Debug, Args)]
+pub struct PreflightArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The activated card whose validation ladder to project.
+    #[arg(long)]
+    pub card_id: String,
 }
 
 /// Arguments accepted by `gate status`.
@@ -143,6 +159,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::List(args) => run_list(args),
         GateCommand::Show(args) => run_show(args),
         GateCommand::Run(args) => run_gate(args, clock),
+        GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
     }
 }
@@ -422,6 +439,108 @@ fn run_show(args: &ShowArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// Builds the same read-only plan every caller must use before attempting
+/// progressive validation. Gate execution order is enforced by #55; this
+/// command only exposes the authoritative frozen inputs and order.
+fn run_preflight(args: &PreflightArgs) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (record, state) = load_card(&control, &card_id)?;
+    let recomputed_card_digest = record.digest()?;
+    if recomputed_card_digest != state.current_digest {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {card_id} revision {} recomputes to {recomputed_card_digest}, but state records {}; the immutable card record was altered",
+                record.revision, state.current_digest
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    }
+    let cycle: CycleRecord =
+        serde_json::from_str(&control.read(&CycleRecord::relative_path(&record.cycle_id))?)
+            .map_err(|source| HarnessError::Control {
+                reason: format!("cycle {} is malformed: {source}", record.cycle_id),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+    let baseline = cycle
+        .baseline_sha
+        .as_deref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("cycle {} has no frozen baseline", cycle.cycle_id),
+            code: ErrorCode::PolicyInvalidCycle,
+        })?;
+    if record.base_sha != baseline {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {card_id} declares base {}, but cycle {} is frozen at {baseline}",
+                record.base_sha, cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyCycleBaselineMismatch,
+        });
+    }
+    let project_digest = Digest::of_canonical(&config)?;
+    if cycle.project_revision != project_digest {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {} was created under project revision {}, but the current project configuration is {}; start a new cycle or restore the frozen policy",
+                cycle.cycle_id, cycle.project_revision, project_digest
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    let policy_digest = Digest::of_canonical(&config.validation_policy)?;
+    let plan = plan(
+        &record,
+        recomputed_card_digest,
+        &config.validation_policy,
+        policy_digest,
+        &all_gates(&control)?,
+    )?;
+    Ok(render_preflight(&card_id, &config.project_id, plan))
+}
+
+/// Renders a plan without adding another source of truth beside the structured
+/// plan itself.
+fn render_preflight(
+    card_id: &CardId,
+    project_id: &crate::domain::ids::ProjectId,
+    plan: ValidationPlan,
+) -> CommandOutcome {
+    let mut text = format!(
+        "Validation preflight for {card_id} r{}\nbase: {}\nrisk: {}\nnext permitted stage: {}",
+        plan.card_revision,
+        plan.base_sha,
+        plan.risk,
+        plan.next_permitted_stage
+            .map_or("complete", |stage| stage.name())
+    );
+    for stage in &plan.stages {
+        let names = stage
+            .checks
+            .iter()
+            .map(|check| check.gate_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            text,
+            "\n  {}: {}",
+            stage.stage.name(),
+            if names.is_empty() {
+                "no checks"
+            } else {
+                &names
+            }
+        );
+    }
+    CommandOutcome::new(
+        "gate.preflight",
+        text,
+        serde_json::to_value(plan).expect("plan is serializable"),
+    )
+    .with_project(project_id.clone())
 }
 
 /// Allocates the next receipt identifier.
