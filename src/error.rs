@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::cli::exit::ExitCategory;
 
+const CYCLE_BASELINE_MISMATCH_RECOVERY: &str =
+    "Set the card base to the cycle's frozen baseline, or create a new cycle for a different base.";
+
 /// A stable, machine-readable error code.
 ///
 /// The rendered form is `CH-<CATEGORY>-<DETAIL>`. Categories come from
@@ -69,6 +72,8 @@ pub enum ErrorCode {
     PolicyInvalidCycle,
     /// A card record is internally inconsistent or violates a card rule.
     PolicyInvalidCard,
+    /// A card declares a base other than its cycle's frozen baseline.
+    PolicyCycleBaselineMismatch,
     /// Two active cards claim overlapping write scopes.
     PolicyOwnershipOverlap,
     /// Two active cards change the same contract domain.
@@ -213,7 +218,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 83] = [
+    pub const ALL: [Self; 84] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -241,6 +246,7 @@ impl ErrorCode {
         Self::PolicyInvalidTransition,
         Self::PolicyInvalidCycle,
         Self::PolicyInvalidCard,
+        Self::PolicyCycleBaselineMismatch,
         Self::PolicyOwnershipOverlap,
         Self::PolicyContractOverlap,
         Self::PolicyResourceConflict,
@@ -331,6 +337,7 @@ impl ErrorCode {
             | Self::PolicyInvalidTransition
             | Self::PolicyInvalidCycle
             | Self::PolicyInvalidCard
+            | Self::PolicyCycleBaselineMismatch
             | Self::PolicyOwnershipOverlap
             | Self::PolicyContractOverlap
             | Self::PolicyResourceConflict
@@ -418,6 +425,7 @@ impl ErrorCode {
             Self::PolicyInvalidTransition => "INVALID-TRANSITION",
             Self::PolicyInvalidCycle => "INVALID-CYCLE",
             Self::PolicyInvalidCard => "INVALID-CARD",
+            Self::PolicyCycleBaselineMismatch => "CYCLE-BASELINE-MISMATCH",
             Self::PolicyOwnershipOverlap => "OWNERSHIP-OVERLAP",
             Self::PolicyContractOverlap => "CONTRACT-OVERLAP",
             Self::PolicyResourceConflict => "RESOURCE-CONFLICT",
@@ -621,6 +629,7 @@ impl ErrorCode {
             Self::PolicyInvalidCard => {
                 "Correct the card so it satisfies the activation rules in Section 10.3."
             }
+            Self::PolicyCycleBaselineMismatch => CYCLE_BASELINE_MISMATCH_RECOVERY,
             Self::PolicyOwnershipOverlap => {
                 "Narrow one card's write scope, or serialize the two cards."
             }

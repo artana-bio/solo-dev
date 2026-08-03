@@ -323,6 +323,30 @@ fn cycle_accepting_cards(
     Ok(cycle)
 }
 
+/// Requires a card to reason from the exact baseline frozen for its cycle.
+fn require_cycle_baseline(cycle: &CycleRecord, draft: &CardDraft) -> Result<(), HarnessError> {
+    let baseline = cycle
+        .baseline_sha
+        .as_deref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "cycle {} accepts cards but has no frozen baseline",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        })?;
+    if draft.base_sha != baseline {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} declares base {}, but cycle {} is frozen at {baseline}",
+                draft.card_id, draft.base_sha, cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyCycleBaselineMismatch,
+        });
+    }
+    Ok(())
+}
+
 /// Collects the claims of every card already declared in a cycle.
 ///
 /// Only activated cards appear: a draft has claimed nothing yet, and a card
@@ -532,6 +556,7 @@ fn preview_activate(
     let draft = stored_draft(&control, card_id)?;
     draft.validate()?;
     let cycle = cycle_accepting_cards(&control, &draft)?;
+    require_cycle_baseline(&cycle, &draft)?;
     let preview = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;
     require_registered(
         &control,
@@ -582,6 +607,7 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             }
             let draft = stored_draft(control, &card_id)?;
             let cycle = cycle_accepting_cards(control, &draft)?;
+            require_cycle_baseline(&cycle, &draft)?;
             let config = control.project()?;
 
             let record = CardRecord::activate(&draft, 1, &args.common.actor, clock.now())?;

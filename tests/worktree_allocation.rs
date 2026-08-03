@@ -139,7 +139,7 @@ fn an_existing_worktree_path_blocks_allocation() {
 }
 
 #[test]
-fn a_card_whose_base_is_missing_is_refused_before_anything_is_created() {
+fn a_card_with_an_unknown_base_is_refused_at_activation_before_work_can_start() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
         "create",
@@ -149,18 +149,80 @@ fn a_card_whose_base_is_missing_is_refused_before_anything_is_created() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    // Activate a card whose base is a well-formed but absent object ID.
-    workspace.activate_card_with_base("F-001", &["src/a.rs"], &"a".repeat(40));
+    // A well-formed but absent object ID must be rejected while the card is
+    // still a draft. It must not become an activated card that fails later in
+    // `work start`.
+    let base = "a".repeat(40);
+    let draft = workspace.root.join("F-001.yaml");
+    fs::write(
+        &draft,
+        format!(
+            "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [src/a.rs]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        ),
+    )
+    .unwrap();
+    workspace.card(&["create", "--draft", &draft.display().to_string()]);
 
-    let output = workspace.work_raw(&["start", "--card-id", "F-001"]);
-    assert_eq!(output.status.code(), Some(4));
+    let output = workspace.card_raw(&["activate", "--card-id", "F-001"]);
+    assert_eq!(output.status.code(), Some(5));
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["error"]["code"], "CH-PRECONDITION-BASE-MISSING");
+    assert_eq!(
+        envelope["error"]["code"],
+        "CH-POLICY-CYCLE-BASELINE-MISMATCH"
+    );
     assert!(
         !workspace.worktrees.join("F-001").exists(),
         "a refusal must create nothing"
     );
     assert!(!workspace.candidate_branch_exists("card/F-001"));
+}
+
+#[test]
+fn a_card_base_that_differs_from_the_frozen_cycle_baseline_is_refused_at_activation() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    let frozen = workspace.authority_head();
+    let later = workspace.advance_authority();
+    assert_ne!(
+        frozen, later,
+        "the fixture must advance authority after freeze"
+    );
+
+    let draft = workspace.root.join("F-001.yaml");
+    fs::write(
+        &draft,
+        format!(
+            "card_id: F-001\ncycle_id: C-001\ntitle: Implement F-001\ngoal: Deliver F-001\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {later}\nwrite_scope:\n  include: [src/a.rs]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        ),
+    )
+    .unwrap();
+    workspace.card(&["create", "--draft", &draft.display().to_string()]);
+
+    for args in [
+        vec!["activate", "--card-id", "F-001", "--dry-run"],
+        vec!["activate", "--card-id", "F-001"],
+    ] {
+        let output = workspace.card_raw(&args);
+        assert_eq!(output.status.code(), Some(5));
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            envelope["error"]["code"],
+            "CH-POLICY-CYCLE-BASELINE-MISMATCH"
+        );
+    }
+
+    assert!(
+        !workspace.control.join("cards/F-001/1.json").exists(),
+        "a mismatched base must not activate a revision"
+    );
+    assert!(!workspace.worktrees.join("F-001").exists());
 }
 
 #[test]
