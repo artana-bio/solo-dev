@@ -150,7 +150,7 @@ pub enum ErrorCode {
     PolicyCandidateOutOfScope,
     /// A staged control entry is not valid control-record text.
     PolicyControlEncoding,
-    /// A staged control entry contains the governed sensitive-value fixture.
+    /// A staged control entry contains the governed sensitive-value shape.
     PolicySensitiveValue,
     /// The gate runner could not execute or supervise a process.
     GateRunnerError,
