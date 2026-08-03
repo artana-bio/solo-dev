@@ -15,6 +15,7 @@ use change_harness::{
         repository::{ControlRepository, PROJECT_FILE},
     },
     domain::clock::FixedClock,
+    error::ErrorCode,
 };
 use tempfile::TempDir;
 
@@ -1333,6 +1334,93 @@ fn an_https_userinfo_password_is_refused_but_compact_json_like_text_commits() {
             assert!(Journal::new(&control).unresolved().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn a_nested_escaped_json_key_uses_a_safe_location_before_durability() {
+    const KEY: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    const ESCAPED_KEY: &str = "\\u0067hp_0123456789abcdef0123456789abcdef0123";
+    const LOCATION: &str = "cards/escaped-key.json:outer[0].[redacted:json-key]";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+    let before_objects = file_snapshot(&fixture.control.join(".git/objects"));
+    let before_cycles = file_snapshot(&fixture.control.join("cycles"));
+    let before_events = file_snapshot(&fixture.control.join("events"));
+    let before_journal = file_snapshot(&fixture.control.join("journal"));
+
+    let contents = format!(r#"{{"outer":[{{"{ESCAPED_KEY}":"ordinary"}}]}}"#);
+    assert!(!contents.contains(KEY));
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    let path = fixture.control.join("cards/escaped-key.json");
+    fs::write(&path, contents.as_bytes()).unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let direct_error = control.validate_hygiene().unwrap_err();
+    assert_eq!(direct_error.code(), ErrorCode::PolicySensitiveValue);
+    assert_eq!(
+        direct_error.to_string(),
+        format!("control state: control entry `{LOCATION}` contains a sensitive value")
+    );
+    assert!(!direct_error.to_string().contains(KEY));
+    assert!(!direct_error.to_string().contains(ESCAPED_KEY));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(5), "{rendered}");
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["error"]["message"],
+        format!("control state: control entry `{LOCATION}` contains a sensitive value")
+    );
+    assert_eq!(
+        envelope["error"]["details"]["reason"],
+        format!("control entry `{LOCATION}` contains a sensitive value")
+    );
+    assert!(!rendered.contains(KEY));
+    assert!(!rendered.contains(ESCAPED_KEY));
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+    assert_eq!(control.head().unwrap(), before_head);
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join(".git/objects")),
+        before_objects
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("cycles")),
+        before_cycles
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("events")),
+        before_events
+    );
+    assert_eq!(
+        file_snapshot(&fixture.control.join("journal")),
+        before_journal
+    );
 }
 
 #[test]

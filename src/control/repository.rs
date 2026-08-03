@@ -617,7 +617,7 @@ fn inspect_complete_json_control_entry(
 
 enum JsonSensitiveLocation {
     Value(String),
-    Key,
+    Key(String),
 }
 
 fn json_sensitive_location(
@@ -643,7 +643,7 @@ fn json_sensitive_location(
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
                 if contains_json_key_sensitive_shape(name) {
-                    return Some(JsonSensitiveLocation::Key);
+                    return Some(JsonSensitiveLocation::Key(location.clone()));
                 }
                 let length = location.len();
                 if !location.is_empty() {
@@ -693,8 +693,13 @@ fn json_sensitive_value_refusal(relative: &str, location: JsonSensitiveLocation)
         JsonSensitiveLocation::Value(location) => {
             format!("control entry `{relative}:{location}` contains a sensitive value")
         }
-        JsonSensitiveLocation::Key => {
-            format!("control entry `{relative}` contains a sensitive value")
+        JsonSensitiveLocation::Key(parent) => {
+            let location = if parent.is_empty() {
+                "[redacted:json-key]".to_owned()
+            } else {
+                format!("{parent}.[redacted:json-key]")
+            };
+            format!("control entry `{relative}:{location}` contains a sensitive value")
         }
     };
     HarnessError::Control {
