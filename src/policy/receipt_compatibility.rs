@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::ValidationStage,
-    domain::digest::Digest,
+    domain::{
+        digest::Digest,
+        ids::{CycleId, IntegrationId},
+    },
     policy::progressive_validation::{PlannedCheck, ValidationPlan},
     runner::receipt::{
         ProvenanceDimension, ProvenanceSubject, Receipt, ReceiptLineageKind, ReceiptProvenanceV1,
@@ -54,6 +57,40 @@ pub struct CompatibilityRequest {
     pub stage: ValidationStage,
     pub check: PlannedCheck,
     pub expected: ReceiptProvenanceV1,
+}
+
+/// Immutable consumer state for one combined-verification receipt.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct IntegrationCompatibilityContextV1 {
+    pub integration_id: IntegrationId,
+    pub cycle_id: CycleId,
+    pub landing_sha: String,
+    pub baseline_sha: String,
+    pub integration_digest: Digest,
+    pub verification_digest: Digest,
+    pub policy_digest: Digest,
+}
+
+/// Typed request for final-integration receipt reuse.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct IntegrationCompatibilityRequestV1 {
+    pub schema: String,
+    pub context: IntegrationCompatibilityContextV1,
+    pub stage: ValidationStage,
+    pub check: PlannedCheck,
+    pub expected: ReceiptProvenanceV1,
+}
+
+/// A read-only compatibility decision for an exact integration verification.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct IntegrationCompatibilityDecision {
+    pub schema: String,
+    pub integration_id: IntegrationId,
+    pub integration_digest: Digest,
+    pub verification_digest: Digest,
+    pub stage: ValidationStage,
+    pub gate_id: String,
+    pub disposition: CompatibilityDisposition,
 }
 
 /// One decision; it does not authorize the next workflow transition.
@@ -131,6 +168,124 @@ pub fn evaluate(request: &CompatibilityRequest, receipts: &[Receipt]) -> Compati
     reasons.sort();
     reasons.dedup();
     rerun(request, reasons)
+}
+
+/// Decides compatibility for one exact final-integration check.
+#[must_use]
+pub fn evaluate_integration(
+    request: &IntegrationCompatibilityRequestV1,
+    receipts: &[Receipt],
+) -> IntegrationCompatibilityDecision {
+    let rerun = |mut reasons: Vec<RerunReason>| {
+        reasons.sort();
+        reasons.dedup();
+        IntegrationCompatibilityDecision {
+            schema: RECEIPT_COMPATIBILITY_SCHEMA.to_owned(),
+            integration_id: request.context.integration_id.clone(),
+            integration_digest: request.context.integration_digest.clone(),
+            verification_digest: request.context.verification_digest.clone(),
+            stage: request.stage,
+            gate_id: request.check.gate_id.clone(),
+            disposition: CompatibilityDisposition::RerunRequired {
+                reasons,
+                minimum_rerun_gate: request.check.gate_id.clone(),
+            },
+        }
+    };
+    if request.schema != RECEIPT_COMPATIBILITY_SCHEMA
+        || request.stage != ValidationStage::FinalIntegration
+        || !integration_request_matches_context(request)
+    {
+        return rerun(vec![RerunReason::Stale]);
+    }
+    let mut ordered: Vec<&Receipt> = receipts.iter().collect();
+    ordered.sort_by_key(|receipt| receipt.receipt_id.as_str());
+    let mut reasons = Vec::new();
+    for receipt in ordered {
+        if receipt.gate_id != request.check.gate_id {
+            continue;
+        }
+        match compatible_integration(request, receipt, receipts) {
+            Ok((receipt_digest, provenance_digest)) => {
+                return IntegrationCompatibilityDecision {
+                    schema: RECEIPT_COMPATIBILITY_SCHEMA.to_owned(),
+                    integration_id: request.context.integration_id.clone(),
+                    integration_digest: request.context.integration_digest.clone(),
+                    verification_digest: request.context.verification_digest.clone(),
+                    stage: request.stage,
+                    gate_id: request.check.gate_id.clone(),
+                    disposition: CompatibilityDisposition::CompatibleReuse {
+                        receipt_id: receipt.receipt_id.to_string(),
+                        receipt_digest,
+                        provenance_digest,
+                        compatibility_version: RECEIPT_COMPATIBILITY_SCHEMA.to_owned(),
+                        freshness_basis: request.expected.freshness_dependencies.clone(),
+                    },
+                };
+            }
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    if reasons.is_empty() {
+        reasons.push(RerunReason::Missing);
+    }
+    rerun(reasons)
+}
+
+fn integration_request_matches_context(request: &IntegrationCompatibilityRequestV1) -> bool {
+    let ProvenanceSubject::Integration {
+        landing_sha,
+        base_sha,
+        cycle_id,
+        integration_id,
+        integration_digest,
+    } = &request.expected.subject
+    else {
+        return false;
+    };
+    landing_sha == &request.context.landing_sha
+        && base_sha == &request.context.baseline_sha
+        && cycle_id == &request.context.cycle_id
+        && integration_id == &request.context.integration_id
+        && integration_digest == &request.context.integration_digest
+        && request.expected.policy_digest == request.context.policy_digest
+        && request.expected.proof_map == crate::runner::receipt::ProofMapBinding::NotApplicable
+        && request.expected.validate().is_ok()
+        && request.expected.has_all_reuse_dimensions()
+}
+
+fn compatible_integration(
+    request: &IntegrationCompatibilityRequestV1,
+    receipt: &Receipt,
+    all_receipts: &[Receipt],
+) -> Result<(Digest, Digest), RerunReason> {
+    if receipt.integration_id.as_ref() != Some(&request.context.integration_id) {
+        return Err(RerunReason::Foreign);
+    }
+    if receipt.schema != request.check.receipt_schema
+        || receipt.gate_digest != request.check.gate_digest
+        || receipt.attempt == 0
+        || receipt.attempt > request.check.max_attempts
+    {
+        return Err(RerunReason::Gate);
+    }
+    if !receipt.passed || receipt.worktree_clean != Some(true) {
+        return Err(RerunReason::Stale);
+    }
+    if has_lineage_relation(all_receipts, receipt, ReceiptLineageKind::Invalidates)? {
+        return Err(RerunReason::Invalidated);
+    }
+    if has_lineage_relation(all_receipts, receipt, ReceiptLineageKind::Supersedes)? {
+        return Err(RerunReason::Superseded);
+    }
+    let provenance = receipt
+        .reuse_material()
+        .map_err(|_| RerunReason::Incomplete)?;
+    compare_provenance(&request.expected, provenance)?;
+    Ok((
+        receipt.digest().map_err(|_| RerunReason::Stale)?,
+        provenance.digest().map_err(|_| RerunReason::Stale)?,
+    ))
 }
 
 /// Refuse a caller-composed request whose expected provenance is not the
@@ -377,7 +532,7 @@ mod tests {
     use crate::{
         domain::{
             clock::{Clock as _, FixedClock},
-            ids::{CardId, CycleId, ProjectId, ReceiptId},
+            ids::{CardId, CycleId, IntegrationId, ProjectId, ReceiptId},
         },
         runner::receipt::{
             ProofMapBinding, ProvenanceSubject, RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA,
@@ -724,6 +879,46 @@ mod tests {
             decision.disposition,
             CompatibilityDisposition::RerunRequired { ref reasons, .. }
                 if reasons == &vec![RerunReason::Stale]
+        ));
+    }
+
+    #[test]
+    fn exact_complete_integration_receipt_reuses() {
+        let mut integration_receipt = receipt("R-000001");
+        integration_receipt.card_id = None;
+        integration_receipt.card_digest = None;
+        integration_receipt.integration_id = Some("INT-000001".parse().unwrap());
+        integration_receipt.provenance.as_mut().unwrap().subject = ProvenanceSubject::Integration {
+            landing_sha: "a".repeat(40),
+            base_sha: "b".repeat(40),
+            cycle_id: "C-001".parse::<CycleId>().unwrap(),
+            integration_id: "INT-000001".parse::<IntegrationId>().unwrap(),
+            integration_digest: digest("integration"),
+        };
+        let expected = integration_receipt.provenance.clone().unwrap();
+        let request = IntegrationCompatibilityRequestV1 {
+            schema: RECEIPT_COMPATIBILITY_SCHEMA.to_owned(),
+            context: IntegrationCompatibilityContextV1 {
+                integration_id: "INT-000001".parse().unwrap(),
+                cycle_id: "C-001".parse().unwrap(),
+                landing_sha: "a".repeat(40),
+                baseline_sha: "b".repeat(40),
+                integration_digest: digest("integration"),
+                verification_digest: digest("verification"),
+                policy_digest: digest("policy"),
+            },
+            stage: ValidationStage::FinalIntegration,
+            check: PlannedCheck {
+                gate_id: "gate.unit".to_owned(),
+                gate_digest: digest("gate"),
+                receipt_schema: RECEIPT_SCHEMA.to_owned(),
+                max_attempts: 1,
+            },
+            expected,
+        };
+        assert!(matches!(
+            evaluate_integration(&request, &[integration_receipt]).disposition,
+            CompatibilityDisposition::CompatibleReuse { .. }
         ));
     }
 }
