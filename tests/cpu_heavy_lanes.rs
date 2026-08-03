@@ -74,7 +74,9 @@ fn two_cpu_heavy_lanes_are_durable_and_release_before_a_third_execution_starts()
     let third_marker = workspace.root.join("third.marker");
     let ordinary_marker = workspace.root.join("ordinary.marker");
     gate(&workspace, "gate.cpu.one", &first_marker, 0.4);
-    gate(&workspace, "gate.cpu.two", &second_marker, 0.4);
+    // Stagger terminal settlement so this test isolates lane capacity rather
+    // than introducing an unrelated race for the project transaction lock.
+    gate(&workspace, "gate.cpu.two", &second_marker, 0.7);
     gate(&workspace, "gate.cpu.three", &third_marker, 0.0);
     gate(&workspace, "gate.ordinary", &ordinary_marker, 0.0);
     workspace.cycle(&[
@@ -140,10 +142,41 @@ fn two_cpu_heavy_lanes_are_durable_and_release_before_a_third_execution_starts()
         !third_marker.exists(),
         "third subprocess must not start without a lane"
     );
-    let ordinary = workspace.gate_raw(&["run", "--card-id", "F-004", "--gate-id", "gate.ordinary"]);
+    // An ordinary named gate still needs the universal execution capability,
+    // but it must not consume one of the CPU-heavy lanes.
+    let ordinary_reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-004",
+        "--gate-id",
+        "gate.ordinary",
+        "--actor",
+        "holder",
+    ])["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // CPU runs hold the project lock only while acquiring/settling. Retry that
+    // short administrative contention, but do not wait for a CPU lane: the
+    // ordinary subprocess must start while both lanes remain occupied.
+    let ordinary_deadline = Instant::now() + Duration::from_secs(2);
+    let ordinary = loop {
+        let output = run_process(
+            &workspace.control,
+            "F-004",
+            "gate.ordinary",
+            &ordinary_reservation,
+        );
+        if output.status.success() || Instant::now() >= ordinary_deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     assert!(
         ordinary.status.success(),
-        "ordinary named gate is not lane constrained"
+        "ordinary named gate is not lane constrained: stdout={} stderr={}",
+        String::from_utf8_lossy(&ordinary.stdout),
+        String::from_utf8_lossy(&ordinary.stderr),
     );
     assert!(ordinary_marker.exists());
     assert!(first_thread.join().unwrap().status.success());

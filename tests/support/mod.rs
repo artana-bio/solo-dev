@@ -167,7 +167,9 @@ impl Workspace {
                 let actual = owned.iter().map(String::as_str).collect::<Vec<_>>();
                 self.gate_raw(&actual)
             } else {
-                self.gate_raw(args)
+                // Never fall back to an unreserved execution. A fixture that
+                // cannot obtain the capability must surface that refusal.
+                reserve
             }
         } else {
             self.gate_raw(args)

@@ -190,7 +190,29 @@ fn a_failing_gate_in_another_language_blocks_exactly_as_a_rust_one_would() {
     support::git(&worktree, &["add", "-A"]);
     support::git(&worktree, &["commit", "-q", "-m", "feat: syntax error"]);
 
-    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "py.compile"]);
+    let reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "py.compile",
+        "--actor",
+        "operator",
+    ]);
+    let reservation_id = reservation["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap();
+    let output = workspace.gate_raw(&[
+        "run",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "py.compile",
+        "--reservation-id",
+        reservation_id,
+        "--actor",
+        "operator",
+    ]);
     assert_eq!(
         output.status.code(),
         Some(7),
