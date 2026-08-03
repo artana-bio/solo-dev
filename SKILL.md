@@ -1,5 +1,6 @@
 ---
 name: change-harness
+version: change-harness-skill/v1
 description: Drive a bounded change through Change Harness: card, allocated worktree, gates, exact-SHA handoff, independent review, integration, and promotion. Use this guide in any repository governed by Change Harness.
 ---
 
