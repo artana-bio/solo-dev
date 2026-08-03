@@ -1,6 +1,9 @@
 //! Card lifecycle commands.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -13,7 +16,7 @@ use crate::{
     domain::{
         card::{CARD_DIR, CardDraft, CardRecord, CardState},
         clock::Clock,
-        cycle::CycleRecord,
+        cycle::{CYCLE_DIR, CycleRecord, CycleStatus},
         digest::Digest,
         ids::CardId,
     },
@@ -349,6 +352,56 @@ fn existing_claims(
     Ok(claims)
 }
 
+/// Collects claims held by cards in every active cycle.
+///
+/// Cycle membership is the authoritative allocation index. It must be read
+/// across the control repository, rather than only from the cycle named by the
+/// candidate draft: concurrent cycles otherwise receive overlapping ownership
+/// leases without either activation seeing the other.
+fn active_cycle_claims(
+    control: &ControlRepository,
+    skip: &CardId,
+) -> Result<Vec<Claim>, HarnessError> {
+    let directory = control.path(CYCLE_DIR);
+    let entries = fs::read_dir(&directory).map_err(|source| HarnessError::ControlIo {
+        path: directory.clone(),
+        source,
+    })?;
+    let mut names: Vec<String> = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|source| HarnessError::ControlIo {
+                    path: directory.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    names.sort();
+
+    let mut claims = Vec::new();
+    for name in names {
+        if !Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let relative = format!("{CYCLE_DIR}/{name}");
+        let cycle: CycleRecord =
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!("cycle record {relative} is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })?;
+        if cycle.status == CycleStatus::Active {
+            claims.extend(existing_claims(control, &cycle, skip)?);
+        }
+    }
+    Ok(claims)
+}
+
 /// Refuses a card that would contend with anything already active.
 fn check_allocation(
     control: &ControlRepository,
@@ -356,8 +409,9 @@ fn check_allocation(
     record: &CardRecord,
 ) -> Result<(), HarnessError> {
     let existing = existing_claims(control, cycle, &record.card_id)?;
+    let active = active_cycle_claims(control, &record.card_id)?;
     let candidate = Claim::from_record(record, CardState::Ready);
-    check_admissible(&candidate, &existing)?;
+    check_admissible(&candidate, &active)?;
 
     let mut all = existing;
     all.push(candidate);

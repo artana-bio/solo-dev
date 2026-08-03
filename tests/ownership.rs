@@ -23,6 +23,7 @@ fn with_active_cycle() -> Workspace {
 /// Builds a draft with configurable ownership claims.
 struct Draft<'a> {
     card_id: &'a str,
+    cycle_id: &'a str,
     include: Vec<&'a str>,
     exclude: Vec<&'a str>,
     contract_changes: Vec<&'a str>,
@@ -34,6 +35,7 @@ impl<'a> Draft<'a> {
     fn new(card_id: &'a str, include: &[&'a str]) -> Self {
         Self {
             card_id,
+            cycle_id: "C-001",
             include: include.to_vec(),
             exclude: vec![],
             contract_changes: vec![],
@@ -44,6 +46,11 @@ impl<'a> Draft<'a> {
 
     fn contracts(mut self, domains: &[&'a str]) -> Self {
         self.contract_changes = domains.to_vec();
+        self
+    }
+
+    fn in_cycle(mut self, cycle_id: &'a str) -> Self {
+        self.cycle_id = cycle_id;
         self
     }
 
@@ -74,7 +81,7 @@ impl<'a> Draft<'a> {
         let body = format!(
             "\
 card_id: {id}
-cycle_id: C-001
+cycle_id: {cycle}
 title: Implement {id}
 goal: Deliver the {id} behavior
 non_goals: []
@@ -98,6 +105,7 @@ review_policy: independent
 rollback_strategy: revert the commit
 ",
             id = self.card_id,
+            cycle = self.cycle_id,
             baseline = workspace.authority_head(),
             include = list(&self.include),
             exclude = list(&self.exclude),
@@ -152,6 +160,49 @@ fn overlapping_cards_cannot_both_activate() {
     // The refused card must not have been declared in the cycle.
     let cycle = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
     assert_eq!(cycle["data"]["card_ids"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn overlapping_cards_in_two_active_cycles_cannot_both_activate() {
+    // #24: ownership used to be calculated only from the current cycle's
+    // membership. This fixture makes both cycles active, then proves the
+    // second activation and its dry-run see the first cycle's existing claim.
+    let workspace = with_active_cycle();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "Concurrent slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+
+    activate(&workspace, &Draft::new("F-001", &["src/shared.rs"]));
+
+    let second = Draft::new("F-002", &["src/shared.rs"]).in_cycle("C-002");
+    let path = second.write(&workspace);
+    workspace.card(&["create", "--draft", &path]);
+
+    let preview = workspace.card_raw(&["activate", "--card-id", "F-002", "--dry-run"]);
+    assert_eq!(preview.status.code(), Some(5));
+    assert_eq!(error_code(&preview), "CH-POLICY-OWNERSHIP-OVERLAP");
+
+    let actual = workspace.card_raw(&["activate", "--card-id", "F-002"]);
+    assert_eq!(actual.status.code(), Some(5));
+    assert_eq!(error_code(&actual), "CH-POLICY-OWNERSHIP-OVERLAP");
+
+    let cycle = workspace.cycle_json(&["status", "--cycle-id", "C-002"]);
+    assert!(
+        cycle["data"]["card_ids"].as_array().unwrap().is_empty(),
+        "a refused cross-cycle activation must not acquire membership"
+    );
+
+    // The second cycle remains usable for independent work. A cross-cycle
+    // conflict is localized to the contested path, not a global stop.
+    activate(
+        &workspace,
+        &Draft::new("F-003", &["src/disjoint.rs"]).in_cycle("C-002"),
+    );
 }
 
 #[test]
