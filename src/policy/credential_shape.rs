@@ -12,22 +12,28 @@ const RSA_PRIVATE_KEY_PEM_HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
 /// Anthropic API-key prefix and at least 20 ASCII token characters.
 #[must_use]
 pub(crate) fn contains_anthropic_api_key_shape(contents: &[u8]) -> bool {
-    contents
+    let mut search_from = 0;
+    while let Some(relative_start) = contents[search_from..]
         .windows(ANTHROPIC_API_KEY_PREFIX.len())
-        .enumerate()
-        .any(|(start, window)| {
-            if !window.starts_with(ANTHROPIC_API_KEY_PREFIX) {
-                return false;
-            }
-            let before = start.checked_sub(1).and_then(|index| contents.get(index));
-            let tail_start = start + ANTHROPIC_API_KEY_PREFIX.len();
-            let tail_length = contents[tail_start..]
-                .iter()
-                .take_while(|byte| is_anthropic_token_character(**byte))
-                .count();
-            tail_length >= ANTHROPIC_API_KEY_MIN_TAIL_LENGTH
-                && !before.is_some_and(|byte| is_anthropic_token_character(*byte))
-        })
+        .position(|window| window == ANTHROPIC_API_KEY_PREFIX)
+    {
+        let start = search_from + relative_start;
+        let before = start.checked_sub(1).and_then(|index| contents.get(index));
+        let tail_start = start + ANTHROPIC_API_KEY_PREFIX.len();
+        if before.is_some_and(|byte| is_anthropic_token_character(*byte)) {
+            search_from = tail_start;
+            continue;
+        }
+        let tail_length = contents[tail_start..]
+            .iter()
+            .take_while(|byte| is_anthropic_token_character(**byte))
+            .count();
+        if tail_length >= ANTHROPIC_API_KEY_MIN_TAIL_LENGTH {
+            return true;
+        }
+        search_from = tail_start + tail_length;
+    }
+    false
 }
 
 /// Returns whether `contents` contains the exact RSA private-key PEM header as

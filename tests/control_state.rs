@@ -1087,7 +1087,7 @@ fn an_anthropic_api_key_shape_is_refused_but_benign_sk_prose_commits() {
         ),
         (
             "cards/benign-sk.json",
-            format!(r#"{{"note":"{BENIGN}"}}"#),
+            format!(r#"{{"{SENSITIVE}":"ordinary","note":"{BENIGN}"}}"#),
             false,
         ),
     ];

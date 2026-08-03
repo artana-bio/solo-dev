@@ -613,9 +613,9 @@ fn contains_github_token_in_json_tree(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(text) => contains_json_sensitive_shape(text),
         serde_json::Value::Array(values) => values.iter().any(contains_github_token_in_json_tree),
-        serde_json::Value::Object(fields) => fields.iter().any(|(name, value)| {
-            contains_json_sensitive_shape(name) || contains_github_token_in_json_tree(value)
-        }),
+        serde_json::Value::Object(fields) => {
+            fields.values().any(contains_github_token_in_json_tree)
+        }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
             false
         }
