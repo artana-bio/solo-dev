@@ -10,7 +10,7 @@ use std::{
 use change_harness::{
     cli::exit::ExitCategory,
     control::{
-        journal::{Journal, OperationState},
+        journal::{JOURNAL_DIR, Journal, OperationState},
         lock::{LOCK_FILE, ProjectLock},
         repository::{ControlRepository, PROJECT_FILE},
     },
@@ -122,6 +122,56 @@ fn init_creates_a_committed_control_repository() {
         "control must be committed clean"
     );
     assert_eq!(control.project().unwrap().project_id.as_str(), "example");
+}
+
+#[test]
+fn occupied_control_init_refuses_before_journal_and_allows_clean_retry() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(&fixture.control).unwrap();
+    let foreign = fixture.control.join("external-sensitive.txt");
+    fs::write(&foreign, "external sensitive file\n").unwrap();
+
+    let mut args = fixture.init_args();
+    args.extend(["--output".into(), "json".into()]);
+    let refused = Fixture::run(&args);
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    assert_eq!(refused.status.code(), Some(4), "{diagnostic}");
+    assert!(diagnostic.contains("CH-PRECONDITION-OCCUPIED-PATH"));
+    assert!(foreign.exists());
+    let git_exists = fixture.control.join(".git").exists();
+    let lock_exists = fixture.control.join(LOCK_FILE).exists();
+    let journal_path = fixture.control.join(JOURNAL_DIR);
+    let journal_exists = journal_path.exists();
+    let journal_has_failed_partial = fs::read_dir(&journal_path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .any(|record| record.contains("failed_partial"));
+    let project_exists = fixture.control.join(PROJECT_FILE).exists();
+    assert!(
+        !git_exists && !lock_exists && !journal_exists && !project_exists,
+        "unexpected init residue: git={git_exists} lock={lock_exists} journal={journal_exists} failed_partial={journal_has_failed_partial} project={project_exists}"
+    );
+
+    fs::remove_file(&foreign).unwrap();
+    let retry = Fixture::run(&args);
+    assert!(
+        retry.status.success(),
+        "identical retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(
+        ControlRepository::open(&fixture.control)
+            .unwrap()
+            .is_initialized()
+    );
 }
 
 #[test]

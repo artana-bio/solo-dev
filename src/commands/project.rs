@@ -296,8 +296,6 @@ fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
         return reinitialize(&control, &config, args.dry_run);
     }
 
-    refuse_occupied_control(&config.control_repository)?;
-
     if args.dry_run {
         return Ok(CommandOutcome::new(
             "project.init",
@@ -328,6 +326,7 @@ fn run_init(args: &InitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
     let journal = Journal::new(&control);
     supersede_interrupted_init(&journal, clock)?;
     journal.require_settled()?;
+    refuse_occupied_control(&config.control_repository)?;
 
     let expected_head = control.head()?;
     let mut operation = journal.begin("project.init", expected_head.clone(), clock)?;
