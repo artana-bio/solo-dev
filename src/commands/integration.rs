@@ -82,6 +82,8 @@ pub enum IntegrationCommand {
     Abandon(AbandonArgs),
     /// Report a prepared integration.
     Inspect(InspectArgs),
+    /// Produce a read-only decision packet for one complete sealed cycle.
+    DecisionPacket(InspectArgs),
 }
 
 impl IntegrationCommand {
@@ -103,6 +105,7 @@ impl IntegrationCommand {
             Self::Promote(..) => "integration.promote",
             Self::Abandon(..) => "integration.abandon",
             Self::Inspect(..) => "integration.inspect",
+            Self::DecisionPacket(..) => "integration.decision-packet",
         }
     }
 }
@@ -217,6 +220,7 @@ pub fn execute(
         IntegrationCommand::Promote(args) => run_promote(args, clock),
         IntegrationCommand::Abandon(args) => run_abandon(args, clock),
         IntegrationCommand::Inspect(args) => run_inspect(args),
+        IntegrationCommand::DecisionPacket(args) => run_decision_packet(args),
     }
 }
 
@@ -1197,6 +1201,160 @@ fn run_inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
         &digest,
         &config.project_id,
     ))
+}
+
+/// Reports the evidence an owner would need before recording acceptance.
+///
+/// This is deliberately a projection, not a record: it cannot authorize,
+/// promote, or alter the integration.  The packet only applies to the one
+/// complete integration prepared for a sealed cycle; presenting an ordinary
+/// per-card integration as a final decision would be misleading.
+#[allow(clippy::too_many_lines)]
+fn run_decision_packet(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
+    let integration_id: IntegrationId = args.integration_id.parse()?;
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let record = load_integration(&control, &integration_id)?;
+    if !record.final_for_cycle {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "integration {integration_id} is not the final integration for its sealed cycle"
+            ),
+            code: ErrorCode::PolicyDecisionPacketFinalOnly,
+        });
+    }
+    let cycle = load_cycle(&control, &record.cycle_id)?;
+    let Some(sealed_cycle_digest) = record.sealed_cycle_digest.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!("final integration {integration_id} has no sealed cycle digest"),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+    if cycle.status != CycleStatus::Sealed || &Digest::of_canonical(&cycle)? != sealed_cycle_digest
+    {
+        return Err(HarnessError::Control {
+            reason: format!("final integration {integration_id} no longer binds its sealed cycle"),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    }
+
+    let selected: std::collections::BTreeSet<String> = record
+        .members
+        .iter()
+        .map(|member| member.card_id.to_string())
+        .collect();
+    let abandoned: std::collections::BTreeSet<String> = record
+        .abandoned_card_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut cards = Vec::new();
+    for card_id in &cycle.card_ids {
+        let key = card_id.to_string();
+        if !selected.contains(&key) && !abandoned.contains(&key) {
+            return Err(HarnessError::Control {
+                reason: format!("final integration {integration_id} omits sealed card {card_id}"),
+                code: ErrorCode::InternalControlCorrupt,
+            });
+        }
+        let (card, _) = load_card(&control, card_id)?;
+        cards.push(serde_json::json!({
+            "card_id": key,
+            "disposition": if selected.contains(&card_id.to_string()) { "selected" } else { "abandoned" },
+            "rollback_strategy": card.rollback_strategy,
+        }));
+    }
+    cards.sort_by(|left, right| left["card_id"].as_str().cmp(&right["card_id"].as_str()));
+
+    let (landing, verification, review, next_action) = match record.status {
+        IntegrationStatus::Prepared
+            if record.integration_head.is_none() && record.landing_sha.is_none() =>
+        {
+            (
+                serde_json::json!({"state":"not_built","sha":null,"tree":null}),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "integration.merge",
+            )
+        }
+        IntegrationStatus::Prepared if record.landing_sha.is_some() => (
+            serde_json::json!({"state":"built","sha":record.landing_sha,"tree":record.integration_tree}),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            "integration.verify",
+        ),
+        IntegrationStatus::Prepared => (
+            serde_json::json!({"state":"not_built","sha":null,"tree":null}),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            "integration.land",
+        ),
+        IntegrationStatus::Verified | IntegrationStatus::Reviewed => {
+            let Some(landing_sha) = record.landing_sha.as_ref() else {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "{integration_id} is {} without a landing commit",
+                        record.status.name()
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                });
+            };
+            let verified = load_verification(&control, &integration_id)?;
+            if verified.landing_sha != *landing_sha || !verified.passed() {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "verification for {integration_id} does not prove its exact landing commit"
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                });
+            }
+            (
+                serde_json::json!({"state":"built","sha":landing_sha,"tree":record.integration_tree}),
+                serde_json::json!({"landing_sha":verified.landing_sha,"landing_tree":verified.landing_tree,"receipt_ids":verified.receipt_ids,"verified_by":verified.verified_by}),
+                if record.status == IntegrationStatus::Reviewed {
+                    serde_json::json!({"state":"recorded"})
+                } else {
+                    serde_json::json!({"state":"not_recorded"})
+                },
+                if record.status == IntegrationStatus::Reviewed {
+                    "acceptance.record"
+                } else {
+                    "integration.review"
+                },
+            )
+        }
+        _ => {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "decision packet is unavailable while integration {integration_id} is `{}`",
+                    record.status.name()
+                ),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+    };
+
+    let data = serde_json::json!({
+        "packet_schema":"harness.decision-packet/v1",
+        "packet_version":1,
+        "integration_id":record.integration_id,
+        "integration_digest":record.digest()?.as_str(),
+        "cycle":{"cycle_id":cycle.cycle_id,"objective":cycle.objective,"sealed_cycle_digest":sealed_cycle_digest},
+        "authority":{"expected_main_sha":record.expected_main_sha,"integration_head":record.integration_head,"integration_tree":record.integration_tree},
+        "landing":landing,
+        "accounting":{"selected_card_ids":record.members.iter().map(|m|m.card_id.to_string()).collect::<Vec<_>>(),"abandoned_card_ids":record.abandoned_card_ids,"cards":cards},
+        "verification":verification,
+        "review":review,
+        "residual_risks":[],
+        "final_rollback":"not_recorded",
+        "exceptions":{"state":"not_implemented","items":[]},
+        "decision_readiness":{"current":record.status.name(),"next_permitted_action":next_action,"is_authorization":false}
+    });
+    Ok(CommandOutcome::new(
+        "integration.decision-packet",
+        format!("Decision packet for {integration_id}\ncycle: {}\nnext action: {next_action}\nThis packet is not authorization.", record.cycle_id),
+        data,
+    ).with_project(config.project_id))
 }
 
 /// Simulates the merge sequence without touching a ref, index, or worktree.

@@ -94,6 +94,8 @@ pub enum ErrorCode {
     PolicyCycleNotSealed,
     /// A sealed cycle member was neither integrable nor explicitly abandoned.
     PolicyFinalCycleIncomplete,
+    /// A decision packet was requested for an ordinary rather than final integration.
+    PolicyDecisionPacketFinalOnly,
     /// The project uses a capability no shipped work package implements yet.
     PolicyUnsupportedUntilWp540,
     /// A declared cycle invariant was neither confirmed nor refused.
@@ -222,7 +224,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 86] = [
+    pub const ALL: [Self; 87] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -261,6 +263,7 @@ impl ErrorCode {
         Self::PolicyIntegrationOpen,
         Self::PolicyCycleNotSealed,
         Self::PolicyFinalCycleIncomplete,
+        Self::PolicyDecisionPacketFinalOnly,
         Self::PolicyUnsupportedUntilWp540,
         Self::PolicyInvariantUnaddressed,
         Self::PolicySameActor,
@@ -354,6 +357,7 @@ impl ErrorCode {
             | Self::PolicyIntegrationOpen
             | Self::PolicyCycleNotSealed
             | Self::PolicyFinalCycleIncomplete
+            | Self::PolicyDecisionPacketFinalOnly
             | Self::PolicyUnsupportedUntilWp540
             | Self::PolicyInvariantUnaddressed
             | Self::PolicySameActor
@@ -444,6 +448,7 @@ impl ErrorCode {
             Self::PolicyIntegrationOpen => "INTEGRATION-OPEN",
             Self::PolicyCycleNotSealed => "CYCLE-NOT-SEALED",
             Self::PolicyFinalCycleIncomplete => "FINAL-CYCLE-INCOMPLETE",
+            Self::PolicyDecisionPacketFinalOnly => "DECISION-PACKET-FINAL-ONLY",
             Self::PolicyUnsupportedUntilWp540 => "UNSUPPORTED-UNTIL-WP-540",
             Self::PolicyInvariantUnaddressed => "INVARIANT-UNADDRESSED",
             Self::PolicySameActor => "SAME-ACTOR",
@@ -631,7 +636,8 @@ impl ErrorCode {
             | Self::PolicyArtifactNotOwned => Self::hardening_recovery(self),
             Self::PolicyIntegrationOpen
             | Self::PolicyCycleNotSealed
-            | Self::PolicyFinalCycleIncomplete => Self::integration_recovery(self),
+            | Self::PolicyFinalCycleIncomplete
+            | Self::PolicyDecisionPacketFinalOnly => Self::integration_recovery(self),
             Self::PolicyLockHeld => "Wait for the other command to finish, then retry.",
             Self::PolicyInvalidTransition => {
                 "Move through the documented states in order, or abandon the subject."
@@ -732,6 +738,9 @@ impl ErrorCode {
             Self::PolicyCycleNotSealed => "Seal the cycle before preparing its final integration.",
             Self::PolicyFinalCycleIncomplete => {
                 "Approve the named card with current evidence, or abandon it explicitly before preparing the final integration."
+            }
+            Self::PolicyDecisionPacketFinalOnly => {
+                "Prepare the sealed cycle with `integration prepare --final` before requesting a decision packet."
             }
             _ => "Report this as a defect; an integration code reached the wrong recovery table.",
         }
