@@ -309,6 +309,39 @@ fn invalid_cycle_id_json_redacts_github_token_from_message_and_details() {
 }
 
 #[test]
+fn text_cycle_id_error_redacts_github_token_exactly() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+
+    let output = harness_command()
+        .args([
+            "cycle",
+            "create",
+            "--cycle-id",
+            TOKEN,
+            "--objective",
+            "ordinary",
+            "--control",
+        ])
+        .arg(&missing)
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        "error: invalid identifier `[redacted:github-token]`: expected prefix `C-`\n"
+    );
+    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
+    assert!(!combined.contains(TOKEN));
+}
+
+#[test]
 fn invalid_arguments_use_the_usage_exit_code() {
     let output = run(&["doctor", "--output", "yaml"]);
     assert_eq!(

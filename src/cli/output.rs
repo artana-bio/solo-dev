@@ -17,6 +17,12 @@ pub const RESULT_SCHEMA: &str = "harness.command-result/v1";
 /// Schema identifier for a failed command result.
 pub const ERROR_SCHEMA: &str = "harness.command-error/v1";
 
+/// Renders one parsed-command error for text mode.
+#[must_use]
+pub fn render_text_error(error: &HarnessError) -> String {
+    redact_github_tokens(&error.to_string())
+}
+
 /// How a command renders its result.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {

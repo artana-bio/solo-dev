@@ -6,7 +6,11 @@ use std::{
 use clap::Parser;
 
 use change_harness::{
-    cli::{Cli, exit::ExitCategory, output::CommandErrorEnvelope, output::OutputFormat},
+    cli::{
+        Cli,
+        exit::ExitCategory,
+        output::{CommandErrorEnvelope, OutputFormat, render_text_error},
+    },
     command_path,
     error::{ErrorCode, HarnessError},
     execute, failure_format,
@@ -117,7 +121,7 @@ fn main() -> ExitCode {
                     Ok(rendered) => println!("{rendered}"),
                     Err(nested) => eprintln!("error: {nested}"),
                 },
-                OutputFormat::Text => eprintln!("error: {error}"),
+                OutputFormat::Text => eprintln!("error: {}", render_text_error(&error)),
             }
             ExitCode::from(error.category())
         }
