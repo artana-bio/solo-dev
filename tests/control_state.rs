@@ -1380,11 +1380,22 @@ fn a_nested_escaped_github_token_is_refused_before_durability() {
         "decoded escaped token became a durable Git object"
     );
     assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(output.stderr.is_empty());
     assert!(
         rendered.contains("CH-POLICY-SENSITIVE-VALUE"),
         "the refusal must identify the existing token policy: {rendered}"
     );
     assert!(!rendered.contains(TOKEN));
+    assert!(!rendered.contains(ESCAPED_TOKEN));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["error"]["message"],
+        "control state: control entry `cards/escaped-nested.json:outer[0].inner.note` contains a sensitive value"
+    );
+    assert_eq!(
+        envelope["error"]["details"]["reason"],
+        "control entry `cards/escaped-nested.json:outer[0].inner.note` contains a sensitive value"
+    );
     assert_eq!(control.head().unwrap(), before_head);
     assert_eq!(
         fs::read(fixture.control.join(".git/index")).unwrap(),

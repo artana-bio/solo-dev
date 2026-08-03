@@ -579,7 +579,8 @@ fn refuse_non_text_control_entries(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
             {
-                inspect_complete_json_control_entry(relative, &blob.stdout_bytes)?
+                inspect_complete_json_control_entry(relative, &blob.stdout_bytes)?;
+                false
             } else {
                 contains_standalone_github_token_shape(&blob.stdout_bytes)
             };
@@ -600,26 +601,64 @@ fn refuse_non_text_control_entries(
 fn inspect_complete_json_control_entry(
     relative: &str,
     contents: &[u8],
-) -> Result<bool, HarnessError> {
+) -> Result<(), HarnessError> {
     if contents.len() > MAX_JSON_INSPECTION_BYTES {
         return Err(json_inspection_refusal(relative, false));
     }
     let tree = serde_json::from_slice::<serde_json::Value>(contents).map_err(|error| {
         json_inspection_refusal(relative, error.to_string().contains("recursion limit"))
     })?;
-    Ok(contains_github_token_in_json_tree(&tree))
+    let mut location = String::new();
+    if let Some(sensitive_location) = json_sensitive_location(&tree, &mut location) {
+        return Err(json_sensitive_value_refusal(relative, sensitive_location));
+    }
+    Ok(())
 }
 
-fn contains_github_token_in_json_tree(value: &serde_json::Value) -> bool {
+enum JsonSensitiveLocation {
+    Value(String),
+    Key,
+}
+
+fn json_sensitive_location(
+    value: &serde_json::Value,
+    location: &mut String,
+) -> Option<JsonSensitiveLocation> {
     match value {
-        serde_json::Value::String(text) => contains_json_sensitive_shape(text),
-        serde_json::Value::Array(values) => values.iter().any(contains_github_token_in_json_tree),
-        serde_json::Value::Object(fields) => fields.iter().any(|(name, value)| {
-            contains_json_key_sensitive_shape(name) || contains_github_token_in_json_tree(value)
-        }),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            false
+        serde_json::Value::String(text) => contains_json_sensitive_shape(text)
+            .then(|| JsonSensitiveLocation::Value(location.clone())),
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let length = location.len();
+                location.push('[');
+                location.push_str(&index.to_string());
+                location.push(']');
+                if let Some(found) = json_sensitive_location(value, location) {
+                    return Some(found);
+                }
+                location.truncate(length);
+            }
+            None
         }
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                if contains_json_key_sensitive_shape(name) {
+                    return Some(JsonSensitiveLocation::Key);
+                }
+                let length = location.len();
+                if !location.is_empty() {
+                    location.push('.');
+                }
+                location.push_str(name);
+                let found = json_sensitive_location(value, location);
+                location.truncate(length);
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => None,
     }
 }
 
@@ -646,6 +685,21 @@ fn json_inspection_refusal(relative: &str, recursion_limited: bool) -> HarnessEr
     HarnessError::Control {
         reason,
         code: ErrorCode::PolicyControlJsonInspection,
+    }
+}
+
+fn json_sensitive_value_refusal(relative: &str, location: JsonSensitiveLocation) -> HarnessError {
+    let reason = match location {
+        JsonSensitiveLocation::Value(location) => {
+            format!("control entry `{relative}:{location}` contains a sensitive value")
+        }
+        JsonSensitiveLocation::Key => {
+            format!("control entry `{relative}` contains a sensitive value")
+        }
+    };
+    HarnessError::Control {
+        reason,
+        code: ErrorCode::PolicySensitiveValue,
     }
 }
 
