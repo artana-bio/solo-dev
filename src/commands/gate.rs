@@ -144,6 +144,9 @@ pub struct ReserveArgs {
     /// Versioned mutation campaign required by `declared-mutations`.
     #[arg(long)]
     pub campaign: Option<PathBuf>,
+    /// Versioned CPU profile required by `cpu-heavy`.
+    #[arg(long)]
+    pub cpu_profile: Option<PathBuf>,
     /// Report the authoritative reservation decision without writing it.
     #[arg(long)]
     pub dry_run: bool,
@@ -288,6 +291,7 @@ fn read_definition(path: &PathBuf) -> Result<GateDefinition, HarnessError> {
 }
 
 const DECLARED_MUTATION_CAMPAIGN_SCHEMA: &str = "harness.declared-mutation-campaign/v1";
+const CPU_HEAVY_PROFILE_SCHEMA: &str = "harness.cpu-heavy-validation-profile/v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -303,6 +307,22 @@ struct DeclaredMutation {
     path: String,
     expected_utf8: String,
     replacement_utf8: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CpuHeavyProfile {
+    schema: String,
+    risk: String,
+    expected_duration_seconds: u64,
+    resource_cost: CpuResourceCost,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CpuResourceCost {
+    cpu_cores: u32,
+    memory_mib: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -359,11 +379,13 @@ fn campaign_digest_for_reservation(
     campaign: Option<&Path>,
 ) -> Result<Option<Digest>, HarnessError> {
     match (mode, campaign) {
-        (ValidationExecutionMode::NamedGate, None) => Ok(None),
-        (ValidationExecutionMode::NamedGate, Some(_)) => Err(HarnessError::Control {
-            reason: "--campaign requires --execution-mode declared-mutations".to_owned(),
-            code: ErrorCode::UsageInvalidArguments,
-        }),
+        (ValidationExecutionMode::NamedGate | ValidationExecutionMode::CpuHeavy, None) => Ok(None),
+        (ValidationExecutionMode::NamedGate | ValidationExecutionMode::CpuHeavy, Some(_)) => {
+            Err(HarnessError::Control {
+                reason: "--campaign requires --execution-mode declared-mutations".to_owned(),
+                code: ErrorCode::UsageInvalidArguments,
+            })
+        }
         (ValidationExecutionMode::DeclaredMutations, Some(path)) => {
             Ok(Some(read_declared_campaign(path)?.1))
         }
@@ -371,6 +393,51 @@ fn campaign_digest_for_reservation(
             reason: "declared-mutations requires --campaign".to_owned(),
             code: ErrorCode::UsageInvalidArguments,
         }),
+    }
+}
+
+fn cpu_profile_digest_for_reservation(
+    mode: ValidationExecutionMode,
+    profile: Option<&Path>,
+) -> Result<Option<Digest>, HarnessError> {
+    match (mode, profile) {
+        (ValidationExecutionMode::CpuHeavy, Some(path)) => {
+            let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+                reason: format!("cannot read CPU profile {}: {source}", path.display()),
+                code: ErrorCode::ConfigMalformed,
+            })?;
+            let profile: CpuHeavyProfile =
+                serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+                    reason: format!("CPU profile {} is malformed: {source}", path.display()),
+                    code: ErrorCode::ConfigMalformed,
+                })?;
+            if profile.schema != CPU_HEAVY_PROFILE_SCHEMA
+                || !matches!(
+                    profile.risk.as_str(),
+                    "low" | "medium" | "high" | "critical"
+                )
+                || profile.expected_duration_seconds == 0
+                || profile.resource_cost.cpu_cores == 0
+                || profile.resource_cost.memory_mib == 0
+            {
+                return Err(HarnessError::Control {
+                    reason:
+                        "CPU profile has unsupported schema or invalid risk, duration, or resources"
+                            .to_owned(),
+                    code: ErrorCode::ConfigMalformed,
+                });
+            }
+            Ok(Some(Digest::of_canonical(&profile)?))
+        }
+        (ValidationExecutionMode::CpuHeavy, None) => Err(HarnessError::Control {
+            reason: "cpu-heavy requires --cpu-profile".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        }),
+        (_, Some(_)) => Err(HarnessError::Control {
+            reason: "--cpu-profile requires --execution-mode cpu-heavy".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        }),
+        (_, None) => Ok(None),
     }
 }
 
@@ -1046,6 +1113,7 @@ fn reservation_key(
     gate_id: &str,
     execution_mode: ValidationExecutionMode,
     campaign_digest: Option<Digest>,
+    cpu_profile_digest: Option<Digest>,
     require_next: bool,
 ) -> Result<ValidationReservationKeyV1, HarnessError> {
     let (record, state) = load_card(control, card_id)?;
@@ -1092,6 +1160,7 @@ fn reservation_key(
         proof_map_digest: progress.plan.proof_map_digest,
         execution_mode,
         campaign_digest,
+        cpu_profile_digest,
     })
 }
 
@@ -1279,6 +1348,7 @@ fn live_reservation_for_run(
         card_id,
         &args.gate_id,
         ValidationExecutionMode::NamedGate,
+        None,
         None,
         true,
     )?;
@@ -1737,6 +1807,8 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
     let execution_mode: ValidationExecutionMode = args.execution_mode.parse()?;
     let campaign_digest =
         campaign_digest_for_reservation(execution_mode, args.campaign.as_deref())?;
+    let cpu_profile_digest =
+        cpu_profile_digest_for_reservation(execution_mode, args.cpu_profile.as_deref())?;
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
         let key = reservation_key(
@@ -1745,6 +1817,7 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
             &args.gate_id,
             execution_mode,
             campaign_digest.clone(),
+            cpu_profile_digest.clone(),
             false,
         )?;
         let key_digest = key.digest()?;
@@ -1773,6 +1846,7 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
             &args.gate_id,
             execution_mode,
             campaign_digest.clone(),
+            cpu_profile_digest.clone(),
             true,
         )?;
         let key_digest = key.digest()?;
@@ -1807,6 +1881,7 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 &args.gate_id,
                 execution_mode,
                 campaign_digest.clone(),
+                cpu_profile_digest.clone(),
                 false,
             )?;
             let key_digest = key.digest()?;
@@ -1837,6 +1912,7 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
                 &args.gate_id,
                 execution_mode,
                 campaign_digest.clone(),
+                cpu_profile_digest.clone(),
                 true,
             )?;
             let key_digest = key.digest()?;
@@ -1918,6 +1994,7 @@ fn live_campaign_reservation(
         &reservation.key.check.gate_id,
         ValidationExecutionMode::DeclaredMutations,
         Some(campaign_digest.clone()),
+        None,
         true,
     )?;
     if current != reservation.key || current.digest()? != reservation.key_digest {

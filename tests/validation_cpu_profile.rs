@@ -34,6 +34,7 @@ fn profile(workspace: &Workspace, name: &str, duration_seconds: u64) -> std::pat
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn cpu_heavy_reservations_require_and_bind_one_versioned_profile_without_changing_named_gates() {
     let workspace = allocated();
     let before = workspace.gate_raw(&[
@@ -98,7 +99,7 @@ fn cpu_heavy_reservations_require_and_bind_one_versioned_profile_without_changin
     assert_eq!(first["data"]["disposition"]["kind"], "reserved");
     assert_eq!(
         first["data"]["reservation"]["key"]["execution_mode"],
-        "cpu_heavy"
+        "cpu-heavy"
     );
     assert!(
         first["data"]["reservation"]["key"]["cpu_profile_digest"]
@@ -139,7 +140,7 @@ fn cpu_heavy_reservations_require_and_bind_one_versioned_profile_without_changin
     assert_eq!(ordinary["data"]["disposition"]["kind"], "reserved");
     assert_eq!(
         ordinary["data"]["reservation"]["key"]["execution_mode"],
-        "named_gate"
+        "named-gate"
     );
     assert!(ordinary["data"]["reservation"]["key"]["cpu_profile_digest"].is_null());
 }

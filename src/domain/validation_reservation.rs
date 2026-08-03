@@ -29,9 +29,14 @@ pub const VALIDATION_RESERVATION_SETTLEMENT_SCHEMA: &str =
 #[serde(rename_all = "kebab-case")]
 pub enum ValidationExecutionMode {
     /// A registered named gate; execution itself remains a later slice.
+    #[serde(alias = "named_gate")]
     NamedGate,
     /// A fixed, reviewed campaign of reversible source mutations.
+    #[serde(alias = "declared_mutations")]
     DeclaredMutations,
+    /// A registered validation run that consumes a governed CPU lane later.
+    #[serde(alias = "cpu_heavy")]
+    CpuHeavy,
 }
 
 impl std::str::FromStr for ValidationExecutionMode {
@@ -41,6 +46,7 @@ impl std::str::FromStr for ValidationExecutionMode {
         match value {
             "named-gate" => Ok(Self::NamedGate),
             "declared-mutations" => Ok(Self::DeclaredMutations),
+            "cpu-heavy" => Ok(Self::CpuHeavy),
             _ => Err(crate::error::HarnessError::Control {
                 reason: format!("unsupported validation execution mode `{value}`"),
                 code: crate::error::ErrorCode::UsageInvalidArguments,
@@ -69,6 +75,8 @@ pub struct ValidationReservationKeyV1 {
     /// Canonical digest of the declared mutation campaign, when this is a
     /// mutation reservation. It is part of the sharing identity.
     pub campaign_digest: Option<Digest>,
+    /// Canonical CPU profile digest for CPU-heavy reservations only.
+    pub cpu_profile_digest: Option<Digest>,
 }
 
 impl ValidationReservationKeyV1 {
@@ -173,6 +181,7 @@ mod tests {
             proof_map_digest: None,
             execution_mode: ValidationExecutionMode::NamedGate,
             campaign_digest: None,
+            cpu_profile_digest: None,
         }
     }
 
