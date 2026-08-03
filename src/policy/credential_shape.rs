@@ -4,6 +4,7 @@
 
 const GITHUB_TOKEN_PREFIX: &[u8] = b"ghp_";
 const GITHUB_TOKEN_TAIL_LENGTH: usize = 36;
+const GITHUB_TOKEN_REDACTION: &str = "[redacted:github-token]";
 const ANTHROPIC_API_KEY_PREFIX: &[u8] = b"sk-ant-api03-";
 const ANTHROPIC_API_KEY_MIN_TAIL_LENGTH: usize = 20;
 const RSA_PRIVATE_KEY_PEM_HEADER: &str = "-----BEGIN RSA PRIVATE KEY-----";
@@ -31,6 +32,22 @@ pub(crate) fn contains_https_userinfo_password_shape(contents: &[u8]) -> bool {
         search_from = authority_end;
     }
     false
+}
+
+/// Replaces every standalone governed GitHub token in human-readable text.
+#[must_use]
+pub(crate) fn redact_github_tokens(text: &str) -> String {
+    let contents = text.as_bytes();
+    let candidate_length = GITHUB_TOKEN_PREFIX.len() + GITHUB_TOKEN_TAIL_LENGTH;
+    let mut cursor = 0;
+    let mut redacted = String::with_capacity(text.len());
+    while let Some(start) = find_standalone_github_token(contents, cursor) {
+        redacted.push_str(&text[cursor..start]);
+        redacted.push_str(GITHUB_TOKEN_REDACTION);
+        cursor = start + candidate_length;
+    }
+    redacted.push_str(&text[cursor..]);
+    redacted
 }
 
 fn contains_nonempty_userinfo_password(authority: &[u8]) -> bool {
@@ -89,22 +106,28 @@ pub(crate) fn contains_rsa_private_key_pem_header_line(contents: &str) -> bool {
 /// merely contains this shape from becoming the governed staged-content class.
 #[must_use]
 pub fn contains_standalone_github_token_shape(contents: &[u8]) -> bool {
+    find_standalone_github_token(contents, 0).is_some()
+}
+
+fn find_standalone_github_token(contents: &[u8], search_from: usize) -> Option<usize> {
     let candidate_length = GITHUB_TOKEN_PREFIX.len() + GITHUB_TOKEN_TAIL_LENGTH;
-    contents
+    contents[search_from..]
         .windows(candidate_length)
         .enumerate()
-        .any(|(start, window)| {
+        .find_map(|(relative_start, window)| {
             if !window.starts_with(GITHUB_TOKEN_PREFIX)
                 || !window[GITHUB_TOKEN_PREFIX.len()..]
                     .iter()
                     .all(u8::is_ascii_alphanumeric)
             {
-                return false;
+                return None;
             }
+            let start = search_from + relative_start;
             let before = start.checked_sub(1).and_then(|index| contents.get(index));
             let after = contents.get(start + candidate_length);
-            !before.is_some_and(|byte| is_token_character(*byte))
-                && !after.is_some_and(|byte| is_token_character(*byte))
+            (!before.is_some_and(|byte| is_token_character(*byte))
+                && !after.is_some_and(|byte| is_token_character(*byte)))
+            .then_some(start)
         })
 }
 

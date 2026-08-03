@@ -258,6 +258,57 @@ fn json_mode_renders_failures_as_the_error_envelope() {
 }
 
 #[test]
+fn invalid_cycle_id_json_redacts_github_token_from_message_and_details() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+
+    let output = harness_command()
+        .args([
+            "cycle",
+            "create",
+            "--cycle-id",
+            TOKEN,
+            "--objective",
+            "ordinary",
+            "--control",
+        ])
+        .arg(&missing)
+        .args(["--output", "json"])
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let rendered = String::from_utf8(output.stdout).expect("JSON output should be UTF-8");
+    assert!(!rendered.contains(TOKEN), "raw token leaked: {rendered}");
+    let envelope: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(envelope["schema"], "harness.command-error/v1");
+    assert_eq!(envelope["command"], "cycle.create");
+    assert_eq!(envelope["error"]["code"], "CH-USAGE-INVALID-ID");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted:github-token]")
+    );
+    assert_eq!(
+        envelope["error"]["details"]["value"],
+        "[redacted:github-token]"
+    );
+    assert_eq!(
+        envelope["error"]["details"]["reason"],
+        "expected prefix `C-`"
+    );
+    assert_eq!(
+        envelope["error"]["recovery"],
+        "Supply an identifier matching its documented prefix and shape."
+    );
+}
+
+#[test]
 fn invalid_arguments_use_the_usage_exit_code() {
     let output = run(&["doctor", "--output", "yaml"]);
     assert_eq!(

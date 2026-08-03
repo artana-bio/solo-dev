@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::ids::{OperationId, ProjectId},
     error::HarnessError,
+    policy::credential_shape::redact_github_tokens,
 };
 
 /// Schema identifier for a successful command result.
@@ -75,14 +76,16 @@ impl CommandErrorEnvelope {
     /// Builds an envelope for one failure.
     #[must_use]
     pub fn new(command: impl Into<String>, error: &HarnessError) -> Self {
+        let mut details = error.details();
+        redact_github_tokens_in_json(&mut details);
         Self {
             schema: ERROR_SCHEMA.to_owned(),
             command: command.into(),
             status: "error".to_owned(),
             error: CommandErrorBody {
                 code: error.code().as_string(),
-                message: error.to_string(),
-                details: error.details(),
+                message: redact_github_tokens(&error.to_string()),
+                details,
                 recovery: error.code().recovery().to_owned(),
             },
         }
@@ -95,6 +98,23 @@ impl CommandErrorEnvelope {
     /// Returns an error when serialization fails.
     pub fn render(&self) -> Result<String, HarnessError> {
         serde_json::to_string_pretty(self).map_err(HarnessError::from)
+    }
+}
+
+fn redact_github_tokens_in_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_github_tokens(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_github_tokens_in_json(value);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values_mut() {
+                redact_github_tokens_in_json(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
