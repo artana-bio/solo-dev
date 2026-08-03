@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     clock::Timestamp,
     digest::Digest,
-    ids::{CardId, CycleId, IntegrationId, LeaseId, ProjectId, ReceiptId},
+    ids::{CardId, CycleId, IntegrationId, LeaseId, ProjectId, ReceiptId, ValidationReservationId},
 };
 use crate::error::{ErrorCode, HarnessError};
 
@@ -232,6 +232,19 @@ pub struct ReceiptProvenanceV1 {
     /// Immutable predecessor relationships observed by this new receipt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lineage: Vec<ReceiptLineageFact>,
+    /// The exact durable reservation that authorized this expensive execution.
+    /// It attributes execution only; receipt-compatibility decisions ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_reservation: Option<ValidationReservationBinding>,
+}
+
+/// Immutable execution authorization recorded with one card gate receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationReservationBinding {
+    /// Durable reservation identifier.
+    pub reservation_id: ValidationReservationId,
+    /// Digest of the frozen reservation key the run executed.
+    pub key_digest: Digest,
 }
 
 impl ReceiptProvenanceV1 {
@@ -850,6 +863,7 @@ mod tests {
                 ("policy".to_owned(), Digest::of_bytes(b"policy")),
             ]),
             lineage: Vec::new(),
+            validation_reservation: None,
         }
     }
 

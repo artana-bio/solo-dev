@@ -1946,6 +1946,7 @@ fn verify_landing(
                         ),
                     ]),
                     lineage: Vec::new(),
+                    validation_reservation: None,
                 }),
             });
         }

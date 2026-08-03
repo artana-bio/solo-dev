@@ -42,7 +42,7 @@ use crate::{
         receipt::{
             LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject, RECEIPT_DIR,
             RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
-            evidence_is_acceptable,
+            ValidationReservationBinding, evidence_is_acceptable,
         },
         run_attempt,
     },
@@ -104,6 +104,9 @@ pub struct RunArgs {
     /// The gate to run.
     #[arg(long)]
     pub gate_id: String,
+    /// Exact live reservation authorizing this expensive run.
+    #[arg(long)]
+    pub reservation_id: Option<String>,
     /// Report planned mutations without performing them.
     #[arg(long)]
     pub dry_run: bool,
@@ -762,6 +765,9 @@ fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, Harne
     let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
     let progress = validation_progress(&control, card_id, Some(&candidate))?;
     require_next_gate(&progress, &args.gate_id)?;
+    let reservation = requires_execution_reservation(&progress, &args.gate_id)
+        .then(|| live_reservation_for_run(&control, args, card_id))
+        .transpose()?;
     Ok(CommandOutcome::new(
         "gate.run",
         format!(
@@ -774,6 +780,7 @@ fn preview_run(args: &RunArgs, card_id: &CardId) -> Result<CommandOutcome, Harne
             "dry_run": true,
             "card_id": card_id.to_string(),
             "gate_id": gate.gate_id,
+            "reservation_id": reservation.as_ref().map(|record| record.reservation_id.to_string()),
             "argv": gate.argv,
             "worktree_path": lease.worktree_path,
         }),
@@ -869,6 +876,7 @@ fn card_receipt_provenance(
             ),
         ]),
         lineage: Vec::new(),
+        validation_reservation: None,
     })
 }
 
@@ -1050,6 +1058,68 @@ fn settlement_for(
         });
     }
     Ok(Some(record))
+}
+
+fn live_reservation_for_run(
+    control: &ControlRepository,
+    args: &RunArgs,
+    card_id: &CardId,
+) -> Result<ValidationReservationRecord, HarnessError> {
+    let reservation_id: ValidationReservationId = args
+        .reservation_id
+        .as_deref()
+        .ok_or_else(|| HarnessError::Control {
+            reason: "gate run requires --reservation-id".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        })?
+        .parse()?;
+    let reservation = reservations_for(control)?
+        .into_iter()
+        .find(|record| record.reservation_id == reservation_id)
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("validation reservation {reservation_id} does not exist"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+    if reservation.holder_actor_id != args.common.actor {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "only reservation holder {} may run {}",
+                reservation.holder_actor_id, reservation_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    if settlement_for(control, &reservation)?.is_some() {
+        return Err(HarnessError::Control {
+            reason: format!("validation reservation {reservation_id} is already settled"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    let key = reservation_key(
+        control,
+        card_id,
+        &args.gate_id,
+        ValidationExecutionMode::NamedGate,
+        true,
+    )?;
+    let key_digest = key.digest()?;
+    if reservation.key != key || reservation.key_digest != key_digest {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "validation reservation {reservation_id} does not match the current gate execution key"
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+    Ok(reservation)
+}
+
+fn requires_execution_reservation(progress: &ValidationProgress, gate_id: &str) -> bool {
+    progress
+        .plan
+        .stages
+        .iter()
+        .any(|stage| stage.checks.iter().any(|check| check.gate_id == gate_id))
 }
 
 fn receipt_matches_reservation(
@@ -1412,10 +1482,11 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let scope = GitScope::work_tree(&lease.worktree_path);
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
-            require_next_gate(
-                &validation_progress(control, &card_id, Some(&evaluated_sha))?,
-                &args.gate_id,
-            )?;
+            let progress = validation_progress(control, &card_id, Some(&evaluated_sha))?;
+            require_next_gate(&progress, &args.gate_id)?;
+            let reservation = requires_execution_reservation(&progress, &args.gate_id)
+                .then(|| live_reservation_for_run(control, args, &card_id))
+                .transpose()?;
             let worktree_clean = inspect::worktree_state(&scope)?.clean;
             let existing = receipts_for(control, &card_id)?;
             let attempt = next_attempt_number(
@@ -1433,7 +1504,7 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
             let finished_at = clock.now();
 
             let receipt_id = next_receipt_id(control)?;
-            let provenance = card_run_provenance(
+            let mut provenance = card_run_provenance(
                 CardProvenanceContext {
                     config: &config,
                     record: &record,
@@ -1448,6 +1519,13 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
                 &args.common.actor,
                 finished_at,
             )?;
+            provenance.validation_reservation =
+                reservation
+                    .as_ref()
+                    .map(|reservation| ValidationReservationBinding {
+                        reservation_id: reservation.reservation_id.clone(),
+                        key_digest: reservation.key_digest.clone(),
+                    });
             let receipt = Receipt {
                 schema: RECEIPT_SCHEMA.to_owned(),
                 receipt_id: receipt_id.clone(),
@@ -1478,27 +1556,76 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             persist_receipt(control, &receipt)?;
 
+            if let Some(reservation) = &reservation {
+                let settlement = ValidationReservationSettlementRecord {
+                    schema: VALIDATION_RESERVATION_SETTLEMENT_SCHEMA.to_owned(),
+                    reservation_id: reservation.reservation_id.clone(),
+                    reservation_key_digest: reservation.key_digest.clone(),
+                    holder_actor_id: reservation.holder_actor_id.clone(),
+                    settled_by_actor_id: args.common.actor.clone(),
+                    settled_at: finished_at,
+                    outcome: ValidationReservationOutcome::ReceiptRecorded {
+                        receipt_id: receipt_id.to_string(),
+                        receipt_digest: receipt.digest()?,
+                    },
+                };
+                steps.at("reservation-settlement-write")?;
+                control.write_atomic(
+                    &ValidationReservationSettlementRecord::relative_path(
+                        &reservation.reservation_id,
+                    ),
+                    &format!("{}\n", serde_json::to_string_pretty(&settlement)?),
+                )?;
+                events.append(
+                    &config.project_id,
+                    EventDraft::new("validation.reservation_settled", &args.common.actor)
+                        .cycle(record.cycle_id.clone())
+                        .card(
+                            card_id.clone(),
+                            state.current_revision,
+                            state.current_digest.clone(),
+                        )
+                        .meta(
+                            "reservation_id",
+                            serde_json::json!(reservation.reservation_id.to_string()),
+                        )
+                        .meta(
+                            "reservation_key_digest",
+                            serde_json::json!(reservation.key_digest.as_str()),
+                        ),
+                    clock,
+                )?;
+            }
+
             // Both outcomes are recorded, per invariant 7.4.1. A failing gate
             // that left no trace would let a later run present itself as the
             // first.
-            events.append(
-                &config.project_id,
-                EventDraft::new("gate.ran", &args.common.actor)
-                    .cycle(record.cycle_id.clone())
-                    .card(
-                        card_id.clone(),
-                        state.current_revision,
-                        state.current_digest.clone(),
+            let mut event = EventDraft::new("gate.ran", &args.common.actor)
+                .cycle(record.cycle_id.clone())
+                .card(
+                    card_id.clone(),
+                    state.current_revision,
+                    state.current_digest.clone(),
+                )
+                .head(evaluated_sha.clone())
+                .meta("gate_id", serde_json::json!(gate.gate_id))
+                .meta("gate_digest", serde_json::json!(gate_digest.as_str()))
+                .meta("receipt_id", serde_json::json!(receipt_id.to_string()))
+                .meta("attempt", serde_json::json!(attempt))
+                .meta("termination", serde_json::json!(outcome.termination.name()))
+                .meta("passed", serde_json::json!(receipt.passed));
+            if let Some(reservation) = &reservation {
+                event = event
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(reservation.reservation_id.to_string()),
                     )
-                    .head(evaluated_sha.clone())
-                    .meta("gate_id", serde_json::json!(gate.gate_id))
-                    .meta("gate_digest", serde_json::json!(gate_digest.as_str()))
-                    .meta("receipt_id", serde_json::json!(receipt_id.to_string()))
-                    .meta("attempt", serde_json::json!(attempt))
-                    .meta("termination", serde_json::json!(outcome.termination.name()))
-                    .meta("passed", serde_json::json!(receipt.passed)),
-                clock,
-            )?;
+                    .meta(
+                        "reservation_key_digest",
+                        serde_json::json!(reservation.key_digest.as_str()),
+                    );
+            }
+            events.append(&config.project_id, event, clock)?;
             control.commit(
                 expected,
                 &format!("gate: run {} for {card_id} attempt {attempt}", gate.gate_id),

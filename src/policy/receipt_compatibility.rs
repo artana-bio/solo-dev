@@ -574,6 +574,7 @@ mod tests {
             ]),
             freshness_dependencies: BTreeMap::from([("policy".to_owned(), digest("policy"))]),
             lineage: vec![],
+            validation_reservation: None,
         }
     }
     fn request() -> CompatibilityRequest {

@@ -135,7 +135,43 @@ impl Workspace {
 
     /// Runs a `gate` subcommand, asserting success.
     pub fn gate(&self, args: &[&str]) -> Output {
-        let output = self.gate_raw(args);
+        let output = if args.first() == Some(&"run") && !args.contains(&"--reservation-id") {
+            let value_after = |flag: &str| {
+                args.windows(2)
+                    .find_map(|pair| (pair[0] == flag).then_some(pair[1]))
+                    .expect("gate run fixture must name its card and gate")
+            };
+            let card_id = value_after("--card-id");
+            let gate_id = value_after("--gate-id");
+            let actor = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--actor").then_some(pair[1]))
+                .unwrap_or("operator");
+            let reserve = self.gate_raw(&[
+                "reserve",
+                "--card-id",
+                card_id,
+                "--gate-id",
+                gate_id,
+                "--actor",
+                actor,
+            ]);
+            if reserve.status.success() {
+                let reservation: serde_json::Value =
+                    serde_json::from_slice(&reserve.stdout).unwrap();
+                let reservation_id = reservation["data"]["reservation"]["reservation_id"]
+                    .as_str()
+                    .expect("reservation id");
+                let mut owned = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+                owned.extend(["--reservation-id".to_owned(), reservation_id.to_owned()]);
+                let actual = owned.iter().map(String::as_str).collect::<Vec<_>>();
+                self.gate_raw(&actual)
+            } else {
+                self.gate_raw(args)
+            }
+        } else {
+            self.gate_raw(args)
+        };
         assert!(
             output.status.success(),
             "gate {args:?} failed: {}{}",

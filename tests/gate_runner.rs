@@ -452,6 +452,18 @@ fn running_a_gate_without_an_allocation_is_a_precondition_failure() {
 #[test]
 fn a_dry_run_produces_no_receipt() {
     let workspace = allocated();
+    let reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.unit",
+        "--actor",
+        "operator",
+    ]);
+    let reservation_id = reservation["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap();
     let before = workspace.control_head();
 
     let envelope = workspace.gate_json(&[
@@ -460,6 +472,8 @@ fn a_dry_run_produces_no_receipt() {
         "F-001",
         "--gate-id",
         "gate.unit",
+        "--reservation-id",
+        reservation_id,
         "--dry-run",
     ]);
     assert_eq!(envelope["data"]["dry_run"], true);
