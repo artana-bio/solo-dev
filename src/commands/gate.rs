@@ -2893,6 +2893,9 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
     // Preserve truthful preflight diagnostics (unknown card, missing lease, or
     // undeclared gate) before refusing the execution capability itself.
     let control = ControlRepository::open(&args.common.control)?;
+    // Resolve the named gate before the reservation check so a typo is never
+    // misreported as a missing execution capability.
+    let _gate = load_gate(&control, &args.gate_id)?;
     let lease = held_lease(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} holds no lease; run `work start` first"),
         code: ErrorCode::PreconditionNotFound,

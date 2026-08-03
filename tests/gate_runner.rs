@@ -36,6 +36,34 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+/// Executes one known gate through the only production-capable path: an exact
+/// holder reservation followed by the governed disposable-source run.
+fn reserved_run_raw(workspace: &Workspace, card_id: &str, gate_id: &str) -> std::process::Output {
+    let reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        card_id,
+        "--gate-id",
+        gate_id,
+        "--actor",
+        "operator",
+    ]);
+    let reservation_id = reservation["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap();
+    workspace.gate_raw(&[
+        "run",
+        "--card-id",
+        card_id,
+        "--gate-id",
+        gate_id,
+        "--reservation-id",
+        reservation_id,
+        "--actor",
+        "operator",
+    ])
+}
+
 #[test]
 fn a_passing_gate_produces_a_receipt_bound_to_the_exact_commit() {
     let workspace = allocated();
@@ -146,10 +174,10 @@ fn a_failing_gate_refuses_but_still_records_its_receipt() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
-    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.fails"]);
+    let output = reserved_run_raw(&workspace, "F-001", "gate.fails");
     assert_eq!(output.status.code(), Some(7), "gate category is exit 7");
     assert_eq!(error_code(&output), "CH-GATE-FAILED");
 
@@ -175,10 +203,10 @@ fn a_timeout_is_recorded_distinctly_from_a_failure() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.slow"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
-    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.slow"]);
+    let output = reserved_run_raw(&workspace, "F-001", "gate.slow");
     assert_eq!(output.status.code(), Some(7));
 
     let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
@@ -191,7 +219,7 @@ fn a_timeout_is_recorded_distinctly_from_a_failure() {
 }
 
 #[test]
-fn every_attempt_is_recorded_and_numbered() {
+fn a_settled_failed_reservation_cannot_silently_rerun_the_same_gate() {
     let workspace = Workspace::initialized();
     workspace.register_gate("gate.fails", &["false"]);
     workspace.cycle(&[
@@ -202,31 +230,31 @@ fn every_attempt_is_recorded_and_numbered() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
-    for _ in 0..3 {
-        let _ = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.fails"]);
-    }
+    let first = reserved_run_raw(&workspace, "F-001", "gate.fails");
+    assert_eq!(first.status.code(), Some(7));
+
+    let reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.fails",
+        "--actor",
+        "operator",
+    ]);
+    assert_eq!(reservation["data"]["disposition"]["kind"], "settled");
 
     let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
     let receipts = status["data"]["receipts"].as_array().unwrap();
-    assert_eq!(receipts.len(), 3, "no attempt may be overwritten");
+    assert_eq!(receipts.len(), 1, "a settled reservation must not be rerun");
     let attempts: Vec<u64> = receipts
         .iter()
         .map(|receipt| receipt["attempt"].as_u64().unwrap())
         .collect();
-    assert_eq!(attempts, vec![1, 2, 3]);
-    let lineage = receipts[1]["provenance"]["lineage"].as_array().unwrap();
-    assert_eq!(lineage.len(), 1, "the successor carries one prior fact");
-    assert_eq!(lineage[0]["kind"], "supersedes");
-    assert_eq!(lineage[0]["prior_receipt_id"], receipts[0]["receipt_id"]);
-    assert!(
-        lineage[0]["actor_digest"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
+    assert_eq!(attempts, vec![1]);
 }
 
 #[test]
@@ -244,7 +272,7 @@ fn a_pass_beyond_the_declared_attempts_is_not_acceptable_evidence() {
     workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
-    let _ = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.fails"]);
+    let _ = reserved_run_raw(&workspace, "F-001", "gate.fails");
 
     let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
     let gate = &status["data"]["feature_gates"][0];
@@ -333,7 +361,7 @@ fn logs_are_written_outside_git_history_and_their_digests_recorded() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.noisy"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
     let envelope = workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.noisy"]);
@@ -414,7 +442,7 @@ fn gate_output_never_contaminates_the_json_envelope() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.chatty"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
     let output = workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.chatty"]);
@@ -626,11 +654,11 @@ fn a_gate_that_leaves_a_process_holding_its_pipes_still_times_out() {
         "First slice",
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
-    workspace.activate_card("F-001", &["src/**"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.escapee"]);
     workspace.work(&["start", "--card-id", "F-001"]);
 
     let started = std::time::Instant::now();
-    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.escapee"]);
+    let output = reserved_run_raw(&workspace, "F-001", "gate.escapee");
     let elapsed = started.elapsed();
 
     // The bound is the point. Without it this returns in about thirty seconds,
