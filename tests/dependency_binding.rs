@@ -26,11 +26,6 @@ fn error_code(output: &Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
-fn error_reason(output: &Output) -> String {
-    let envelope: Value = serde_json::from_slice(&output.stdout).expect("an error envelope");
-    envelope["error"]["message"].as_str().unwrap().to_owned()
-}
-
 /// True when `ancestor` is in `descendant`'s history in the candidate repo.
 fn contains(workspace: &Workspace, ancestor: &str, descendant: &str) -> bool {
     std::process::Command::new("git")
@@ -79,7 +74,9 @@ fn remove_loose_object(workspace: &Workspace, sha: &str) {
     );
 }
 
-/// F-001 approved, and F-002 declaring it and branched from its candidate.
+/// F-001 approved, and F-002 declares it while retaining the cycle baseline.
+/// A dependent may declare a prerequisite without incorporating its unlanded
+/// candidate; #25 owns any future explicit rebase/incorporation model.
 ///
 /// Returns the workspace and F-001's approved candidate.
 fn dependent_built_on_its_dependency() -> (Workspace, String) {
@@ -90,21 +87,20 @@ fn dependent_built_on_its_dependency() -> (Workspace, String) {
     workspace.approve_card("F-001", "src/F-001/a.rs");
 
     let first = head_of(&workspace, "F-001");
-    workspace.activate_card_depending_on_at("F-002", &["src/F-002/**"], &["F-001"], &first);
+    workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
     workspace.approve_card("F-002", "src/F-002/b.rs");
 
-    // The fixture must actually have built one on the other, or every
-    // assertion below passes for a reason that has nothing to do with
-    // dependencies.
+    // The fixture proves the valid fixed-baseline path. A declaration records
+    // scheduling/integration dependency, not an implicit candidate rebase.
     assert!(
-        contains(&workspace, &first, &head_of(&workspace, "F-002")),
-        "fixture: F-002's candidate must contain F-001's approved commit"
+        !contains(&workspace, &first, &head_of(&workspace, "F-002")),
+        "fixture: F-002 must retain the frozen cycle baseline"
     );
     (workspace, first)
 }
 
 #[test]
-fn a_rewritten_dependency_invalidates_the_dependent_built_on_it() {
+fn a_rewritten_dependency_does_not_invalidate_a_fixed_baseline_dependent() {
     let (workspace, first) = dependent_built_on_its_dependency();
 
     let second = workspace.rework_and_reapprove("F-001", "src/F-001/a.rs", true);
@@ -114,28 +110,15 @@ fn a_rewritten_dependency_invalidates_the_dependent_built_on_it() {
         "fixture: the rework must have rewritten history, not extended it"
     );
 
-    // The enforcement assertion first: the approval must have stopped
-    // standing. A test that led with the recorded field would report the
-    // record being written as the defect being fixed.
+    // F-002 records a declared dependency but does not carry F-001's
+    // unlanded candidate. Rewriting that candidate cannot stale F-002.
     let inspect = workspace.review_json(&["inspect", "--card-id", "F-002"]);
     assert_eq!(
-        inspect["data"]["has_current_approval"], false,
-        "F-002's approval covers a version of F-001 that is no longer approved"
+        inspect["data"]["has_current_approval"], true,
+        "a fixed-baseline dependent must not inherit an unincorporated rewrite"
     );
-    let reason = inspect["data"]["latest_stale_reason"]
-        .as_str()
-        .expect("a stale reason")
-        .to_owned();
-    assert!(
-        reason.contains("F-001"),
-        "must name the dependency: {reason}"
-    );
-    assert!(
-        reason.contains(&first) && reason.contains(&second),
-        "must name both commits: {reason}"
-    );
-
-    let refused = workspace.integration_raw(&[
+    assert_eq!(inspect["data"]["latest_stale_reason"], Value::Null);
+    let prepared = workspace.integration_json(&[
         "prepare",
         "--cycle-id",
         "C-001",
@@ -146,23 +129,7 @@ fn a_rewritten_dependency_invalidates_the_dependent_built_on_it() {
         "--card-id",
         "F-002",
     ]);
-    assert_eq!(refused.status.code(), Some(5), "integration must refuse");
-    assert_eq!(error_code(&refused), "CH-POLICY-NOT-INTEGRABLE");
-    let refusal = error_reason(&refused);
-    assert!(
-        refusal.contains("F-001") && refusal.contains(&first),
-        "the refusal must name the dependency and the superseded commit: {refusal}"
-    );
-
-    // And the record carries the binding the check reads, so a holder of the
-    // evidence can reach the same conclusion without the harness.
-    let handoff = workspace.handoff_json(&["inspect", "--card-id", "F-002"]);
-    let bindings = handoff["data"]["handoff"]["dependency_bindings"]
-        .as_array()
-        .expect("dependency bindings");
-    assert_eq!(bindings.len(), 1);
-    assert_eq!(bindings[0]["card_id"], "F-001");
-    assert_eq!(bindings[0]["incorporated_sha"], first.as_str());
+    assert_eq!(prepared["data"]["members"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -287,29 +254,22 @@ fn a_missing_handed_off_dependency_commit_is_not_bound() {
 }
 
 #[test]
-fn a_missing_bound_dependency_commit_does_not_invalidate_the_review() {
-    // F-002 genuinely bound F-001 before its parent object disappeared. The
-    // missing object then makes `ancestry` return `None` through the live
-    // review-inspection path, where the conservative default is "contained".
-    let (workspace, bound) = dependent_built_on_its_dependency();
-    let recorded = workspace.review_json(&["inspect", "--card-id", "F-002"]);
-    assert_eq!(
-        recorded["data"]["reviews"][0]["dependency_bindings"][0]["incorporated_sha"],
-        bound.as_str(),
-        "fixture: F-002 must have bound the object before it disappears"
-    );
-    remove_loose_object(&workspace, &bound);
-
-    let inspect = workspace.review_json(&["inspect", "--card-id", "F-002"]);
-    assert_eq!(
-        inspect["data"]["has_current_approval"], true,
-        "an unanswerable containment question must not invalidate the approval"
-    );
-    assert_eq!(
-        inspect["data"]["latest_stale_reason"],
-        Value::Null,
-        "the review remains current rather than receiving a fabricated stale reason"
-    );
+fn a_dependent_cannot_declare_an_unlanded_dependency_candidate_as_its_base() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let dependency_candidate = head_of(&workspace, "F-001");
+    let draft = workspace.root.join("F-002-wrong-base.yaml");
+    fs::write(&draft, format!(
+        "card_id: F-002\ncycle_id: C-001\ntitle: dependent\ngoal: dependent\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {dependency_candidate}\nwrite_scope:\n  include: [\"src/F-002/**\"]\n  exclude: []\ndepends_on: [\"F-001\"]\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+    )).unwrap();
+    workspace.card(&["create", "--draft", draft.to_str().unwrap()]);
+    let refused = workspace.card_raw(&["activate", "--card-id", "F-002"]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-CYCLE-BASELINE-MISMATCH");
+    assert!(!workspace.worktrees.join("F-002").exists());
 }
 
 #[test]
@@ -407,11 +367,9 @@ fn a_dependent_may_be_handed_off_before_its_dependency_is_approved() {
 }
 
 #[test]
-fn a_prepare_that_takes_everything_ready_names_what_it_left_out() {
-    // `select` drops a blocked card when the coordinator names none, which is
-    // right — a cycle almost always holds unfinished work. Doing it silently
-    // is what was wrong: the batch shipped fewer cards than the coordinator
-    // believed, with an empty `warnings` array.
+fn a_prepare_keeps_a_valid_fixed_baseline_dependent_after_dependency_rework() {
+    // A declaration without candidate incorporation is a scheduling edge, not
+    // evidence that F-002 reviewed F-001's old candidate. Both remain ready.
     let (workspace, _) = dependent_built_on_its_dependency();
     workspace.rework_and_reapprove("F-001", "src/F-001/a.rs", true);
 
@@ -428,7 +386,7 @@ fn a_prepare_that_takes_everything_ready_names_what_it_left_out() {
         .iter()
         .map(|member| member["card_id"].as_str().unwrap())
         .collect();
-    assert_eq!(members, ["F-001"], "F-002 is not integrable");
+    assert_eq!(members, ["F-001", "F-002"]);
 
     let warnings: Vec<&str> = prepared["warnings"]
         .as_array()
@@ -437,7 +395,7 @@ fn a_prepare_that_takes_everything_ready_names_what_it_left_out() {
         .map(|warning| warning.as_str().unwrap())
         .collect();
     assert!(
-        warnings.iter().any(|warning| warning.contains("F-002")),
-        "the plan must say which cards it left out: {warnings:?}"
+        !warnings.iter().any(|warning| warning.contains("F-002")),
+        "a valid baseline dependent must not be silently dropped: {warnings:?}"
     );
 }
