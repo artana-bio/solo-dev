@@ -1240,7 +1240,15 @@ fn run_integration_status(
     let compatibility = args
         .compatibility_request
         .as_ref()
-        .map(|path| read_integration_compatibility_request(path, &record, &verification, &receipts))
+        .map(|path| {
+            read_integration_compatibility_request(
+                &control,
+                path,
+                &record,
+                &verification,
+                &receipts,
+            )
+        })
         .transpose()?;
     Ok(CommandOutcome::new(
         "gate.status",
@@ -1259,18 +1267,29 @@ fn run_integration_status(
 }
 
 pub(crate) fn read_integration_compatibility_request(
+    control: &ControlRepository,
     path: &PathBuf,
     record: &crate::domain::integration::IntegrationRecord,
     verification: &crate::domain::integration::VerificationRecord,
     receipts: &[Receipt],
 ) -> Result<IntegrationCompatibilityDecision, HarnessError> {
     let request: IntegrationCompatibilityRequestV1 = load_json_request(path)?;
+    let config = control.project()?;
+    let gate = load_gate(control, &request.check.gate_id)?;
     if request.context.integration_id != record.integration_id
         || request.context.cycle_id != record.cycle_id
         || record.landing_sha.as_deref() != Some(request.context.landing_sha.as_str())
         || request.context.baseline_sha != record.baseline_sha
         || request.context.integration_digest != record.substantive_digest()?
         || request.context.verification_digest != verification.digest()?
+        || request.context.policy_digest != Digest::of_canonical(&config.validation_policy)?
+        || request.check.gate_digest != gate.digest()?
+        || request.check.max_attempts != gate.retry_policy.max_attempts
+        || request.expected.gate_definition_digest != gate.digest()?
+        || request.expected.argv_digest != Digest::of_canonical(&gate.argv)?
+        || verification.integration_id != record.integration_id
+        || verification.cycle_id != record.cycle_id
+        || record.landing_sha.as_deref() != Some(verification.landing_sha.as_str())
     {
         return Err(HarnessError::Control { reason: "integration compatibility request is stale for the current integration or verification".to_owned(), code: ErrorCode::GateEvidenceStale });
     }

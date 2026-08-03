@@ -342,6 +342,7 @@ fn audit_compatibility(
         let (verification, receipts) =
             receipts_for_integration_verification(control, &request.context.integration_id)?;
         return serde_json::to_value(read_integration_compatibility_request(
+            control,
             path,
             &record,
             &verification,
