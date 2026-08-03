@@ -19,7 +19,7 @@ use crate::{
         cycle::CycleRecord,
         digest::Digest,
         gate::{GATE_DIR, GateDefinition, NetworkPolicy},
-        ids::{CardId, ReceiptId},
+        ids::{CardId, IntegrationId, ReceiptId},
         lease::LeaseRecord,
     },
     error::{ErrorCode, HarnessError},
@@ -653,6 +653,38 @@ pub fn receipts_for(
         }
     }
     Ok(receipts)
+}
+
+/// Returns only the receipts pinned by one immutable integration verification.
+///
+/// A final-integration reuse decision must never search all receipts by gate
+/// name: a same-named receipt outside this verification proves a different
+/// landing state. The verification record is the authoritative inventory.
+pub fn receipts_for_integration_verification(
+    control: &ControlRepository,
+    integration_id: &IntegrationId,
+) -> Result<(crate::domain::integration::VerificationRecord, Vec<Receipt>), HarnessError> {
+    let verification = crate::commands::integration::load_verification(control, integration_id)?;
+    let mut receipts = Vec::with_capacity(verification.receipt_ids.len());
+    for receipt_id in &verification.receipt_ids {
+        let receipt_id: ReceiptId = receipt_id.parse()?;
+        let raw = control.read(&Receipt::relative_path(&receipt_id))?;
+        let receipt: Receipt =
+            serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+                reason: format!("verification receipt {receipt_id} is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        if receipt.integration_id.as_ref() != Some(integration_id) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "verification {integration_id} names receipt {receipt_id} for a different subject"
+                ),
+                code: ErrorCode::InternalControlCorrupt,
+            });
+        }
+        receipts.push(receipt);
+    }
+    Ok((verification, receipts))
 }
 
 /// Reports what `gate run` would execute, without running it.
