@@ -2890,9 +2890,8 @@ fn run_governed_gate(
 
 fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
-    if args.dry_run {
-        return preview_run(args, &card_id, clock);
-    }
+    // Preserve truthful preflight diagnostics (unknown card, missing lease, or
+    // undeclared gate) before refusing the execution capability itself.
     let control = ControlRepository::open(&args.common.control)?;
     let lease = held_lease(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} holds no lease; run `work start` first"),
@@ -2901,15 +2900,23 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
     let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
     let progress = validation_progress(&control, &card_id, Some(&candidate))?;
     require_next_gate(&progress, &args.gate_id)?;
-    if args.reservation_id.is_some() {
-        return run_governed_gate(args, &card_id, clock);
+    if args.reservation_id.is_none() {
+        return Err(HarnessError::Control {
+            reason: format!("gate run for card {card_id} requires one live validation reservation"),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
     }
-    run_gate_locked(args, clock)
+    if args.dry_run {
+        return preview_run(args, &card_id, clock);
+    }
+    run_governed_gate(args, &card_id, clock)
 }
 
 // This is the intentionally linear transaction boundary: its order is the
 // safety contract (load → validate → run → record → event → commit).
-#[allow(clippy::too_many_lines)]
+// It is retained temporarily for an explicit future migration/removal pass;
+// `run_gate` no longer has a production path to this unreserved executor.
+#[allow(dead_code, clippy::too_many_lines)]
 fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     if args.dry_run {
