@@ -23,8 +23,9 @@ use crate::{
         lease::LeaseRecord,
         validation_reservation::{
             VALIDATION_RESERVATION_DIR, VALIDATION_RESERVATION_KEY_SCHEMA,
-            VALIDATION_RESERVATION_SCHEMA, ValidationExecutionMode, ValidationReservationKeyV1,
-            ValidationReservationRecord,
+            VALIDATION_RESERVATION_SCHEMA, VALIDATION_RESERVATION_SETTLEMENT_SCHEMA,
+            ValidationExecutionMode, ValidationReservationKeyV1, ValidationReservationOutcome,
+            ValidationReservationRecord, ValidationReservationSettlementRecord,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -62,6 +63,8 @@ pub enum GateCommand {
     Run(RunArgs),
     /// Reserve one exact, expensive validation run without executing it.
     Reserve(ReserveArgs),
+    /// Record the terminal outcome of an exact validation reservation.
+    Settle(SettleArgs),
     /// Show the deterministic validation stages for an activated card.
     Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
@@ -83,6 +86,7 @@ impl GateCommand {
             Self::Show(..) => "gate.show",
             Self::Run(..) => "gate.run",
             Self::Reserve(..) => "gate.reserve",
+            Self::Settle(..) => "gate.settle",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
         }
@@ -122,6 +126,22 @@ pub struct ReserveArgs {
     /// Report the authoritative reservation decision without writing it.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments accepted by `gate settle`.
+#[derive(Debug, Args)]
+pub struct SettleArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The reservation whose exact terminal outcome is being recorded.
+    #[arg(long)]
+    pub reservation_id: String,
+    /// A card-run receipt that exactly matches the reservation identity.
+    #[arg(long)]
+    pub receipt_id: Option<String>,
+    /// Terminal non-receipt outcome: `failed` or `abandoned`.
+    #[arg(long)]
+    pub outcome: Option<String>,
 }
 
 /// Arguments accepted by `gate preflight`.
@@ -206,6 +226,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::Show(args) => run_show(args),
         GateCommand::Run(args) => run_gate(args, clock),
         GateCommand::Reserve(args) => run_reserve(args, clock),
+        GateCommand::Settle(args) => run_settle(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
     }
@@ -882,6 +903,7 @@ fn reservation_key(
     card_id: &CardId,
     gate_id: &str,
     execution_mode: ValidationExecutionMode,
+    require_next: bool,
 ) -> Result<ValidationReservationKeyV1, HarnessError> {
     let (record, state) = load_card(control, card_id)?;
     let lease = held_lease(control, card_id)?.ok_or_else(|| HarnessError::Control {
@@ -891,22 +913,25 @@ fn reservation_key(
     let candidate_sha =
         inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
     let progress = validation_progress(control, card_id, Some(&candidate_sha))?;
-    require_next_gate(&progress, gate_id)?;
-    let current_stage = progress
-        .next_permitted_stage
-        .ok_or_else(|| HarnessError::Control {
-            reason: format!("card {card_id} has no required validation check to reserve"),
-            code: ErrorCode::PolicyInvalidTransition,
-        })?;
-    let check = progress
+    if require_next {
+        require_next_gate(&progress, gate_id)?;
+    }
+    let (current_stage, check) = progress
         .plan
         .stages
         .iter()
-        .find(|entry| entry.stage == current_stage)
-        .and_then(|entry| entry.checks.iter().find(|check| check.gate_id == gate_id))
-        .cloned()
+        .find_map(|entry| {
+            entry
+                .checks
+                .iter()
+                .find(|check| check.gate_id == gate_id)
+                .cloned()
+                .map(|check| (entry.stage, check))
+        })
         .ok_or_else(|| HarnessError::Control {
-            reason: format!("gate `{gate_id}` is not the next required validation check"),
+            reason: format!(
+                "gate `{gate_id}` is not a required validation check for card {card_id}"
+            ),
             code: ErrorCode::PolicyInvalidTransition,
         })?;
     Ok(ValidationReservationKeyV1 {
@@ -992,6 +1017,230 @@ fn next_reservation_id(
     format!("VR-{:06}", highest + 1).parse()
 }
 
+fn settlement_for(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+) -> Result<Option<ValidationReservationSettlementRecord>, HarnessError> {
+    let reservation_id = &reservation.reservation_id;
+    let path = control.path(&ValidationReservationSettlementRecord::relative_path(
+        reservation_id,
+    ));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: ValidationReservationSettlementRecord = serde_json::from_str(&control.read(
+        &ValidationReservationSettlementRecord::relative_path(reservation_id),
+    )?)
+    .map_err(|source| HarnessError::Control {
+        reason: format!(
+            "validation reservation settlement {reservation_id} is malformed: {source}"
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    if record.schema != VALIDATION_RESERVATION_SETTLEMENT_SCHEMA
+        || record.reservation_id != *reservation_id
+        || record.reservation_key_digest != reservation.key_digest
+        || record.holder_actor_id != reservation.holder_actor_id
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "validation reservation settlement {reservation_id} has an invalid identity"
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    }
+    Ok(Some(record))
+}
+
+fn receipt_matches_reservation(
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+    project_id: &crate::domain::ids::ProjectId,
+) -> bool {
+    let Some(card_id) = receipt.card_id.as_ref() else {
+        return false;
+    };
+    let Some(card_digest) = receipt.card_digest.as_ref() else {
+        return false;
+    };
+    let Some(provenance) = receipt.provenance.as_ref() else {
+        return false;
+    };
+    if provenance.validate().is_err()
+        || receipt.schema != reservation.key.check.receipt_schema
+        || receipt.project_id != *project_id
+        || receipt.integration_id.is_some()
+        || card_id != &reservation.key.card_id
+        || card_digest != &reservation.key.card_digest
+        || receipt.cycle_id != reservation.key.cycle_id
+        || receipt.evaluated_sha != reservation.key.candidate_sha
+        || receipt.gate_id != reservation.key.check.gate_id
+        || receipt.gate_digest != reservation.key.check.gate_digest
+        || provenance.gate_definition_digest != reservation.key.check.gate_digest
+        || provenance.policy_digest != reservation.key.policy_digest
+    {
+        return false;
+    }
+    let expected_proof = reservation
+        .key
+        .proof_map_digest
+        .as_ref()
+        .map_or(ProofMapBinding::NotApplicable, |digest| {
+            ProofMapBinding::Bound(digest.clone())
+        });
+    match &provenance.subject {
+        ProvenanceSubject::Card {
+            candidate_sha,
+            base_sha,
+            cycle_id,
+            card_id: provenance_card_id,
+            card_revision,
+            card_digest: provenance_card_digest,
+            lease_id,
+        } => {
+            candidate_sha == &reservation.key.candidate_sha
+                && base_sha == &reservation.key.base_sha
+                && cycle_id == &reservation.key.cycle_id
+                && provenance_card_id == &reservation.key.card_id
+                && *card_revision == reservation.key.card_revision
+                && provenance_card_digest == &reservation.key.card_digest
+                && lease_id == &reservation.key.lease_id
+                && provenance.proof_map == expected_proof
+        }
+        ProvenanceSubject::Integration { .. } => false,
+    }
+}
+
+fn settlement_outcome(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+    receipt_id: Option<&str>,
+    outcome: Option<&str>,
+    project_id: &crate::domain::ids::ProjectId,
+) -> Result<ValidationReservationOutcome, HarnessError> {
+    if let Some(receipt_id) = receipt_id {
+        let receipt_id: ReceiptId = receipt_id.parse()?;
+        let receipt: Receipt = serde_json::from_str(
+            &control.read(&Receipt::relative_path(&receipt_id))?,
+        )
+        .map_err(|source| HarnessError::Control {
+            reason: format!("receipt {receipt_id} is malformed: {source}"),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+        if !receipt_matches_reservation(&receipt, reservation, project_id) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "receipt {receipt_id} does not exactly match validation reservation {}",
+                    reservation.reservation_id
+                ),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+        return Ok(ValidationReservationOutcome::ReceiptRecorded {
+            receipt_id: receipt_id.to_string(),
+            receipt_digest: receipt.digest()?,
+        });
+    }
+    match outcome {
+        Some("failed") => Ok(ValidationReservationOutcome::Failed),
+        Some("abandoned") => Ok(ValidationReservationOutcome::Abandoned),
+        _ => Err(HarnessError::Control {
+            reason: "--outcome must be `failed` or `abandoned`".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        }),
+    }
+}
+
+fn run_settle(args: &SettleArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
+    if u8::from(args.receipt_id.is_some()) + u8::from(args.outcome.is_some()) != 1 {
+        return Err(HarnessError::Control {
+            reason: "provide exactly one of --receipt-id or --outcome".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+    with_transaction(
+        &args.common.control,
+        "gate.settle",
+        clock,
+        |control, events, expected, steps| {
+            let config = control.project()?;
+            let reservation = reservations_for(control)?
+                .into_iter()
+                .find(|record| record.reservation_id == reservation_id)
+                .ok_or_else(|| HarnessError::Control {
+                    reason: format!("validation reservation {reservation_id} does not exist"),
+                    code: ErrorCode::PreconditionNotFound,
+                })?;
+            if settlement_for(control, &reservation)?.is_some() {
+                return Err(HarnessError::Control {
+                    reason: format!("validation reservation {reservation_id} is already settled"),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            if reservation.holder_actor_id != args.common.actor {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "only reservation holder {} may settle {reservation_id}",
+                        reservation.holder_actor_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            let outcome = settlement_outcome(
+                control,
+                &reservation,
+                args.receipt_id.as_deref(),
+                args.outcome.as_deref(),
+                &config.project_id,
+            )?;
+            let settlement = ValidationReservationSettlementRecord {
+                schema: VALIDATION_RESERVATION_SETTLEMENT_SCHEMA.to_owned(),
+                reservation_id: reservation_id.clone(),
+                reservation_key_digest: reservation.key_digest.clone(),
+                holder_actor_id: reservation.holder_actor_id.clone(),
+                settled_by_actor_id: args.common.actor.clone(),
+                settled_at: clock.now(),
+                outcome,
+            };
+            steps.at("reservation-settlement-write")?;
+            control.write_atomic(
+                &ValidationReservationSettlementRecord::relative_path(&reservation_id),
+                &format!("{}\n", serde_json::to_string_pretty(&settlement)?),
+            )?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("validation.reservation_settled", &args.common.actor)
+                    .cycle(reservation.key.cycle_id.clone())
+                    .card(
+                        reservation.key.card_id.clone(),
+                        reservation.key.card_revision,
+                        reservation.key.card_digest.clone(),
+                    )
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(reservation_id.to_string()),
+                    )
+                    .meta(
+                        "reservation_key_digest",
+                        serde_json::json!(reservation.key_digest.as_str()),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("gate: settle validation reservation {reservation_id}"),
+            )?;
+            Ok(CommandOutcome::new(
+                "gate.settle",
+                format!("Settled validation reservation {reservation_id}"),
+                serde_json::json!({ "settlement": settlement }),
+            )
+            .with_project(config.project_id))
+        },
+    )
+}
+
 fn reservation_outcome(
     disposition: &str,
     record: &ValidationReservationRecord,
@@ -1008,6 +1257,24 @@ fn reservation_outcome(
             "dry_run": dry_run,
             "disposition": { "kind": disposition },
             "reservation": record,
+        }),
+    )
+}
+
+fn settled_reservation_outcome(
+    record: &ValidationReservationRecord,
+    settlement: &ValidationReservationSettlementRecord,
+    dry_run: bool,
+) -> CommandOutcome {
+    CommandOutcome::new(
+        "gate.reserve",
+        format!("settled: validation reservation {}", record.reservation_id),
+        serde_json::json!({
+            "schema": "harness.validation-reservation-decision/v1",
+            "dry_run": dry_run,
+            "disposition": { "kind": "settled" },
+            "reservation": record,
+            "settlement": settlement,
         }),
     )
 }
@@ -1034,14 +1301,19 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
     let execution_mode: ValidationExecutionMode = args.execution_mode.parse()?;
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode)?;
+        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode, false)?;
         let key_digest = key.digest()?;
         if let Some(record) = reservations_for(&control)?
             .into_iter()
             .find(|record| record.key_digest == key_digest && record.key == key)
         {
+            if let Some(settlement) = settlement_for(&control, &record)? {
+                return Ok(settled_reservation_outcome(&record, &settlement, true));
+            }
             return Ok(reservation_outcome("wait_for_reserved_run", &record, true));
         }
+        let key = reservation_key(&control, &card_id, &args.gate_id, execution_mode, true)?;
+        let key_digest = key.digest()?;
         let now = clock.now();
         let record = ValidationReservationRecord {
             schema: VALIDATION_RESERVATION_SCHEMA.to_owned(),
@@ -1063,15 +1335,21 @@ fn reserve_once(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome,
         clock,
         |control, events, expected, steps| {
             let config = control.project()?;
-            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode)?;
+            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode, false)?;
             let key_digest = key.digest()?;
             if let Some(record) = reservations_for(control)?
                 .into_iter()
                 .find(|record| record.key_digest == key_digest && record.key == key)
             {
+                if let Some(settlement) = settlement_for(control, &record)? {
+                    return Ok(settled_reservation_outcome(&record, &settlement, false)
+                        .with_project(config.project_id));
+                }
                 return Ok(reservation_outcome("wait_for_reserved_run", &record, false)
                     .with_project(config.project_id));
             }
+            let key = reservation_key(control, &card_id, &args.gate_id, execution_mode, true)?;
+            let key_digest = key.digest()?;
             let now = clock.now();
             let record = ValidationReservationRecord {
                 schema: VALIDATION_RESERVATION_SCHEMA.to_owned(),

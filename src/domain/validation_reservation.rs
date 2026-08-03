@@ -18,6 +18,11 @@ pub const VALIDATION_RESERVATION_DIR: &str = "validation-reservations";
 pub const VALIDATION_RESERVATION_SCHEMA: &str = "harness.validation-reservation/v1";
 /// Schema for an exact reservation key.
 pub const VALIDATION_RESERVATION_KEY_SCHEMA: &str = "harness.validation-reservation-key/v1";
+/// Directory holding immutable terminal outcomes for reservations.
+pub const VALIDATION_RESERVATION_SETTLEMENT_DIR: &str = "validation-reservation-settlements";
+/// Schema for a terminal reservation settlement.
+pub const VALIDATION_RESERVATION_SETTLEMENT_SCHEMA: &str =
+    "harness.validation-reservation-settlement/v1";
 
 /// The only execution mode this first reservation slice permits.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -91,6 +96,41 @@ impl ValidationReservationRecord {
     #[must_use]
     pub fn relative_path(reservation_id: &ValidationReservationId) -> String {
         format!("{VALIDATION_RESERVATION_DIR}/{reservation_id}.json")
+    }
+}
+
+/// The terminal outcome recorded for one reservation.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ValidationReservationOutcome {
+    /// One exact receipt was recorded; whether it is reusable remains #31's decision.
+    ReceiptRecorded {
+        receipt_id: String,
+        receipt_digest: Digest,
+    },
+    /// The reserved execution completed unsuccessfully.
+    Failed,
+    /// An operator deliberately stopped the reserved execution.
+    Abandoned,
+}
+
+/// The only terminal fact for one immutable reservation.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationReservationSettlementRecord {
+    pub schema: String,
+    pub reservation_id: ValidationReservationId,
+    pub reservation_key_digest: Digest,
+    pub holder_actor_id: String,
+    pub settled_by_actor_id: String,
+    pub settled_at: Timestamp,
+    pub outcome: ValidationReservationOutcome,
+}
+
+impl ValidationReservationSettlementRecord {
+    #[must_use]
+    pub fn relative_path(reservation_id: &ValidationReservationId) -> String {
+        format!("{VALIDATION_RESERVATION_SETTLEMENT_DIR}/{reservation_id}.json")
     }
 }
 
