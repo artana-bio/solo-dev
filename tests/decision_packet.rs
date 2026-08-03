@@ -90,3 +90,66 @@ fn ordinary_integration_cannot_be_presented_as_a_final_decision() {
     );
     assert_eq!(workspace.control_head(), before);
 }
+
+#[test]
+fn packet_tracks_exact_landing_then_verification_and_review_without_writing() {
+    let workspace = final_cycle();
+    let id = "INT-001";
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", id, "--actor-id", "coordinator"]);
+    }
+    let inspected = workspace.integration_json(&["inspect", "--integration-id", id]);
+    let landing_sha = inspected["data"]["landing_sha"]
+        .as_str()
+        .expect("a real landing SHA")
+        .to_owned();
+
+    let before = workspace.control_head();
+    let landed = workspace.integration_json(&["decision-packet", "--integration-id", id]);
+    assert_eq!(landed["data"]["landing"]["state"], "built");
+    assert_eq!(landed["data"]["landing"]["sha"], landing_sha);
+    assert_eq!(
+        landed["data"]["decision_readiness"]["next_permitted_action"],
+        "integration.verify"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "packet after land must be read-only"
+    );
+
+    workspace.integration(&["verify", "--integration-id", id, "--actor-id", "verifier"]);
+    let before = workspace.control_head();
+    let verified = workspace.integration_json(&["decision-packet", "--integration-id", id]);
+    assert_eq!(verified["data"]["verification"]["landing_sha"], landing_sha);
+    assert!(verified["data"]["verification"]["receipt_ids"].is_array());
+    assert_eq!(
+        verified["data"]["decision_readiness"]["next_permitted_action"],
+        "integration.review"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "packet after verify must be read-only"
+    );
+
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        id,
+        "--reviewer-actor-id",
+        "integration-reviewer",
+    ]);
+    let before = workspace.control_head();
+    let reviewed = workspace.integration_json(&["decision-packet", "--integration-id", id]);
+    assert_eq!(reviewed["data"]["review"]["state"], "recorded");
+    assert_eq!(
+        reviewed["data"]["decision_readiness"]["next_permitted_action"],
+        "acceptance.record"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "packet after review must be read-only"
+    );
+}
