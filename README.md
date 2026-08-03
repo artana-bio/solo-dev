@@ -30,8 +30,7 @@ will not own the workflow engine.
 
 ## For coding agents
 
-The operating guide is
-[`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md):
+The operating guide is [`SKILL.md`](./SKILL.md):
 the lifecycle in order, the exact YAML each command accepts, the actor-flag
 split, and every common refusal with its remedy. It is written to be followed
 without reading anything else. An independent reviewer drove a complete
@@ -40,9 +39,10 @@ alone — and then failed it, on three sentences that were word-for-word wrong
 about the CLI. Those were corrected and re-verified against the binary before
 a second reviewer accepted it.
 
-It is a portable skill. Copy the `.claude/skills/change-harness/` directory
-into any repository this harness governs, and agents working there will find
-it.
+It is a portable, tool-neutral guide. Copy `SKILL.md` into any repository this
+harness governs, or provide it to any person or agent using the CLI. It does
+not contain live assignments or authority: those always come from fresh
+Harness status queries.
 
 Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
 instead, which carries the reading contract and engineering rules for building
@@ -234,9 +234,9 @@ this, twice, against a temporary project.
 
 > **Driving this CLI as an agent?** The operating guide — lifecycle in order,
 > the exact YAML shapes the deserializers accept, the actor-flag split, and
-> the common refusal codes with their remedies — is maintained as a skill at
-> [`.claude/skills/change-harness/SKILL.md`](./.claude/skills/change-harness/SKILL.md).
-> Copy that directory into any governed project so agents discover it there.
+> the common refusal codes with their remedies — is maintained at
+> [`SKILL.md`](./SKILL.md). Copy that one tool-neutral file into a governed
+> project so any agent or person can discover it.
 
 **1. Register the gates cards may name.** Gates are registered deliberately
 rather than declared inline, so a card cannot invent a check that nobody
