@@ -32,6 +32,20 @@ pub fn contains_standalone_github_token_shape(contents: &[u8]) -> bool {
         })
 }
 
+/// Returns whether a path contains the governed token shape delimited by
+/// underscores. The token-shape predicate remains the single credential
+/// classifier; underscores only provide the path boundary needed before mode
+/// dispatch.
+#[must_use]
+pub(crate) fn contains_underscore_delimited_github_token_shape(path: &[u8]) -> bool {
+    let candidate_length = GITHUB_TOKEN_PREFIX.len() + GITHUB_TOKEN_TAIL_LENGTH;
+    path.windows(candidate_length + 2).any(|window| {
+        window[0] == b'_'
+            && window[candidate_length + 1] == b'_'
+            && contains_standalone_github_token_shape(&window[1..=candidate_length])
+    })
+}
+
 const fn is_token_character(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }

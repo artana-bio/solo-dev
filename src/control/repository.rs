@@ -16,7 +16,9 @@ use crate::{
     domain::clock::Clock,
     error::{ErrorCode, HarnessError},
     git::command::{GitScope, run, run_ok, run_with_config_and_environment, run_with_config_ok},
-    policy::credential_shape::contains_standalone_github_token_shape,
+    policy::credential_shape::{
+        contains_standalone_github_token_shape, contains_underscore_delimited_github_token_shape,
+    },
 };
 
 /// Path of the project document inside the control repository.
@@ -486,6 +488,12 @@ fn refuse_non_text_control_entries(
             reason: "a staged control path is not valid UTF-8".to_owned(),
             code: ErrorCode::PolicyControlEncoding,
         })?;
+        if contains_underscore_delimited_github_token_shape(relative.as_bytes()) {
+            return Err(HarnessError::Control {
+                reason: "a staged control path contains a sensitive value".to_owned(),
+                code: ErrorCode::PolicySensitiveValue,
+            });
+        }
         let spec = format!(":{relative}");
         let blob = run_with_config_and_environment(scope, overrides, environment, ["show", &spec])?;
         if blob.success() {

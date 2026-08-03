@@ -694,6 +694,86 @@ fn a_recognized_github_token_in_staged_utf8_is_refused_without_becoming_durable(
 }
 
 #[test]
+fn a_credential_shaped_gitlink_path_is_refused_before_mode_dispatch() {
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+
+    let relative = format!("cards/fixture_{TOKEN}_gitlink");
+    let gitlink = fixture.control.join(&relative);
+    fs::create_dir_all(&gitlink).unwrap();
+    git(&gitlink, &["init", "-q", "-b", "main"]);
+    git(&gitlink, &["config", "user.email", "gitlink@local.invalid"]);
+    git(&gitlink, &["config", "user.name", "Gitlink"]);
+    fs::write(gitlink.join("README.md"), "gitlink\n").unwrap();
+    git(&gitlink, &["add", "-A"]);
+    git(&gitlink, &["commit", "-q", "-m", "gitlink"]);
+    let nested_head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&gitlink)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let nested_head = nested_head.trim();
+    assert!(!git_has_object(&fixture.control, nested_head));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !git_has_object(&fixture.control, nested_head),
+        "the rejected gitlink commit became a durable object"
+    );
+    assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(rendered.contains("CH-POLICY-SENSITIVE-VALUE"));
+    assert!(!rendered.contains(TOKEN));
+    assert!(!rendered.contains(&relative));
+    assert_eq!(
+        control.head().unwrap(),
+        before_head,
+        "HEAD must not advance"
+    );
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index,
+        "the durable index must remain byte-identical"
+    );
+    let cached = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.control)
+        .args(["diff", "--cached", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(
+        cached.status.success(),
+        "the durable index must remain clean"
+    );
+}
+
+#[test]
 fn incomplete_staged_json_is_refused_without_durable_state_or_payload_leak() {
     const PAYLOAD: &str = "malformed-json-control-sentinel";
 
