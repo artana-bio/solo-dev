@@ -4,7 +4,14 @@
 //! project policy, and cards may only name them. Registration is therefore a
 //! deliberate act with its own command, not a side effect of authoring a card.
 
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use clap::{Args, Subcommand};
 
@@ -44,7 +51,7 @@ use crate::{
             RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
             ValidationReservationBinding, evidence_is_acceptable,
         },
-        run_attempt,
+        run_attempt, run_attempt_with_validation_cache,
     },
 };
 
@@ -1122,6 +1129,122 @@ fn requires_execution_reservation(progress: &ValidationProgress, gate_id: &str) 
         .any(|stage| stage.checks.iter().any(|check| check.gate_id == gate_id))
 }
 
+struct DisposableExecution {
+    _root: tempfile::TempDir,
+    source: PathBuf,
+    cache: PathBuf,
+}
+
+impl DisposableExecution {
+    fn create(
+        control: &ControlRepository,
+        repository: &Path,
+        reservation: &ValidationReservationRecord,
+        candidate_worktree: &Path,
+    ) -> Result<Self, HarnessError> {
+        let execution_root = control.path("validation-executions");
+        fs::create_dir_all(&execution_root).map_err(|source| HarnessError::ControlIo {
+            path: execution_root.clone(),
+            source,
+        })?;
+        let root = tempfile::Builder::new()
+            .prefix(&format!(
+                "{}-{}-",
+                reservation.reservation_id,
+                &reservation.key_digest.as_str()[..12]
+            ))
+            .tempdir_in(&execution_root)
+            .map_err(|source| HarnessError::ControlIo {
+                path: execution_root,
+                source,
+            })?;
+        let source = root.path().join("source");
+        let cache = root.path().join(format!(
+            "cache-{}-{}",
+            reservation.reservation_id,
+            &reservation.key_digest.as_str()[..12]
+        ));
+        let clone = Command::new("git")
+            .args(["clone", "--no-checkout"])
+            .arg(repository)
+            .arg(&source)
+            .output()
+            .map_err(|source_error| HarnessError::Control {
+                reason: format!("could not create disposable validation source: {source_error}"),
+                code: ErrorCode::GateRunnerError,
+            })?;
+        if !clone.status.success() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "could not create disposable validation source: {}",
+                    String::from_utf8_lossy(&clone.stderr).trim()
+                ),
+                code: ErrorCode::GateRunnerError,
+            });
+        }
+        let checkout = Command::new("git")
+            .args(["-C"])
+            .arg(&source)
+            .args(["checkout", "--detach", &reservation.key.candidate_sha])
+            .output()
+            .map_err(|source_error| HarnessError::Control {
+                reason: format!("could not checkout reserved validation SHA: {source_error}"),
+                code: ErrorCode::GateRunnerError,
+            })?;
+        if !checkout.status.success() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "could not checkout reserved validation SHA: {}",
+                    String::from_utf8_lossy(&checkout.stderr).trim()
+                ),
+                code: ErrorCode::GateRunnerError,
+            });
+        }
+        fs::create_dir(&cache).map_err(|source_error| HarnessError::ControlIo {
+            path: cache.clone(),
+            source: source_error,
+        })?;
+        let source_canonical =
+            fs::canonicalize(&source).map_err(|source_error| HarnessError::ControlIo {
+                path: source.clone(),
+                source: source_error,
+            })?;
+        let candidate_canonical = fs::canonicalize(candidate_worktree).map_err(|source_error| {
+            HarnessError::ControlIo {
+                path: candidate_worktree.to_path_buf(),
+                source: source_error,
+            }
+        })?;
+        if source_canonical == candidate_canonical
+            || fs::canonicalize(&cache)
+                .map_err(|source_error| HarnessError::ControlIo {
+                    path: cache.clone(),
+                    source: source_error,
+                })?
+                .starts_with(&candidate_canonical)
+        {
+            return Err(HarnessError::Control {
+                reason: "disposable validation environment overlaps the candidate workspace"
+                    .to_owned(),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+        let actual = inspect::resolve_commit(&GitScope::work_tree(&source), "HEAD")?;
+        if actual != reservation.key.candidate_sha {
+            return Err(HarnessError::Control {
+                reason: "disposable validation source does not match the reserved candidate SHA"
+                    .to_owned(),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+        Ok(Self {
+            _root: root,
+            source,
+            cache,
+        })
+    }
+}
+
 fn receipt_matches_reservation(
     receipt: &Receipt,
     reservation: &ValidationReservationRecord,
@@ -1499,8 +1622,30 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
 
             let started_at = clock.now();
             let log_root = control.path(LOG_DIR).join(card_id.as_str());
+            let execution = if let Some(reservation) = &reservation {
+                steps.at("validation-execution-setup")?;
+                Some(DisposableExecution::create(
+                    control,
+                    &config.repository,
+                    reservation,
+                    &lease.worktree_path,
+                )?)
+            } else {
+                None
+            };
             steps.at("gate-attempt-started")?;
-            let outcome = run_attempt(&gate, &lease.worktree_path, &log_root, attempt, clock)?;
+            let outcome = if let Some(execution) = &execution {
+                run_attempt_with_validation_cache(
+                    &gate,
+                    &execution.source,
+                    &log_root,
+                    attempt,
+                    clock,
+                    Some(&execution.cache),
+                )?
+            } else {
+                run_attempt(&gate, &lease.worktree_path, &log_root, attempt, clock)?
+            };
             let finished_at = clock.now();
 
             let receipt_id = next_receipt_id(control)?;

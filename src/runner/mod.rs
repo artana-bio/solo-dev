@@ -121,6 +121,25 @@ pub fn run_attempt(
     attempt: u32,
     clock: &dyn Clock,
 ) -> Result<AttemptOutcome, HarnessError> {
+    run_attempt_with_validation_cache(gate, worktree, log_root, attempt, clock, None)
+}
+
+/// Runs one attempt with an optional private validation cache supplied by the
+/// execution coordinator. The override is installed after gate configuration,
+/// so a gate definition cannot redirect a governed run to shared state.
+///
+/// # Errors
+///
+/// Returns the same runner and filesystem errors as [`run_attempt`].
+#[allow(clippy::too_many_lines)]
+pub fn run_attempt_with_validation_cache(
+    gate: &GateDefinition,
+    worktree: &Path,
+    log_root: &Path,
+    attempt: u32,
+    clock: &dyn Clock,
+    validation_cache: Option<&Path>,
+) -> Result<AttemptOutcome, HarnessError> {
     let working_directory = resolve_working_directory(gate, worktree)?;
     let (stdout_path, stderr_path) = attempt_log_paths(log_root, &gate.gate_id, attempt);
     if let Some(parent) = stdout_path.parent() {
@@ -145,6 +164,9 @@ pub fn run_attempt(
     }
     for (name, value) in &gate.environment.set {
         command.env(name, value);
+    }
+    if let Some(cache) = validation_cache {
+        command.env("CHANGE_HARNESS_VALIDATION_CACHE", cache);
     }
 
     command.stdin(Stdio::null());

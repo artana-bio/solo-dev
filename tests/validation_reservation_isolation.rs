@@ -2,11 +2,15 @@
 
 mod support;
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use support::Workspace;
 
-fn marker_gate(workspace: &Workspace, gate_id: &str, marker: &PathBuf) {
+fn marker_gate(workspace: &Workspace, gate_id: &str, marker: &Path) {
     let command = "printf '%s\\n%s\\n%s\\n' \"$PWD\" \"$CHANGE_HARNESS_VALIDATION_CACHE\" \"$(git rev-parse HEAD)\" > \"$MARKER_PATH\"";
     let argv = serde_json::to_string(&["sh", "-c", command]).unwrap();
     let marker = serde_json::to_string(&marker.display().to_string()).unwrap();
@@ -67,10 +71,13 @@ fn reserve_and_run(workspace: &Workspace, card_id: &str, gate_id: &str) -> serde
         "reserved gate must run: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let run: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut reservation = reservation;
+    reservation["run"] = run;
     reservation
 }
 
-fn marker(path: &PathBuf) -> (PathBuf, PathBuf, String) {
+fn marker(path: &Path) -> (PathBuf, PathBuf, String) {
     let lines = fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -82,6 +89,65 @@ fn marker(path: &PathBuf) -> (PathBuf, PathBuf, String) {
         PathBuf::from(&lines[1]),
         lines[2].clone(),
     )
+}
+
+#[test]
+fn setup_failure_happens_before_attempt_receipt_settlement_or_subprocess() {
+    let (workspace, first_marker, _) = allocated();
+    let reservation = workspace.gate_json(&[
+        "reserve",
+        "--card-id",
+        "F-001",
+        "--gate-id",
+        "gate.first",
+        "--actor",
+        "holder",
+    ]);
+    let reservation_id = reservation["data"]["reservation"]["reservation_id"]
+        .as_str()
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("CHANGE_HARNESS_FAIL_AT", "validation-execution-setup")
+        .args([
+            "gate",
+            "run",
+            "--output",
+            "json",
+            "--control",
+            workspace.control.to_str().unwrap(),
+            "--card-id",
+            "F-001",
+            "--gate-id",
+            "gate.first",
+            "--reservation-id",
+            reservation_id,
+            "--actor",
+            "holder",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!first_marker.exists());
+    assert!(
+        workspace.gate_json(&["status", "--card-id", "F-001"])["data"]["receipts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !workspace
+            .control
+            .join(format!(
+                "validation-reservation-settlements/{reservation_id}.json"
+            ))
+            .exists()
+    );
+    assert!(
+        workspace
+            .events()
+            .into_iter()
+            .all(|event| event["event_type"] != "gate.ran")
+    );
 }
 
 #[test]
@@ -112,6 +178,26 @@ fn reserved_gates_run_in_distinct_disposable_exact_source_and_cache_directories(
         first_cache, second_cache,
         "reservations must not share a cache"
     );
+    assert!(
+        first_cache.file_name().unwrap().to_string_lossy().contains(
+            first["data"]["reservation"]["reservation_id"]
+                .as_str()
+                .unwrap()
+        ),
+        "cache identity must name the reservation that owns it"
+    );
+    assert!(
+        second_cache
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(
+                second["data"]["reservation"]["reservation_id"]
+                    .as_str()
+                    .unwrap()
+            ),
+        "cache identity must name the reservation that owns it"
+    );
     assert_eq!(
         first_sha,
         first["data"]["reservation"]["key"]["candidate_sha"]
@@ -124,4 +210,18 @@ fn reserved_gates_run_in_distinct_disposable_exact_source_and_cache_directories(
             .as_str()
             .unwrap()
     );
+    for (reservation, source, cache) in [
+        (&first, &first_source, &first_cache),
+        (&second, &second_source, &second_cache),
+    ] {
+        let receipt_id = reservation["run"]["data"]["receipt_id"].as_str().unwrap();
+        let raw = fs::read_to_string(
+            workspace
+                .control
+                .join(format!("receipts/{receipt_id}.json")),
+        )
+        .unwrap();
+        assert!(!raw.contains(&source.display().to_string()));
+        assert!(!raw.contains(&cache.display().to_string()));
+    }
 }

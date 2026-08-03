@@ -8,10 +8,21 @@ use support::{Workspace, git};
 
 fn allocated() -> Workspace {
     let workspace = Workspace::initialized();
-    workspace.register_gate(
-        "gate.marker",
-        &["sh", "-c", "printf invoked >> reservation-run-marker"],
+    let marker = serde_json::to_string(
+        &workspace
+            .root
+            .join("reservation-run-marker")
+            .display()
+            .to_string(),
+    )
+    .unwrap();
+    let definition = workspace.gate_definition(
+        "gate-marker",
+        &format!(
+            "schema: harness.gate/v1\ngate_id: gate.marker\nrevision: 1\nargv: [sh, -c, \"printf invoked >> \\\"$MARKER_PATH\\\"\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER_PATH: {marker}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+        ),
     );
+    workspace.gate(&["register", "--definition", &definition]);
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -26,12 +37,7 @@ fn allocated() -> Workspace {
 }
 
 fn marker(workspace: &Workspace) -> PathBuf {
-    let worktree = workspace.work_json(&["status", "--card-id", "F-001"])["data"]
-        ["held_lease"]["worktree_path"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    PathBuf::from(worktree).join("reservation-run-marker")
+    workspace.root.join("reservation-run-marker")
 }
 
 fn reserve(workspace: &Workspace, actor: &str) -> (String, String) {
@@ -111,7 +117,11 @@ fn gate_execution_requires_one_exact_live_holder_reservation_before_subprocess_s
 
     let moved = allocated();
     let (reservation_id, _) = reserve(&moved, "holder");
-    let worktree = marker(&moved).parent().unwrap().to_path_buf();
+    let worktree: PathBuf =
+        moved.work_json(&["status", "--card-id", "F-001"])["data"]["held_lease"]["worktree_path"]
+            .as_str()
+            .unwrap()
+            .into();
     fs::write(worktree.join("moved.txt"), "later\n").unwrap();
     git(&worktree, &["add", "moved.txt"]);
     git(&worktree, &["commit", "-qm", "move candidate"]);
