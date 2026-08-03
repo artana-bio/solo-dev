@@ -616,6 +616,83 @@ fn a_non_utf8_control_blob_is_refused_before_it_reaches_git_history() {
 }
 
 #[test]
+fn a_recognized_github_token_in_staged_utf8_is_refused_without_becoming_durable() {
+    let fixture = Fixture::new();
+    assert!(fixture.init().status.success());
+    let control = ControlRepository::open(&fixture.control).unwrap();
+    let before_head = control.head().unwrap();
+    let before_index = fs::read(fixture.control.join(".git/index")).unwrap();
+
+    const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+    let contents = format!(
+        r#"{{"note":"{TOKEN}"}}
+"#
+    );
+    fs::create_dir_all(fixture.control.join("cards")).unwrap();
+    fs::write(
+        fixture.control.join("cards/external-credential.json"),
+        contents.as_bytes(),
+    )
+    .unwrap();
+    let would_be_blob = git_hash_object(&fixture.control, contents.as_bytes());
+    assert!(!git_has_object(&fixture.control, &would_be_blob));
+
+    let output = Fixture::run(&[
+        "cycle".into(),
+        "create".into(),
+        "--output".into(),
+        "json".into(),
+        "--control".into(),
+        fixture.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--objective".into(),
+        "ordinary".into(),
+    ]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // This assertion is deliberately first: bypassing the staged-content
+    // classifier must make the mutation fail by observing durable leakage.
+    assert!(
+        !git_has_object(&fixture.control, &would_be_blob),
+        "the recognized token became a durable Git object"
+    );
+    assert_eq!(output.status.code(), Some(5), "policy refusal expected");
+    assert!(
+        rendered.contains("CH-POLICY-SENSITIVE-VALUE"),
+        "the refusal must identify the narrow credential policy"
+    );
+    assert!(
+        !rendered.contains(TOKEN),
+        "the refusal output must not echo the token"
+    );
+    assert_eq!(
+        control.head().unwrap(),
+        before_head,
+        "HEAD must not advance"
+    );
+    assert_eq!(
+        fs::read(fixture.control.join(".git/index")).unwrap(),
+        before_index,
+        "the durable index must remain byte-identical"
+    );
+    let history = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.control)
+        .args(["log", "--all", "-p"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&history.stdout).contains(TOKEN),
+        "the recognized token must be absent from every ref"
+    );
+}
+
+#[test]
 fn a_split_index_refusal_does_not_create_or_change_shared_indexes() {
     let fixture = Fixture::new();
     assert!(fixture.init().status.success());
