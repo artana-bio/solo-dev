@@ -20,6 +20,14 @@ pub const VALIDATION_RESERVATION_SCHEMA: &str = "harness.validation-reservation/
 pub const VALIDATION_RESERVATION_KEY_SCHEMA: &str = "harness.validation-reservation-key/v1";
 /// Directory holding immutable terminal outcomes for reservations.
 pub const VALIDATION_RESERVATION_SETTLEMENT_DIR: &str = "validation-reservation-settlements";
+/// Directory holding live, single-use governed execution permits.
+///
+/// Unlike a reservation, this record exists only between durable acquire and
+/// terminal settlement. Its presence is the recovery-visible fact that a
+/// subprocess may be running or was interrupted after acquire.
+pub const VALIDATION_EXECUTION_PERMIT_DIR: &str = "validation-execution-permits";
+/// Schema for a governed execution permit.
+pub const VALIDATION_EXECUTION_PERMIT_SCHEMA: &str = "harness.validation-execution-permit/v1";
 /// Schema for a terminal reservation settlement.
 pub const VALIDATION_RESERVATION_SETTLEMENT_SCHEMA: &str =
     "harness.validation-reservation-settlement/v1";
@@ -153,6 +161,30 @@ impl ValidationReservationSettlementRecord {
     #[must_use]
     pub fn relative_path(reservation_id: &ValidationReservationId) -> String {
         format!("{VALIDATION_RESERVATION_SETTLEMENT_DIR}/{reservation_id}.json")
+    }
+}
+
+/// A single-use permit to execute one exact validation reservation.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationExecutionPermitRecord {
+    /// Always [`VALIDATION_EXECUTION_PERMIT_SCHEMA`].
+    pub schema: String,
+    /// Reservation being consumed.
+    pub reservation_id: ValidationReservationId,
+    /// Exact immutable key bound to the reservation.
+    pub reservation_key_digest: Digest,
+    /// Only this actor may settle or consume the permit.
+    pub holder_actor_id: String,
+    /// Durable acquire time.
+    pub acquired_at: Timestamp,
+}
+
+impl ValidationExecutionPermitRecord {
+    /// Relative path of the one permit for one reservation.
+    #[must_use]
+    pub fn relative_path(reservation_id: &ValidationReservationId) -> String {
+        format!("{VALIDATION_EXECUTION_PERMIT_DIR}/{reservation_id}.json")
     }
 }
 

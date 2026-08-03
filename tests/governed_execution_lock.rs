@@ -65,6 +65,7 @@ fn wait(p: &Path) {
 }
 
 #[test]
+#[allow(clippy::many_single_char_names)]
 fn exact_permits_run_outside_the_global_lock_then_settle_once() {
     let w = Workspace::initialized();
     let a = w.root.join("a");
@@ -118,5 +119,64 @@ fn exact_permits_run_outside_the_global_lock_then_settle_once() {
             .unwrap()
             .count()
             == 2
+    );
+}
+
+#[test]
+fn interruption_after_durable_acquire_leaves_one_explicit_recovery_permit() {
+    let w = Workspace::initialized();
+    let marker = w.root.join("marker");
+    slow_gate(&w, "gate.a", &marker);
+    w.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Governed recovery",
+    ]);
+    w.cycle(&["activate", "--cycle-id", "C-001"]);
+    w.activate_card_with_gates("F-001", &["src/a/**"], &["gate.a"]);
+    w.work(&["start", "--card-id", "F-001"]);
+    let reservation = reserve(&w, "F-001", "gate.a");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("CHANGE_HARNESS_FAIL_AT", "governed-execution-after-acquire")
+        .args([
+            "gate",
+            "run",
+            "--output",
+            "json",
+            "--control",
+            w.control.to_str().unwrap(),
+            "--card-id",
+            "F-001",
+            "--gate-id",
+            "gate.a",
+            "--reservation-id",
+            &reservation,
+            "--actor",
+            "holder",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        w.control
+            .join(format!("validation-execution-permits/{reservation}.json"))
+            .exists(),
+        "a post-acquire interruption must leave a durable, non-reusable permit"
+    );
+    assert!(
+        !w.control
+            .join(format!(
+                "validation-reservation-settlements/{reservation}.json"
+            ))
+            .exists()
+    );
+    assert!(
+        !run(&w.control, "F-001", "gate.a", &reservation)
+            .status
+            .success(),
+        "a second runner must refuse while recovery owns the permit"
     );
 }

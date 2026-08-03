@@ -20,7 +20,11 @@ use clap::{Args, Subcommand};
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
-    commands::{card::load_card, transaction::with_transaction, work::held_lease},
+    commands::{
+        card::{CardStateRecord, load_card},
+        transaction::with_transaction,
+        work::held_lease,
+    },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         card::CardRecord,
@@ -31,10 +35,12 @@ use crate::{
         ids::{CardId, IntegrationId, ReceiptId, ValidationReservationId},
         lease::LeaseRecord,
         validation_reservation::{
-            VALIDATION_RESERVATION_DIR, VALIDATION_RESERVATION_KEY_SCHEMA,
-            VALIDATION_RESERVATION_SCHEMA, VALIDATION_RESERVATION_SETTLEMENT_SCHEMA,
-            ValidationExecutionMode, ValidationReservationKeyV1, ValidationReservationOutcome,
-            ValidationReservationRecord, ValidationReservationSettlementRecord,
+            VALIDATION_EXECUTION_PERMIT_SCHEMA, VALIDATION_RESERVATION_DIR,
+            VALIDATION_RESERVATION_KEY_SCHEMA, VALIDATION_RESERVATION_SCHEMA,
+            VALIDATION_RESERVATION_SETTLEMENT_SCHEMA, ValidationExecutionMode,
+            ValidationExecutionPermitRecord, ValidationReservationKeyV1,
+            ValidationReservationOutcome, ValidationReservationRecord,
+            ValidationReservationSettlementRecord,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -47,7 +53,7 @@ use crate::{
         },
     },
     runner::{
-        environment_fingerprint,
+        AttemptOutcome, environment_fingerprint,
         receipt::{
             LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject, RECEIPT_DIR,
             RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
@@ -2162,10 +2168,435 @@ fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     )
 }
 
+#[derive(Clone)]
+struct GovernedGateExecution {
+    config: crate::config::ProjectConfig,
+    record: CardRecord,
+    state: CardStateRecord,
+    gate: GateDefinition,
+    gate_digest: Digest,
+    lease: LeaseRecord,
+    evaluated_sha: String,
+    worktree_clean: bool,
+    existing: Vec<Receipt>,
+    attempt: u32,
+    reservation: ValidationReservationRecord,
+    permit: ValidationExecutionPermitRecord,
+}
+
+fn execution_permit_for(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+) -> Result<Option<ValidationExecutionPermitRecord>, HarnessError> {
+    let relative = ValidationExecutionPermitRecord::relative_path(&reservation.reservation_id);
+    let path = control.path(&relative);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let permit: ValidationExecutionPermitRecord = serde_json::from_str(&control.read(&relative)?)
+        .map_err(|source| HarnessError::Control {
+        reason: format!(
+            "validation execution permit {} is malformed: {source}",
+            reservation.reservation_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    if permit.schema != VALIDATION_EXECUTION_PERMIT_SCHEMA
+        || permit.reservation_id != reservation.reservation_id
+        || permit.reservation_key_digest != reservation.key_digest
+        || permit.holder_actor_id != reservation.holder_actor_id
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "validation execution permit {} has an invalid identity",
+                reservation.reservation_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    }
+    Ok(Some(permit))
+}
+
+fn acquire_governed_gate_execution(
+    args: &RunArgs,
+    card_id: &CardId,
+    clock: &dyn Clock,
+) -> Result<GovernedGateExecution, HarnessError> {
+    let mut acquired = None;
+    with_transaction(
+        &args.common.control,
+        "gate.run.acquire",
+        clock,
+        |control, events, expected, steps| {
+            let config = control.project()?;
+            let (record, state) = load_card(control, card_id)?;
+            let gate = load_gate(control, &args.gate_id)?;
+            let gate_digest = gate.digest()?;
+            let lease = held_lease(control, card_id)?.ok_or_else(|| HarnessError::Control {
+                reason: format!("card {card_id} holds no lease; run `work start` first"),
+                code: ErrorCode::PreconditionNotFound,
+            })?;
+            let scope = GitScope::work_tree(&lease.worktree_path);
+            let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
+            let progress = validation_progress(control, card_id, Some(&evaluated_sha))?;
+            require_next_gate(&progress, &args.gate_id)?;
+            let reservation = live_reservation_for_run(control, args, card_id, clock)?;
+            if execution_permit_for(control, &reservation)?.is_some() {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} is already acquired",
+                        reservation.reservation_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            let existing = receipts_for(control, card_id)?;
+            let attempt = next_attempt_number(
+                &existing,
+                &state.current_digest,
+                &gate.gate_id,
+                &evaluated_sha,
+                &gate_digest,
+            );
+            let permit = ValidationExecutionPermitRecord {
+                schema: VALIDATION_EXECUTION_PERMIT_SCHEMA.to_owned(),
+                reservation_id: reservation.reservation_id.clone(),
+                reservation_key_digest: reservation.key_digest.clone(),
+                holder_actor_id: args.common.actor.clone(),
+                acquired_at: clock.now(),
+            };
+            steps.at("execution-permit-write")?;
+            control.write_atomic(
+                &ValidationExecutionPermitRecord::relative_path(&reservation.reservation_id),
+                &format!("{}\n", serde_json::to_string_pretty(&permit)?),
+            )?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("validation.execution_acquired", &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(reservation.reservation_id.to_string()),
+                    )
+                    .meta(
+                        "reservation_key_digest",
+                        serde_json::json!(reservation.key_digest.as_str()),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("gate: acquire execution for {}", reservation.reservation_id),
+            )?;
+            acquired = Some(GovernedGateExecution {
+                config,
+                record,
+                state,
+                gate,
+                gate_digest,
+                lease,
+                evaluated_sha,
+                worktree_clean: inspect::worktree_state(&scope)?.clean,
+                existing,
+                attempt,
+                reservation,
+                permit,
+            });
+            Ok(CommandOutcome::new(
+                "gate.run.acquire",
+                "acquired governed validation execution",
+                serde_json::json!({}),
+            ))
+        },
+    )?;
+    acquired.ok_or_else(|| HarnessError::Control {
+        reason: "governed execution acquire completed without a permit".to_owned(),
+        code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn settle_governed_gate_execution(
+    args: &RunArgs,
+    execution: &GovernedGateExecution,
+    outcome: &AttemptOutcome,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    with_transaction(
+        &args.common.control,
+        "gate.run.settle",
+        clock,
+        |control, events, expected, steps| {
+            let permit =
+                execution_permit_for(control, &execution.reservation)?.ok_or_else(|| {
+                    HarnessError::Control {
+                        reason: format!(
+                            "validation reservation {} has no live execution permit",
+                            execution.reservation.reservation_id
+                        ),
+                        code: ErrorCode::PolicyInvalidTransition,
+                    }
+                })?;
+            if permit.reservation_id != execution.permit.reservation_id
+                || permit.reservation_key_digest != execution.permit.reservation_key_digest
+                || permit.holder_actor_id != execution.permit.holder_actor_id
+                || permit.holder_actor_id != args.common.actor
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} execution permit changed",
+                        execution.reservation.reservation_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            if settlement_for(control, &execution.reservation)?.is_some() {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "validation reservation {} is already settled",
+                        execution.reservation.reservation_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            let receipt_id = next_receipt_id(control)?;
+            let finished_at = clock.now();
+            let mut provenance = card_run_provenance(
+                CardProvenanceContext {
+                    config: &execution.config,
+                    record: &execution.record,
+                    card_digest: execution.state.current_digest.clone(),
+                    card_revision: execution.state.current_revision,
+                    lease: &execution.lease,
+                    gate: &execution.gate,
+                    gate_digest: execution.gate_digest.clone(),
+                    evaluated_sha: &execution.evaluated_sha,
+                },
+                &execution.existing,
+                &args.common.actor,
+                finished_at,
+            )?;
+            provenance.validation_reservation = Some(ValidationReservationBinding {
+                reservation_id: execution.reservation.reservation_id.clone(),
+                key_digest: execution.reservation.key_digest.clone(),
+            });
+            let receipt = Receipt {
+                schema: RECEIPT_SCHEMA.to_owned(),
+                receipt_id: receipt_id.clone(),
+                project_id: execution.config.project_id.clone(),
+                cycle_id: execution.record.cycle_id.clone(),
+                card_id: Some(execution.record.card_id.clone()),
+                card_digest: Some(execution.state.current_digest.clone()),
+                integration_id: None,
+                evaluated_sha: execution.evaluated_sha.clone(),
+                gate_id: execution.gate.gate_id.clone(),
+                gate_digest: execution.gate_digest.clone(),
+                harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+                environment_fingerprint: environment_fingerprint(&execution.gate),
+                started_at: execution.permit.acquired_at,
+                finished_at,
+                duration_ms: outcome.duration_ms,
+                exit_code: outcome.exit_code,
+                termination: outcome.termination,
+                stdout_digest: outcome.stdout_digest.clone(),
+                stderr_digest: outcome.stderr_digest.clone(),
+                artifact_digests: outcome.artifact_digests.clone(),
+                log_location: outcome.log_location.clone(),
+                attempt: execution.attempt,
+                passed: outcome.passed(),
+                worktree_clean: Some(execution.worktree_clean),
+                provenance: Some(provenance),
+            };
+            persist_receipt(control, &receipt)?;
+            let settlement = ValidationReservationSettlementRecord {
+                schema: VALIDATION_RESERVATION_SETTLEMENT_SCHEMA.to_owned(),
+                reservation_id: execution.reservation.reservation_id.clone(),
+                reservation_key_digest: execution.reservation.key_digest.clone(),
+                holder_actor_id: execution.reservation.holder_actor_id.clone(),
+                settled_by_actor_id: args.common.actor.clone(),
+                settled_at: finished_at,
+                outcome: ValidationReservationOutcome::ReceiptRecorded {
+                    receipt_id: receipt_id.to_string(),
+                    receipt_digest: receipt.digest()?,
+                },
+            };
+            steps.at("governed-execution-settlement-write")?;
+            control.write_atomic(
+                &ValidationReservationSettlementRecord::relative_path(
+                    &execution.reservation.reservation_id,
+                ),
+                &format!("{}\n", serde_json::to_string_pretty(&settlement)?),
+            )?;
+            fs::remove_file(
+                control.path(&ValidationExecutionPermitRecord::relative_path(
+                    &execution.reservation.reservation_id,
+                )),
+            )
+            .map_err(|source| HarnessError::ControlIo {
+                path: control.path(&ValidationExecutionPermitRecord::relative_path(
+                    &execution.reservation.reservation_id,
+                )),
+                source,
+            })?;
+            events.append(
+                &execution.config.project_id,
+                EventDraft::new("validation.execution_settled", &args.common.actor)
+                    .cycle(execution.record.cycle_id.clone())
+                    .card(
+                        execution.record.card_id.clone(),
+                        execution.state.current_revision,
+                        execution.state.current_digest.clone(),
+                    )
+                    .meta(
+                        "reservation_id",
+                        serde_json::json!(execution.reservation.reservation_id.to_string()),
+                    )
+                    .meta("receipt_id", serde_json::json!(receipt_id.to_string())),
+                clock,
+            )?;
+            let mut event = EventDraft::new("gate.ran", &args.common.actor)
+                .cycle(execution.record.cycle_id.clone())
+                .card(
+                    execution.record.card_id.clone(),
+                    execution.state.current_revision,
+                    execution.state.current_digest.clone(),
+                )
+                .head(execution.evaluated_sha.clone())
+                .meta("gate_id", serde_json::json!(execution.gate.gate_id))
+                .meta(
+                    "gate_digest",
+                    serde_json::json!(execution.gate_digest.as_str()),
+                )
+                .meta("receipt_id", serde_json::json!(receipt_id.to_string()))
+                .meta("attempt", serde_json::json!(execution.attempt))
+                .meta("termination", serde_json::json!(outcome.termination.name()))
+                .meta("passed", serde_json::json!(receipt.passed));
+            event = event
+                .meta(
+                    "reservation_id",
+                    serde_json::json!(execution.reservation.reservation_id.to_string()),
+                )
+                .meta(
+                    "reservation_key_digest",
+                    serde_json::json!(execution.reservation.key_digest.as_str()),
+                );
+            events.append(&execution.config.project_id, event, clock)?;
+            control.commit(
+                expected,
+                &format!(
+                    "gate: settle governed execution {}",
+                    execution.reservation.reservation_id
+                ),
+            )?;
+            report_run(&receipt, &execution.config.project_id)
+        },
+    )
+}
+
+fn settle_governed_gate_execution_with_retry(
+    args: &RunArgs,
+    execution: &GovernedGateExecution,
+    outcome: &AttemptOutcome,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    for attempt in 0..20 {
+        match settle_governed_gate_execution(args, execution, outcome, clock) {
+            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded settlement retry always returns")
+}
+
+fn run_governed_gate(
+    args: &RunArgs,
+    card_id: &CardId,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    // This retry is deliberately local to permit acquisition. It lets two
+    // independently reserved runs pass the short control mutation boundary,
+    // while preserving the project's normal fail-fast lock semantics for
+    // every other command and for terminal settlement.
+    let mut acquired = None;
+    for attempt in 0..20 {
+        match acquire_governed_gate_execution(args, card_id, clock) {
+            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(execution) => {
+                acquired = Some(execution);
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let execution = acquired.ok_or_else(|| HarnessError::Control {
+        reason: "governed execution permit acquisition exhausted its bounded retry".to_owned(),
+        code: ErrorCode::PolicyLockHeld,
+    })?;
+    // A crash after this point must not make the reservation reusable: the
+    // committed permit is the recovery-visible state. This injectable boundary
+    // exercises precisely that otherwise hard-to-reproduce phase split.
+    if std::env::var(crate::control::journal::INJECT_FAILURE_VAR)
+        .ok()
+        .as_deref()
+        == Some("governed-execution-after-acquire")
+    {
+        return Err(HarnessError::Control {
+            reason: "deliberate interruption after governed execution acquire".to_owned(),
+            code: ErrorCode::RecoveryIncomplete,
+        });
+    }
+    let log_root = ControlRepository::open(&args.common.control)?
+        .path(LOG_DIR)
+        .join(card_id.as_str());
+    let disposable = DisposableExecution::create(
+        &ControlRepository::open(&args.common.control)?,
+        &execution.config.repository,
+        &execution.reservation,
+        &execution.lease.worktree_path,
+    )?;
+    let outcome = run_attempt_with_validation_cache(
+        &execution.gate,
+        &disposable.source,
+        &log_root,
+        execution.attempt,
+        clock,
+        Some(&disposable.cache),
+    )?;
+    settle_governed_gate_execution_with_retry(args, &execution, &outcome, clock)
+}
+
+fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    if args.dry_run {
+        return preview_run(args, &card_id, clock);
+    }
+    let control = ControlRepository::open(&args.common.control)?;
+    let lease = held_lease(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+        reason: format!("card {card_id} holds no lease; run `work start` first"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
+    let candidate = inspect::resolve_commit(&GitScope::work_tree(&lease.worktree_path), "HEAD")?;
+    let progress = validation_progress(&control, &card_id, Some(&candidate))?;
+    require_next_gate(&progress, &args.gate_id)?;
+    if requires_execution_reservation(&progress, &args.gate_id) {
+        return run_governed_gate(args, &card_id, clock);
+    }
+    run_gate_locked(args, clock)
+}
+
 // This is the intentionally linear transaction boundary: its order is the
 // safety contract (load → validate → run → record → event → commit).
 #[allow(clippy::too_many_lines)]
-fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     if args.dry_run {
         return preview_run(args, &card_id, clock);
