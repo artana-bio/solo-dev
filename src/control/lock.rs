@@ -331,8 +331,8 @@ impl ProjectLock {
     /// so it is rediagnosed against whoever holds it now — for up to two
     /// passes, which bounds this to at most two calls to `liveness` no
     /// matter how fast the lock churns. A lock still changing after both
-    /// passes is reported `Ambiguous`: two conflicting reads is grounds to
-    /// say so, not grounds to pick one.
+    /// passes is reported `Held`, not `Ambiguous` — see the final return
+    /// below for why that is a truthful answer rather than a guess.
     fn diagnose_with(control: &Path, liveness: &dyn Fn(u32) -> Liveness) -> LockDiagnosis {
         let path = control.join(LOCK_FILE);
 
@@ -370,11 +370,23 @@ impl ProjectLock {
             }
         }
 
-        LockDiagnosis::Ambiguous {
-            holder: Some(holder),
-            reason: "the lock is being acquired and released faster than it can be inspected"
-                .to_owned(),
-        }
+        // A holder record that changed on reread was written *inside* the
+        // inspection window: whoever holds it took the lock milliseconds
+        // ago. Abandonment leaves the file still; this file is the opposite
+        // of still, so `Held` is the truthful reading, not a guess reached
+        // for want of a better one.
+        //
+        // It self-corrects, too. If this last holder turns out to have died
+        // right after acquiring, `Held` maps to `PolicyLockHeld` in
+        // `acquire`, which the retry loops in `gate.rs` cover; the next
+        // attempt reads that same, now-unchanging file, liveness reports
+        // `Gone`, and `Stale` comes out correctly then. Reporting
+        // `Ambiguous` here instead would map to `PolicyLockAmbiguous`, which
+        // none of those retry loops cover, so a healthy system busy enough
+        // to keep changing the lock during inspection would fail outright
+        // with "confirm no harness command is running" — the exact failure
+        // #78 exists to remove, reappearing at higher contention.
+        LockDiagnosis::Held(holder)
     }
 
     /// Reads whatever the lock file currently says.
@@ -765,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_that_keeps_changing_under_inspection_is_ambiguous_rather_than_guessed() {
+    fn a_lock_that_keeps_changing_under_inspection_is_held_not_stale() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(LOCK_FILE);
         let initial = LockHolder {
@@ -798,12 +810,26 @@ mod tests {
             "must consult liveness exactly twice, never loop"
         );
 
-        let LockDiagnosis::Ambiguous { reason, .. } = &diagnosis else {
-            panic!("expected ambiguous, got {diagnosis:?}");
+        // A lock that changed on both rereads was written inside the
+        // inspection window each time, so its holder is milliseconds old,
+        // not abandoned. Reporting `Ambiguous` here would map to
+        // `PolicyLockAmbiguous`, which no retry loop in `gate.rs` covers —
+        // it would fail a command that only lost a race to a busy lock,
+        // without retry, which is #78's defect again at higher contention.
+        // `Held` is both the truthful answer and the retryable one.
+        let LockDiagnosis::Held(held) = diagnosis else {
+            panic!("expected held, got {diagnosis:?}");
         };
-        assert!(
-            reason.contains("faster than it can be inspected"),
-            "{reason}"
+        let last_generation = calls.get();
+        assert_eq!(
+            held,
+            LockHolder {
+                pid: last_generation,
+                acquired_at: clock().now(),
+                operation: format!("generation {last_generation}"),
+                process_start: Some(format!("start {last_generation}")),
+            },
+            "must be held by the last generation observed, not the first"
         );
     }
 }
