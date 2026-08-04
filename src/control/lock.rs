@@ -173,6 +173,20 @@ pub struct ProjectLock {
     holder: LockHolder,
 }
 
+/// What reading the lock file established, for `diagnose_with`.
+///
+/// A plain `Option<LockHolder>` cannot tell "no lock file" apart from "a
+/// lock file present with contents that didn't parse" — and those two need
+/// different diagnoses, `Free` and `Ambiguous` respectively.
+enum HolderRead {
+    /// No lock file exists.
+    Missing,
+    /// A lock file exists but its contents did not parse.
+    Unreadable,
+    /// A lock file exists and named this holder.
+    Present(LockHolder),
+}
+
 impl ProjectLock {
     /// Acquires the lock, failing if another process holds it.
     ///
@@ -292,22 +306,96 @@ impl ProjectLock {
     /// Establishes what can be known about an existing lock.
     #[must_use]
     pub fn diagnose(control: &Path) -> LockDiagnosis {
+        Self::diagnose_with(control, &process_liveness)
+    }
+
+    /// `diagnose`, with liveness checking injected so the race it has to
+    /// survive can be driven deterministically instead of merely hoped not
+    /// to happen.
+    ///
+    /// The race, exactly as issue #78 hit it: `diagnose` reads the holder
+    /// record, then asks `liveness` whether that process is still running.
+    /// For the real `process_liveness` that means shelling out to `ps` —
+    /// milliseconds, not microseconds. If the recorded holder finishes and
+    /// its `Drop` removes the lock file inside that window, `ps` truthfully
+    /// reports the process gone, but the file it was gone from is no longer
+    /// there to be diagnosed. Reporting `Stale` anyway — what this used to
+    /// do — reaches `acquire`, which maps `Stale` to `PolicyStaleLock`: no
+    /// retry, and a message sending a healthy operator to run `project
+    /// recover --resume` against a lock that already released itself.
+    ///
+    /// The fix: a diagnosis computed from the pre-`liveness` read is not
+    /// trusted until the lock file is read again and still names that exact
+    /// holder. A holder that changed was diagnosed against a lock that, by
+    /// the time the answer came back, was already someone else's business,
+    /// so it is rediagnosed against whoever holds it now — for up to two
+    /// passes, which bounds this to at most two calls to `liveness` no
+    /// matter how fast the lock churns. A lock still changing after both
+    /// passes is reported `Ambiguous`: two conflicting reads is grounds to
+    /// say so, not grounds to pick one.
+    fn diagnose_with(control: &Path, liveness: &dyn Fn(u32) -> Liveness) -> LockDiagnosis {
         let path = control.join(LOCK_FILE);
-        if !path.exists() {
-            return LockDiagnosis::Free;
-        }
-        let Some(holder) = Self::read_holder(&path) else {
-            return LockDiagnosis::Ambiguous {
-                holder: None,
-                reason: "the lock file could not be read".to_owned(),
-            };
+
+        let mut holder = match Self::read_current(&path) {
+            HolderRead::Missing => return LockDiagnosis::Free,
+            HolderRead::Unreadable => {
+                return LockDiagnosis::Ambiguous {
+                    holder: None,
+                    reason: "the lock file could not be read".to_owned(),
+                };
+            }
+            HolderRead::Present(holder) => holder,
         };
 
-        match process_liveness(holder.pid) {
+        for _ in 0..2 {
+            let diagnosis = Self::diagnose_holder(&holder, liveness);
+            match Self::read_current(&path) {
+                HolderRead::Missing => return LockDiagnosis::Free,
+                // Unchanged since it was read: the diagnosis just computed
+                // describes the lock as it actually is right now, not as it
+                // was milliseconds ago.
+                HolderRead::Present(reread) if reread == holder => return diagnosis,
+                // Changed hands mid-check: the diagnosis above is an answer
+                // to a question that is no longer being asked. Ask again,
+                // about whoever holds it now.
+                HolderRead::Present(reread) => holder = reread,
+                // No holder to retry with, and in this module "present but
+                // unreadable" has never meant `Free`.
+                HolderRead::Unreadable => {
+                    return LockDiagnosis::Ambiguous {
+                        holder: None,
+                        reason: "the lock changed while it was being inspected, and its new contents could not be read".to_owned(),
+                    };
+                }
+            }
+        }
+
+        LockDiagnosis::Ambiguous {
+            holder: Some(holder),
+            reason: "the lock is being acquired and released faster than it can be inspected"
+                .to_owned(),
+        }
+    }
+
+    /// Reads whatever the lock file currently says.
+    fn read_current(path: &Path) -> HolderRead {
+        if !path.exists() {
+            return HolderRead::Missing;
+        }
+        Self::read_holder(path).map_or(HolderRead::Unreadable, HolderRead::Present)
+    }
+
+    /// Diagnoses one holder record via `liveness`.
+    ///
+    /// Says nothing about whether that record still describes the lock file
+    /// by the time it returns — confirming that is `diagnose_with`'s job,
+    /// because it is the one with a second read to compare against.
+    fn diagnose_holder(holder: &LockHolder, liveness: &dyn Fn(u32) -> Liveness) -> LockDiagnosis {
+        match liveness(holder.pid) {
             // No such process: whoever held it is gone.
             Liveness::Gone => LockDiagnosis::Stale {
                 reason: format!("process {} is no longer running", holder.pid),
-                holder,
+                holder: holder.clone(),
             },
             // Nothing was established, so nothing may be concluded. Clearing a
             // lock whose holder might still be writing is the failure this
@@ -318,11 +406,11 @@ impl ProjectLock {
                     "process {} could not be checked: {reason}. Confirm by hand whether it is still running",
                     holder.pid
                 ),
-                holder: Some(holder),
+                holder: Some(holder.clone()),
             },
             Liveness::Running(current) => match &holder.process_start {
                 // Same PID, same start instant: it is the same process.
-                Some(recorded) if *recorded == current => LockDiagnosis::Held(holder),
+                Some(recorded) if *recorded == current => LockDiagnosis::Held(holder.clone()),
                 // Same PID, different start instant: the number was recycled
                 // and this is an unrelated program.
                 Some(recorded) => LockDiagnosis::Stale {
@@ -330,7 +418,7 @@ impl ProjectLock {
                         "process {} started at {current}, but the lock was taken by a process started at {recorded}; the PID was reused",
                         holder.pid
                     ),
-                    holder,
+                    holder: holder.clone(),
                 },
                 // A lock written before start times were recorded. A live PID
                 // might be the holder or might be a reuse, and there is no way
@@ -340,7 +428,7 @@ impl ProjectLock {
                         "process {} is running, but the lock records no start time to compare against",
                         holder.pid
                     ),
-                    holder: Some(holder),
+                    holder: Some(holder.clone()),
                 },
             },
         }
@@ -601,6 +689,121 @@ mod tests {
         assert!(
             !ProjectLock::clear_stale(temp.path(), &diagnosis).unwrap(),
             "an unprovable lock must not be cleared"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_finishes_during_the_liveness_check_is_not_reported_stale() {
+        // The exact race from issue #78: `diagnose` reads the holder, then
+        // spends milliseconds inside `ps`. If the real holder finishes and
+        // its `Drop` removes the lock file inside that window, `ps`
+        // truthfully reports the process gone — but by the time the answer
+        // comes back, the file it was gone *from* no longer exists to be
+        // diagnosed as `Stale`. Before this fix, `diagnose` never looked
+        // again and reported `Stale` anyway, sending a healthy operator to
+        // run `project recover --resume`.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(LOCK_FILE);
+        let holder = LockHolder {
+            pid: 12_345,
+            acquired_at: clock().now(),
+            operation: "finishing".to_owned(),
+            process_start: Some("whenever".to_owned()),
+        };
+        fs::write(&path, serde_json::to_string(&holder).unwrap()).unwrap();
+
+        let lock_path = path.clone();
+        let liveness = move |_pid: u32| {
+            fs::remove_file(&lock_path).unwrap();
+            Liveness::Gone
+        };
+
+        let diagnosis = ProjectLock::diagnose_with(temp.path(), &liveness);
+        assert_eq!(diagnosis, LockDiagnosis::Free);
+    }
+
+    #[test]
+    fn a_lock_replaced_during_inspection_is_diagnosed_against_the_new_holder() {
+        // Not the finishing race above: here the lock does not empty out, it
+        // changes hands. The first holder's liveness check must not be
+        // trusted to describe whoever holds the lock by the time that check
+        // returns.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(LOCK_FILE);
+        let original = LockHolder {
+            pid: 11_111,
+            acquired_at: clock().now(),
+            operation: "original".to_owned(),
+            process_start: Some("original start".to_owned()),
+        };
+        fs::write(&path, serde_json::to_string(&original).unwrap()).unwrap();
+
+        let replacement = LockHolder {
+            pid: 22_222,
+            acquired_at: clock().now(),
+            operation: "replacement".to_owned(),
+            process_start: Some("replacement start".to_owned()),
+        };
+
+        let original_pid = original.pid;
+        let lock_path = path.clone();
+        let injected = replacement.clone();
+        let liveness = move |pid: u32| {
+            if pid == original_pid {
+                fs::write(&lock_path, serde_json::to_string(&injected).unwrap()).unwrap();
+                Liveness::Gone
+            } else {
+                Liveness::Running(injected.process_start.clone().unwrap())
+            }
+        };
+
+        let diagnosis = ProjectLock::diagnose_with(temp.path(), &liveness);
+        let LockDiagnosis::Held(held) = diagnosis else {
+            panic!("expected the replacement holder to be held, got {diagnosis:?}");
+        };
+        assert_eq!(held, replacement);
+    }
+
+    #[test]
+    fn a_lock_that_keeps_changing_under_inspection_is_ambiguous_rather_than_guessed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(LOCK_FILE);
+        let initial = LockHolder {
+            pid: 0,
+            acquired_at: clock().now(),
+            operation: "generation 0".to_owned(),
+            process_start: Some("start 0".to_owned()),
+        };
+        fs::write(&path, serde_json::to_string(&initial).unwrap()).unwrap();
+
+        let lock_path = path.clone();
+        let calls = std::cell::Cell::new(0u32);
+        let liveness = |_pid: u32| {
+            let generation = calls.get() + 1;
+            calls.set(generation);
+            let next = LockHolder {
+                pid: generation,
+                acquired_at: clock().now(),
+                operation: format!("generation {generation}"),
+                process_start: Some(format!("start {generation}")),
+            };
+            fs::write(&lock_path, serde_json::to_string(&next).unwrap()).unwrap();
+            Liveness::Gone
+        };
+
+        let diagnosis = ProjectLock::diagnose_with(temp.path(), &liveness);
+        assert_eq!(
+            calls.get(),
+            2,
+            "must consult liveness exactly twice, never loop"
+        );
+
+        let LockDiagnosis::Ambiguous { reason, .. } = &diagnosis else {
+            panic!("expected ambiguous, got {diagnosis:?}");
+        };
+        assert!(
+            reason.contains("faster than it can be inspected"),
+            "{reason}"
         );
     }
 }
