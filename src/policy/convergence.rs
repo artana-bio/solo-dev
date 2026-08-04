@@ -24,6 +24,7 @@ use crate::{
     config::ConvergencePolicy,
     control::event_store::Event,
     domain::{
+        card::Risk,
         digest::Digest,
         ids::{CardId, CycleId, ProjectId},
     },
@@ -503,6 +504,150 @@ pub fn project(
 
 fn is_exact_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Which bounded card dimension a budget covers.
+///
+/// Declaration order is significant: `assess_card` reports exhausted
+/// dimensions in this order, not discovery order, so the same card always
+/// lists its exhausted dimensions the same way regardless of which facts a
+/// projection happened to fold first.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum CardDimension {
+    ReviewReturns,
+    RepairAttempts,
+    GateFailures,
+    MaterialScopeRevisions,
+}
+
+/// One dimension whose budget is spent, and what spent it.
+///
+/// `evidence` is copied from the matching `DimensionCount`, so the same
+/// "count is authoritative, evidence may undercount because two facts can
+/// cite one reference" property documented there holds here too.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ExhaustedDimension {
+    pub dimension: CardDimension,
+    pub count: u32,
+    pub limit: u32,
+    pub evidence: BTreeSet<String>,
+}
+
+/// What the recorded facts say about one card's budget.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CardConvergence {
+    /// No policy configured: nothing to enforce, and no budget implied.
+    LegacyUnassessed,
+    /// A policy is configured and every dimension still has budget.
+    Within,
+    /// At least one registered budget is spent.
+    Escalated {
+        exhausted: Vec<ExhaustedDimension>,
+        next_permitted_action: NextPermittedAction,
+    },
+}
+
+/// The only thing that may happen next to an escalated card.
+///
+/// A single-variant enum on purpose: the next action is a closed value
+/// programs compare against, not a prose sentence whose wording can drift
+/// between call sites. #74 adds the command that satisfies it; until then
+/// this names what is required, not what already exists.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NextPermittedAction {
+    RecordAuthorizedDisposition,
+}
+
+/// Assesses one card against the budget its declared risk selects.
+///
+/// A missing policy, or a project still in `LegacyUnassessed`, answers
+/// `LegacyUnassessed` rather than inferring a budget nobody configured. The
+/// opposite mistake matters just as much: a card the projection never
+/// mentions has no entry in `view.cards`, and that absence is silence about
+/// *attempts*, not absence of *budget* — such a card is `Within`, exactly as
+/// if it had been recorded with every counter sitting at zero.
+///
+/// A dimension is exhausted at `count >= limit`, not `count > limit`: a
+/// limit of 2 grants two attempts, and it is the second one — not some third
+/// attempt that was never going to be permitted anyway — that spends the
+/// budget.
+///
+/// Every exhausted dimension is reported, in `CardDimension`'s declared
+/// order, not only the first one found. An operator who fixes the one
+/// dimension a partial answer happened to mention, then meets a second
+/// dimension hiding behind it on the next attempt, has lost a whole review
+/// cycle to a check that already knew about both.
+#[must_use]
+pub fn assess_card(
+    policy: Option<&ConvergencePolicy>,
+    view: &ProjectConvergence,
+    card_id: &CardId,
+    risk: Risk,
+) -> CardConvergence {
+    let Some(policy) = policy else {
+        return CardConvergence::LegacyUnassessed;
+    };
+    let ProjectConvergence::Configured(view) = view else {
+        return CardConvergence::LegacyUnassessed;
+    };
+    let limits = policy.card_limits.for_risk(risk);
+    // A card the projection never mentions has no `CardCounters` entry at
+    // all. That is silence, not a zero-attempt fact; `Default` gives exactly
+    // the all-zero counters that silence implies, without inventing an
+    // entry in a map that is supposed to mean "facts were recorded here".
+    let empty_counters = CardCounters::default();
+    let counters = view.cards.get(card_id).unwrap_or(&empty_counters);
+
+    // Fixed order, not discovery order: this list mirrors `CardDimension`'s
+    // own declaration so the two can never silently drift apart.
+    let budgets = [
+        (
+            CardDimension::ReviewReturns,
+            &counters.review_returns,
+            limits.review_returns,
+        ),
+        (
+            CardDimension::RepairAttempts,
+            &counters.repair_attempts,
+            limits.repair_attempts,
+        ),
+        (
+            CardDimension::GateFailures,
+            &counters.gate_failures,
+            limits.gate_failures,
+        ),
+        (
+            CardDimension::MaterialScopeRevisions,
+            &counters.material_scope_revisions,
+            limits.material_scope_revisions,
+        ),
+    ];
+
+    let mut exhausted = Vec::new();
+    for (dimension, count, limit) in budgets {
+        // `>=`, not `>`: the boundary this function exists to get right.
+        // See the doc comment above.
+        if count.count >= limit {
+            exhausted.push(ExhaustedDimension {
+                dimension,
+                count: count.count,
+                limit,
+                evidence: count.evidence.clone(),
+            });
+        }
+    }
+
+    if exhausted.is_empty() {
+        CardConvergence::Within
+    } else {
+        CardConvergence::Escalated {
+            exhausted,
+            next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+        }
+    }
 }
 
 impl Trend {
@@ -1365,5 +1510,254 @@ mod tests {
         let mut missing_digest = event(2, AttemptKind::RepairAttempt);
         missing_digest.card_digest = None;
         assert!(project(Some(&policy()), &project_id, &cycle, &[missing_digest]).is_err());
+    }
+
+    #[test]
+    fn a_dimension_exactly_at_its_limit_is_exhausted() {
+        // The frontier this card exists to get right: two review returns
+        // against a limit of two is the budget spent, not one short of
+        // spent.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium),
+            CardConvergence::Escalated {
+                exhausted: vec![ExhaustedDimension {
+                    dimension: CardDimension::ReviewReturns,
+                    count: 2,
+                    limit: 2,
+                    evidence: BTreeSet::from(["receipt:1".to_owned(), "receipt:2".to_owned()]),
+                }],
+                next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+            }
+        );
+    }
+
+    #[test]
+    fn a_dimension_one_below_its_limit_still_has_budget() {
+        // The other half of the same frontier, in its own test so neither
+        // side can drift without the other noticing.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![event(1, AttemptKind::ReviewReturn)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium),
+            CardConvergence::Within,
+            "one review return against a limit of two is one attempt still available"
+        );
+    }
+
+    #[test]
+    fn every_exhausted_dimension_is_reported_not_only_the_first() {
+        // Review returns and gate failures both spent; repair attempts and
+        // material scope revisions both untouched. An operator who only
+        // learns about review_returns here, fixes it, and then meets
+        // gate_failures on the next attempt has lost a cycle for nothing.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+            event(3, AttemptKind::GateFailure),
+            event(4, AttemptKind::GateFailure),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        let CardConvergence::Escalated { exhausted, .. } =
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium)
+        else {
+            panic!("two spent dimensions must escalate the card");
+        };
+        assert_eq!(
+            exhausted
+                .iter()
+                .map(|item| item.dimension)
+                .collect::<Vec<_>>(),
+            vec![CardDimension::ReviewReturns, CardDimension::GateFailures],
+            "both exhausted dimensions must appear, in CardDimension's declared order"
+        );
+    }
+
+    #[test]
+    fn the_budget_follows_the_cards_declared_risk() {
+        // Same one recorded review return, two risk tiers with different
+        // review_returns limits: low risk still has budget, high risk does
+        // not. If this read a fixed tier instead of the card's own declared
+        // risk, both assertions below would see the same answer.
+        let low_limits = CardConvergenceLimits {
+            review_returns: 5,
+            repair_attempts: 5,
+            gate_failures: 5,
+            material_scope_revisions: 5,
+        };
+        let high_limits = CardConvergenceLimits {
+            review_returns: 1,
+            repair_attempts: 5,
+            gate_failures: 5,
+            material_scope_revisions: 5,
+        };
+        let tiered_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: RiskConvergenceLimits {
+                low: low_limits,
+                medium: high_limits.clone(),
+                high: high_limits.clone(),
+                critical: high_limits,
+            },
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: 2,
+            },
+        };
+        let card_id = CardId::from_str("F-001").unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: tiered_policy.digest().unwrap(),
+            cycle: CycleCounters::default(),
+            cards: BTreeMap::from([(
+                card_id.clone(),
+                CardCounters {
+                    review_returns: DimensionCount {
+                        count: 1,
+                        evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                    },
+                    ..CardCounters::default()
+                },
+            )]),
+        });
+
+        assert_eq!(
+            assess_card(Some(&tiered_policy), &view, &card_id, Risk::Low),
+            CardConvergence::Within,
+            "low risk grants five review returns; one is nowhere near spent"
+        );
+        assert_eq!(
+            assess_card(Some(&tiered_policy), &view, &card_id, Risk::High),
+            CardConvergence::Escalated {
+                exhausted: vec![ExhaustedDimension {
+                    dimension: CardDimension::ReviewReturns,
+                    count: 1,
+                    limit: 1,
+                    evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                }],
+                next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+            },
+            "high risk grants only one review return, and it is already spent"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_recorded_facts_is_within_budget() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let view = project(Some(&policy()), &project_id, &cycle, &[]).unwrap();
+
+        assert_eq!(
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium),
+            CardConvergence::Within,
+            "absence of facts is not absence of budget"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_policy_assesses_as_legacy_unassessed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+        ];
+        let configured_view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_card(None, &configured_view, &card_id, Risk::Medium),
+            CardConvergence::LegacyUnassessed,
+            "no configured policy means nothing to enforce, even though these \
+             facts would otherwise exhaust the budget"
+        );
+        assert_eq!(
+            assess_card(
+                Some(&policy()),
+                &ProjectConvergence::LegacyUnassessed,
+                &card_id,
+                Risk::Medium
+            ),
+            CardConvergence::LegacyUnassessed,
+            "a legacy project has no implicit budget even once a policy exists"
+        );
+    }
+
+    #[test]
+    fn only_the_named_card_is_assessed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let exhausted_card = CardId::from_str("F-001").unwrap();
+        let quiet_card = CardId::from_str("F-002").unwrap();
+        let mut third = event(3, AttemptKind::ReviewReturn);
+        third.card_id = Some(quiet_card.clone());
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+            third,
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert!(
+            matches!(
+                assess_card(Some(&policy()), &view, &exhausted_card, Risk::Medium),
+                CardConvergence::Escalated { .. }
+            ),
+            "F-001 has spent its review_returns budget"
+        );
+        assert_eq!(
+            assess_card(Some(&policy()), &view, &quiet_card, Risk::Medium),
+            CardConvergence::Within,
+            "F-002 has one review return against a limit of two and must not \
+             inherit F-001's exhaustion"
+        );
+    }
+
+    #[test]
+    fn the_three_shapes_serialize_exactly() {
+        assert_eq!(
+            serde_json::to_string(&CardConvergence::LegacyUnassessed).unwrap(),
+            r#"{"status":"legacy_unassessed"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CardConvergence::Within).unwrap(),
+            r#"{"status":"within"}"#
+        );
+
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let mut first = event(1, AttemptKind::ReviewReturn);
+        first.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("review:RV-000001"),
+        );
+        let mut second = event(2, AttemptKind::ReviewReturn);
+        second.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("review:RV-000002"),
+        );
+        let view = project(Some(&policy()), &project_id, &cycle, &[first, second]).unwrap();
+
+        let escalated = assess_card(Some(&policy()), &view, &card_id, Risk::Medium);
+        assert_eq!(
+            serde_json::to_string(&escalated).unwrap(),
+            r#"{"status":"escalated","exhausted":[{"dimension":"review_returns","count":2,"limit":2,"evidence":["review:RV-000001","review:RV-000002"]}],"next_permitted_action":"record_authorized_disposition"}"#
+        );
     }
 }
