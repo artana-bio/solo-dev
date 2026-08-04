@@ -797,7 +797,13 @@ fn preview_revise(
     )?;
     require_declared_proof(&config.validation_policy, &preview)?;
     // The same verdict the real command reaches: a fact is recorded only when
-    // a policy is configured *and* the revision is material.
+    // a policy is configured *and* the revision is material. Reported below
+    // as `material_scope_revision_recorded`, not `material_scope_revision`:
+    // the field states whether a fact would be *written*, not whether the
+    // revision is material on its own. Under no configured policy it reads
+    // `false` even for a revision that widens the write scope, because
+    // nothing would be recorded — a consumer must not read `false` here as
+    // "this revision was not material".
     let material_scope_revision =
         config.convergence_policy.is_some() && is_material_scope_revision(&previous, &preview);
     Ok(CommandOutcome::new(
@@ -816,7 +822,7 @@ fn preview_revise(
             "dry_run": true,
             "card_id": card_id.to_string(),
             "superseded_revision": state.current_revision,
-            "material_scope_revision": material_scope_revision,
+            "material_scope_revision_recorded": material_scope_revision,
         }),
     ))
 }
@@ -948,6 +954,11 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &format!("card: revise {card_id} to r{}", record.revision),
             )?;
 
+            // `material_scope_revision_recorded`, not `material_scope_revision`:
+            // this reports whether the fact above was actually written, not
+            // whether the revision was material on its own. It reads `false`
+            // whenever no policy is configured, however material the revision
+            // was, because there was nothing to record.
             Ok(CommandOutcome::new(
                 "card.revise",
                 format!(
@@ -968,7 +979,7 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     "superseded_revision": state.current_revision,
                     "superseded_digest": state.current_digest.as_str(),
                     "state": CardState::Ready.name(),
-                    "material_scope_revision": recorded_material_scope_fact,
+                    "material_scope_revision_recorded": recorded_material_scope_fact,
                 }),
             )
             .with_project(config.project_id.clone()))

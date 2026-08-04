@@ -1040,7 +1040,7 @@ fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
     );
     let preview_envelope: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(
-        preview_envelope["data"]["material_scope_revision"].as_bool(),
+        preview_envelope["data"]["material_scope_revision_recorded"].as_bool(),
         Some(true),
         "the preview must predict a material revision: {preview_envelope}"
     );
@@ -1057,7 +1057,7 @@ fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
     );
     let real_envelope: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
     assert_eq!(
-        real_envelope["data"]["material_scope_revision"].as_bool(),
+        real_envelope["data"]["material_scope_revision_recorded"].as_bool(),
         Some(true),
         "the real command's own report must match what it predicted: {real_envelope}"
     );
@@ -1085,7 +1085,7 @@ fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
     let preview_reword_envelope: serde_json::Value =
         serde_json::from_slice(&preview_reword.stdout).unwrap();
     assert_eq!(
-        preview_reword_envelope["data"]["material_scope_revision"].as_bool(),
+        preview_reword_envelope["data"]["material_scope_revision_recorded"].as_bool(),
         Some(false),
         "the preview must predict no fact for a reword-only revision: {preview_reword_envelope}"
     );
@@ -1099,7 +1099,7 @@ fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
     let real_reword_envelope: serde_json::Value =
         serde_json::from_slice(&real_reword.stdout).unwrap();
     assert_eq!(
-        real_reword_envelope["data"]["material_scope_revision"].as_bool(),
+        real_reword_envelope["data"]["material_scope_revision_recorded"].as_bool(),
         Some(false),
         "{real_reword_envelope}"
     );
