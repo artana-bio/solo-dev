@@ -48,7 +48,10 @@ use crate::{
         inspect, integration_worktree, landing,
         merge::{Conflict, ConflictClass, merge_tree},
     },
-    policy::actors,
+    policy::{
+        actors,
+        convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory},
+    },
     runner::{
         environment_fingerprint,
         receipt::{
@@ -2226,6 +2229,13 @@ fn build_integration(
     outcome
 }
 
+// 71-R4's post-transaction sequencing — capturing the merge transaction's
+// result in full before ever deciding whether to record a failure fact — has
+// to stay visible in this one function: splitting it into a helper the
+// length limit would otherwise invite risks hiding, at a call site, exactly
+// the "never nested inside the failed transaction" ordering the frozen
+// contract requires.
+#[allow(clippy::too_many_lines)]
 fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
 
@@ -2246,7 +2256,7 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         .with_project(config.project_id));
     }
 
-    with_transaction(
+    let outcome = with_transaction(
         &args.control,
         "integration.merge",
         clock,
@@ -2339,7 +2349,165 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             )
             .with_project(config.project_id.clone()))
         },
-    )
+    );
+
+    // 71-R4: the transaction above has just failed and rolled back — every
+    // path that reaches `ConflictMergeFailed` inside it, in `build_integration`
+    // and in the preflight check, returns before writing the integration
+    // record, appending `integration.merged`, or calling `control.commit`, so
+    // nothing about the attempted integration is ever durable. What runs next
+    // is a second, independent transaction, never nested inside the one that
+    // just failed — see `record_integration_failure` for why a refusal path
+    // writes at all and what "writes the fact and nothing else" is checked
+    // against.
+    match outcome {
+        Err(error) if error.code() == ErrorCode::ConflictMergeFailed => Err(finalize_conflict(
+            &args.control,
+            &integration_id,
+            &args.actor_id,
+            clock,
+            error,
+        )),
+        other => other,
+    }
+}
+
+/// The bare text of a [`HarnessError`], without [`HarnessError::Control`]'s
+/// own `"control state: "` prefix.
+///
+/// Exists only so `finalize_conflict` can join two error reasons into one
+/// sentence without nesting that prefix in its own middle.
+fn plain_reason(error: &HarnessError) -> String {
+    match error {
+        HarnessError::Control { reason, .. } => reason.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Turns a `ConflictMergeFailed` from `run_merge` into the error it actually
+/// returns, after attempting to record it.
+///
+/// Recording succeeding changes nothing about the refusal: the conflict is
+/// still returned, unchanged, because a fact was recorded about it, not
+/// instead of it. Recording failing must not be silent — rule 4 of the frozen
+/// contract requires the returned error to say both that the integration
+/// conflicted and that the failure could not be recorded — so this combines
+/// the two rather than choosing one.
+fn finalize_conflict(
+    control_path: &std::path::Path,
+    integration_id: &IntegrationId,
+    actor_id: &str,
+    clock: &dyn Clock,
+    error: HarnessError,
+) -> HarnessError {
+    match record_integration_failure(control_path, integration_id, actor_id, clock) {
+        Ok(()) => error,
+        Err(record_error) => HarnessError::Control {
+            reason: format!(
+                "{}; additionally, the integration failure could not be recorded as a convergence fact: {}",
+                plain_reason(&error),
+                plain_reason(&record_error)
+            ),
+            code: ErrorCode::ConflictMergeFailed,
+        },
+    }
+}
+
+/// Records a cycle-bound `integration_failure` convergence fact for a merge
+/// that just refused with [`ErrorCode::ConflictMergeFailed`].
+///
+/// This is a new precedent: every convergence fact recorded before 71-R4 was
+/// written from a command's own successful transaction, alongside the state
+/// that command was already writing. There is no such transaction here — the
+/// merge failed and rolled back, on purpose, before this function is ever
+/// called (see `finalize_conflict`'s caller) — so this opens a second,
+/// complete transaction of its own, entirely after the first one's has ended.
+/// Its only effect is to append one event and commit it: no integration
+/// record update, no card state, no refs, no worktrees. That is what makes it
+/// safe to write from what is otherwise a read-only refusal path — what is
+/// committed is a complete record of one failed attempt, never a
+/// half-finished integration.
+///
+/// Nesting the append inside the failed transaction instead was not an
+/// option: that transaction must keep returning `Err` without calling
+/// `control.commit`, which is exactly what leaves it clean and rolled back,
+/// so any write placed inside it would either never be committed or would
+/// force the failed merge itself to become durable to carry it.
+///
+/// Without a configured convergence policy, this returns `Ok(())` having
+/// opened no transaction at all — not even one that would append nothing —
+/// so an unconfigured project's refusal stays byte-for-byte what it was
+/// before this fact existed.
+///
+/// # Errors
+///
+/// Returns an error when a policy is configured but the fact could not be
+/// durably recorded. The caller combines this with the original conflict
+/// rather than swallowing it.
+fn record_integration_failure(
+    control_path: &std::path::Path,
+    integration_id: &IntegrationId,
+    actor_id: &str,
+    clock: &dyn Clock,
+) -> Result<(), HarnessError> {
+    let control = ControlRepository::open(control_path)?;
+    let config = control.project()?;
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Ok(());
+    };
+    let policy_digest = policy.digest()?;
+    let record = load_integration(&control, integration_id)?;
+    let project_id = config.project_id.clone();
+    let cycle_id = record.cycle_id;
+    // The field of the integration record naming the exact commit the merge
+    // was attempted against: captured fresh from the authority at `integration
+    // prepare` time (`build_record`) and re-verified equal to the live
+    // protected branch by `require_fresh_authority`, which both
+    // `ConflictMergeFailed` sites in `run_merge` run after. `integration_head`
+    // is not a candidate — it is exactly the field this failed attempt never
+    // got to set.
+    let head = record.expected_main_sha;
+
+    with_transaction(
+        control_path,
+        "integration.merge-failure",
+        clock,
+        move |control, events, expected, _steps| {
+            events.append(
+                &project_id,
+                EventDraft::new(ATTEMPT_RECORDED_EVENT, actor_id)
+                    .cycle(cycle_id)
+                    .head(head)
+                    .meta(
+                        "attempt_kind",
+                        serde_json::to_value(AttemptKind::IntegrationFailure)?,
+                    )
+                    .meta(
+                        "reason_category",
+                        serde_json::to_value(ReasonCategory::IntegrationConflict)?,
+                    )
+                    .meta(
+                        "evidence_ref",
+                        serde_json::json!(format!("integration:{integration_id}")),
+                    )
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("integration: record merge failure of {integration_id}"),
+            )?;
+            Ok(CommandOutcome::new(
+                "integration.merge-failure",
+                format!(
+                    "recorded one integration_failure convergence fact for integration {integration_id}"
+                ),
+                serde_json::json!({"integration_id": integration_id.to_string()}),
+            )
+            .with_project(project_id))
+        },
+    )?;
+    Ok(())
 }
 
 /// Refuses an integration whose cards declare *shared* generated artifacts.

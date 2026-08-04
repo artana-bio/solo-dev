@@ -7,8 +7,13 @@
 
 mod support;
 
-use std::{fmt::Write as _, fs};
+use std::{collections::BTreeSet, fmt::Write as _, fs};
 
+use change_harness::{
+    control::{event_store::Event, repository::ControlRepository},
+    domain::ids::{CycleId, ProjectId},
+    policy::convergence::{ProjectConvergence, project},
+};
 use support::Workspace;
 
 /// Warnings are advisories on stderr; the envelope carries them too.
@@ -1573,5 +1578,353 @@ fn a_project_without_a_convergence_policy_records_no_facts_at_handoff() {
     assert!(
         attempt_recorded_events(&workspace).is_empty(),
         "no configured policy means no attempt fact, however the declaration reads"
+    );
+}
+
+// 71-R4: an `integration merge` that fails with `ConflictMergeFailed` records
+// a cycle-bound `integration_failure` fact before it refuses.
+
+/// Prepares every ready card and returns the integration identifier.
+fn prepare_integration(workspace: &Workspace) -> String {
+    workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// An approved card that conflicts with the protected branch.
+///
+/// The same fixture shape as `merge_preflight.rs`'s `conflicting()`: `WP-230`
+/// refuses two active cards claiming the same path, so two cards can never be
+/// made to conflict with each other. A conflict reaches `integration merge`
+/// by the other route instead — the protected branch moving under an already
+/// approved candidate — which is exactly what `expected_main_sha` exists to
+/// pin. Kept as its own copy here rather than shared with that file: each
+/// file under `tests/` is its own binary, and `merge_preflight.rs`'s version
+/// is a private fn, not part of `support`.
+fn conflicting() -> Workspace {
+    let workspace = Workspace::initialized();
+    // A file the card and the branch will both edit must exist at the baseline.
+    fs::write(
+        workspace.repository.join("shared.txt"),
+        "line1\nline2\nline3\n",
+    )
+    .unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+    support::git(&workspace.repository, &["commit", "-q", "-m", "add shared"]);
+    support::git(
+        &workspace.repository,
+        &["push", "-q", "harness-authority", "main"],
+    );
+
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["shared.txt"]);
+    workspace.approve_card("F-001", "shared.txt");
+
+    // Someone lands a change to the same file directly on the protected branch.
+    fs::write(
+        workspace.repository.join("shared.txt"),
+        "landed elsewhere\nline2\nline3\n",
+    )
+    .unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+    support::git(&workspace.repository, &["commit", "-q", "-m", "hotfix"]);
+    support::git(
+        &workspace.repository,
+        &["push", "-q", "harness-authority", "main"],
+    );
+    workspace
+}
+
+/// Like [`conflicting`], but with a convergence policy configured first — see
+/// [`opened_with_policy`] for why the policy has to precede `cycle create`.
+fn conflicting_under_policy(card_limit: u32, integration_limit: u32) -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.configure_convergence_policy(card_limit, integration_limit);
+
+    fs::write(
+        workspace.repository.join("shared.txt"),
+        "line1\nline2\nline3\n",
+    )
+    .unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+    support::git(&workspace.repository, &["commit", "-q", "-m", "add shared"]);
+    support::git(
+        &workspace.repository,
+        &["push", "-q", "harness-authority", "main"],
+    );
+
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["shared.txt"]);
+    workspace.approve_card("F-001", "shared.txt");
+
+    fs::write(
+        workspace.repository.join("shared.txt"),
+        "landed elsewhere\nline2\nline3\n",
+    )
+    .unwrap();
+    support::git(&workspace.repository, &["add", "-A"]);
+    support::git(&workspace.repository, &["commit", "-q", "-m", "hotfix"]);
+    support::git(
+        &workspace.repository,
+        &["push", "-q", "harness-authority", "main"],
+    );
+    workspace
+}
+
+/// `count` independent approved cards, each touching its own directory, ready
+/// to integrate cleanly, under a configured convergence policy.
+fn integrable_under_policy(card_limit: u32, integration_limit: u32, count: usize) -> Workspace {
+    let workspace = opened_with_policy(card_limit, integration_limit);
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
+        workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+        workspace.approve_card(&card, &format!("src/{card}/a.rs"));
+    }
+    workspace
+}
+
+#[test]
+fn a_conflicting_integration_records_one_cycle_bound_failure_fact_and_still_refuses() {
+    let workspace = conflicting_under_policy(3, 3);
+    let id = prepare_integration(&workspace);
+    let authority_head = workspace.authority_head();
+
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert!(
+        !output.status.success(),
+        "a conflicting merge must still be refused"
+    );
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(error_code(&output), "CH-CONFLICT-MERGE-FAILED");
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "exactly one attempt fact must be recorded: {attempts:?}"
+    );
+    let fact = &attempts[0];
+    assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+    assert!(
+        fact["card_id"].is_null(),
+        "an integration failure names no card: {fact}"
+    );
+    assert!(
+        fact["card_revision"].is_null(),
+        "an integration failure names no card revision: {fact}"
+    );
+    assert!(
+        fact["card_digest"].is_null(),
+        "an integration failure names no card digest: {fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["attempt_kind"], "integration_failure",
+        "{fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["reason_category"], "integration_conflict",
+        "{fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["evidence_ref"],
+        format!("integration:{id}"),
+        "{fact}"
+    );
+    let head_sha = fact["head_sha"].as_str().expect("head_sha is a string");
+    assert_eq!(
+        head_sha.len(),
+        40,
+        "head_sha must be an exact commit SHA: {fact}"
+    );
+    assert!(
+        head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "head_sha must be hex: {fact}"
+    );
+    assert_eq!(
+        head_sha, authority_head,
+        "head must name the exact commit the merge was attempted against: {fact}"
+    );
+    assert_real_policy_digest(fact);
+}
+
+#[test]
+fn two_conflicting_attempts_record_two_facts() {
+    let workspace = conflicting_under_policy(3, 3);
+    let id = prepare_integration(&workspace);
+
+    for _ in 0..2 {
+        let output = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(error_code(&output), "CH-CONFLICT-MERGE-FAILED");
+    }
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the counter must rise to two: {attempts:?}"
+    );
+    // R1 already documents that the counter is authoritative and evidence is
+    // a set of distinct references: repeated failures of the same
+    // integration share one `evidence_ref`.
+    let expected_ref = format!("integration:{id}");
+    for fact in &attempts {
+        assert_eq!(
+            fact["metadata"]["evidence_ref"], expected_ref,
+            "repeated failures of the same integration share one evidence_ref: {fact}"
+        );
+    }
+}
+
+#[test]
+fn a_successful_integration_records_no_failure_fact() {
+    let workspace = integrable_under_policy(3, 3, 2);
+    let id = prepare_integration(&workspace);
+
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert!(
+        output.status.success(),
+        "the fixture must merge cleanly: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a successful merge must not record an integration_failure fact"
+    );
+}
+
+#[test]
+fn a_refusal_that_is_not_a_conflict_records_no_failure_fact() {
+    let workspace = opened_with_policy(3, 3);
+
+    // No integration named `INT-999` was ever prepared: a precondition
+    // failure, not a conflict.
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        "INT-999",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a refusal that is not a conflict must not record an integration_failure fact"
+    );
+}
+
+#[test]
+fn a_project_without_a_convergence_policy_records_no_fact_when_integration_conflicts() {
+    // No `configure_convergence_policy` call, matching
+    // `a_project_without_a_convergence_policy_records_no_attempt_fact`
+    // elsewhere in this file: the same rejection as today, cero facts.
+    let workspace = conflicting();
+    let id = prepare_integration(&workspace);
+    let control_before = workspace.control_head();
+
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(error_code(&output), "CH-CONFLICT-MERGE-FAILED");
+    assert_eq!(
+        workspace.control_head(),
+        control_before,
+        "no configured policy means no additional control write; a refused merge records nothing"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "no configured policy means no attempt fact, however the merge failed"
+    );
+}
+
+#[test]
+fn the_recorded_failure_projects_into_the_cycle_counter() {
+    let workspace = conflicting_under_policy(3, 3);
+    let id = prepare_integration(&workspace);
+    workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(
+        attempt_recorded_events(&workspace).len(),
+        1,
+        "the fixture must produce exactly one attempt fact before projecting it"
+    );
+
+    // The real proof that the fact is usable by #73 and not merely written:
+    // round-trip every event through the actual projection.
+    let events: Vec<Event> = workspace
+        .events()
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("a well-formed event"))
+        .collect();
+    let control = ControlRepository::open(&workspace.control).expect("control repository opens");
+    let config = control.project().expect("the project document reads");
+    let project_id: ProjectId = "example".parse().unwrap();
+    let cycle_id: CycleId = "C-001".parse().unwrap();
+
+    let projection = project(
+        config.convergence_policy.as_ref(),
+        &project_id,
+        &cycle_id,
+        &events,
+    )
+    .expect("a well-formed projection");
+
+    let ProjectConvergence::Configured(view) = projection else {
+        panic!("a configured policy must project as configured");
+    };
+    assert_eq!(view.cycle.integration_failures.count, 1);
+    assert_eq!(
+        view.cycle.integration_failures.evidence,
+        BTreeSet::from([format!("integration:{id}")]),
+        "the projection must retain the evidence #73 will read"
     );
 }
