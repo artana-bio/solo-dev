@@ -203,11 +203,12 @@ pub enum AttemptKind {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCategory {
-    ReviewFindings,
-    ImplementationRepair,
-    GateFailure,
-    ScopeRevision,
-    IntegrationFailure,
+    AcceptanceDefect,
+    Regression,
+    SecurityConcern,
+    ScopeChange,
+    IntegrationConflict,
+    NonBlockingImprovement,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -258,7 +259,6 @@ pub struct CycleCounters {
 /// discovery order.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ConvergenceProjection {
-    pub status: String,
     pub policy_digest: Digest,
     pub cycle: CycleCounters,
     pub cards: BTreeMap<CardId, CardCounters>,
@@ -297,12 +297,12 @@ pub fn project(
         reason: error.to_string(),
     })?;
     let mut result = ConvergenceProjection {
-        status: "configured".to_owned(),
         policy_digest: policy_digest.clone(),
         cycle: CycleCounters::default(),
         cards: BTreeMap::new(),
     };
     let mut seen = BTreeSet::new();
+    let mut bindings: BTreeMap<CardId, (u32, Digest, String)> = BTreeMap::new();
 
     for event in events
         .iter()
@@ -346,14 +346,14 @@ pub fn project(
                 if event.card_id.is_some()
                     || event.card_revision.is_some()
                     || event.card_digest.is_some()
-                    || event.head_sha.is_some()
+                    || !event.head_sha.as_deref().is_some_and(is_exact_sha)
                 {
                     return Err(ProjectionError {
                         event_id,
                         reason: "integration failure must be cycle-only".to_owned(),
                     });
                 }
-                if metadata.reason_category != ReasonCategory::IntegrationFailure {
+                if !reason_is_compatible(metadata.attempt_kind, metadata.reason_category) {
                     return Err(ProjectionError {
                         event_id,
                         reason: "integration failure has incompatible reason category".to_owned(),
@@ -369,7 +369,7 @@ pub fn project(
                     })?;
             }
             kind => {
-                let (Some(card_id), Some(_revision), Some(_digest), Some(_head)) = (
+                let (Some(card_id), Some(revision), Some(digest), Some(head)) = (
                     event.card_id.as_ref(),
                     event.card_revision,
                     event.card_digest.as_ref(),
@@ -381,17 +381,25 @@ pub fn project(
                             .to_owned(),
                     });
                 };
-                let expected_reason = match kind {
-                    AttemptKind::ReviewReturn => ReasonCategory::ReviewFindings,
-                    AttemptKind::RepairAttempt => ReasonCategory::ImplementationRepair,
-                    AttemptKind::GateFailure => ReasonCategory::GateFailure,
-                    AttemptKind::MaterialScopeRevision => ReasonCategory::ScopeRevision,
-                    AttemptKind::IntegrationFailure => unreachable!(),
-                };
-                if metadata.reason_category != expected_reason {
+                if !is_exact_sha(head) {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "card attempt head is not an exact commit SHA".to_owned(),
+                    });
+                }
+                if !reason_is_compatible(kind, metadata.reason_category) {
                     return Err(ProjectionError {
                         event_id,
                         reason: "card attempt has incompatible reason category".to_owned(),
+                    });
+                }
+                let binding = (revision, digest.clone(), head.clone());
+                if let Some(existing) = bindings.insert(card_id.clone(), binding.clone())
+                    && existing != binding
+                {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "card attempts mix revision, digest, or head bindings".to_owned(),
                     });
                 }
                 let counters = result.cards.entry(card_id.clone()).or_default();
@@ -410,6 +418,34 @@ pub fn project(
         }
     }
     Ok(ProjectConvergence::Configured(result))
+}
+
+fn is_exact_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn reason_is_compatible(kind: AttemptKind, reason: ReasonCategory) -> bool {
+    match kind {
+        AttemptKind::ReviewReturn => matches!(
+            reason,
+            ReasonCategory::AcceptanceDefect
+                | ReasonCategory::Regression
+                | ReasonCategory::SecurityConcern
+                | ReasonCategory::NonBlockingImprovement
+        ),
+        AttemptKind::RepairAttempt => matches!(
+            reason,
+            ReasonCategory::AcceptanceDefect
+                | ReasonCategory::Regression
+                | ReasonCategory::SecurityConcern
+        ),
+        AttemptKind::GateFailure => matches!(
+            reason,
+            ReasonCategory::Regression | ReasonCategory::SecurityConcern
+        ),
+        AttemptKind::MaterialScopeRevision => reason == ReasonCategory::ScopeChange,
+        AttemptKind::IntegrationFailure => reason == ReasonCategory::IntegrationConflict,
+    }
 }
 
 impl Trend {
@@ -551,11 +587,10 @@ mod tests {
     fn event(id: u64, kind: AttemptKind) -> Event {
         let policy = policy();
         let reason = match kind {
-            AttemptKind::ReviewReturn => ReasonCategory::ReviewFindings,
-            AttemptKind::RepairAttempt => ReasonCategory::ImplementationRepair,
-            AttemptKind::GateFailure => ReasonCategory::GateFailure,
-            AttemptKind::MaterialScopeRevision => ReasonCategory::ScopeRevision,
-            AttemptKind::IntegrationFailure => ReasonCategory::IntegrationFailure,
+            AttemptKind::ReviewReturn => ReasonCategory::AcceptanceDefect,
+            AttemptKind::RepairAttempt | AttemptKind::GateFailure => ReasonCategory::Regression,
+            AttemptKind::MaterialScopeRevision => ReasonCategory::ScopeChange,
+            AttemptKind::IntegrationFailure => ReasonCategory::IntegrationConflict,
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -588,7 +623,7 @@ mod tests {
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: None,
             next_state: None,
-            head_sha: (!integration).then(|| "0123456789012345678901234567890123456789".to_owned()),
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
             metadata,
         }
     }
@@ -992,15 +1027,17 @@ mod tests {
     fn omitted_convergence_policy_is_legacy_unassessed() {
         let project_id = ProjectId::from_str("example").unwrap();
         let cycle = CycleId::from_str("C-001").unwrap();
+        let view = project(
+            None,
+            &project_id,
+            &cycle,
+            &[event(1, AttemptKind::RepairAttempt)],
+        )
+        .unwrap();
+        assert_eq!(view, ProjectConvergence::LegacyUnassessed);
         assert_eq!(
-            project(
-                None,
-                &project_id,
-                &cycle,
-                &[event(1, AttemptKind::RepairAttempt)]
-            )
-            .unwrap(),
-            ProjectConvergence::LegacyUnassessed
+            serde_json::to_string(&view).unwrap(),
+            r#"{"status":"legacy_unassessed"}"#
         );
     }
 
@@ -1012,6 +1049,12 @@ mod tests {
         let mut invalid = policy.clone();
         invalid.card_limits.low.gate_failures = 0;
         assert!(invalid.validate().is_err());
+        let mut unsupported = policy.clone();
+        unsupported.version = "harness.convergence-policy/v99".to_owned();
+        assert!(unsupported.validate().is_err());
+        let mut changed = policy.clone();
+        changed.cycle_limits.integration_failures = 4;
+        assert_ne!(policy.digest().unwrap(), changed.digest().unwrap());
     }
 
     #[test]
@@ -1042,6 +1085,13 @@ mod tests {
                 gate_failures: 1,
                 material_scope_revisions: 1,
             }
+        );
+        assert_eq!(
+            serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
+            format!(
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":1}},"cards":{{"F-001":{{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1}}}}}}"#,
+                view.policy_digest
+            )
         );
     }
 
@@ -1077,5 +1127,18 @@ mod tests {
             serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
         );
         assert!(project(Some(&policy()), &project_id, &cycle, &[foreign]).is_err());
+    }
+
+    #[test]
+    fn mixed_card_revisions_and_missing_integration_head_fail_closed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let first = event(1, AttemptKind::RepairAttempt);
+        let mut mixed = event(2, AttemptKind::RepairAttempt);
+        mixed.card_revision = Some(2);
+        assert!(project(Some(&policy()), &project_id, &cycle, &[first, mixed]).is_err());
+        let mut integration = event(3, AttemptKind::IntegrationFailure);
+        integration.head_sha = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[integration]).is_err());
     }
 }

@@ -756,6 +756,23 @@ mod tests {
     }
 
     #[test]
+    fn convergence_policy_refuses_unknown_missing_and_zero_limits() {
+        let complete = r#"{"version":"harness.convergence-policy/v1","card_limits":{"low":{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1},"medium":{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1},"high":{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1},"critical":{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1}},"cycle_limits":{"integration_failures":1}}"#;
+        let with_policy = |policy: &str| {
+            valid_document().replace(
+                "\"host_policy\": {",
+                &format!("\"convergence_policy\": {policy},\n  \"host_policy\": {{"),
+            )
+        };
+        let unknown = complete.replace("/v1", "/v99");
+        assert!(ProjectConfig::from_json(&with_policy(&unknown)).is_err());
+        let missing = complete.replace("\"high\":{\"review_returns\":1,\"repair_attempts\":1,\"gate_failures\":1,\"material_scope_revisions\":1},", "");
+        assert!(ProjectConfig::from_json(&with_policy(&missing)).is_err());
+        let zero = complete.replace("\"integration_failures\":1", "\"integration_failures\":0");
+        assert!(ProjectConfig::from_json(&with_policy(&zero)).is_err());
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let config = ProjectConfig::from_json(&valid_document()).unwrap();
         let reparsed = ProjectConfig::from_json(&config.to_json().unwrap()).unwrap();
