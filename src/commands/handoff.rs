@@ -8,7 +8,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        card::{load_card, store_card_state},
+        card::{load_card, require_convergence_budget, store_card_state},
         gate::{load_gate, receipts_for, require_before_handoff},
         review::dependency_standings,
         transaction::with_transaction,
@@ -595,6 +595,10 @@ fn preview_create(
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
+    // 72-2: the first check that can refuse, before anything else — a
+    // preview must never promise a handoff the real command would refuse
+    // for an escalated card. See `require_convergence_budget`.
+    require_convergence_budget(&control, &config, &record)?;
     state.state.check_transition(CardState::HandedOff)?;
     // 71-R3: the same validation `run_create` performs, in the same place
     // relative to its other checks — see `validate_declared_gate_failures`.
@@ -813,6 +817,9 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            // 72-2: the first check that can refuse, before anything is
+            // written — see `require_convergence_budget`.
+            require_convergence_budget(control, &config, &record)?;
             state.state.check_transition(CardState::HandedOff)?;
             // 71-R3: refused before any candidate resolution or write, in the
             // same place relative to this transaction's other checks that

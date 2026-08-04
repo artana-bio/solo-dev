@@ -204,6 +204,9 @@ pub enum ErrorCode {
     PolicyStaleHandoff,
     /// A verdict was recorded against a handoff no review round ever opened.
     PolicyReviewNotBegun,
+    /// A card's registered convergence budget is spent, and no authorized
+    /// disposition has released it.
+    PolicyConvergenceEscalated,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -243,7 +246,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 88] = [
+    pub const ALL: [Self; 89] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -325,6 +328,7 @@ impl ErrorCode {
         Self::PolicyIncompleteReview,
         Self::PolicyStaleHandoff,
         Self::PolicyReviewNotBegun,
+        Self::PolicyConvergenceEscalated,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -406,7 +410,8 @@ impl ErrorCode {
             | Self::PolicyOpenFindings
             | Self::PolicyIncompleteReview
             | Self::PolicyStaleHandoff
-            | Self::PolicyReviewNotBegun => ExitCategory::Policy,
+            | Self::PolicyReviewNotBegun
+            | Self::PolicyConvergenceEscalated => ExitCategory::Policy,
             Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
                 ExitCategory::Gate
             }
@@ -512,6 +517,7 @@ impl ErrorCode {
             Self::PolicyIncompleteReview => "INCOMPLETE-REVIEW",
             Self::PolicyStaleHandoff => "STALE-HANDOFF",
             Self::PolicyReviewNotBegun => "REVIEW-NOT-BEGUN",
+            Self::PolicyConvergenceEscalated => "CONVERGENCE-ESCALATED",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -542,6 +548,9 @@ impl ErrorCode {
                 | Self::PolicySensitiveValue
         ) {
             return self.record_recovery();
+        }
+        if matches!(self, Self::PolicyConvergenceEscalated) {
+            return Self::convergence_recovery();
         }
         match self.category() {
             ExitCategory::Usage => self.usage_recovery(),
@@ -647,6 +656,16 @@ impl ErrorCode {
             }
             _ => "Report this as a defect; a record-hygiene code reached the wrong recovery table.",
         }
+    }
+
+    /// Guidance for a card whose convergence budget is spent.
+    ///
+    /// Split out for the same reason [`Self::record_recovery`] is: it is
+    /// dispatched to directly from `recovery`, ahead of `policy_recovery`'s
+    /// per-category match, so its longer remedy text does not push that
+    /// function over its line budget the way it did before this split.
+    const fn convergence_recovery() -> &'static str {
+        "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. The command that records one is not part of this release; see issue #74."
     }
 
     const fn policy_recovery(self) -> &'static str {

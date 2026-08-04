@@ -1928,3 +1928,403 @@ fn the_recorded_failure_projects_into_the_cycle_counter() {
         "the projection must retain the evidence #73 will read"
     );
 }
+
+// 72-2: once `assess_card` reports a card `Escalated`, that card's own
+// delivery and review loop stops. `handoff create`, `review begin`, and
+// `review record` — the real commands, and the previews for the two whose
+// contract calls for preview parity — all refuse before writing anything,
+// naming every exhausted dimension with its count, limit, and evidence.
+// Other cards in the same cycle are unaffected. Every test below reaches
+// escalation the same way: a limit-1 `review_returns` policy and one
+// declared return — the shortest path that exists today, using only real
+// commands.
+
+/// The human-readable message from a failed command's JSON envelope.
+fn error_message(output: &std::process::Output) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    envelope["error"]["message"]
+        .as_str()
+        .expect("a coded refusal carries a message")
+        .to_owned()
+}
+
+/// Exhausts a card's `review_returns` budget with one declared return, under
+/// a limit-1 policy — the shortest real path to `Escalated`. Leaves the card
+/// `changes_requested`, still holding its work lease. Returns the review's
+/// id, so a caller can assert the refusal names its evidence reference.
+fn escalate_via_review_returns(workspace: &Workspace, card_id: &str) -> String {
+    open_review_round(workspace, card_id);
+    let path = write_verdict(workspace, card_id, RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+    let output = workspace.review(&[
+        "record",
+        "--card-id",
+        card_id,
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    envelope["data"]["review"]["review_id"]
+        .as_str()
+        .expect("the recorded review's id")
+        .to_owned()
+}
+
+/// Resumes work on an escalated card and delivers one more commit through a
+/// green gate, without attempting `handoff create` — the shared setup for
+/// every fixture below that needs a ready candidate to attempt delivery
+/// against.
+fn redeliver_candidate(workspace: &Workspace, card_id: &str) -> String {
+    workspace.work(&["resume", "--card-id", card_id]);
+    let worktree = workspace.worktrees.join(card_id);
+    fs::write(worktree.join("src/a.rs"), "fn main() { /* fixed */ }\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "fix: address review"]);
+    workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+    support::capture(&worktree, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn an_escalated_card_refuses_a_new_handoff_before_writing_anything() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+    let head = redeliver_candidate(&workspace, "F-001");
+    let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+
+    let before_head = workspace.control_head();
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "an escalated card must refuse a new handoff: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    let message = error_message(&output);
+    assert!(message.contains("review_returns"), "{message}");
+    assert!(message.contains("1/1"), "{message}");
+    assert!(
+        message.contains(&format!("review:{review_id}")),
+        "the operator must see the evidence without opening the control repository: {message}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+    assert!(
+        workspace
+            .handoff_raw(&["inspect", "--card-id", "F-001"])
+            .status
+            .success(),
+        "the card's earlier handoff must be unaffected"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active",
+        "`work resume` already moved the card to active; the refused handoff must not move it to handed_off"
+    );
+}
+
+#[test]
+fn an_escalated_card_refuses_review_begin() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+
+    let before_head = workspace.control_head();
+    let output = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+
+    assert!(
+        !output.status.success(),
+        "an escalated card must refuse a new review round: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    let message = error_message(&output);
+    assert!(message.contains("review_returns"), "{message}");
+    assert!(
+        message.contains(&format!("review:{review_id}")),
+        "{message}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+}
+
+#[test]
+fn an_escalated_card_refuses_review_record() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+    let before_reviews = recorded_review_count(&workspace, "F-001");
+    let before_head = workspace.control_head();
+
+    // A fresh verdict against the still-open handoff: proof that a new
+    // review cannot dodge the escalation through the ordinary CLI surface.
+    let path = write_verdict(
+        &workspace,
+        "F-001",
+        RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+    );
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a new review must not escape the escalation: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    assert!(
+        error_message(&output).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&output)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+    assert_eq!(
+        recorded_review_count(&workspace, "F-001"),
+        before_reviews,
+        "no new review record may exist after a refusal"
+    );
+}
+
+#[test]
+fn an_unrelated_card_in_the_same_cycle_still_delivers_and_is_reviewed() {
+    let workspace = opened_with_policy(1, 3);
+    escalate_via_review_returns(&workspace, "F-001");
+
+    // A second, unrelated card in the same cycle, scoped away from `src/**`
+    // so the two can coexist without an ownership-overlap refusal, must be
+    // completely unaffected by F-001's escalation.
+    workspace.activate_card("F-002", &["docs/f002/**"]);
+    workspace.approve_card("F-002", "docs/f002/a.md");
+
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+        "approved",
+        "an unrelated card must still deliver and be reviewed"
+    );
+
+    // And F-001 remains blocked throughout, proving the isolation runs both
+    // ways.
+    let output = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+}
+
+#[test]
+fn a_card_one_return_below_its_limit_still_delivers() {
+    // The escalation boundary from the other side: with a limit of two, one
+    // recorded return must not spend the budget.
+    let workspace = opened_with_policy(2, 3);
+    let (output, _head) = redeliver_after_return(
+        &workspace,
+        "F-001",
+        RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+    );
+    assert!(
+        output.status.success(),
+        "one return below a limit of two must not escalate: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "handed_off"
+    );
+}
+
+#[test]
+fn a_project_without_a_convergence_policy_never_refuses_for_convergence() {
+    // No `configure_convergence_policy` call: five change-requested rounds is
+    // more than any policy configured elsewhere in this file, and none of
+    // them may refuse for convergence — an unconfigured project has no
+    // budget to spend in the first place. `review_round` already drives a
+    // full commit/gate/handoff/review-begin/review-record/work-resume cycle
+    // per call (asserting each step's success itself), and honors the
+    // "carry every open finding forward" rule a hand-rolled loop would not.
+    let workspace = opened();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    review_round(&workspace, "F-001", 1, &[], &["src/a.rs"]);
+    review_round(&workspace, "F-001", 2, &["src/a.rs"], &["src/a.rs"]);
+    review_round(&workspace, "F-001", 3, &["src/a.rs"], &["src/a.rs"]);
+    review_round(&workspace, "F-001", 4, &["src/a.rs"], &["src/a.rs"]);
+    review_round(&workspace, "F-001", 5, &["src/a.rs"], &["src/a.rs"]);
+
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "no configured policy means no facts, however many rounds ran"
+    );
+}
+
+#[test]
+fn the_dry_run_preview_refuses_the_same_escalation() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+
+    // `handoff create --dry-run`.
+    let head = redeliver_candidate(&workspace, "F-001");
+    let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+    let before_head = workspace.control_head();
+    let handoff_preview = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+        "--dry-run",
+    ]);
+    assert!(
+        !handoff_preview.status.success(),
+        "the dry run must refuse the same escalation the real command does"
+    );
+    assert_eq!(
+        error_code(&handoff_preview),
+        "CH-POLICY-CONVERGENCE-ESCALATED"
+    );
+    assert!(
+        error_message(&handoff_preview).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&handoff_preview)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "a dry run must never write"
+    );
+
+    // `review record --dry-run`.
+    let verdict_path = write_verdict(
+        &workspace,
+        "F-001",
+        RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+    );
+    let review_preview = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict_path,
+        "--actor",
+        "reviewer",
+        "--dry-run",
+    ]);
+    assert!(
+        !review_preview.status.success(),
+        "the dry run must refuse the same escalation the real command does"
+    );
+    assert_eq!(
+        error_code(&review_preview),
+        "CH-POLICY-CONVERGENCE-ESCALATED"
+    );
+    assert!(
+        error_message(&review_preview).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&review_preview)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "a dry run must never write"
+    );
+}
+
+#[test]
+fn a_corrupt_convergence_fact_fails_closed_instead_of_reading_as_unspent_budget() {
+    // A policy generous enough (limit 3) that the one recorded return, left
+    // intact, would answer `Within` and let this card proceed. Corrupting
+    // that one fact must still refuse the next controlled action — a
+    // malformed fact must never be read as an empty, unspent budget, which
+    // is exactly the failure `project`'s fail-closed refusal exists to
+    // prevent.
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+    redeliver_candidate(&workspace, "F-001");
+
+    let events_dir = workspace.control.join("events");
+    let mut corrupted = 0;
+    for entry in fs::read_dir(&events_dir).unwrap() {
+        let entry = entry.unwrap();
+        let entry_path = entry.path();
+        if entry_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&entry_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if value["event_type"] == "convergence.attempt_recorded" {
+            value["metadata"]["evidence_ref"] = serde_json::json!("");
+            fs::write(
+                &entry_path,
+                format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+            )
+            .unwrap();
+            corrupted += 1;
+        }
+    }
+    assert_eq!(
+        corrupted, 1,
+        "the fixture must have produced exactly one convergence fact to corrupt"
+    );
+
+    let before_head = workspace.control_head();
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]),
+        "",
+    );
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a corrupted convergence fact must fail closed, not read as unused budget: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_ne!(
+        error_code(&output),
+        "CH-POLICY-CONVERGENCE-ESCALATED",
+        "this must fail because the fact is unreadable, not because the (otherwise unspent) budget looks exhausted"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+}

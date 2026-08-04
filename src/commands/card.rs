@@ -12,8 +12,11 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{gate::require_registered, transaction::with_transaction},
-    config::ValidationPolicy,
-    control::{event_store::EventDraft, repository::ControlRepository},
+    config::{ProjectConfig, ValidationPolicy},
+    control::{
+        event_store::{EventDraft, EventStore},
+        repository::ControlRepository,
+    },
     domain::{
         card::{CARD_DIR, CardDraft, CardRecord, CardState},
         clock::Clock,
@@ -23,7 +26,10 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     policy::allocation::{Claim, check_admissible, check_dependencies},
-    policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, ScopeBreadth},
+    policy::convergence::{
+        ATTEMPT_RECORDED_EVENT, AttemptKind, CardConvergence, CardDimension, ReasonCategory,
+        ScopeBreadth, assess_card, project,
+    },
 };
 
 /// Schema identifier for a card's mutable state file.
@@ -251,6 +257,101 @@ pub fn load_card(
         code: ErrorCode::InternalControlCorrupt,
     })?;
     Ok((record, state))
+}
+
+/// Renders a [`CardDimension`] using the same spelling it would serialize
+/// to, so a refusal message never hand-spells a name `serde` already owns.
+/// Mirrors `reason_wire_name` in `handoff.rs` and `review.rs`.
+fn dimension_wire_name(dimension: CardDimension) -> String {
+    match serde_json::to_value(dimension) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{dimension:?}"),
+    }
+}
+
+/// Refuses a controlled action on a card whose convergence budget is spent.
+///
+/// #72-2: once `assess_card` reports a card `Escalated`, the delivery and
+/// review loop for *that* card stops. `handoff create`, `review begin`, and
+/// `review record` — and the previews that must never promise a write the
+/// real command would refuse — all call this before writing anything, so a
+/// raw retry or a fresh review cannot dodge the escalation through the
+/// ordinary CLI surface. Other cards in the same cycle are unaffected: this
+/// only ever assesses the one `record` names.
+///
+/// `config.convergence_policy` is read exactly once, into `policy`, and that
+/// same value feeds both [`project`] and [`assess_card`] below. `assess_card`
+/// never checks that the projection it is handed was built under the policy
+/// supplying its limits, so this function — the one place that calls both —
+/// is the one place that has to guarantee they agree; reading the policy
+/// once and passing that same reference to both calls is how.
+///
+/// A malformed, duplicate, foreign, or unbound convergence fact makes
+/// `project` refuse the whole projection. That refusal is propagated as-is,
+/// never treated as an unspent budget: a card whose recorded history cannot
+/// be trusted does not get to proceed as though it were `Within`.
+///
+/// `LegacyUnassessed` and `Within` both mean the action may proceed.
+/// `Escalated` refuses it, naming every exhausted dimension with its count,
+/// limit, and evidence references in the returned error, so an operator can
+/// see what spent the budget without opening the control repository.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyConvergenceEscalated`] when the card's
+/// declared risk has at least one convergence dimension at or over its
+/// configured limit. Propagates a control-read or projection failure
+/// unchanged otherwise.
+pub fn require_convergence_budget(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+) -> Result<(), HarnessError> {
+    let policy = config.convergence_policy.as_ref();
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view =
+        project(policy, &config.project_id, &record.cycle_id, &cycle_events).map_err(|error| {
+            HarnessError::Control {
+                reason: format!(
+                    "convergence projection for cycle {} is unusable: {error}",
+                    record.cycle_id
+                ),
+                code: ErrorCode::InternalControlCorrupt,
+            }
+        })?;
+
+    let CardConvergence::Escalated { exhausted, .. } =
+        assess_card(policy, &view, &record.card_id, record.risk)
+    else {
+        return Ok(());
+    };
+
+    let detail = exhausted
+        .iter()
+        .map(|dimension| {
+            format!(
+                "{}: {}/{} (evidence: {})",
+                dimension_wire_name(dimension.dimension),
+                dimension.count,
+                dimension.limit,
+                dimension
+                    .evidence
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Err(HarnessError::Control {
+        reason: format!(
+            "card {} is escalated; convergence budget exhausted: {detail}",
+            record.card_id
+        ),
+        code: ErrorCode::PolicyConvergenceEscalated,
+    })
 }
 
 /// Moves a card to a new state, keeping its revision and digest.

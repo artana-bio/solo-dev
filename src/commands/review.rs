@@ -9,7 +9,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        card::{load_card, store_card_state},
+        card::{load_card, require_convergence_budget, store_card_state},
         handoff::{ancestry, latest_handoff},
         transaction::with_transaction,
         work::held_lease,
@@ -400,6 +400,9 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            // 72-2: the first check that can refuse, before anything is
+            // written — see `require_convergence_budget`.
+            require_convergence_budget(control, &config, &record)?;
             state.state.check_transition(CardState::ReviewPending)?;
 
             let handoff =
@@ -589,22 +592,27 @@ fn require_review_return_reason(
 /// was never called here at all. It now asks exactly what `run_record` asks,
 /// with the same `HandoffScope` split by decision.
 ///
-/// Order matters here, not just presence, and this now checks four things in
+/// Order matters here, not just presence, and this now checks five things in
 /// the same order `run_record` does: whether the verdict declares an
-/// admissible reason for a review return, then whether a review round ever
-/// opened for this handoff, then staleness, then independence. A verdict that
-/// is both a self-review and stale is refused as stale first — the
-/// independence check pre-existed the staleness fix and ran first; moved it
-/// after staleness so a case failing both reasons reports the same one in
-/// both forms, which is the entire point of a preview. Caught by review
-/// round 1 of this exact card, on the fixture where a revoked handoff is also
-/// a self-review. The review-begun check runs ahead of staleness and
-/// independence because it asks the most basic question: whether there is a
-/// review to be stale or self-reviewing about at all. The reason-declaration
-/// check runs ahead of all three: 71-R2 requires it to refuse before anything
-/// is written, and nothing above it needs a card, a handoff, or a worktree to
-/// answer — it needs only the project's configured policy and the verdict
-/// the caller already supplied.
+/// admissible reason for a review return, then whether the card's
+/// convergence budget is spent, then whether a review round ever opened for
+/// this handoff, then staleness, then independence. A verdict that is both a
+/// self-review and stale is refused as stale first — the independence check
+/// pre-existed the staleness fix and ran first; moved it after staleness so a
+/// case failing both reasons reports the same one in both forms, which is
+/// the entire point of a preview. Caught by review round 1 of this exact
+/// card, on the fixture where a revoked handoff is also a self-review. The
+/// review-begun check runs ahead of staleness and independence because it
+/// asks the most basic question: whether there is a review to be stale or
+/// self-reviewing about at all. The reason-declaration check runs ahead of
+/// everything else: 71-R2 requires it to refuse before anything is written,
+/// and nothing above it needs a card, a handoff, or a worktree to answer —
+/// it needs only the project's configured policy and the verdict the caller
+/// already supplied. The convergence-budget check (72-2) runs immediately
+/// after: it is the first thing that needs the loaded card record, so it is
+/// the first check able to refuse once that record exists, ahead of the
+/// review-begun, staleness, and independence checks below, which all need a
+/// handoff besides.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
@@ -613,7 +621,8 @@ fn preview_record(
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     require_review_return_reason(config.convergence_policy.as_ref(), verdict)?;
-    let (_, state) = load_card(&control, card_id)?;
+    let (record, state) = load_card(&control, card_id)?;
+    require_convergence_budget(&control, &config, &record)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
         code: ErrorCode::PreconditionNotFound,
@@ -770,6 +779,9 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             // policy and the verdict the caller already supplied.
             require_review_return_reason(config.convergence_policy.as_ref(), &verdict)?;
             let (record, state) = load_card(control, &card_id)?;
+            // 72-2: the first check able to refuse once the card record
+            // exists — see `require_convergence_budget`.
+            require_convergence_budget(control, &config, &record)?;
             let handoff =
                 latest_handoff(control, &card_id)?.ok_or_else(|| HarnessError::Control {
                     reason: format!("card {card_id} has no handoff to review"),
