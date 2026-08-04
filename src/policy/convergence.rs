@@ -198,6 +198,43 @@ pub enum AttemptKind {
     IntegrationFailure,
 }
 
+impl AttemptKind {
+    /// Whether a fact of this class may declare `reason`.
+    ///
+    /// The one compatibility table for the whole harness. `project` calls this
+    /// rather than re-deciding the question from scratch, and so must every
+    /// command that accepts a reason before a fact naming it is ever written —
+    /// `review record` (71-R2) is the first. A second, hand-written copy of
+    /// this table anywhere upstream would only need to disagree with this one
+    /// once for a verdict the command accepted to become a fact the projection
+    /// then refuses: accepted, then unrecorded, which is worse for an operator
+    /// than being refused up front.
+    #[must_use]
+    pub const fn admits(self, reason: ReasonCategory) -> bool {
+        match self {
+            Self::ReviewReturn => matches!(
+                reason,
+                ReasonCategory::AcceptanceDefect
+                    | ReasonCategory::Regression
+                    | ReasonCategory::SecurityConcern
+                    | ReasonCategory::NonBlockingImprovement
+            ),
+            Self::RepairAttempt => matches!(
+                reason,
+                ReasonCategory::AcceptanceDefect
+                    | ReasonCategory::Regression
+                    | ReasonCategory::SecurityConcern
+            ),
+            Self::GateFailure => matches!(
+                reason,
+                ReasonCategory::Regression | ReasonCategory::SecurityConcern
+            ),
+            Self::MaterialScopeRevision => matches!(reason, ReasonCategory::ScopeChange),
+            Self::IntegrationFailure => matches!(reason, ReasonCategory::IntegrationConflict),
+        }
+    }
+}
+
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
 /// than an enforcement decision; #72–#74 consume the counters later.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -383,7 +420,7 @@ pub fn project(
                         reason: "integration failure must be cycle-only".to_owned(),
                     });
                 }
-                if !reason_is_compatible(metadata.attempt_kind, metadata.reason_category) {
+                if !metadata.attempt_kind.admits(metadata.reason_category) {
                     return Err(ProjectionError {
                         event_id,
                         reason: "integration failure has incompatible reason category".to_owned(),
@@ -435,7 +472,7 @@ pub fn project(
                         reason: "card attempt head is not an exact commit SHA".to_owned(),
                     });
                 }
-                if !reason_is_compatible(kind, metadata.reason_category) {
+                if !kind.admits(metadata.reason_category) {
                     return Err(ProjectionError {
                         event_id,
                         reason: "card attempt has incompatible reason category".to_owned(),
@@ -466,30 +503,6 @@ pub fn project(
 
 fn is_exact_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn reason_is_compatible(kind: AttemptKind, reason: ReasonCategory) -> bool {
-    match kind {
-        AttemptKind::ReviewReturn => matches!(
-            reason,
-            ReasonCategory::AcceptanceDefect
-                | ReasonCategory::Regression
-                | ReasonCategory::SecurityConcern
-                | ReasonCategory::NonBlockingImprovement
-        ),
-        AttemptKind::RepairAttempt => matches!(
-            reason,
-            ReasonCategory::AcceptanceDefect
-                | ReasonCategory::Regression
-                | ReasonCategory::SecurityConcern
-        ),
-        AttemptKind::GateFailure => matches!(
-            reason,
-            ReasonCategory::Regression | ReasonCategory::SecurityConcern
-        ),
-        AttemptKind::MaterialScopeRevision => reason == ReasonCategory::ScopeChange,
-        AttemptKind::IntegrationFailure => reason == ReasonCategory::IntegrationConflict,
-    }
 }
 
 impl Trend {

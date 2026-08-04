@@ -29,6 +29,29 @@ fn opened() -> Workspace {
     workspace
 }
 
+/// Like [`opened`], but with a convergence policy configured first.
+///
+/// A cycle pins the project configuration's digest at the moment it is
+/// created — `cycle create` after `configure_convergence_policy` refused
+/// every later command in this project with `CH-POLICY-INVALID-CYCLE`,
+/// "cycle C-001 was created under project revision ..., but the current
+/// project configuration is ...", because the project document had changed
+/// out from under an already-created cycle. The policy has to be in place
+/// before the cycle is, not after.
+fn opened_with_policy(card_limit: u32, integration_limit: u32) -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.configure_convergence_policy(card_limit, integration_limit);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace
+}
+
 /// Stores a draft with an arbitrary include list, without activating it.
 fn draft_with_scope(workspace: &Workspace, card_id: &str, include: &[String]) {
     let list = include
@@ -504,4 +527,284 @@ fn findings_moving_to_new_areas_are_flagged_even_while_the_count_falls() {
         "spreading is a signal on its own: {warned}"
     );
     assert!(warned.contains("src/e.rs"), "and it names where: {warned}");
+}
+
+// 71-R2: a `changes_requested` review return, under a configured convergence
+// policy, declares its reason and appends exactly one bound
+// `convergence.attempt_recorded` fact in the same transaction as
+// `review.recorded`. Unlike the advisories above, this is a hard refusal, not
+// a warning — the tests below assert failure, not just an absent message.
+
+/// Activates a card, drives one commit through gate and handoff, and opens a
+/// review round for it. Returns the candidate commit the handoff bound, for
+/// asserting the attempt fact's `head_sha` binds to the same commit.
+fn open_review_round(workspace: &Workspace, card_id: &str) -> String {
+    workspace.activate_card(card_id, &["src/**"]);
+    workspace.work(&["start", "--card-id", card_id]);
+
+    let worktree = workspace.worktrees.join(card_id);
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: implement"]);
+    workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: it works\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        card_id,
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", card_id, "--actor", "reviewer"]);
+    head
+}
+
+/// Writes a verdict body to disk and returns its path.
+fn write_verdict(workspace: &Workspace, card_id: &str, body: &str) -> String {
+    let path = workspace.root.join(format!("{card_id}-verdict.yaml"));
+    fs::write(&path, body).unwrap();
+    path.display().to_string()
+}
+
+/// Every `convergence.attempt_recorded` fact in the control repository.
+fn attempt_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+    workspace
+        .events()
+        .into_iter()
+        .filter(|event| event["event_type"] == "convergence.attempt_recorded")
+        .collect()
+}
+
+/// A card's stored review count, read back through `review inspect`.
+fn recorded_review_count(workspace: &Workspace, card_id: &str) -> usize {
+    workspace.review_json(&["inspect", "--card-id", card_id])["data"]["reviews"]
+        .as_array()
+        .expect("reviews is an array")
+        .len()
+}
+
+/// The stable error code from a failed command's JSON envelope.
+fn error_code(output: &std::process::Output) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("an error envelope");
+    envelope["error"]["code"]
+        .as_str()
+        .expect("a coded refusal")
+        .to_owned()
+}
+
+/// A `changes_requested` verdict declaring `reason_category: acceptance_defect`.
+const RETURN_WITH_ACCEPTANCE_DEFECT_REASON: &str = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: acceptance_defect\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: something is wrong\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+
+/// A `changes_requested` verdict with no `reason_category` declared at all.
+const RETURN_WITH_NO_REASON: &str = "reviewer_actor_id: reviewer\ndecision: changes_requested\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: something is wrong\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+
+/// A `changes_requested` verdict declaring `reason_category: scope_change`,
+/// which is `MaterialScopeRevision`'s reason, not a review return's.
+const RETURN_WITH_SCOPE_CHANGE_REASON: &str = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: scope_change\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: something is wrong\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+
+#[test]
+fn a_returned_review_under_a_configured_policy_records_one_bound_attempt_fact() {
+    let workspace = opened_with_policy(3, 3);
+    let head = open_review_round(&workspace, "F-001");
+
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+    assert!(
+        output.status.success(),
+        "a declared, admissible reason must be accepted: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let review_id = envelope["data"]["review"]["review_id"]
+        .as_str()
+        .expect("the recorded review's id");
+
+    let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "exactly one attempt fact must be recorded: {attempts:?}"
+    );
+    let fact = &attempts[0];
+    assert_eq!(fact["card_id"], "F-001", "{fact}");
+    assert_eq!(
+        fact["card_revision"], card_status["data"]["revision"],
+        "{fact}"
+    );
+    assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+    assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+    assert_eq!(fact["head_sha"], head, "{fact}");
+    assert_eq!(fact["metadata"]["attempt_kind"], "review_return", "{fact}");
+    assert_eq!(
+        fact["metadata"]["reason_category"], "acceptance_defect",
+        "{fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["evidence_ref"],
+        format!("review:{review_id}"),
+        "{fact}"
+    );
+    let policy_digest = fact["metadata"]["policy_digest"]
+        .as_str()
+        .expect("policy_digest is a string");
+    assert!(
+        policy_digest.starts_with("sha256:") && policy_digest.len() == "sha256:".len() + 64,
+        "policy_digest must be a real digest, not a placeholder: {policy_digest}"
+    );
+}
+
+#[test]
+fn a_returned_review_without_a_declared_reason_is_refused_before_anything_is_written() {
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+
+    let before_head = workspace.control_head();
+    let before_reviews = recorded_review_count(&workspace, "F-001");
+
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_NO_REASON);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a changes-requested verdict with no declared reason must be refused"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+    assert_eq!(
+        recorded_review_count(&workspace, "F-001"),
+        before_reviews,
+        "no new review record may exist after a refusal"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a refused review must not record an attempt fact either"
+    );
+}
+
+#[test]
+fn a_reason_a_review_return_cannot_have_is_refused() {
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_SCOPE_CHANGE_REASON);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "scope_change is material-scope-revision's reason, not a review return's"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a refused review must not record an attempt fact"
+    );
+}
+
+#[test]
+fn an_approval_records_no_attempt_fact() {
+    let workspace = opened_with_policy(3, 3);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.approve_card("F-001", "src/a.rs");
+
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "approved"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "an approval must not record an attempt fact"
+    );
+}
+
+#[test]
+fn a_project_without_a_convergence_policy_records_no_attempt_fact() {
+    // No `configure_convergence_policy` call: every fixture used elsewhere in
+    // this file runs exactly this way, unconfigured, which is what this test
+    // asserts is safe by construction rather than by omission.
+    let workspace = opened();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    review_round(&workspace, "F-001", 1, &[], &["src/a.rs"]);
+
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "no configured policy means no attempt fact, however the decision reads"
+    );
+}
+
+#[test]
+fn the_dry_run_preview_refuses_the_same_missing_reason() {
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_NO_REASON);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+        "--dry-run",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "the dry run must refuse the same missing reason the real command does"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a dry run must never write a fact"
+    );
+    assert_eq!(
+        recorded_review_count(&workspace, "F-001"),
+        0,
+        "a dry run must not record a review either"
+    );
 }

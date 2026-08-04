@@ -181,7 +181,15 @@ pub enum ErrorCode {
     PolicySelfReview,
     /// A review approved while findings remain open.
     PolicyOpenFindings,
-    /// A review is missing a required field.
+    /// A review is missing a required field, or names one a value it cannot
+    /// hold.
+    ///
+    /// The second half covers a declared `reason_category` an attempt kind
+    /// does not admit — `scope_change` on a `changes_requested` verdict, for
+    /// instance, which is a material scope revision wearing a review return's
+    /// clothes. Grouped with the missing-field case rather than given a new
+    /// code: both are a review that cannot be acted on until the reviewer
+    /// supplies something the schema already had a place for.
     PolicyIncompleteReview,
     /// The handoff under review no longer describes the branch.
     PolicyStaleHandoff,

@@ -14,6 +14,7 @@ use crate::{
         transaction::with_transaction,
         work::held_lease,
     },
+    config::ConvergencePolicy,
     control::{
         event_store::{EventDraft, EventStore},
         repository::ControlRepository,
@@ -31,7 +32,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
-    policy::convergence::{Round, Trend},
+    policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, Round, Trend},
 };
 
 /// Subcommands under `review`.
@@ -124,6 +125,27 @@ pub struct Verdict {
     pub reviewer_actor_id: String,
     /// The conclusion.
     pub decision: Decision,
+    /// Why the work is being returned.
+    ///
+    /// Declared, not derived. A [`Finding`] carries `severity`, `location`,
+    /// `detail`, and `disposition` — none of which distinguishes an
+    /// acceptance defect from a regression from a security concern, so there
+    /// is no field here a harness could read that fact off of. This mirrors a
+    /// rule this codebase already keeps for [`ExceptionTrigger`](crate::config::ExceptionTrigger):
+    /// "the harness never infers that an exception exists from a failed check
+    /// or a conversation; a configured actor must raise one of these declared
+    /// reasons with evidence." A review return is the same shape of claim —
+    /// so the reviewer states why, and the harness only checks that the
+    /// stated reason is one [`AttemptKind::ReviewReturn`](crate::policy::convergence::AttemptKind::ReviewReturn)
+    /// admits.
+    ///
+    /// Required, and validated against that admission rule, only when
+    /// `decision` is `changes_requested` under a project with a configured
+    /// convergence policy; see `require_review_return_reason`. Omitted here
+    /// is fine for every other verdict shape, which is what keeps every
+    /// existing fixture, written before this field existed, still valid.
+    #[serde(default)]
+    pub reason_category: Option<ReasonCategory>,
     /// What the reviewer found.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -464,6 +486,99 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
     })
 }
 
+/// Whether a decision returns work to the feature actor.
+///
+/// `Blocked` halts work pending a decision outside the reviewer's own remit
+/// — see [`Decision::Blocked`] — it is a park, not a verdict on the
+/// candidate, and nobody has been told to change anything. Recording a
+/// convergence attempt against it, or demanding a `reason_category` before it
+/// can be filed, would count and gate a return that never happened. Only
+/// `ChangesRequested` sends the candidate back to the actor who wrote it, so
+/// only `ChangesRequested` is a review return.
+const fn is_review_return(decision: Decision) -> bool {
+    matches!(decision, Decision::ChangesRequested)
+}
+
+/// Every reason category that exists, so an error message can render the set
+/// [`AttemptKind::admits`] actually accepts instead of a second, hand-typed
+/// list that could silently drift from it.
+const ALL_REASON_CATEGORIES: [ReasonCategory; 6] = [
+    ReasonCategory::AcceptanceDefect,
+    ReasonCategory::Regression,
+    ReasonCategory::SecurityConcern,
+    ReasonCategory::ScopeChange,
+    ReasonCategory::IntegrationConflict,
+    ReasonCategory::NonBlockingImprovement,
+];
+
+/// Renders a reason category using the same spelling it would serialize to,
+/// so a diagnostic never hand-spells a name `serde` already owns.
+fn reason_wire_name(reason: ReasonCategory) -> String {
+    match serde_json::to_value(reason) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{reason:?}"),
+    }
+}
+
+/// The reasons a review return may declare, rendered for an error message.
+fn admissible_review_return_reasons() -> String {
+    ALL_REASON_CATEGORIES
+        .into_iter()
+        .filter(|reason| AttemptKind::ReviewReturn.admits(*reason))
+        .map(reason_wire_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuses a `changes_requested` verdict, under a configured convergence
+/// policy, that does not declare an admissible `reason_category`.
+///
+/// #9 requires every review return to be recorded with its reason, and the
+/// codebase's rule for a declared fact is that the harness never infers one
+/// — see the [`Verdict::reason_category`] doc for the full argument. This is
+/// where that rule is enforced rather than merely stated: called from both
+/// `run_record` and `preview_record`, in the same place relative to their
+/// other checks, so the dry run can never promise a write the real command
+/// would refuse.
+///
+/// Silent whenever the question does not apply: no policy configured, or a
+/// decision — including `Blocked`, see [`is_review_return`] — that returns no
+/// work to anyone. This is `review record`'s ledger obligation, not a general
+/// shape rule for every verdict.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyIncompleteReview`] when `reason_category` is
+/// absent, or present but not one [`AttemptKind::ReviewReturn`] admits.
+fn require_review_return_reason(
+    policy: Option<&ConvergencePolicy>,
+    verdict: &Verdict,
+) -> Result<(), HarnessError> {
+    if policy.is_none() || !is_review_return(verdict.decision) {
+        return Ok(());
+    }
+    let Some(reason) = verdict.reason_category else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "verdict is missing `reason_category`; a changes-requested decision under a configured convergence policy must declare why the work is being returned — one of: {}",
+                admissible_review_return_reasons()
+            ),
+            code: ErrorCode::PolicyIncompleteReview,
+        });
+    };
+    if !AttemptKind::ReviewReturn.admits(reason) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "verdict declares `reason_category: {}`, which a review return cannot declare; admissible reasons are: {}",
+                reason_wire_name(reason),
+                admissible_review_return_reasons()
+            ),
+            code: ErrorCode::PolicyIncompleteReview,
+        });
+    }
+    Ok(())
+}
+
 /// Reports what `review record` would write, without writing it.
 ///
 /// Tier 3 defect 24: a preview that skips a check the real command enforces
@@ -474,23 +589,30 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 /// was never called here at all. It now asks exactly what `run_record` asks,
 /// with the same `HandoffScope` split by decision.
 ///
-/// Order matters here, not just presence, and this now checks three things
-/// in the same order `run_record` does: whether a review round ever opened
-/// for this handoff, then staleness, then independence. A verdict that is
-/// both a self-review and stale is refused as stale first — the independence
-/// check pre-existed the staleness fix and ran first; moved it after
-/// staleness so a case failing both reasons reports the same one in both
-/// forms, which is the entire point of a preview. Caught by review round 1
-/// of this exact card, on the fixture where a revoked handoff is also a
-/// self-review. The review-begun check runs ahead of both because it asks
-/// the most basic question: whether there is a review to be stale or
-/// self-reviewing about at all.
+/// Order matters here, not just presence, and this now checks four things in
+/// the same order `run_record` does: whether the verdict declares an
+/// admissible reason for a review return, then whether a review round ever
+/// opened for this handoff, then staleness, then independence. A verdict that
+/// is both a self-review and stale is refused as stale first — the
+/// independence check pre-existed the staleness fix and ran first; moved it
+/// after staleness so a case failing both reasons reports the same one in
+/// both forms, which is the entire point of a preview. Caught by review
+/// round 1 of this exact card, on the fixture where a revoked handoff is also
+/// a self-review. The review-begun check runs ahead of staleness and
+/// independence because it asks the most basic question: whether there is a
+/// review to be stale or self-reviewing about at all. The reason-declaration
+/// check runs ahead of all three: 71-R2 requires it to refuse before anything
+/// is written, and nothing above it needs a card, a handoff, or a worktree to
+/// answer — it needs only the project's configured policy and the verdict
+/// the caller already supplied.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
     verdict: &Verdict,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    require_review_return_reason(config.convergence_policy.as_ref(), verdict)?;
     let (_, state) = load_card(&control, card_id)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
@@ -623,6 +745,11 @@ fn require_review_begun(
     })
 }
 
+// 71-R2's reason refusal and its fact emission both have to run inside this
+// one transaction, in this exact program order relative to the writes around
+// them — splitting either into a helper the length limit would otherwise
+// invite risks losing that ordering at a call site instead of at a glance.
+#[allow(clippy::too_many_lines)]
 fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let verdict = read_verdict(&args.verdict)?;
@@ -638,6 +765,10 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         |control, events, expected, steps| {
             steps.at("control-write")?;
             let config = control.project()?;
+            // Before anything else is even read: 71-R2 requires this refusal
+            // to happen before any write, and this needs nothing but the
+            // policy and the verdict the caller already supplied.
+            require_review_return_reason(config.convergence_policy.as_ref(), &verdict)?;
             let (record, state) = load_card(control, &card_id)?;
             let handoff =
                 latest_handoff(control, &card_id)?.ok_or_else(|| HarnessError::Control {
@@ -742,6 +873,46 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     ),
                 clock,
             )?;
+
+            // A review return under a configured policy records exactly one
+            // bound `convergence.attempt_recorded` fact, in the same
+            // transaction as `review.recorded` — #9's ledger, written where
+            // the return itself is written rather than reconstructed later
+            // from the review history. `reason_category` is `Some` and
+            // admissible here because `require_review_return_reason` already
+            // refused otherwise, above, before this transaction wrote
+            // anything; `Blocked` never reaches this arm — see
+            // `is_review_return` — so it neither needs a declared reason nor
+            // ever emits a fact.
+            if is_review_return(verdict.decision)
+                && let (Some(policy), Some(reason)) =
+                    (config.convergence_policy.as_ref(), verdict.reason_category)
+            {
+                let policy_digest = policy.digest()?;
+                events.append(
+                    &config.project_id,
+                    EventDraft::new(ATTEMPT_RECORDED_EVENT, &verdict.reviewer_actor_id)
+                        .cycle(record.cycle_id.clone())
+                        .card(
+                            card_id.clone(),
+                            state.current_revision,
+                            state.current_digest.clone(),
+                        )
+                        .head(handoff.candidate_sha.clone())
+                        .meta(
+                            "attempt_kind",
+                            serde_json::to_value(AttemptKind::ReviewReturn)?,
+                        )
+                        .meta("reason_category", serde_json::to_value(reason)?)
+                        .meta(
+                            "evidence_ref",
+                            serde_json::json!(format!("review:{review_id}")),
+                        )
+                        .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                    clock,
+                )?;
+            }
+
             control.commit(
                 expected,
                 &format!("review: {} {card_id}", verdict.decision.name()),

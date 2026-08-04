@@ -930,6 +930,51 @@ impl Workspace {
         )
         .unwrap();
     }
+
+    /// Writes a convergence policy into the authoritative project document.
+    ///
+    /// `card_limit` is set across all four counted dimensions at all four
+    /// risk levels, and `integration_limit` for the one cycle-level
+    /// dimension — every convergence test needs only "a policy is
+    /// configured", not any particular limit, so one value stands in for
+    /// all four card dimensions. Committed with the existing `git()` helper
+    /// so the control tree stays clean afterward. Unlike `tamper_card_state`
+    /// and `tamper_cycle_status`, which leave the tree dirty on purpose to
+    /// simulate an external edit, this simulates an operator setting project
+    /// configuration through the normal, committed path.
+    pub fn configure_convergence_policy(&self, card_limit: u32, integration_limit: u32) {
+        let path = self.control.join("project/project.json");
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let card_limits = serde_json::json!({
+            "review_returns": card_limit,
+            "repair_attempts": card_limit,
+            "gate_failures": card_limit,
+            "material_scope_revisions": card_limit,
+        });
+        document["convergence_policy"] = serde_json::json!({
+            "version": "harness.convergence-policy/v1",
+            "card_limits": {
+                "low": card_limits.clone(),
+                "medium": card_limits.clone(),
+                "high": card_limits.clone(),
+                "critical": card_limits,
+            },
+            "cycle_limits": { "integration_failures": integration_limit },
+        });
+
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+        )
+        .unwrap();
+        git(&self.control, &["add", "-A"]);
+        git(
+            &self.control,
+            &["commit", "-q", "-m", "test: configure convergence policy"],
+        );
+    }
 }
 
 /// Concatenates every gate log stdout under a control repository.
