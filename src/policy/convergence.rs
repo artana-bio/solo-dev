@@ -236,6 +236,17 @@ impl AttemptKind {
     }
 }
 
+/// The single append-only disposition fact the v1 projection recognizes.
+pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
+
+/// Closed set of authorized dispositions. Only the one #74's first card
+/// implements exists here; the rest arrive with their own bounded effects.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionKind {
+    Renew,
+}
+
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
 /// than an enforcement decision; #72–#74 consume the counters later.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -255,6 +266,20 @@ struct AttemptMetadata {
     attempt_kind: AttemptKind,
     reason_category: ReasonCategory,
     evidence_ref: String,
+    policy_digest: Digest,
+}
+
+/// Metadata a disposition fact must declare, validated with the same
+/// closed-set rigor as `AttemptMetadata`: an unrecognized `disposition` or
+/// `dimension` value, or any field this shape does not name, refuses the
+/// fact rather than being silently ignored or defaulted.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispositionMetadata {
+    disposition: DispositionKind,
+    dimension: CardDimension,
+    rationale: String,
+    authorized_by: String,
     policy_digest: Digest,
 }
 
@@ -293,6 +318,11 @@ pub struct DimensionCount {
     /// Distinct evidence references of the counted facts, sorted.
     /// `count` is authoritative: two facts may cite one reference.
     pub evidence: BTreeSet<String>,
+    /// Budgets granted back by authorized renewal dispositions.
+    ///
+    /// Not evidence and not a count of facts: this is how many times an
+    /// authorized actor decided to grant the configured budget again.
+    pub renewals: u32,
 }
 
 /// Counters derived for a card, accumulated over every fact recorded against
@@ -499,6 +529,102 @@ pub fn project(
             }
         }
     }
+
+    // A disposition fact binds with exactly the same rigor as an attempt
+    // fact — project/cycle, duplicate identifier, policy digest, and exact
+    // card revision/digest/head — with one addition: `rationale` and
+    // `authorized_by` must both be non-blank, because a decision with no
+    // declared reason and no declared actor is not a decision. Unlike
+    // `IntegrationFailure`, a disposition has no cycle-only shape: it is
+    // always about one card in one exact state, so the card binding below
+    // is unconditional rather than selected by a match arm.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT)
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: DispositionMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        if metadata.rationale.trim().is_empty() || metadata.authorized_by.trim().is_empty() {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared rationale and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        if metadata.policy_digest != policy_digest {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(card_id), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+
+        let counters = result.cards.entry(card_id.clone()).or_default();
+        let dimension = match metadata.dimension {
+            CardDimension::ReviewReturns => &mut counters.review_returns,
+            CardDimension::RepairAttempts => &mut counters.repair_attempts,
+            CardDimension::GateFailures => &mut counters.gate_failures,
+            CardDimension::MaterialScopeRevisions => &mut counters.material_scope_revisions,
+        };
+        match metadata.disposition {
+            // Exactly one renewal grant per fact, hard-coded rather than
+            // read from any amount this metadata could declare — it
+            // declares none. `continue` must never silently expand a
+            // budget (#74's acceptance criterion): if a disposition could
+            // name its own amount, "renew" would be an unlimited budget
+            // with extra steps, since nothing would stop a `+1000` behind
+            // a plausible-sounding rationale. Granting back exactly the
+            // configured limit, once per fact, means widening a budget
+            // further always costs another authorized decision with its
+            // own rationale, actor, and trail — never a bigger number on
+            // this one.
+            DispositionKind::Renew => {
+                dimension.renewals =
+                    dimension
+                        .renewals
+                        .checked_add(1)
+                        .ok_or_else(|| ProjectionError {
+                            event_id,
+                            reason: "counter overflow".to_owned(),
+                        })?;
+            }
+        }
+    }
+
     Ok(ProjectConvergence::Configured(result))
 }
 
@@ -530,6 +656,11 @@ pub enum CardDimension {
 pub struct ExhaustedDimension {
     pub dimension: CardDimension,
     pub count: u32,
+    /// The effective budget this dimension was actually compared against —
+    /// the configured limit already multiplied by `renewals + 1` — never
+    /// the bare configuration limit. Reporting the base limit here would
+    /// read as "no renewal was ever granted" even when several were; this
+    /// is the number `count` was really measured against.
     pub limit: u32,
     pub evidence: BTreeSet<String>,
 }
@@ -570,10 +701,14 @@ pub enum NextPermittedAction {
 /// *attempts*, not absence of *budget* — such a card is `Within`, exactly as
 /// if it had been recorded with every counter sitting at zero.
 ///
-/// A dimension is exhausted at `count >= limit`, not `count > limit`: a
-/// limit of 2 grants two attempts, and it is the second one — not some third
-/// attempt that was never going to be permitted anyway — that spends the
-/// budget.
+/// A dimension is exhausted at `count >= effective budget`, not
+/// `count > effective budget`: a limit of 2 grants two attempts, and it is
+/// the second one — not some third attempt that was never going to be
+/// permitted anyway — that spends the budget. The effective budget is the
+/// configured limit multiplied by `renewals + 1`, computed with checked
+/// arithmetic; see the loop below for why every renewal is worth exactly
+/// one more configured budget, never an actor-chosen amount, and for why an
+/// overflow there fails closed instead of wrapping into an enormous one.
 ///
 /// Every exhausted dimension is reported, in `CardDimension`'s declared
 /// order, not only the first one found. An operator who fixes the one
@@ -627,14 +762,36 @@ pub fn assess_card(
     ];
 
     let mut exhausted = Vec::new();
-    for (dimension, count, limit) in budgets {
+    for (dimension, count, base_limit) in budgets {
+        // The effective budget is the configured limit granted again once
+        // per authorized renewal, never an actor-chosen amount: `renewals`
+        // only ever moves by exactly 1 per fact (see `project`), so
+        // multiplying the base limit by `renewals + 1` is the whole grant a
+        // renewal can ever be worth. A card with zero renewals is assessed
+        // against exactly the configured limit, unchanged from before this
+        // dimension existed.
+        //
+        // Both the `+ 1` and the multiplication are checked, chained with
+        // `and_then` so an overflow in either step — not only the
+        // multiplication — is caught. Fail closed, never open: an overflow
+        // must never wrap into a small or enormous budget by accident, so
+        // it forces this dimension exhausted outright, regardless of
+        // `count`.
+        let effective_budget = count
+            .renewals
+            .checked_add(1)
+            .and_then(|multiplier| base_limit.checked_mul(multiplier));
+        let overflowed = effective_budget.is_none();
+        let effective_budget = effective_budget.unwrap_or(u32::MAX);
         // `>=`, not `>`: the boundary this function exists to get right.
-        // See the doc comment above.
-        if count.count >= limit {
+        // See the doc comment above. An overflowed budget is exhausted
+        // unconditionally: there is no safe number left to compare `count`
+        // against, so escalating is the only fail-closed answer.
+        if overflowed || count.count >= effective_budget {
             exhausted.push(ExhaustedDimension {
                 dimension,
                 count: count.count,
-                limit,
+                limit: effective_budget,
                 evidence: count.evidence.clone(),
             });
         }
@@ -821,6 +978,47 @@ mod tests {
             card_revision: (!integration).then_some(1),
             card_digest: (!integration).then(|| Digest::of_bytes(b"card")),
             event_type: ATTEMPT_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `renew` disposition fact for `F-001`, naming the given
+    /// dimension. Tests that need an invalid or differently bound
+    /// disposition mutate the returned event.
+    fn disposition_event(id: u64, dimension: CardDimension) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Renew).unwrap(),
+        );
+        metadata.insert(
+            "dimension".to_owned(),
+            serde_json::to_value(dimension).unwrap(),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("renewal:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
             actor_id: "luna".to_owned(),
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: None,
@@ -1288,25 +1486,29 @@ mod tests {
                 review_returns: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                    renewals: 0,
                 },
                 repair_attempts: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:2".to_owned()]),
+                    renewals: 0,
                 },
                 gate_failures: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:3".to_owned()]),
+                    renewals: 0,
                 },
                 material_scope_revisions: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:4".to_owned()]),
+                    renewals: 0,
                 },
             }
         );
         assert_eq!(
             serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
             format!(
-                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"]}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"]}},"repair_attempts":{{"count":1,"evidence":["receipt:2"]}},"gate_failures":{{"count":1,"evidence":["receipt:3"]}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"]}}}}}}}}"#,
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0}}}}}}}}"#,
                 view.policy_digest
             )
         );
@@ -1488,6 +1690,7 @@ mod tests {
             DimensionCount {
                 count: 1,
                 evidence: BTreeSet::from(["receipt:6".to_owned()]),
+                renewals: 0,
             },
         );
         assert_eq!(f002.repair_attempts, DimensionCount::default());
@@ -1629,6 +1832,7 @@ mod tests {
                     review_returns: DimensionCount {
                         count: 1,
                         evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                        renewals: 0,
                     },
                     ..CardCounters::default()
                 },
@@ -1758,6 +1962,238 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&escalated).unwrap(),
             r#"{"status":"escalated","exhausted":[{"dimension":"review_returns","count":2,"limit":2,"evidence":["review:RV-000001","review:RV-000002"]}],"next_permitted_action":"record_authorized_disposition"}"#
+        );
+    }
+
+    #[test]
+    fn a_renewal_grants_exactly_one_more_budget() {
+        // The central test. Limit 2, spent twice, is escalated on its own —
+        // register exactly one authorized renewal against the same facts
+        // and the card is `Within` again.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        assert!(
+            matches!(
+                assess_card(Some(&policy()), &view, &card_id, Risk::Medium),
+                CardConvergence::Escalated { .. }
+            ),
+            "two review returns against a limit of two, with no renewal, must escalate"
+        );
+
+        let mut renewed = facts;
+        renewed.push(disposition_event(3, CardDimension::ReviewReturns));
+        let renewed_view = project(Some(&policy()), &project_id, &cycle, &renewed).unwrap();
+        assert_eq!(
+            assess_card(Some(&policy()), &renewed_view, &card_id, Risk::Medium),
+            CardConvergence::Within,
+            "one authorized renewal grants the configured limit again"
+        );
+    }
+
+    #[test]
+    fn a_renewed_budget_escalates_again_once_it_is_spent() {
+        // limit 2, one renewal -> effective budget 2 * (1 + 1) = 4. Four
+        // review returns spend all of it, and the reported `limit` is the
+        // effective budget actually compared against, not the base 2.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let mut facts: Vec<Event> = (1u64..=4)
+            .map(|id| event(id, AttemptKind::ReviewReturn))
+            .collect();
+        facts.push(disposition_event(5, CardDimension::ReviewReturns));
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        let CardConvergence::Escalated { exhausted, .. } =
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium)
+        else {
+            panic!("four review returns against an effective budget of four must escalate");
+        };
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].dimension, CardDimension::ReviewReturns);
+        assert_eq!(exhausted[0].count, 4);
+        assert_eq!(
+            exhausted[0].limit, 4,
+            "limit reports the effective budget (2 * (1 renewal + 1)), not the base 2"
+        );
+    }
+
+    #[test]
+    fn two_renewals_grant_two_budgets_and_no_more() {
+        // limit 2, two renewals -> effective budget 2 * (2 + 1) = 6. Six
+        // review returns spend it exactly. This is the test that catches a
+        // renewal being treated as "unlimited" instead of "one more
+        // configured budget".
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let mut facts: Vec<Event> = (1u64..=6)
+            .map(|id| event(id, AttemptKind::ReviewReturn))
+            .collect();
+        facts.push(disposition_event(7, CardDimension::ReviewReturns));
+        facts.push(disposition_event(8, CardDimension::ReviewReturns));
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        let CardConvergence::Escalated { exhausted, .. } =
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium)
+        else {
+            panic!(
+                "two renewals grant exactly two extra budgets (6 total); six review returns must spend all of it"
+            );
+        };
+        assert_eq!(
+            exhausted[0].limit, 6,
+            "two renewals means 2 * (2 + 1), not an unbounded budget"
+        );
+    }
+
+    #[test]
+    fn a_renewal_only_affects_the_dimension_it_names() {
+        // A review_returns renewal must not rescue an exhausted
+        // gate_failures dimension on the same card.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::GateFailure),
+            event(2, AttemptKind::GateFailure),
+            disposition_event(3, CardDimension::ReviewReturns),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        let CardConvergence::Escalated { exhausted, .. } =
+            assess_card(Some(&policy()), &view, &card_id, Risk::Medium)
+        else {
+            panic!("gate_failures must still be exhausted; the renewal named review_returns");
+        };
+        assert_eq!(
+            exhausted
+                .iter()
+                .map(|item| item.dimension)
+                .collect::<Vec<_>>(),
+            vec![CardDimension::GateFailures],
+            "only gate_failures is exhausted; review_returns was never spent"
+        );
+    }
+
+    #[test]
+    fn a_renewal_only_affects_the_card_it_names() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let exhausted_card = CardId::from_str("F-001").unwrap();
+        let other_card = CardId::from_str("F-002").unwrap();
+
+        let mut renewal_for_other_card = disposition_event(3, CardDimension::ReviewReturns);
+        renewal_for_other_card.card_id = Some(other_card);
+
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+            renewal_for_other_card,
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert!(
+            matches!(
+                assess_card(Some(&policy()), &view, &exhausted_card, Risk::Medium),
+                CardConvergence::Escalated { .. }
+            ),
+            "F-001 never received a renewal; one recorded against F-002 must not rescue it"
+        );
+    }
+
+    #[test]
+    fn a_disposition_without_a_rationale_or_an_authorizing_actor_is_refused() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_rationale = disposition_event(1, CardDimension::ReviewReturns);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[blank_rationale]).is_err(),
+            "a decision with no declared reason is not a decision"
+        );
+
+        let mut blank_actor = disposition_event(2, CardDimension::ReviewReturns);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[blank_actor]).is_err(),
+            "a decision with no declared authorizing actor is not a decision"
+        );
+    }
+
+    #[test]
+    fn a_disposition_bound_to_a_foreign_policy_or_no_card_is_refused() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = disposition_event(1, CardDimension::ReviewReturns);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        assert!(project(Some(&policy()), &project_id, &cycle, &[foreign]).is_err());
+
+        let mut no_revision = disposition_event(2, CardDimension::ReviewReturns);
+        no_revision.card_revision = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[no_revision]).is_err());
+
+        let mut no_digest = disposition_event(3, CardDimension::ReviewReturns);
+        no_digest.card_digest = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[no_digest]).is_err());
+
+        let mut no_head = disposition_event(4, CardDimension::ReviewReturns);
+        no_head.head_sha = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[no_head]).is_err());
+    }
+
+    #[test]
+    fn renewals_are_independent_of_event_order() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::ReviewReturn),
+            disposition_event(3, CardDimension::ReviewReturns),
+            disposition_event(4, CardDimension::GateFailures),
+            event(5, AttemptKind::GateFailure),
+        ];
+        let first = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        let mut shuffled = facts;
+        shuffled.reverse();
+        let second = project(Some(&policy()), &project_id, &cycle, &shuffled).unwrap();
+        assert_eq!(
+            first, second,
+            "the same facts in a different order must project the same view"
+        );
+    }
+
+    #[test]
+    fn the_projection_json_carries_renewals() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            disposition_event(2, CardDimension::ReviewReturns),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        let ProjectConvergence::Configured(configured) = view else {
+            panic!("configured")
+        };
+        let dimension = &configured.cards[&CardId::from_str("F-001").unwrap()].review_returns;
+        assert_eq!(
+            serde_json::to_string(dimension).unwrap(),
+            r#"{"count":1,"evidence":["receipt:1"],"renewals":1}"#
         );
     }
 }
