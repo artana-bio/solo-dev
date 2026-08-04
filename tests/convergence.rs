@@ -2356,3 +2356,386 @@ fn a_corrupt_convergence_fact_fails_closed_instead_of_reading_as_unspent_budget(
         "the control repository head must not move on refusal"
     );
 }
+
+// 72-3: once a card is `Escalated`, none of the three remaining routes that
+// would advance it stay open either — `work start`, `work resume`, and
+// `card revise` all refuse before writing anything, the same way 72-2 closed
+// `handoff create` and the two `review` commands. `card revise` is the one
+// that matters most: 71-R1 already made the convergence counters span
+// revisions, so revising never resets a spent budget, but nothing before this
+// card stopped a revision from moving an escalated card back to `ready` and
+// so back into `work start`'s reach — the escape route this closes. `card
+// status`, `work block`, and `work checkpoint` are the other half of the same
+// line: convergence blocks what advances a card, not what parks or looks at
+// it, so all three stay open on an escalated card, and `card status` reports
+// the escalation as data instead of refusing to answer at all.
+
+#[test]
+fn an_escalated_card_refuses_work_start() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+    let before_head = workspace.control_head();
+
+    // `work start --dry-run`: the preview must never promise a start the real
+    // command would refuse.
+    let preview = workspace.work_raw(&["start", "--card-id", "F-001", "--dry-run"]);
+    assert!(
+        !preview.status.success(),
+        "the dry run must refuse the same escalation the real command does: {}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    assert_eq!(error_code(&preview), "CH-POLICY-CONVERGENCE-ESCALATED");
+    assert!(
+        error_message(&preview).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&preview)
+    );
+
+    let output = workspace.work_raw(&["start", "--card-id", "F-001"]);
+    assert!(
+        !output.status.success(),
+        "an escalated card must refuse a new work start: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    let message = error_message(&output);
+    assert!(message.contains("review_returns"), "{message}");
+    assert!(message.contains("1/1"), "{message}");
+    assert!(
+        message.contains(&format!("review:{review_id}")),
+        "the operator must see the evidence without opening the control repository: {message}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "neither the dry run nor the refusal may move the control repository head"
+    );
+}
+
+#[test]
+fn an_escalated_card_refuses_work_resume() {
+    // `resumes_to_active` admits four source states, and its own doc comment
+    // explains why: `changes_requested` and `blocked` are an actor
+    // continuing work they already own — resuming from there must stay open,
+    // or a card could never accumulate the review returns, repair attempts,
+    // or gate failures its own budget exists to count, since redelivering
+    // after a return requires becoming `active` again. `ready` is different:
+    // it is reached only when a revision leaves a lease stranded (`work
+    // start` refuses outright because the lease exists), so resuming from
+    // `ready` is functionally the same advance `work start` blocks for a
+    // fresh assignment, just through its alternate entry point. That is the
+    // reachable, unambiguous case this test drives: a material scope
+    // revision that itself spends the budget — the revision is allowed, the
+    // budget is unspent when it runs — leaves the card exactly there.
+    let workspace = opened_with_policy(1, 3);
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let widened = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs", "src/b.rs"],
+        &["it works"],
+    );
+    let revise = revise_raw(&workspace, &widened, "widen scope", false);
+    assert!(
+        revise.status.success(),
+        "the revision that spends the budget is itself allowed: {}{}",
+        String::from_utf8_lossy(&revise.stdout),
+        String::from_utf8_lossy(&revise.stderr)
+    );
+    let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(card_status["data"]["state"], "ready");
+    assert_eq!(
+        card_status["data"]["convergence"],
+        serde_json::json!({
+            "status": "escalated",
+            "exhausted": [
+                {
+                    "dimension": "material_scope_revisions",
+                    "count": 1,
+                    "limit": 1,
+                    "evidence": ["card-revision:F-001@2"],
+                }
+            ],
+            "next_permitted_action": "record_authorized_disposition",
+        }),
+        "the revision must leave the card escalated: {card_status}"
+    );
+
+    let before_head = workspace.control_head();
+
+    // `work resume --dry-run`.
+    let preview = workspace.work_raw(&["resume", "--card-id", "F-001", "--dry-run"]);
+    assert!(
+        !preview.status.success(),
+        "the dry run must refuse the same escalation the real command does: {}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    assert_eq!(error_code(&preview), "CH-POLICY-CONVERGENCE-ESCALATED");
+    assert!(
+        error_message(&preview).contains("material_scope_revisions"),
+        "{}",
+        error_message(&preview)
+    );
+
+    let output = workspace.work_raw(&["resume", "--card-id", "F-001"]);
+    assert!(
+        !output.status.success(),
+        "an escalated card must refuse taking a lease-stranding revision back up: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    let message = error_message(&output);
+    assert!(message.contains("material_scope_revisions"), "{message}");
+    assert!(message.contains("1/1"), "{message}");
+    assert!(
+        message.contains("card-revision:F-001@2"),
+        "the operator must see the evidence without opening the control repository: {message}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "neither the dry run nor the refusal may move the control repository head"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "ready",
+        "the refused resume must not have moved the card"
+    );
+}
+
+#[test]
+fn an_escalated_card_refuses_a_scope_revision() {
+    // This is the escape route: a revision returns the card to `ready`
+    // (Section 7.3.4), and from `ready` `work start` looks legal again. 71-R1
+    // already keeps the convergence counters from resetting across revisions,
+    // so the budget itself cannot be dodged this way — but without this
+    // check, the *state* could still be walked back out of its stuck place.
+    let workspace = opened_with_policy(1, 3);
+    let base = workspace.authority_head();
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+    let before_head = workspace.control_head();
+    let before_revision =
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["revision"].clone();
+
+    let widened = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/**", "docs/**"],
+        &["it works"],
+    );
+
+    // `card revise --dry-run`.
+    let preview = revise_raw(&workspace, &widened, "widen scope", true);
+    assert!(
+        !preview.status.success(),
+        "the dry run must refuse the same escalation the real command does: {}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    assert_eq!(error_code(&preview), "CH-POLICY-CONVERGENCE-ESCALATED");
+    assert!(
+        error_message(&preview).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&preview)
+    );
+
+    let output = revise_raw(&workspace, &widened, "widen scope", false);
+    assert!(
+        !output.status.success(),
+        "an escalated card must refuse a scope revision: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+    let message = error_message(&output);
+    assert!(message.contains("review_returns"), "{message}");
+    assert!(message.contains("1/1"), "{message}");
+    assert!(
+        message.contains(&format!("review:{review_id}")),
+        "the operator must see the evidence without opening the control repository: {message}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "neither the dry run nor the refusal may move the control repository head"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["revision"],
+        before_revision,
+        "no new revision may exist after the refusal — the card stays exactly where the escalation left it"
+    );
+}
+
+#[test]
+fn card_status_reports_the_escalation_instead_of_refusing() {
+    let workspace = opened_with_policy(1, 3);
+    let review_id = escalate_via_review_returns(&workspace, "F-001");
+
+    let output = workspace.card_raw(&["status", "--card-id", "F-001"]);
+    assert!(
+        output.status.success(),
+        "card status must never refuse, even for an escalated card: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({
+            "status": "escalated",
+            "exhausted": [
+                {
+                    "dimension": "review_returns",
+                    "count": 1,
+                    "limit": 1,
+                    "evidence": [format!("review:{review_id}")],
+                }
+            ],
+            "next_permitted_action": "record_authorized_disposition",
+        }),
+        "data.convergence must be exactly CardConvergence's own serialization: {envelope}"
+    );
+
+    // The human-readable text must say the same thing: which dimension is
+    // exhausted and what may happen next, without requiring JSON.
+    let text_output = Workspace::run(&[
+        "card".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--card-id".to_owned(),
+        "F-001".to_owned(),
+    ]);
+    assert!(
+        text_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    let text = String::from_utf8_lossy(&text_output.stdout).into_owned();
+    assert!(text.contains("review_returns"), "{text}");
+    assert!(text.contains("1/1"), "{text}");
+    assert!(text.contains(&format!("review:{review_id}")), "{text}");
+    assert!(
+        text.contains("record_authorized_disposition"),
+        "the text must name the next permitted action too: {text}"
+    );
+}
+
+#[test]
+fn card_status_reports_within_budget_for_a_healthy_card() {
+    let workspace = opened_with_policy(3, 3);
+    workspace.activate_card("F-001", &["src/**"]);
+
+    let envelope = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "within" }),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn card_status_reports_legacy_unassessed_without_a_policy() {
+    let workspace = opened();
+    workspace.activate_card("F-001", &["src/**"]);
+
+    let envelope = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "legacy_unassessed" }),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn an_unrelated_card_in_the_same_cycle_still_starts_work() {
+    let workspace = opened_with_policy(1, 3);
+    escalate_via_review_returns(&workspace, "F-001");
+
+    // A second, unrelated card, scoped away from `src/**` so the two can
+    // coexist without an ownership-overlap refusal, must be completely
+    // unaffected by F-001's escalation.
+    workspace.activate_card("F-002", &["docs/f002/**"]);
+    let output = workspace.work_raw(&["start", "--card-id", "F-002"]);
+    assert!(
+        output.status.success(),
+        "an unrelated card in the same cycle must still be able to start work: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+        "active"
+    );
+
+    // And F-001 remains blocked throughout, proving the isolation runs both
+    // ways.
+    let still_blocked = workspace.work_raw(&["start", "--card-id", "F-001"]);
+    assert_eq!(
+        error_code(&still_blocked),
+        "CH-POLICY-CONVERGENCE-ESCALATED"
+    );
+}
+
+#[test]
+fn blocking_and_checkpointing_an_escalated_card_are_still_permitted() {
+    let workspace = opened_with_policy(1, 3);
+    escalate_via_review_returns(&workspace, "F-001");
+
+    // `escalate_via_review_returns` leaves the card `changes_requested`, and
+    // `CardState::successors` only admits `blocked` from `active` — so the
+    // actor first takes the returned work back up. That resume is not itself
+    // blocked (see the note on `resumes_to_active` in `work.rs`): an actor
+    // must be able to continue work they already own even once escalated,
+    // since #72-2 already refuses the delivery and review attempts
+    // themselves.
+    let resume = workspace.work_raw(&["resume", "--card-id", "F-001"]);
+    assert!(
+        resume.status.success(),
+        "resuming already-owned work must stay permitted on an escalated card: {}{}",
+        String::from_utf8_lossy(&resume.stdout),
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active"
+    );
+
+    // From `active`, blocking is a legitimate exit on its own — halting is
+    // not advancing.
+    let block = workspace.work_raw(&[
+        "block",
+        "--card-id",
+        "F-001",
+        "--reason",
+        "escalated; awaiting an authorized disposition",
+    ]);
+    assert!(
+        block.status.success(),
+        "blocking must stay permitted on an escalated card: {}{}",
+        String::from_utf8_lossy(&block.stdout),
+        String::from_utf8_lossy(&block.stderr)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "blocked"
+    );
+
+    // A progress note does not advance the card either, and it is the record
+    // of why the card is where it is — refusing it would destroy exactly
+    // what an operator needs most on a stuck card.
+    let checkpoint = workspace.work_raw(&[
+        "checkpoint",
+        "--card-id",
+        "F-001",
+        "--note",
+        "waiting on a disposition",
+    ]);
+    assert!(
+        checkpoint.status.success(),
+        "a progress note must stay permitted on an escalated card: {}{}",
+        String::from_utf8_lossy(&checkpoint.stdout),
+        String::from_utf8_lossy(&checkpoint.stderr)
+    );
+}

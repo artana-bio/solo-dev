@@ -1,6 +1,7 @@
 //! Card lifecycle commands.
 
 use std::{
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -27,8 +28,8 @@ use crate::{
     error::{ErrorCode, HarnessError},
     policy::allocation::{Claim, check_admissible, check_dependencies},
     policy::convergence::{
-        ATTEMPT_RECORDED_EVENT, AttemptKind, CardConvergence, CardDimension, ReasonCategory,
-        ScopeBreadth, assess_card, project,
+        ATTEMPT_RECORDED_EVENT, AttemptKind, CardConvergence, CardDimension, NextPermittedAction,
+        ReasonCategory, ScopeBreadth, assess_card, project,
     },
 };
 
@@ -269,6 +270,16 @@ fn dimension_wire_name(dimension: CardDimension) -> String {
     }
 }
 
+/// Renders a [`NextPermittedAction`] using the same spelling it would
+/// serialize to, so `card status`'s human text never hand-spells a name
+/// `serde` already owns. Mirrors `dimension_wire_name`, just above.
+fn next_permitted_action_wire_name(action: NextPermittedAction) -> String {
+    match serde_json::to_value(action) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{action:?}"),
+    }
+}
+
 /// Refuses a controlled action on a card whose convergence budget is spent.
 ///
 /// #72-2: once `assess_card` reports a card `Escalated`, the delivery and
@@ -352,6 +363,46 @@ pub fn require_convergence_budget(
         ),
         code: ErrorCode::PolicyConvergenceEscalated,
     })
+}
+
+/// Assesses a card's convergence budget for `card status`, without refusing.
+///
+/// 72-3: `card status` is the operator's window into why a card stopped, so
+/// unlike [`require_convergence_budget`] this never turns an `Escalated`
+/// budget into a refusal — it hands the [`CardConvergence`] back as data.
+/// Mirrors that function's own projection and assessment exactly: same
+/// policy, same cycle events, same [`assess_card`] call, so the JSON `card
+/// status` publishes and the JSON the block above decides from can never
+/// disagree about whether a card is escalated. Kept as its own small function
+/// rather than a shared call site because `require_convergence_budget` is
+/// frozen by #72-2's contract; this only reads what it already reads.
+///
+/// A malformed, duplicate, foreign, or unbound convergence fact still fails
+/// here exactly as it does there: that is control-repository corruption, a
+/// different problem than an exhausted budget, and there is no projection
+/// left to assess.
+///
+/// # Errors
+///
+/// Propagates a control-read or projection failure unchanged.
+fn card_convergence(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+) -> Result<CardConvergence, HarnessError> {
+    let policy = config.convergence_policy.as_ref();
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view =
+        project(policy, &config.project_id, &record.cycle_id, &cycle_events).map_err(|error| {
+            HarnessError::Control {
+                reason: format!(
+                    "convergence projection for cycle {} is unusable: {error}",
+                    record.cycle_id
+                ),
+                code: ErrorCode::InternalControlCorrupt,
+            }
+        })?;
+    Ok(assess_card(policy, &view, &record.card_id, record.risk))
 }
 
 /// Moves a card to a new state, keeping its revision and digest.
@@ -890,6 +941,12 @@ fn preview_revise(
         code: ErrorCode::InternalControlCorrupt,
     })?;
     let config = control.project()?;
+    // 72-3: same placement as `run_revise` — right after the current
+    // revision's record and the project config are both available, before
+    // anything else, so a preview can never promise a revision the real
+    // command would refuse for an escalated card. See
+    // `require_convergence_budget`.
+    require_convergence_budget(&control, &config, &previous)?;
     let preview = CardRecord::activate(
         draft,
         state.current_revision + 1,
@@ -971,6 +1028,14 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             })?;
 
             let config = control.project()?;
+            // 72-3: the first check able to refuse once the card record and
+            // project config both exist — a revision returns the card to
+            // `ready`, which would otherwise be the one route left able to
+            // dodge the escalation. 71-R1 already made the convergence
+            // counters span revisions, so revising does not reset the
+            // budget; what was still missing is that revising itself must
+            // not be permitted at all. See `require_convergence_budget`.
+            require_convergence_budget(control, &config, &previous)?;
             let record = previous.revise(&draft, &args.common.actor, clock.now())?;
             require_declared_proof(&config.validation_policy, &record)?;
             // A revision may widen the write scope, so allocation is re-checked
@@ -1143,6 +1208,13 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     )
 }
 
+// 72-3: the convergence report below has to sit inside this one function,
+// alongside the digest-integrity report already here — both are read-only
+// facts about the same loaded `record`, and splitting either into a helper
+// the length limit would otherwise invite risks losing the "this command
+// never refuses for convergence" property at a call site instead of at a
+// glance.
+#[allow(clippy::too_many_lines)]
 fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
@@ -1182,16 +1254,57 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let recomputed = record.digest()?;
     let intact = recomputed == state.current_digest;
 
+    // 72-3: `card status` is the operator's window into why a card stopped,
+    // so unlike every blocked command above it never turns an escalated
+    // budget into a refusal — see `card_convergence`. `data.convergence` is
+    // exactly `CardConvergence`'s own serialization, the same shape
+    // `require_convergence_budget` decides from, so the JSON this command
+    // publishes and the JSON that decides a block elsewhere can never
+    // disagree.
+    let convergence = card_convergence(&control, &config, &record)?;
+
+    let mut text = format!(
+        "Card {card_id}\ntitle: {}\ncycle: {}\nstate: {}\nrevision: {}\ndigest: {recomputed}\nrisk: {}",
+        record.title,
+        record.cycle_id,
+        state.state,
+        state.current_revision,
+        record.risk.name()
+    );
+    // The human text says the same thing the JSON does, not less: an
+    // operator reading text output must not have to ask for JSON to learn
+    // which dimension is exhausted or what they may do next.
+    if let CardConvergence::Escalated {
+        exhausted,
+        next_permitted_action,
+    } = &convergence
+    {
+        let _ = write!(text, "\nconvergence: escalated");
+        for dimension in exhausted {
+            let _ = write!(
+                text,
+                "\n  {}: {}/{} (evidence: {})",
+                dimension_wire_name(dimension.dimension),
+                dimension.count,
+                dimension.limit,
+                dimension
+                    .evidence
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let _ = write!(
+            text,
+            "\n  next permitted action: {}",
+            next_permitted_action_wire_name(*next_permitted_action)
+        );
+    }
+
     let mut outcome = CommandOutcome::new(
         "card.status",
-        format!(
-            "Card {card_id}\ntitle: {}\ncycle: {}\nstate: {}\nrevision: {}\ndigest: {recomputed}\nrisk: {}",
-            record.title,
-            record.cycle_id,
-            state.state,
-            state.current_revision,
-            record.risk.name()
-        ),
+        text,
         serde_json::json!({
             "card_id": card_id.to_string(),
             "cycle_id": record.cycle_id.to_string(),
@@ -1203,6 +1316,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "canonical_algorithm": state.canonical_algorithm,
             "risk": record.risk.name(),
             "title": record.title,
+            "convergence": convergence,
         }),
     )
     .with_project(config.project_id.clone());

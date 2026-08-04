@@ -13,7 +13,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        card::{CardStateRecord, load_card, store_card_state},
+        card::{CardStateRecord, load_card, require_convergence_budget, store_card_state},
         transaction::{Steps, with_transaction},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
@@ -397,6 +397,13 @@ fn preflight_start(
     record: &CardRecord,
     state: &CardStateRecord,
 ) -> Result<(String, String, PathBuf), HarnessError> {
+    // 72-3: the first check that can refuse, before anything else — an
+    // escalated card cannot take a new assignment. `preview_start` and
+    // `run_start`'s transaction both call this one function, so there is a
+    // single place this has to be checked rather than one in each, and
+    // neither can promise or perform a start the other would refuse. See
+    // `require_convergence_budget`.
+    require_convergence_budget(control, config, record)?;
     // Lease availability is checked before the state transition on purpose. A
     // card that already holds a lease will also fail the transition check, but
     // "you hold lease L-000001 at <path>, resume it" tells the operator what to
@@ -589,6 +596,12 @@ fn run_status(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
     .with_project(config.project_id.clone()))
 }
 
+// 72-3: deliberately never gated by `require_convergence_budget`. #72's
+// escalation blocks what advances a card, not what parks or looks at it — a
+// checkpoint is a progress note, not a step forward, and an escalated card is
+// exactly the one whose record of "why it is where it is" matters most. See
+// the same line drawn at `run_block`, below, and at `card status`'s report in
+// `card.rs`.
 fn run_checkpoint(
     args: &CheckpointArgs,
     clock: &dyn Clock,
@@ -721,8 +734,21 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let (_record, state, lease) = allocation(&control, &card_id)?;
+        let (record, state, lease) = allocation(&control, &card_id)?;
         let config = control.project()?;
+        // 72-3: checked only for `ready`, the one source state
+        // `resumes_to_active` admits that is functionally equivalent to
+        // `work start` rather than to continuing already-owned work — see
+        // the doc comment below. Resuming from `changes_requested`,
+        // `blocked`, or `review_pending` is deliberately left open: an actor
+        // must be able to take a returned card back up to redeliver, or a
+        // card could never accumulate the attempts its budget exists to
+        // count in the first place, and #72-2 already refuses the delivery
+        // and review attempts themselves once that budget is spent. See
+        // `require_convergence_budget`.
+        if state.state == CardState::Ready {
+            require_convergence_budget(&control, &config, &record)?;
+        }
         verify_locator(&control, &lease, &config.project_id)?;
         return Ok(CommandOutcome::new(
             "work.resume",
@@ -786,6 +812,19 @@ fn resume_to_active(
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
+            // 72-3: the same narrow case the dry run checks, for the same
+            // reason — see the note there. `resume_to_active` handles every
+            // source state `resumes_to_active` admits, and only `ready` is
+            // gated: it is the one case a lease survives a revision back to
+            // `ready`, making this the alternate entry point to the exact
+            // advance `work start` already refuses for a fresh assignment.
+            // Re-read fresh here rather than trusted from the caller's
+            // routing decision, matching how every other fact this
+            // transaction commits on is read at commit time, not assumed
+            // from before it began.
+            if state.state == CardState::Ready {
+                require_convergence_budget(control, &config, &record)?;
+            }
             verify_locator(control, &lease, &config.project_id)?;
             // Section 11.2 routes `ready` to `active` through `leased`, which
             // is the same path `work start` takes. Stepping through it rather
@@ -993,6 +1032,11 @@ fn run_verify(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
     }
 }
 
+// 72-3: deliberately never gated by `require_convergence_budget` either.
+// Blocking halts work; it does not advance the card, and it is a legitimate
+// exit on its own. Refusing to record a halt on the one card that most needs
+// one recorded would destroy the reason the card is where it is, not protect
+// anything.
 fn run_block(args: &BlockArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
 
