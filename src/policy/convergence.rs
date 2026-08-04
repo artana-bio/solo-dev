@@ -239,12 +239,15 @@ impl AttemptKind {
 /// The single append-only disposition fact the v1 projection recognizes.
 pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
 
-/// Closed set of authorized dispositions. Only the one #74's first card
-/// implements exists here; the rest arrive with their own bounded effects.
+/// Closed set of authorized dispositions. The two #74 has implemented so
+/// far are here; the rest arrive with their own bounded effects.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DispositionKind {
     Renew,
+    /// Retires a policy digest so facts recorded under it stop counting
+    /// toward the current budget, without erasing them from the record.
+    Rebaseline,
 }
 
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
@@ -278,6 +281,26 @@ struct AttemptMetadata {
 struct DispositionMetadata {
     disposition: DispositionKind,
     dimension: CardDimension,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata a rebaseline fact must declare, with the same closed-set rigor
+/// as `DispositionMetadata`.
+///
+/// Deliberately a separate shape rather than `dimension` being optional on
+/// `DispositionMetadata`: a rebaseline names no card dimension at all — it
+/// retires a policy digest for the whole project — so an optional field
+/// would let a malformed fact of either kind pass by leaving out the part
+/// that distinguishes them. `policy_digest` here is the digest this fact is
+/// itself recorded under (checked in `project` exactly like any other
+/// fact's), not the one it retires; that is `retired_policy_digest`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebaselineMetadata {
+    disposition: DispositionKind,
+    retired_policy_digest: Digest,
     rationale: String,
     authorized_by: String,
     policy_digest: Digest,
@@ -402,6 +425,99 @@ pub fn project(
     };
     let mut seen = BTreeSet::new();
 
+    // Pass 1 of 2: collect rebaselines before anything else is folded.
+    //
+    // A retired digest has to be known application-wide before a single
+    // attempt or disposition fact is judged against it — otherwise the same
+    // set of facts would project two different views depending on whether a
+    // retired fact happened to appear before or after the rebaseline that
+    // retired it in `events`, which is any order an honest event log can
+    // hand this function. Collecting every rebaseline first, into
+    // `retired_policy_digests`, before the fold below ever runs, is what
+    // makes the result depend only on the set of facts, never their order;
+    // see `rebaselines_are_independent_of_event_order`.
+    //
+    // A rebaseline is cycle-only, not card-bound — a policy belongs to the
+    // whole project, not one card — so its shape mirrors `IntegrationFailure`
+    // rather than an ordinary disposition: no `card_id`, `card_revision`, or
+    // `card_digest`, and an exact `head_sha`.
+    let mut retired_policy_digests: BTreeSet<Digest> = BTreeSet::new();
+    let mut rebaselines: Vec<(String, RebaselineMetadata)> = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_rebaseline(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: RebaselineMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_rebaseline` already selected only rebaseline-tagged events, so
+        // this can never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Rebaseline);
+        if metadata.rationale.trim().is_empty() || metadata.authorized_by.trim().is_empty() {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared rationale and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        if event.card_id.is_some()
+            || event.card_revision.is_some()
+            || event.card_digest.is_some()
+            || !event.head_sha.as_deref().is_some_and(is_exact_sha)
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "rebaseline must be cycle-only".to_owned(),
+            });
+        }
+        if metadata.retired_policy_digest == policy_digest {
+            return Err(ProjectionError {
+                event_id,
+                reason: "rebaseline cannot retire the policy digest currently in force".to_owned(),
+            });
+        }
+        retired_policy_digests.insert(metadata.retired_policy_digest.clone());
+        rebaselines.push((event_id, metadata));
+    }
+    // A rebaseline's own governing digest is judged by the same rule as any
+    // other fact — current, retired, or refused — but only once every
+    // rebaseline above has contributed to `retired_policy_digests`: a chain
+    // like A retired under B, B retired under the digest in force, must
+    // leave both retired regardless of which of the two facts this function
+    // met first. Checked here, once, rather than inline in the loop above,
+    // so this legality check always sees the complete set.
+    for (event_id, metadata) in &rebaselines {
+        if metadata.policy_digest != policy_digest
+            && !retired_policy_digests.contains(&metadata.policy_digest)
+        {
+            return Err(ProjectionError {
+                event_id: event_id.clone(),
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+    }
+
+    // Pass 2 of 2: fold everything else. `retired_policy_digests` is
+    // complete from here on and never changes again.
     for event in events
         .iter()
         .filter(|event| event.event_type == ATTEMPT_RECORDED_EVENT)
@@ -432,7 +548,19 @@ pub fn project(
                 reason: "evidence_ref must not be empty".to_owned(),
             });
         }
-        if metadata.policy_digest != policy_digest {
+        // A fact under the digest currently in force counts as it always
+        // has. One under a digest a rebaseline retired (`retired_policy_
+        // digests`, collected in the first pass above) is a true record of
+        // what happened but no longer a measure of today's budget — it is
+        // still validated fully below, it simply never reaches the
+        // `count`/`evidence` step at the end of each arm. Anything else — a
+        // digest nobody ever decided anything about — still refuses the
+        // whole view exactly as before: the fail-closed default narrows
+        // only for digests an authorized rebaseline explicitly named, never
+        // for one this projection has never heard of. See
+        // `an_unretired_foreign_digest_still_refuses_the_whole_view`.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
             return Err(ProjectionError {
                 event_id,
                 reason: "fact names a foreign policy digest".to_owned(),
@@ -456,6 +584,9 @@ pub fn project(
                         event_id,
                         reason: "integration failure has incompatible reason category".to_owned(),
                     });
+                }
+                if under_retired_digest {
+                    continue;
                 }
                 result.cycle.integration_failures.count = result
                     .cycle
@@ -509,6 +640,9 @@ pub fn project(
                         reason: "card attempt has incompatible reason category".to_owned(),
                     });
                 }
+                if under_retired_digest {
+                    continue;
+                }
                 let counters = result.cards.entry(card_id.clone()).or_default();
                 let dimension = match kind {
                     AttemptKind::ReviewReturn => &mut counters.review_returns,
@@ -538,9 +672,16 @@ pub fn project(
     // `IntegrationFailure`, a disposition has no cycle-only shape: it is
     // always about one card in one exact state, so the card binding below
     // is unconditional rather than selected by a match arm.
+    //
+    // Rebaselines are excluded here: they are cycle-only, not card-bound,
+    // and the first pass above already collected, validated, and accounted
+    // for every one of them. Visiting one again here would both attempt a
+    // `dimension`-shaped parse a rebaseline's metadata was never going to
+    // satisfy and double-insert its event identifier into `seen`,
+    // misreporting a lone valid rebaseline as a duplicate.
     for event in events
         .iter()
-        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT)
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && !is_rebaseline(event))
     {
         let event_id = event.event_id.as_str().to_owned();
         if !seen.insert(event_id.clone()) {
@@ -569,7 +710,11 @@ pub fn project(
                     .to_owned(),
             });
         }
-        if metadata.policy_digest != policy_digest {
+        // Same three-way rule as an attempt fact — current counts, retired
+        // is ignored, anything else refuses the whole view. See the longer
+        // note above the equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
             return Err(ProjectionError {
                 event_id,
                 reason: "fact names a foreign policy digest".to_owned(),
@@ -591,6 +736,9 @@ pub fn project(
                 event_id,
                 reason: "disposition head is not an exact commit SHA".to_owned(),
             });
+        }
+        if under_retired_digest {
+            continue;
         }
 
         let counters = result.cards.entry(card_id.clone()).or_default();
@@ -622,6 +770,10 @@ pub fn project(
                             reason: "counter overflow".to_owned(),
                         })?;
             }
+            // Unreachable: this loop's filter excludes every rebaseline
+            // fact, and the first pass above is the only place one is ever
+            // folded.
+            DispositionKind::Rebaseline => unreachable!("rebaseline facts are filtered out above"),
         }
     }
 
@@ -630,6 +782,25 @@ pub fn project(
 
 fn is_exact_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is a rebaseline, decided from
+/// its raw `disposition` field rather than by committing to either full
+/// metadata shape first.
+///
+/// This has to be knowable before a shape is chosen: `RebaselineMetadata`
+/// and `DispositionMetadata` disagree on almost every other field, and
+/// `deny_unknown_fields` turns a wrong guess into a spurious refusal rather
+/// than a graceful fallback. A fact that is not recognizably a rebaseline —
+/// including one with a missing or malformed `disposition` field — answers
+/// `false` here and is left for the ordinary `DispositionMetadata` parse to
+/// accept or, correctly, refuse.
+fn is_rebaseline(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Rebaseline)
 }
 
 /// Which bounded card dimension a budget covers.
@@ -1018,6 +1189,50 @@ mod tests {
             card_id: Some("F-001".parse().unwrap()),
             card_revision: Some(1),
             card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `rebaseline` fact, itself recorded under the digest
+    /// currently in force, that retires `retired_policy_digest`. Cycle-only,
+    /// like `event(_, AttemptKind::IntegrationFailure)`, never card-bound.
+    /// Tests that need an invalid rebaseline, or one recorded under a
+    /// different governing digest, mutate the returned event exactly as
+    /// `disposition_event` is mutated elsewhere in this module.
+    fn rebaseline_event(id: u64, retired_policy_digest: &Digest) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Rebaseline).unwrap(),
+        );
+        metadata.insert(
+            "retired_policy_digest".to_owned(),
+            serde_json::json!(retired_policy_digest.as_str()),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("rebaseline:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: None,
+            card_revision: None,
+            card_digest: None,
             event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
             actor_id: "luna".to_owned(),
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
@@ -2271,6 +2486,263 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![CardDimension::ReviewReturns],
             "the overflowed dimension is the one that must be reported exhausted"
+        );
+    }
+
+    #[test]
+    fn facts_under_a_retired_digest_are_ignored_rather_than_refused() {
+        // The central test. A review return recorded under a digest an
+        // authorized rebaseline retires must not refuse the view, and must
+        // not be counted either — the card ends up with no entry at all,
+        // exactly as if that fact had never been recorded.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut old_attempt = event(1, AttemptKind::ReviewReturn);
+        old_attempt.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(retired_digest.as_str()),
+        );
+
+        let facts = vec![old_attempt, rebaseline_event(2, &retired_digest)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts)
+            .expect("a fact under a retired digest must not refuse the view");
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        assert!(
+            !view.cards.contains_key(&card_id),
+            "a review return recorded only under a retired digest must leave no trace in the counters"
+        );
+    }
+
+    #[test]
+    fn an_unretired_foreign_digest_still_refuses_the_whole_view() {
+        // The distinction this card exists to draw: the fail-closed default
+        // narrows only for a digest an authorized rebaseline named
+        // explicitly. A rebaseline retiring some other digest must not make
+        // an unrelated, undecided digest pass by accident — that would turn
+        // a bounded exception into a hole.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+        let undecided_digest = Digest::of_bytes(b"policy-nobody-decided-about");
+
+        let mut undecided_attempt = event(1, AttemptKind::ReviewReturn);
+        undecided_attempt.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(undecided_digest.as_str()),
+        );
+
+        let facts = vec![undecided_attempt, rebaseline_event(2, &retired_digest)];
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &facts).is_err(),
+            "a digest no rebaseline named must still refuse the whole view, even with an \
+             unrelated rebaseline present"
+        );
+    }
+
+    #[test]
+    fn counters_after_a_rebaseline_count_only_the_facts_under_the_current_policy() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut old_attempt = event(1, AttemptKind::ReviewReturn);
+        old_attempt.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(retired_digest.as_str()),
+        );
+        let current_attempt = event(2, AttemptKind::ReviewReturn);
+
+        let facts = vec![
+            old_attempt,
+            current_attempt,
+            rebaseline_event(3, &retired_digest),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        let counters = &view.cards[&card_id];
+        assert_eq!(
+            counters.review_returns.count, 1,
+            "only the fact recorded under the current policy counts"
+        );
+        assert_eq!(
+            counters.review_returns.evidence,
+            BTreeSet::from(["receipt:2".to_owned()]),
+            "the retired fact's evidence must not appear alongside the current count"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_rebaselines_retires_every_earlier_digest() {
+        // A -> B -> C: a rebaseline retiring A is itself recorded under B,
+        // and a second rebaseline retiring B is recorded under C, the
+        // digest currently in force. Both A and B must end up retired, so
+        // only a fact recorded under C counts.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let digest_a = Digest::of_bytes(b"policy-a");
+        let digest_b = Digest::of_bytes(b"policy-b");
+        let digest_c = policy().digest().unwrap();
+
+        let mut retire_a_under_b = rebaseline_event(1, &digest_a);
+        retire_a_under_b.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(digest_b.as_str()),
+        );
+        // Recorded under the digest currently in force: no override needed.
+        let retire_b_under_c = rebaseline_event(2, &digest_b);
+
+        let mut attempt_under_a = event(3, AttemptKind::ReviewReturn);
+        attempt_under_a.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(digest_a.as_str()),
+        );
+        let mut attempt_under_b = event(4, AttemptKind::ReviewReturn);
+        attempt_under_b.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(digest_b.as_str()),
+        );
+        let attempt_under_c = event(5, AttemptKind::ReviewReturn);
+
+        let facts = vec![
+            retire_a_under_b,
+            retire_b_under_c,
+            attempt_under_a,
+            attempt_under_b,
+            attempt_under_c,
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts)
+            .expect("A retired under B, B retired under the current digest, must both resolve");
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        assert_eq!(view.policy_digest, digest_c);
+        let counters = &view.cards[&card_id];
+        assert_eq!(
+            counters.review_returns.count, 1,
+            "A and B are both retired by the chain; only the attempt under C, the current \
+             digest, counts"
+        );
+        assert_eq!(
+            counters.review_returns.evidence,
+            BTreeSet::from(["receipt:5".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rebaseline_naming_a_card_or_lacking_an_exact_head_is_refused() {
+        // A policy belongs to the whole project, not one card: a rebaseline
+        // follows the same cycle-only binding `IntegrationFailure` already
+        // follows, not a card fact's.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut named_card = rebaseline_event(1, &retired_digest);
+        named_card.card_id = Some(CardId::from_str("F-001").unwrap());
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[named_card]).is_err(),
+            "a rebaseline naming a card must be refused"
+        );
+
+        let mut no_head = rebaseline_event(2, &retired_digest);
+        no_head.head_sha = None;
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[no_head]).is_err(),
+            "a rebaseline without a head must be refused"
+        );
+
+        let mut short_head = rebaseline_event(3, &retired_digest);
+        short_head.head_sha = Some("abc123".to_owned());
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[short_head]).is_err(),
+            "a rebaseline head that is not an exact 40-hex commit SHA must be refused"
+        );
+    }
+
+    #[test]
+    fn a_rebaseline_without_a_rationale_an_actor_or_a_retired_digest_is_refused() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut blank_rationale = rebaseline_event(1, &retired_digest);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[blank_rationale]).is_err(),
+            "a rebaseline with no declared reason is not a decision"
+        );
+
+        let mut blank_actor = rebaseline_event(2, &retired_digest);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[blank_actor]).is_err(),
+            "a rebaseline with no declared authorizing actor is not a decision"
+        );
+
+        let mut no_retired_digest = rebaseline_event(3, &retired_digest);
+        no_retired_digest.metadata.remove("retired_policy_digest");
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[no_retired_digest]).is_err(),
+            "a rebaseline that names no retired digest is malformed"
+        );
+    }
+
+    #[test]
+    fn a_rebaseline_that_retires_the_digest_in_force_is_refused() {
+        // Retiring the digest currently in force would retire the budget
+        // every other fact in this same view is being measured against.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let current_digest = policy().digest().unwrap();
+        let retiring_current = rebaseline_event(1, &current_digest);
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[retiring_current]).is_err(),
+            "a rebaseline cannot retire the policy digest currently in force"
+        );
+    }
+
+    #[test]
+    fn rebaselines_are_independent_of_event_order() {
+        // A fold that collected rebaselines in the same pass as everything
+        // else would refuse this exact list: the retired fact appears
+        // before the rebaseline that retires it, so at the moment that fact
+        // is folded its digest still looks foreign. Collecting every
+        // rebaseline first, before anything else is folded, is what makes
+        // the result depend only on the set of facts, never their order.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut old_attempt = event(1, AttemptKind::ReviewReturn);
+        old_attempt.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(retired_digest.as_str()),
+        );
+        let current_attempt = event(2, AttemptKind::ReviewReturn);
+        let rebaseline = rebaseline_event(3, &retired_digest);
+
+        // The retired fact precedes its own rebaseline here.
+        let facts = vec![old_attempt, rebaseline, current_attempt];
+        let first = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        let mut shuffled = facts;
+        shuffled.reverse();
+        let second = project(Some(&policy()), &project_id, &cycle, &shuffled).unwrap();
+        assert_eq!(
+            first, second,
+            "the same facts in a different order must project the same view"
         );
     }
 }
