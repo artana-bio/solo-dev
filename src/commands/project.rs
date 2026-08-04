@@ -1,6 +1,10 @@
 //! Project configuration and control-state commands.
 
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand};
 
@@ -14,17 +18,18 @@ use crate::{
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
-        event_store::EVENT_DIR,
+        event_store::{EVENT_DIR, EventDraft, EventStore},
         journal::{JOURNAL_DIR, Journal, OperationState},
         lock::{LOCK_FILE, LockDiagnosis, ProjectLock},
-        repository::{ControlRepository, write_project},
+        repository::{ControlRepository, PROJECT_FILE, write_project},
     },
     domain::{
         acceptance::ACCEPTANCE_DIR,
         archive::ARCHIVE_DIR,
         card::CARD_DIR,
         clock::Clock,
-        cycle::CYCLE_DIR,
+        cycle::{CYCLE_DIR, CycleRecord, CycleStatus},
+        digest::Digest,
         gate::GATE_DIR,
         handoff::HANDOFF_DIR,
         ids::ProjectId,
@@ -40,6 +45,7 @@ use crate::{
         command::{GitScope, run, run_ok},
         inspect,
     },
+    policy::convergence::ATTEMPT_RECORDED_EVENT,
     runner::receipt::{LOG_DIR, RECEIPT_DIR},
 };
 
@@ -54,6 +60,8 @@ pub enum ProjectCommand {
     Status(StatusArgs),
     /// Report interrupted operations and how to resolve them.
     Recover(RecoverArgs),
+    /// Install a convergence policy on an already-initialized project.
+    SetConvergencePolicy(SetConvergencePolicyArgs),
 }
 
 impl ProjectCommand {
@@ -69,6 +77,7 @@ impl ProjectCommand {
             Self::Validate(..) => "project.validate",
             Self::Status(..) => "project.status",
             Self::Recover(..) => "project.recover",
+            Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
         }
     }
 }
@@ -146,6 +155,24 @@ pub struct RecoverArgs {
     pub actor_id: String,
 }
 
+/// Arguments accepted by `project set-convergence-policy`.
+#[derive(Debug, Args)]
+pub struct SetConvergencePolicyArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    /// Path to a JSON convergence policy to install, in the shape
+    /// `ConvergencePolicy` deserializes.
+    #[arg(long)]
+    pub policy: PathBuf,
+    /// Who is installing the policy.
+    #[arg(long, default_value = "operator")]
+    pub actor: String,
+    /// Validate and report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `project` subcommand.
 ///
 /// # Errors
@@ -160,6 +187,7 @@ pub fn execute(
         ProjectCommand::Validate(args) => run_validate(args),
         ProjectCommand::Status(args) => run_status(args),
         ProjectCommand::Recover(args) => run_recover(args, clock),
+        ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
     }
 }
 
@@ -846,6 +874,337 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// The digest a project's currently configured convergence policy is frozen
+/// at, or `None` for a `legacy_unassessed` project that has never had one.
+fn existing_policy_digest(config: &ProjectConfig) -> Result<Option<Digest>, HarnessError> {
+    config
+        .convergence_policy
+        .as_ref()
+        .map(ConvergencePolicy::digest)
+        .transpose()
+}
+
+/// Whether a cycle carrying this status could still be compared against
+/// `project_revision` at `src/commands/gate.rs:791`
+/// (`gate::validation_progress`).
+///
+/// That function never inspects a cycle's status at all — it only requires
+/// `load_card` to find a `CardRecord` and the cycle's `baseline_sha` to be
+/// `Some`. So this is not "does the code check status", which it does not,
+/// but "could a cycle legitimately at this status still hold a card whose
+/// gate commands run the comparison". Established empirically, not guessed,
+/// by reading every writer of a `CycleRecord` and every path that can put a
+/// card under one:
+///
+/// - `src/commands/cycle.rs`'s `store` is the only function in this codebase
+///   that persists a `CycleRecord`, and it has exactly five call sites:
+///   create, activate, seal, declare-group, abandon. No command anywhere
+///   sets a stored cycle's status to `integrating`, `accepted`, `landed`, or
+///   `blocked` — those four are real, designed states with transition edges
+///   already in `CycleStatus::successors`, but no shipped work package
+///   produces them yet.
+/// - `src/commands/card.rs`'s `run_activate` is the only path that creates a
+///   `CardRecord`, gated by `cycle_accepting_cards` on
+///   `CycleStatus::accepts_cards`, true only for `active`.
+///
+/// From those two facts:
+///
+/// - `draft` cannot block. No command frozen a baseline yet, and no stored
+///   cycle ever returns to `draft` (`successors` has no edge back to it), so
+///   a draft cycle can hold no card and the comparison is unreachable for
+///   it — not merely unlikely.
+/// - `closed` and `abandoned` cannot block. Both are
+///   `CycleStatus::is_terminal`: the coordinator has already taken the cycle
+///   out of play, and both are the exact remedy this command's own refusal
+///   offers below. Refusing a `closed` or `abandoned` cycle would be the fix
+///   and the fault at once — the canonical over-blocking mistake.
+/// - Every other status blocks. `active` and `sealed` are real today (the
+///   only other two statuses any command produces), and cards keep working
+///   in both — `sealed`'s own doc comment says existing cards continue
+///   through work and review. `integrating`, `accepted`, `landed`, and
+///   `blocked` are not producible by any command in this codebase yet, but
+///   each names a cycle still expected to move — `blocked` most explicitly,
+///   since its own successors lead back to `active` or `integrating` — so a
+///   card declared under any of them keeps exactly the frozen baseline
+///   `validation_progress` reads with no regard to the label on it.
+const fn blocks_convergence_policy_change(status: CycleStatus) -> bool {
+    !matches!(
+        status,
+        CycleStatus::Draft | CycleStatus::Closed | CycleStatus::Abandoned
+    )
+}
+
+/// Every cycle record in the control repository, sorted by identifier.
+///
+/// Mirrors the directory walk `commands::card::active_cycle_claims` already
+/// uses to scan every cycle: `CYCLE_DIR` may not exist yet on a freshly
+/// initialized project.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read or a record is
+/// malformed.
+fn all_cycles(control: &ControlRepository) -> Result<Vec<CycleRecord>, HarnessError> {
+    let directory = control.path(CYCLE_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory.clone(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let relative = format!("{CYCLE_DIR}/{name}");
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!("cycle record {relative} is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Refuses when a cycle could still be compared against `project_revision`
+/// and would start failing that comparison the moment this policy changes
+/// the project's digest.
+///
+/// Today that comparison lives entirely inside `gate::validation_progress`
+/// and fires only after the fact, as `CH-POLICY-INVALID-CYCLE` on whichever
+/// gate command the cycle's cards happen to run next. This is the same
+/// refusal, moved to the moment the policy change is proposed, while the
+/// operator can still decide, instead of discovered later by accident.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidCycle`] naming every offending cycle and
+/// its status when one exists.
+fn refuse_blocking_cycles(control: &ControlRepository) -> Result<(), HarnessError> {
+    let offenders: Vec<CycleRecord> = all_cycles(control)?
+        .into_iter()
+        .filter(|cycle| blocks_convergence_policy_change(cycle.status))
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    let named = offenders
+        .iter()
+        .map(|cycle| format!("{} ({})", cycle.cycle_id, cycle.status))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(HarnessError::Control {
+        reason: format!(
+            "{} cycle(s) could still be compared against `project_revision` and would start failing that comparison once this policy changes the project's digest: {named}. Close or abandon them, or start a new cycle instead, before changing the convergence policy.",
+            offenders.len()
+        ),
+        code: ErrorCode::PolicyInvalidCycle,
+    })
+}
+
+/// Refuses when convergence facts are already recorded and this policy would
+/// change the digest they are bound to.
+///
+/// `policy::convergence::project` refuses its entire view — not just the
+/// mismatched fact — the moment one recorded `convergence.attempt_recorded`
+/// event names a digest other than the currently configured policy's, and it
+/// stays refused forever: nothing in this codebase can rebind an old fact to
+/// a new policy. That rebaseline is issue #74; until it ships, installing a
+/// policy that would orphan existing facts is refused here instead of
+/// leaving the projection permanently unusable.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConfigControlIncompatible`] when facts are already
+/// recorded and this digest would not match what they were recorded against.
+fn refuse_orphaning_facts(
+    control: &ControlRepository,
+    existing_digest: Option<&Digest>,
+    new_digest: &Digest,
+) -> Result<(), HarnessError> {
+    let events = EventStore::new(control);
+    let has_facts = events
+        .all()?
+        .iter()
+        .any(|event| event.event_type == ATTEMPT_RECORDED_EVENT);
+    if !has_facts {
+        return Ok(());
+    }
+    let currently = existing_digest.map_or_else(
+        || "no configured policy".to_owned(),
+        |digest| format!("policy digest {digest}"),
+    );
+    Err(HarnessError::Control {
+        reason: format!(
+            "convergence facts are already recorded against {currently}; installing digest {new_digest} would name a foreign digest for every one of them, and the convergence projection refuses its entire view rather than read a fact it cannot bind — permanently, since nothing here can rebaseline an old fact onto a new policy. That rebaseline is issue #74; until it ships, this refuses instead of orphaning the recorded facts."
+        ),
+        code: ErrorCode::ConfigControlIncompatible,
+    })
+}
+
+/// Reports installing a policy that is already in force, unchanged.
+///
+/// Reinstalling a byte-identical policy is a success, not an error: nothing
+/// about the project's digest moves, so it cannot possibly break a cycle's
+/// frozen `project_revision` or orphan a recorded fact. Checked first, and
+/// ahead of both refusals above and the project lock, because idempotent
+/// success needs neither.
+fn already_installed_outcome(
+    config: &ProjectConfig,
+    digest: &Digest,
+    dry_run: bool,
+) -> CommandOutcome {
+    CommandOutcome::new(
+        "project.set-convergence-policy",
+        format!(
+            "Project {} already has convergence policy digest {digest} installed; nothing to do{}",
+            config.project_id,
+            if dry_run { " (dry run)" } else { "" }
+        ),
+        serde_json::json!({
+            "project_id": config.project_id.to_string(),
+            "policy_digest": digest.as_str(),
+            "changed": false,
+            "dry_run": dry_run,
+        }),
+    )
+    .with_project(config.project_id.clone())
+}
+
+/// Validates every check the real write makes, without taking the project
+/// lock or opening a transaction: reporting rather than performing, the same
+/// split `acceptance::preview_record` uses over `acceptance::run_record`'s
+/// checks.
+fn preview_set_convergence_policy(
+    args: &SetConvergencePolicyArgs,
+    new_digest: &Digest,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let existing_digest = existing_policy_digest(&config)?;
+
+    if existing_digest.as_ref() == Some(new_digest) {
+        return Ok(already_installed_outcome(&config, new_digest, true));
+    }
+
+    refuse_blocking_cycles(&control)?;
+    refuse_orphaning_facts(&control, existing_digest.as_ref(), new_digest)?;
+
+    Ok(CommandOutcome::new(
+        "project.set-convergence-policy",
+        format!(
+            "Dry run: project {} would install convergence policy digest {new_digest}\nwould write: project/project.json\nwould commit control state\nnothing was changed",
+            config.project_id
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "project_id": config.project_id.to_string(),
+            "policy_digest": new_digest.as_str(),
+            "previous_policy_digest": existing_digest.as_ref().map(Digest::to_string),
+            "planned_mutations": [
+                "write project/project.json".to_owned(),
+                "commit control state".to_owned(),
+            ],
+        }),
+    )
+    .with_project(config.project_id.clone()))
+}
+
+/// Installs a convergence policy on a project that already exists.
+///
+/// 79-1 gave the path for a policy declared at `project init`; this is the
+/// path for a project that already has cards and cycles, where a careless
+/// change silently breaks in two ways: a cycle already frozen under the old
+/// digest starts failing `gate.rs:791`'s comparison on its next command, or a
+/// convergence fact already recorded under the old digest makes
+/// `policy::convergence::project` refuse its entire view forever. Both are
+/// now refused here, before anything is written, instead of discovered later
+/// by whichever command happens to run into them.
+///
+/// # Errors
+///
+/// Returns a configuration error when the policy file cannot be read or
+/// fails its own validation, or a policy error naming the blocking cycles or
+/// the facts already recorded, as established by [`refuse_blocking_cycles`]
+/// and [`refuse_orphaning_facts`].
+fn run_set_convergence_policy(
+    args: &SetConvergencePolicyArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    // Reuses 79-1's reader as-is: same reads, same rejections, same
+    // validation.
+    let new_policy = read_convergence_policy(&args.policy)?;
+    let new_digest = new_policy.digest()?;
+
+    if args.dry_run {
+        return preview_set_convergence_policy(args, &new_digest);
+    }
+
+    with_transaction(
+        &args.control,
+        "project.set-convergence-policy",
+        clock,
+        move |control, events, expected, steps| {
+            steps.at("control-write")?;
+            // Re-read and re-check inside the lock rather than trust the
+            // preview's reads: two operations racing to install the same
+            // policy must both still see one consistent, idempotent outcome.
+            let mut config = control.project()?;
+            let existing_digest = existing_policy_digest(&config)?;
+            if existing_digest.as_ref() == Some(&new_digest) {
+                return Ok(already_installed_outcome(&config, &new_digest, false));
+            }
+            refuse_blocking_cycles(control)?;
+            refuse_orphaning_facts(control, existing_digest.as_ref(), &new_digest)?;
+
+            config.convergence_policy = Some(new_policy);
+            control.write_atomic(PROJECT_FILE, &format!("{}\n", config.to_json()?))?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("project.convergence_policy_installed", &args.actor)
+                    .meta("policy_digest", serde_json::json!(new_digest.as_str()))
+                    .meta(
+                        "previous_policy_digest",
+                        serde_json::json!(existing_digest.as_ref().map(Digest::to_string)),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("project: set convergence policy {new_digest}"),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "project.set-convergence-policy",
+                format!(
+                    "Installed convergence policy digest {new_digest} on project {}",
+                    config.project_id
+                ),
+                serde_json::json!({
+                    "project_id": config.project_id.to_string(),
+                    "policy_digest": new_digest.as_str(),
+                    "previous_policy_digest": existing_digest.as_ref().map(Digest::to_string),
+                    "changed": true,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
 }
 
 /// Creates the bare authority, registers its remote, and seeds the protected

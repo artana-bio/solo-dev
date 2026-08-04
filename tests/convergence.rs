@@ -2934,3 +2934,409 @@ fn a_convergence_policy_with_an_unsupported_version_refuses() {
         "a refused init must not leave the control directory behind at all"
     );
 }
+
+// Installing a convergence policy on a project that already exists.
+//
+// 79-1 covers `project init --convergence-policy`, for a project that does
+// not exist yet. `project set-convergence-policy` is the other half: it
+// changes or first installs a policy on a project that may already have open
+// cycles and recorded convergence facts, where a careless change breaks
+// silently in two ways `read_convergence_policy` alone cannot catch — see
+// `refuse_blocking_cycles` and `refuse_orphaning_facts` in
+// `src/commands/project.rs`.
+
+/// The `project set-convergence-policy` argv this section exercises.
+fn set_convergence_policy_args(
+    workspace: &Workspace,
+    policy_path: &str,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "project".to_owned(),
+        "set-convergence-policy".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--policy".to_owned(),
+        policy_path.to_owned(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ];
+    if dry_run {
+        args.push("--dry-run".to_owned());
+    }
+    args
+}
+
+#[test]
+fn set_convergence_policy_installs_on_a_project_with_no_open_cycles() {
+    let workspace = Workspace::initialized();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let before = workspace.control_head();
+
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+    assert!(
+        output.status.success(),
+        "installing on a project with no open cycles must succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"],
+        policy,
+        "the installed policy must reach the project document unchanged"
+    );
+    // The install must itself commit: a write left uncommitted would still
+    // read back correctly here (the file is on disk) but would leave the
+    // control repository's tree dirty and its head unmoved, with the change
+    // only actually landing later, swept into whatever command happens to
+    // commit next — attributed to the wrong operation, and invisible if
+    // nothing ever runs again.
+    assert_ne!(
+        workspace.control_head(),
+        before,
+        "installing the policy must itself create a control commit"
+    );
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        "",
+        "installing the policy must leave the control tree clean, not written but uncommitted"
+    );
+
+    // Worth nothing unless a cycle created afterward actually operates under
+    // it — the same proof 79-1's own installation test requires.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+
+    let envelope = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "within" }),
+        "a card in a cycle created after installation must see the policy in effect: {envelope}"
+    );
+}
+
+#[test]
+fn set_convergence_policy_refuses_while_a_cycle_could_still_break() {
+    // `opened()` leaves cycle C-001 `active` with no policy configured —
+    // exactly the shape whose next gate command discovered the mismatch by
+    // accident before this command existed, as `opened_with_policy`'s own
+    // doc comment records. A second cycle is sealed rather than left active,
+    // so the refusal is shown naming two different reachable statuses, not
+    // just one.
+    let workspace = opened();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "Second slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+    workspace.cycle(&["seal", "--cycle-id", "C-002"]);
+    let before = workspace.control_head();
+
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "an active or sealed cycle must block the install: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE", "{output:?}");
+    let message = error_message(&output);
+    assert!(
+        message.contains("C-001") && message.contains("active"),
+        "the refusal must name the active offending cycle and its status: {message}"
+    );
+    assert!(
+        message.contains("C-002") && message.contains("sealed"),
+        "the refusal must name the sealed offending cycle and its status too: {message}"
+    );
+    assert!(
+        !stored_project_document(&workspace)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "a refused install must leave the project document unchanged"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "a refused install must not move the control repository's head"
+    );
+}
+
+#[test]
+fn set_convergence_policy_refuses_to_change_a_policy_once_facts_exist() {
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+    let recorded = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+    assert!(
+        recorded.status.success(),
+        "the fixture return must be recorded: {}",
+        String::from_utf8_lossy(&recorded.stdout)
+    );
+    assert_eq!(
+        attempt_recorded_events(&workspace).len(),
+        1,
+        "the fixture must leave exactly one recorded fact"
+    );
+
+    // Abandoning C-001 takes it out of `refuse_blocking_cycles`'s offending
+    // set (it is terminal) without erasing the fact just recorded against
+    // it, so what follows isolates the facts check from the cycle check:
+    // this test's refusal must come from the recorded fact, not from an
+    // incidentally still-open cycle.
+    workspace.cycle(&[
+        "abandon",
+        "--cycle-id",
+        "C-001",
+        "--reason",
+        "isolate the facts check from the cycle check",
+    ]);
+    let before = workspace.control_head();
+
+    // A different `integration_failures` limit is enough to change the
+    // digest without touching `card_limits` at all.
+    let different = convergence_policy_document(3, 5);
+    let policy_path = write_json(&workspace, "different-policy.json", &different);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "changing the policy once a fact is recorded against the old digest must refuse"
+    );
+    assert_eq!(
+        error_code(&output),
+        "CH-CONFIG-CONTROL-INCOMPATIBLE",
+        "{output:?}"
+    );
+    let message = error_message(&output);
+    assert!(
+        message.contains("#74"),
+        "the refusal must name #74 as where the rebaseline comes from: {message}"
+    );
+    assert!(
+        message.contains("entire view"),
+        "the refusal must say why: the projection rejects the whole view, not just the mismatched fact: {message}"
+    );
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"]["cycle_limits"]["integration_failures"],
+        serde_json::json!(3),
+        "the original policy must remain installed, unchanged"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "a refused change must not move the control repository's head"
+    );
+}
+
+#[test]
+fn reinstalling_an_identical_policy_succeeds_without_changing_anything() {
+    // `opened_with_policy` also leaves cycle C-001 `active`, which proves the
+    // idempotent path really does skip both refusals below rather than
+    // happening to have nothing to refuse.
+    let workspace = opened_with_policy(3, 3);
+    let before = workspace.control_head();
+
+    let identical = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "same-policy.json", &identical);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        output.status.success(),
+        "reinstalling a byte-identical policy must succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["changed"],
+        serde_json::json!(false),
+        "{envelope}"
+    );
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"],
+        identical
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "an idempotent reinstall must not create a new control commit"
+    );
+}
+
+#[test]
+fn set_convergence_policy_refuses_an_invalid_policy() {
+    let workspace = Workspace::initialized();
+    // Any one of the four counted dimensions at zero fails
+    // `CardConvergenceLimits::validate`, the same as 79-1's equivalent test.
+    let policy = convergence_policy_document(0, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let before = workspace.control_head();
+
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "a policy with a zero limit must refuse"
+    );
+    assert_eq!(error_code(&output), "CH-CONFIG-INVALID-VALUE", "{output:?}");
+    assert!(
+        !stored_project_document(&workspace)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "a refused install must leave the project document unchanged"
+    );
+    assert_eq!(workspace.control_head(), before);
+}
+
+#[test]
+fn the_dry_run_makes_every_check_and_writes_nothing() {
+    // The success case: nothing blocks, so the dry run reports what the real
+    // command would do without doing it.
+    let clear = Workspace::initialized();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&clear, "policy.json", &policy);
+    let before = clear.control_head();
+
+    let output = Workspace::run(&set_convergence_policy_args(&clear, &policy_path, true));
+    assert!(
+        output.status.success(),
+        "a dry run with nothing blocking must report success: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["dry_run"],
+        serde_json::json!(true),
+        "{envelope}"
+    );
+    assert!(
+        !stored_project_document(&clear)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "a dry run must write nothing even when it would succeed"
+    );
+    assert_eq!(clear.control_head(), before);
+
+    // The refusal case: an open cycle blocks, and the dry run must hit the
+    // exact same refusal the real command would rather than promise success.
+    let blocked = opened();
+    let policy_path = write_json(&blocked, "policy.json", &policy);
+    let before = blocked.control_head();
+
+    let output = Workspace::run(&set_convergence_policy_args(&blocked, &policy_path, true));
+    assert!(
+        !output.status.success(),
+        "a dry run must refuse exactly when the real command would"
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE", "{output:?}");
+    assert!(
+        error_message(&output).contains("C-001"),
+        "the dry run's refusal must still name the offending cycle: {}",
+        error_message(&output)
+    );
+    assert!(
+        !stored_project_document(&blocked)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "a dry run must write nothing even when it refuses"
+    );
+    assert_eq!(blocked.control_head(), before);
+}
+
+#[test]
+fn a_cycle_in_a_terminal_state_does_not_block_the_install() {
+    let workspace = Workspace::initialized();
+
+    // `closed`: no command in this codebase can ever produce it —
+    // `src/commands/cycle.rs`'s `store` has exactly five call sites
+    // (create/activate/seal/declare-group/abandon) and none of them writes
+    // `closed`. `tamper_cycle_status` simulates the future command Section
+    // 11.1 already reserves the transition for.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.tamper_cycle_status("C-001", "closed");
+
+    // `abandoned`: genuinely reachable today, through the very command this
+    // refusal's own message recommends running.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "Second slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+    workspace.cycle(&["abandon", "--cycle-id", "C-002", "--reason", "superseded"]);
+
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        output.status.success(),
+        "a closed or abandoned cycle must not block installing a convergence policy — refusing one would be refusing for no reason: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"],
+        policy
+    );
+}
