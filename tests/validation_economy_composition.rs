@@ -5,10 +5,10 @@ mod support;
 
 use std::{
     fs,
-    path::Path,
-    process::Command,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use change_harness::{
@@ -20,12 +20,13 @@ use change_harness::{
 };
 use support::{Workspace, git};
 
-fn slow_gate(workspace: &Workspace, gate_id: &str, marker: &Path) {
+fn slow_gate(workspace: &Workspace, gate_id: &str, marker: &Path, release: &Path) {
     let marker = serde_json::to_string(&marker.display().to_string()).unwrap();
+    let release = serde_json::to_string(&release.display().to_string()).unwrap();
     let definition = workspace.gate_definition(
         gate_id,
         &format!(
-            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [\"sh\", \"-c\", \"printf started > \\\"$MARKER\\\"; sleep 0.3\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER: {marker}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [\"sh\", \"-c\", \"printf started > \\\"$MARKER\\\"; while [ ! -e \\\"$RELEASE\\\" ]; do sleep 0.01; done\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER: {marker}\n    RELEASE: {release}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
         ),
     );
     workspace.gate(&["register", "--definition", &definition]);
@@ -41,12 +42,58 @@ fn cpu_profile(workspace: &Workspace) -> String {
     path.display().to_string()
 }
 
-fn wait_for(marker: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !marker.exists() && Instant::now() < deadline {
+fn await_started(marker: &Path, child: &mut Child) {
+    while !marker.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("gate exited before writing its start marker: {status}");
+        }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(marker.exists(), "gate did not start before deadline");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "gate exited after writing its start marker"
+    );
+}
+
+struct HeldGateRuns {
+    release_paths: Vec<PathBuf>,
+    children: Vec<Child>,
+}
+
+impl HeldGateRuns {
+    fn new(release_paths: Vec<PathBuf>, children: Vec<Child>) -> Self {
+        Self {
+            release_paths,
+            children,
+        }
+    }
+
+    fn child_mut(&mut self, index: usize) -> &mut Child {
+        &mut self.children[index]
+    }
+
+    fn release(&self) {
+        for release in &self.release_paths {
+            fs::write(release, "release\n").unwrap();
+        }
+    }
+
+    fn release_and_reap(mut self) -> Vec<Output> {
+        self.release();
+        self.children
+            .drain(..)
+            .map(|child| child.wait_with_output().unwrap())
+            .collect()
+    }
+}
+
+impl Drop for HeldGateRuns {
+    fn drop(&mut self) {
+        self.release();
+        for child in &mut self.children {
+            let _ = child.wait();
+        }
+    }
 }
 
 fn schedule_raw(
@@ -229,14 +276,19 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
         workspace.root.join("lane-one"),
         workspace.root.join("lane-two"),
     ];
+    let releases = [
+        workspace.root.join("release-lane-one"),
+        workspace.root.join("release-lane-two"),
+    ];
     workspace.register_gate("gate.narrow", &["true"]);
     workspace.register_gate("gate.mutation", &["false"]);
-    slow_gate(&workspace, "gate.cpu.one", &markers[0]);
-    slow_gate(&workspace, "gate.cpu.two", &markers[1]);
+    slow_gate(&workspace, "gate.cpu.one", &markers[0], &releases[0]);
+    slow_gate(&workspace, "gate.cpu.two", &markers[1], &releases[1]);
     slow_gate(
         &workspace,
         "gate.cpu.three",
         &workspace.root.join("lane-three"),
+        &workspace.root.join("release-lane-three"),
     );
     workspace.register_gate("gate.independent", &["true"]);
     for (card, scope, gate) in [
@@ -494,32 +546,37 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
     let third = reserve_cpu("F-006", "gate.cpu.three");
     let run_cpu = |card: &'static str, gate: &'static str, reservation: String| {
         let control = workspace.control.clone();
-        thread::spawn(move || {
-            Command::new(env!("CARGO_BIN_EXE_change-harness"))
-                .args([
-                    "gate",
-                    "run",
-                    "--output",
-                    "json",
-                    "--control",
-                    control.to_str().unwrap(),
-                    "--card-id",
-                    card,
-                    "--gate-id",
-                    gate,
-                    "--reservation-id",
-                    &reservation,
-                    "--actor",
-                    "holder",
-                ])
-                .output()
-                .unwrap()
-        })
+        Command::new(env!("CARGO_BIN_EXE_change-harness"))
+            .args([
+                "gate",
+                "run",
+                "--output",
+                "json",
+                "--control",
+                control.to_str().unwrap(),
+                "--card-id",
+                card,
+                "--gate-id",
+                gate,
+                "--reservation-id",
+                &reservation,
+                "--actor",
+                "holder",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
     };
-    let first_run = run_cpu("F-004", "gate.cpu.one", first);
-    let second_run = run_cpu("F-005", "gate.cpu.two", second);
-    wait_for(&markers[0]);
-    wait_for(&markers[1]);
+    let mut held_runs = HeldGateRuns::new(
+        releases.to_vec(),
+        vec![
+            run_cpu("F-004", "gate.cpu.one", first),
+            run_cpu("F-005", "gate.cpu.two", second),
+        ],
+    );
+    await_started(&markers[0], held_runs.child_mut(0));
+    await_started(&markers[1], held_runs.child_mut(1));
     let defer: serde_json::Value =
         serde_json::from_slice(&schedule_raw(&workspace, &third, None).stdout).unwrap();
     assert_eq!(
@@ -543,8 +600,12 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
             .success(),
         "stale dashboard state must not authorize action"
     );
-    assert!(first_run.join().unwrap().status.success());
-    assert!(second_run.join().unwrap().status.success());
+    for output in held_runs.release_and_reap() {
+        assert!(
+            output.status.success(),
+            "held gate must settle successfully"
+        );
+    }
     let start: serde_json::Value =
         serde_json::from_slice(&schedule_raw(&workspace, &third, None).stdout).unwrap();
     assert_eq!(start["data"]["recommendation"]["kind"], "start");
