@@ -240,19 +240,50 @@ impl std::fmt::Display for ProjectionError {
 
 impl std::error::Error for ProjectionError {}
 
-/// Counters derived for one exact card revision and digest.
+/// One bounded dimension's count and the evidence behind it.
+///
+/// `count` is authoritative, not `evidence`: two facts may cite the same
+/// reference, so `evidence.len()` can be less than `count`, and that is
+/// expected rather than a defect. Evidence is retained at all because #72
+/// has to publish exact evidence for each blocking return; before this type
+/// existed, `evidence_ref` was validated on every fact and then discarded —
+/// a malformed reference still failed the whole projection, but a fact that
+/// passed left no trace of which receipt justified which count.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub struct DimensionCount {
+    pub count: u32,
+    /// Distinct evidence references of the counted facts, sorted.
+    /// `count` is authoritative: two facts may cite one reference.
+    pub evidence: BTreeSet<String>,
+}
+
+/// Counters derived for a card, accumulated over every fact recorded against
+/// it in this cycle, whichever revision each fact names.
+///
+/// Not "for one exact revision", which is what this held until this change.
+/// `material_scope_revisions` counts a card moving from one revision to
+/// another, so it can never share a single revision with the attempts
+/// around it; counting it per revision would hold it at 1 forever and call
+/// that a count. Worse, resetting a card's counters whenever its facts
+/// crossed into a new revision would make revising the card the exact
+/// bypass #72 exists to close: "a raw retry cannot bypass the escalation"
+/// stops being true the moment resubmitting under a new revision clears the
+/// budget that was tracking it. Each fact still binds exactly to the
+/// revision, digest, and head it names — see the per-fact checks in
+/// `project` — only the tally reaches across revisions, not the identity of
+/// any one fact.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CardCounters {
-    pub review_returns: u32,
-    pub repair_attempts: u32,
-    pub gate_failures: u32,
-    pub material_scope_revisions: u32,
+    pub review_returns: DimensionCount,
+    pub repair_attempts: DimensionCount,
+    pub gate_failures: DimensionCount,
+    pub material_scope_revisions: DimensionCount,
 }
 
 /// Counters derived for a whole exact cycle.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CycleCounters {
-    pub integration_failures: u32,
+    pub integration_failures: DimensionCount,
 }
 
 /// The pure, reproducible v1 view. `BTreeMap` makes output independent of event
@@ -302,7 +333,6 @@ pub fn project(
         cards: BTreeMap::new(),
     };
     let mut seen = BTreeSet::new();
-    let mut bindings: BTreeMap<CardId, (u32, Digest, String)> = BTreeMap::new();
 
     for event in events
         .iter()
@@ -359,17 +389,35 @@ pub fn project(
                         reason: "integration failure has incompatible reason category".to_owned(),
                     });
                 }
-                result.cycle.integration_failures = result
+                result.cycle.integration_failures.count = result
                     .cycle
                     .integration_failures
+                    .count
                     .checked_add(1)
                     .ok_or_else(|| ProjectionError {
                         event_id: event_id.clone(),
                         reason: "counter overflow".to_owned(),
                     })?;
+                result
+                    .cycle
+                    .integration_failures
+                    .evidence
+                    .insert(metadata.evidence_ref);
             }
             kind => {
-                let (Some(card_id), Some(revision), Some(digest), Some(head)) = (
+                // Each fact still must name its own exact card_id,
+                // card_revision, card_digest, and head — refused right here
+                // if it does not — regardless of what any other fact for
+                // this card names. What is gone is the older requirement
+                // that every fact toward one card agree on the *same*
+                // revision, digest, and head as the others: that combined a
+                // real rule (a fact must bind to reality) with a false
+                // assumption (a card has one revision for its whole life).
+                // `MaterialScopeRevision` exists because that assumption is
+                // false; see `CardCounters` for why the tally spans
+                // revisions even though each fact's own binding stays
+                // exact.
+                let (Some(card_id), Some(_), Some(_), Some(head)) = (
                     event.card_id.as_ref(),
                     event.card_revision,
                     event.card_digest.as_ref(),
@@ -393,27 +441,23 @@ pub fn project(
                         reason: "card attempt has incompatible reason category".to_owned(),
                     });
                 }
-                let binding = (revision, digest.clone(), head.clone());
-                if let Some(existing) = bindings.insert(card_id.clone(), binding.clone())
-                    && existing != binding
-                {
-                    return Err(ProjectionError {
-                        event_id,
-                        reason: "card attempts mix revision, digest, or head bindings".to_owned(),
-                    });
-                }
                 let counters = result.cards.entry(card_id.clone()).or_default();
-                let count = match kind {
+                let dimension = match kind {
                     AttemptKind::ReviewReturn => &mut counters.review_returns,
                     AttemptKind::RepairAttempt => &mut counters.repair_attempts,
                     AttemptKind::GateFailure => &mut counters.gate_failures,
                     AttemptKind::MaterialScopeRevision => &mut counters.material_scope_revisions,
                     AttemptKind::IntegrationFailure => unreachable!(),
                 };
-                *count = count.checked_add(1).ok_or_else(|| ProjectionError {
-                    event_id,
-                    reason: "counter overflow".to_owned(),
-                })?;
+                dimension.count =
+                    dimension
+                        .count
+                        .checked_add(1)
+                        .ok_or_else(|| ProjectionError {
+                            event_id,
+                            reason: "counter overflow".to_owned(),
+                        })?;
+                dimension.evidence.insert(metadata.evidence_ref);
             }
         }
     }
@@ -1072,24 +1116,39 @@ mod tests {
         let mut shuffled = facts;
         shuffled.reverse();
         let second = project(Some(&policy()), &project_id, &cycle, &shuffled).unwrap();
+        // Equality on the whole projection compares each `DimensionCount`'s
+        // `evidence` as a `BTreeSet`, so this also proves the recorded
+        // evidence does not depend on the order the facts arrived in.
         assert_eq!(first, second);
         let ProjectConvergence::Configured(view) = first else {
             panic!("configured")
         };
-        assert_eq!(view.cycle.integration_failures, 1);
+        assert_eq!(view.cycle.integration_failures.count, 1);
         assert_eq!(
             view.cards[&CardId::from_str("F-001").unwrap()],
             CardCounters {
-                review_returns: 1,
-                repair_attempts: 1,
-                gate_failures: 1,
-                material_scope_revisions: 1,
+                review_returns: DimensionCount {
+                    count: 1,
+                    evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                },
+                repair_attempts: DimensionCount {
+                    count: 1,
+                    evidence: BTreeSet::from(["receipt:2".to_owned()]),
+                },
+                gate_failures: DimensionCount {
+                    count: 1,
+                    evidence: BTreeSet::from(["receipt:3".to_owned()]),
+                },
+                material_scope_revisions: DimensionCount {
+                    count: 1,
+                    evidence: BTreeSet::from(["receipt:4".to_owned()]),
+                },
             }
         );
         assert_eq!(
             serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
             format!(
-                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":1}},"cards":{{"F-001":{{"review_returns":1,"repair_attempts":1,"gate_failures":1,"material_scope_revisions":1}}}}}}"#,
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"]}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"]}},"repair_attempts":{{"count":1,"evidence":["receipt:2"]}},"gate_failures":{{"count":1,"evidence":["receipt:3"]}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"]}}}}}}}}"#,
                 view.policy_digest
             )
         );
@@ -1130,15 +1189,168 @@ mod tests {
     }
 
     #[test]
-    fn mixed_card_revisions_and_missing_integration_head_fail_closed() {
+    fn an_integration_failure_without_an_exact_head_is_refused() {
+        // The half of the old `mixed_card_revisions_and_missing_integration_
+        // head_fail_closed` that is still a rejection: mixed card revisions
+        // moved to `attempts_across_card_revisions_accumulate_into_one_
+        // budget`, where mixing revisions is the ordinary case, not a
+        // refusal.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let mut integration = event(1, AttemptKind::IntegrationFailure);
+        integration.head_sha = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[integration]).is_err());
+    }
+
+    #[test]
+    fn attempts_across_card_revisions_accumulate_into_one_budget() {
+        // The shape a revised card actually produces: the same card, the
+        // same dimension, two different revisions each with their own
+        // digest and head. Before this change, the second fact's differing
+        // binding made the whole projection fail closed forever — so a card
+        // could never be revised more than once and keep a working budget.
         let project_id = ProjectId::from_str("example").unwrap();
         let cycle = CycleId::from_str("C-001").unwrap();
         let first = event(1, AttemptKind::RepairAttempt);
-        let mut mixed = event(2, AttemptKind::RepairAttempt);
-        mixed.card_revision = Some(2);
-        assert!(project(Some(&policy()), &project_id, &cycle, &[first, mixed]).is_err());
-        let mut integration = event(3, AttemptKind::IntegrationFailure);
-        integration.head_sha = None;
-        assert!(project(Some(&policy()), &project_id, &cycle, &[integration]).is_err());
+        let mut second = event(2, AttemptKind::RepairAttempt);
+        second.card_revision = Some(2);
+        second.card_digest = Some(Digest::of_bytes(b"card-revision-2"));
+        second.head_sha = Some("ab".repeat(20));
+
+        let view = project(Some(&policy()), &project_id, &cycle, &[first, second]).unwrap();
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        let counters = &view.cards[&CardId::from_str("F-001").unwrap()];
+        assert_eq!(
+            counters.repair_attempts.count, 2,
+            "both revisions' attempts count toward the one budget"
+        );
+        assert_eq!(
+            counters.repair_attempts.evidence,
+            BTreeSet::from(["receipt:1".to_owned(), "receipt:2".to_owned()]),
+            "the evidence behind each revision's attempt is retained"
+        );
+    }
+
+    #[test]
+    fn a_material_scope_revision_is_counted_alongside_earlier_attempts() {
+        // The real flow, not a contrived one: a card is returned in review
+        // once, then its scope is revised before the next attempt.
+        // `MaterialScopeRevision` records that a new revision now exists, so
+        // it can never share a revision with the `ReviewReturn` before it —
+        // that pairing is not an edge case, it is what recording a scope
+        // change looks like. Before this change, that ordinary sequence left
+        // the whole projection in permanent error.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let review_return = event(1, AttemptKind::ReviewReturn);
+        let mut scope_revision = event(2, AttemptKind::MaterialScopeRevision);
+        scope_revision.card_revision = Some(2);
+        scope_revision.card_digest = Some(Digest::of_bytes(b"card-revision-2"));
+        scope_revision.head_sha = Some("cd".repeat(20));
+
+        let view = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[review_return, scope_revision],
+        )
+        .unwrap();
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        let counters = &view.cards[&CardId::from_str("F-001").unwrap()];
+        assert_eq!(counters.review_returns.count, 1);
+        assert_eq!(counters.material_scope_revisions.count, 1);
+    }
+
+    #[test]
+    fn every_counted_dimension_retains_its_evidence_reference() {
+        // One fact of each class, spread across two cards so both halves of
+        // the claim show up in one run: `F-001` shows a dimension holds
+        // exactly the reference of the fact that hit it, and no other
+        // dimension's reference leaks in. `F-002`, which only ever receives
+        // a `ReviewReturn`, shows that a dimension no fact ever touched is
+        // still present in the output at its zero default — `count: 0` and
+        // empty evidence — rather than missing.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let review_return = event(1, AttemptKind::ReviewReturn);
+        let repair_attempt = event(2, AttemptKind::RepairAttempt);
+        let gate_failure = event(3, AttemptKind::GateFailure);
+        let scope_revision = event(4, AttemptKind::MaterialScopeRevision);
+        let integration_failure = event(5, AttemptKind::IntegrationFailure);
+        let mut second_card = event(6, AttemptKind::ReviewReturn);
+        second_card.card_id = Some(CardId::from_str("F-002").unwrap());
+
+        let view = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[
+                review_return,
+                repair_attempt,
+                gate_failure,
+                scope_revision,
+                integration_failure,
+                second_card,
+            ],
+        )
+        .unwrap();
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+
+        let f001 = &view.cards[&CardId::from_str("F-001").unwrap()];
+        assert_eq!(
+            f001.review_returns.evidence,
+            BTreeSet::from(["receipt:1".to_owned()])
+        );
+        assert_eq!(
+            f001.repair_attempts.evidence,
+            BTreeSet::from(["receipt:2".to_owned()])
+        );
+        assert_eq!(
+            f001.gate_failures.evidence,
+            BTreeSet::from(["receipt:3".to_owned()])
+        );
+        assert_eq!(
+            f001.material_scope_revisions.evidence,
+            BTreeSet::from(["receipt:4".to_owned()])
+        );
+        assert_eq!(
+            view.cycle.integration_failures.evidence,
+            BTreeSet::from(["receipt:5".to_owned()])
+        );
+
+        let f002 = &view.cards[&CardId::from_str("F-002").unwrap()];
+        assert_eq!(
+            f002.review_returns,
+            DimensionCount {
+                count: 1,
+                evidence: BTreeSet::from(["receipt:6".to_owned()]),
+            },
+        );
+        assert_eq!(f002.repair_attempts, DimensionCount::default());
+        assert_eq!(f002.gate_failures, DimensionCount::default());
+        assert_eq!(f002.material_scope_revisions, DimensionCount::default());
+    }
+
+    #[test]
+    fn a_card_attempt_without_an_exact_revision_or_digest_is_refused() {
+        // With the cross-fact bindings map gone, `card_revision` and
+        // `card_digest` have no safety net left but this per-fact check.
+        // Losing it silently would let an attempt with no revision, or no
+        // digest, at all still count toward a card's budget.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let mut missing_revision = event(1, AttemptKind::RepairAttempt);
+        missing_revision.card_revision = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[missing_revision]).is_err());
+
+        let mut missing_digest = event(2, AttemptKind::RepairAttempt);
+        missing_digest.card_digest = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[missing_digest]).is_err());
     }
 }
