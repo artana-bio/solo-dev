@@ -1145,3 +1145,433 @@ fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
         "still exactly the one fact recorded by the first, material revision"
     );
 }
+
+// 71-R3: a successful `handoff create`, under a configured convergence
+// policy, appends one bound `gate_failure` fact for each gate failure the
+// actor declares, and one bound `repair_attempt` fact when the delivery
+// answers a prior review return, inheriting that return's declared reason.
+// `GateEvidenceStale` and every other refusal path in `handoff create` is
+// untouched: a refusal commits no transaction and records nothing.
+
+/// Activates a card naming exactly `feature_gates`, drives one commit through
+/// all of them, and returns the candidate's head SHA — the shared setup every
+/// 71-R3 handoff fixture below needs before it can write its own declaration.
+fn ready_candidate(workspace: &Workspace, card_id: &str, feature_gates: &[&str]) -> String {
+    workspace.activate_card_with_gates(card_id, &["src/**"], feature_gates);
+    workspace.work(&["start", "--card-id", card_id]);
+
+    let worktree = workspace.worktrees.join(card_id);
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: implement"]);
+    for gate_id in feature_gates {
+        workspace.gate(&["run", "--card-id", card_id, "--gate-id", gate_id]);
+    }
+    support::capture(&worktree, &["rev-parse", "HEAD"])
+}
+
+/// Writes a handoff declaration for `card_id` at `head`, with `gate_failures_yaml`
+/// appended verbatim (already-formatted YAML, or an empty string to declare
+/// none at all), and returns its path.
+fn declaration_with_gate_failures(
+    workspace: &Workspace,
+    card_id: &str,
+    head: &str,
+    gate_failures_yaml: &str,
+) -> String {
+    let path = workspace.root.join(format!("{card_id}-declaration.yaml"));
+    fs::write(
+        &path,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: it works\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n{gate_failures_yaml}"
+        ),
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+/// Every recorded attempt fact of one `attempt_kind`.
+fn attempt_facts_of_kind(workspace: &Workspace, kind: &str) -> Vec<serde_json::Value> {
+    attempt_recorded_events(workspace)
+        .into_iter()
+        .filter(|fact| fact["metadata"]["attempt_kind"] == kind)
+        .collect()
+}
+
+/// Asserts `policy_digest` looks like a real digest, never a placeholder.
+fn assert_real_policy_digest(fact: &serde_json::Value) {
+    let policy_digest = fact["metadata"]["policy_digest"]
+        .as_str()
+        .expect("policy_digest is a string");
+    assert!(
+        policy_digest.starts_with("sha256:") && policy_digest.len() == "sha256:".len() + 64,
+        "policy_digest must be a real digest, not a placeholder: {policy_digest}"
+    );
+}
+
+#[test]
+fn a_delivery_declaring_a_gate_failure_records_one_bound_gate_failure_fact() {
+    let workspace = opened_with_policy(3, 3);
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &head,
+        "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+    );
+
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+    assert!(
+        output.status.success(),
+        "a declared, admissible gate failure must be accepted: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let handoff_id = envelope["data"]["handoff"]["handoff_id"]
+        .as_str()
+        .expect("the created handoff's id");
+    let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "exactly one attempt fact must be recorded: {attempts:?}"
+    );
+    let fact = &attempts[0];
+    assert_eq!(fact["card_id"], "F-001", "{fact}");
+    assert_eq!(
+        fact["card_revision"], card_status["data"]["revision"],
+        "{fact}"
+    );
+    assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+    assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+    assert_eq!(fact["head_sha"], head, "{fact}");
+    assert_eq!(fact["metadata"]["attempt_kind"], "gate_failure", "{fact}");
+    assert_eq!(fact["metadata"]["reason_category"], "regression", "{fact}");
+    assert_eq!(
+        fact["metadata"]["evidence_ref"],
+        format!("handoff:{handoff_id}#gate:gate.unit"),
+        "{fact}"
+    );
+    assert_real_policy_digest(fact);
+}
+
+#[test]
+fn two_declared_gate_failures_record_two_facts_in_declaration_order() {
+    let workspace = opened_with_policy(3, 3);
+    // A second feature gate distinct from `gate.all`, which is already this
+    // fixture's integration gate — Section 10.3 refuses a card that declares
+    // one gate in two validation stages.
+    workspace.register_gate("gate.extra", &["true"]);
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit", "gate.extra"]);
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &head,
+        "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n  - gate_id: gate.extra\n    reason_category: security_concern\n",
+    );
+
+    let output = workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let handoff_id = envelope["data"]["handoff"]["handoff_id"]
+        .as_str()
+        .expect("the created handoff's id");
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "both declared failures must be recorded: {attempts:?}"
+    );
+    assert_eq!(attempts[0]["metadata"]["attempt_kind"], "gate_failure");
+    assert_eq!(attempts[0]["metadata"]["reason_category"], "regression");
+    assert_eq!(
+        attempts[0]["metadata"]["evidence_ref"],
+        format!("handoff:{handoff_id}#gate:gate.unit"),
+        "the first declared gate must be the first fact: {:?}",
+        attempts[0]
+    );
+    assert_eq!(attempts[1]["metadata"]["attempt_kind"], "gate_failure");
+    assert_eq!(
+        attempts[1]["metadata"]["reason_category"],
+        "security_concern"
+    );
+    assert_eq!(
+        attempts[1]["metadata"]["evidence_ref"],
+        format!("handoff:{handoff_id}#gate:gate.extra"),
+        "the second declared gate must be the second fact: {:?}",
+        attempts[1]
+    );
+}
+
+#[test]
+fn a_gate_failure_naming_an_unregistered_gate_is_refused_before_anything_is_written() {
+    let workspace = opened_with_policy(3, 3);
+    // Feature gates are `[gate.unit]`; the declaration names a gate this card
+    // never registered for its feature stage at all.
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &head,
+        "gate_failures:\n  - gate_id: gate.nonexistent\n    reason_category: regression\n",
+    );
+
+    let before_head = workspace.control_head();
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a gate the card never named must be refused"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-HANDOFF");
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "the control repository head must not move on refusal"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a refused handoff must not record an attempt fact"
+    );
+    let inspected = workspace.handoff_raw(&["inspect", "--card-id", "F-001"]);
+    assert!(
+        !inspected.status.success(),
+        "no handoff may exist for this card after the refusal"
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+        "active",
+        "the card must not have moved to handed_off"
+    );
+}
+
+#[test]
+fn a_gate_failure_reason_the_kind_cannot_admit_is_refused() {
+    let workspace = opened_with_policy(3, 3);
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &head,
+        "gate_failures:\n  - gate_id: gate.unit\n    reason_category: acceptance_defect\n",
+    );
+
+    let before_head = workspace.control_head();
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "acceptance_defect is not a reason a gate failure may declare"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-HANDOFF");
+    assert_eq!(workspace.control_head(), before_head);
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a refused handoff must not record an attempt fact"
+    );
+}
+
+/// A `changes_requested` verdict declaring `reason_category: regression`.
+const RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF: &str = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: regression\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: something is wrong\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+
+/// A `changes_requested` verdict declaring `reason_category:
+/// non_blocking_improvement` — admissible for a review return, but not for
+/// the repair attempt that answers it.
+const RETURN_WITH_NON_BLOCKING_REASON_FOR_HANDOFF: &str = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: non_blocking_improvement\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: something is wrong\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+
+/// Drives a card through one review round that returns it with the given
+/// verdict body, resumes work, and delivers a second commit through gate and
+/// handoff — the shape every repair-attempt fixture below needs. Returns the
+/// second delivery's `handoff create` output and its candidate SHA.
+fn redeliver_after_return(
+    workspace: &Workspace,
+    card_id: &str,
+    verdict_body: &str,
+) -> (std::process::Output, String) {
+    open_review_round(workspace, card_id);
+    let verdict_path = write_verdict(workspace, card_id, verdict_body);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        card_id,
+        "--verdict",
+        &verdict_path,
+        "--actor",
+        "reviewer",
+    ]);
+    workspace.work(&["resume", "--card-id", card_id]);
+
+    let worktree = workspace.worktrees.join(card_id);
+    fs::write(worktree.join("src/a.rs"), "fn main() { /* fixed */ }\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "fix: address review"]);
+    workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = declaration_with_gate_failures(workspace, card_id, &head, "");
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        card_id,
+        "--declaration",
+        &declaration,
+    ]);
+    (output, head)
+}
+
+#[test]
+fn a_delivery_answering_a_review_return_records_one_repair_attempt_inheriting_its_reason() {
+    let workspace = opened_with_policy(3, 3);
+    let (output, head) = redeliver_after_return(
+        &workspace,
+        "F-001",
+        RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+    );
+    assert!(
+        output.status.success(),
+        "the redelivery must succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let handoff_id = envelope["data"]["handoff"]["handoff_id"]
+        .as_str()
+        .expect("the created handoff's id");
+    let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+
+    let repairs = attempt_facts_of_kind(&workspace, "repair_attempt");
+    assert_eq!(
+        repairs.len(),
+        1,
+        "exactly one repair attempt must be recorded: {repairs:?}"
+    );
+    let fact = &repairs[0];
+    assert_eq!(fact["card_id"], "F-001", "{fact}");
+    assert_eq!(
+        fact["card_revision"], card_status["data"]["revision"],
+        "{fact}"
+    );
+    assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+    assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+    assert_eq!(fact["head_sha"], head, "{fact}");
+    assert_eq!(
+        fact["metadata"]["reason_category"], "regression",
+        "the repair attempt must inherit the review return's declared reason: {fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["evidence_ref"],
+        format!("handoff:{handoff_id}"),
+        "{fact}"
+    );
+    assert_real_policy_digest(fact);
+
+    // And the review return itself is still on record, distinct from the
+    // repair attempt it caused.
+    let returns = attempt_facts_of_kind(&workspace, "review_return");
+    assert_eq!(returns.len(), 1, "{returns:?}");
+    assert_eq!(returns[0]["metadata"]["reason_category"], "regression");
+}
+
+#[test]
+fn a_repair_attempt_is_not_recorded_when_the_return_it_answers_was_non_blocking() {
+    let workspace = opened_with_policy(3, 3);
+    let (output, _head) = redeliver_after_return(
+        &workspace,
+        "F-001",
+        RETURN_WITH_NON_BLOCKING_REASON_FOR_HANDOFF,
+    );
+    assert!(
+        output.status.success(),
+        "the redelivery must still succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        attempt_facts_of_kind(&workspace, "repair_attempt").is_empty(),
+        "polishing on request is not the convergence failure this budget exists to detect"
+    );
+}
+
+#[test]
+fn a_first_delivery_records_no_repair_attempt() {
+    let workspace = opened_with_policy(3, 3);
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+    let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+
+    let output = workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+    assert!(output.status.success());
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a card that was never returned cannot be repairing anything, and nothing else was declared either"
+    );
+}
+
+#[test]
+fn a_project_without_a_convergence_policy_records_no_facts_at_handoff() {
+    // No `configure_convergence_policy` call: an unconfigured project must
+    // accept and ignore `gate_failures` entirely — not validate it against
+    // `admits`, and not record anything — so a gate_id the card never named
+    // and a reason `GateFailure` could never admit must still succeed.
+    let workspace = opened();
+    let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+    let declaration = declaration_with_gate_failures(
+        &workspace,
+        "F-001",
+        &head,
+        "gate_failures:\n  - gate_id: gate.never-named\n    reason_category: acceptance_defect\n",
+    );
+
+    let output = workspace.handoff_raw(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration,
+    ]);
+    assert!(
+        output.status.success(),
+        "an unconfigured project must not validate declared gate failures, however they read: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "no configured policy means no attempt fact, however the declaration reads"
+    );
+}

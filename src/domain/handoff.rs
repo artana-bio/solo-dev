@@ -21,6 +21,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::diff::ChangedPath,
+    policy::convergence::ReasonCategory,
 };
 
 /// Schema identifier for a handoff.
@@ -37,6 +38,17 @@ pub enum HandoffStatus {
     Active,
     /// The handoff was withdrawn or superseded.
     Revoked,
+}
+
+/// One gate the actor declares they had to get past before this delivery
+/// succeeded.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredGateFailure {
+    /// The gate that failed.
+    pub gate_id: String,
+    /// Why it failed.
+    pub reason_category: ReasonCategory,
 }
 
 /// What the feature actor claims about their work.
@@ -63,6 +75,24 @@ pub struct ActorDeclaration {
     pub residual_risks: Vec<String>,
     /// How to undo the change.
     pub rollback_notes: String,
+    /// Gate failures this delivery had to get past, declared by the actor.
+    ///
+    /// 71-R3 records this at the handoff boundary rather than counting every
+    /// red `gate run` along the way. `gate run` is mechanical: nothing about
+    /// it declares *why* a run failed, and counting every one would count
+    /// ordinary iteration — an implementer runs a gate red repeatedly while
+    /// writing the code, and that is not a convergence failure. What is: the
+    /// card was declared ready, at `handoff create`, and getting there took
+    /// an admitted gate failure. That is why this lives on the declaration a
+    /// *successful* handoff makes, not on `gate run`'s own result.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` keeps every
+    /// declaration written before this field existed readable, and — the
+    /// reason it is not merely a preference — keeps a handoff that declares
+    /// no gate failures serializing byte-identically to one written before
+    /// this field existed, so no already-computed handoff digest moves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_failures: Vec<DeclaredGateFailure>,
 }
 
 impl ActorDeclaration {
@@ -465,6 +495,7 @@ mod tests {
             known_limitations: vec![],
             residual_risks: vec![],
             rollback_notes: "revert the commit".to_owned(),
+            gate_failures: vec![],
         }
     }
 
@@ -811,6 +842,44 @@ mod tests {
             narrative.digest().unwrap(),
             "the actor's claim is part of what a review is bound to"
         );
+    }
+
+    #[test]
+    fn a_handoff_with_no_declared_gate_failures_serializes_byte_identically_to_before_71r3() {
+        // 71-R3 added `ActorDeclaration::gate_failures`. This exact digest was
+        // captured from this exact fixture on `1f1aaf2`, the commit
+        // immediately before the field existed at all, by printing
+        // `handoff().digest()` and reading it back. Pinning that value here,
+        // rather than trusting that `skip_serializing_if` alone must be
+        // enough, is what makes this a verification instead of an assumption.
+        assert_eq!(
+            handoff().digest().unwrap().as_str(),
+            "sha256:bf6e81fd6bdde83878d58466b05fbb2fc65db38bad330c097a3f6c6b38255628",
+            "a handoff declaring no gate failures must not move any already-computed handoff digest"
+        );
+        assert!(
+            !serde_json::to_string(&handoff())
+                .unwrap()
+                .contains("gate_failures"),
+            "an empty declared list must be omitted entirely, not written out as `[]`"
+        );
+    }
+
+    #[test]
+    fn a_declared_gate_failure_moves_the_handoff_digest() {
+        // The other half of the claim above: the field is not merely absent,
+        // it is live. A reviewer's digest has to cover a declared gate
+        // failure, or binding evidence to it below would mean nothing.
+        let base = handoff().digest().unwrap();
+        let mut declared = handoff();
+        declared
+            .declaration
+            .gate_failures
+            .push(DeclaredGateFailure {
+                gate_id: "gate.unit".to_owned(),
+                reason_category: ReasonCategory::Regression,
+            });
+        assert_ne!(base, declared.digest().unwrap());
     }
 
     #[test]

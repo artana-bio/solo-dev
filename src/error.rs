@@ -173,7 +173,16 @@ pub enum ErrorCode {
     GateFailed,
     /// Required gate evidence is missing or no longer applies.
     GateEvidenceStale,
-    /// A handoff declaration is missing a required field.
+    /// A handoff declaration is missing a required field, or names one a
+    /// value it cannot hold.
+    ///
+    /// The second half covers a declared gate failure: a `gate_id` that is
+    /// not among the card's feature gates, a `reason_category`
+    /// `AttemptKind::GateFailure` does not admit, or the same gate declared
+    /// twice. Grouped with the missing-field case rather than given a new
+    /// code, for the same reason `PolicyIncompleteReview` groups its own
+    /// second half: both are a declaration that cannot be acted on until the
+    /// actor supplies something the schema already had a place for.
     PolicyIncompleteHandoff,
     /// The branch was rewritten between delivery and handoff creation.
     PolicyDeliveredShaMismatch,

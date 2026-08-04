@@ -1,6 +1,6 @@
 //! Handoff commands: create, inspect, and revoke.
 
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{collections::BTreeSet, fmt::Write as _, fs, path::PathBuf};
 
 use clap::{Args, Subcommand};
 
@@ -14,20 +14,25 @@ use crate::{
         transaction::with_transaction,
         work::held_lease,
     },
-    control::{event_store::EventDraft, repository::ControlRepository},
+    config::ConvergencePolicy,
+    control::{
+        event_store::{EventDraft, EventStore},
+        repository::ControlRepository,
+    },
     domain::{
         card::CardState,
         clock::Clock,
         cycle::CycleRecord,
         digest::CANONICAL_ALGORITHM,
         handoff::{
-            ActorDeclaration, DependencyBinding, EvidenceEntry, HANDOFF_DIR, HANDOFF_SCHEMA,
-            HandoffRecord, HandoffStatus, check_delivered_sha,
+            ActorDeclaration, DeclaredGateFailure, DependencyBinding, EvidenceEntry, HANDOFF_DIR,
+            HANDOFF_SCHEMA, HandoffRecord, HandoffStatus, check_delivered_sha,
         },
         ids::CardId,
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, diff::DiffSummary, inspect},
+    policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory},
     policy::verification::{CandidateFacts, VerificationReport, verify},
     runner::receipt::evidence_is_acceptable,
 };
@@ -389,6 +394,198 @@ fn collect_evidence(
     Ok(evidence)
 }
 
+// 71-R3: a successful `handoff create`, under a configured convergence
+// policy, records a `gate_failure` fact for each gate failure the actor
+// declares and a `repair_attempt` fact when the delivery answers a prior
+// review return. See `ActorDeclaration::gate_failures` for why the first is
+// declared here rather than counted from `gate run`, and
+// `repair_attempt_reason` for why the second is inherited rather than
+// declared or derived from card state.
+
+/// Every reason category that exists, so an error message can render the set
+/// [`AttemptKind::GateFailure`] actually admits instead of a second,
+/// hand-typed list that could silently drift from [`AttemptKind::admits`].
+/// Mirrors `review.rs`'s constant of the same purpose; kept as its own copy
+/// here rather than shared, because there is no third caller yet to justify
+/// factoring it out.
+const ALL_REASON_CATEGORIES: [ReasonCategory; 6] = [
+    ReasonCategory::AcceptanceDefect,
+    ReasonCategory::Regression,
+    ReasonCategory::SecurityConcern,
+    ReasonCategory::ScopeChange,
+    ReasonCategory::IntegrationConflict,
+    ReasonCategory::NonBlockingImprovement,
+];
+
+/// Renders a reason category using the same spelling it would serialize to,
+/// so a diagnostic never hand-spells a name `serde` already owns.
+fn reason_wire_name(reason: ReasonCategory) -> String {
+    match serde_json::to_value(reason) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{reason:?}"),
+    }
+}
+
+/// The reasons a declared gate failure may name, rendered for an error
+/// message.
+fn admissible_gate_failure_reasons() -> String {
+    ALL_REASON_CATEGORIES
+        .into_iter()
+        .filter(|reason| AttemptKind::GateFailure.admits(*reason))
+        .map(reason_wire_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuses a declaration whose `gate_failures` cannot be recorded: a `gate_id`
+/// the card does not name among its feature gates, a `reason_category`
+/// [`AttemptKind::GateFailure`] does not admit, or the same gate declared
+/// twice.
+///
+/// Checked only under a configured convergence policy — with none
+/// configured, `gate_failures` is accepted and ignored exactly as
+/// [`ActorDeclaration::gate_failures`] documents, so an unconfigured project
+/// gains no refusal it did not already have. Called from both `run_create`
+/// and `preview_create`, in the same place relative to their other checks,
+/// so a dry run can never promise a write the real command would refuse —
+/// the same discipline `review.rs`'s `require_review_return_reason`
+/// established for 71-R2.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyIncompleteHandoff`] for an unregistered gate,
+/// an inadmissible reason, or a repeated gate.
+fn validate_declared_gate_failures(
+    policy: Option<&ConvergencePolicy>,
+    feature_gates: &[String],
+    gate_failures: &[DeclaredGateFailure],
+) -> Result<(), HarnessError> {
+    if policy.is_none() {
+        return Ok(());
+    }
+    let mut declared_gates = BTreeSet::new();
+    for failure in gate_failures {
+        if !feature_gates.contains(&failure.gate_id) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "declared gate failure names `{}`, which is not one of this card's feature gates: {}",
+                    failure.gate_id,
+                    feature_gates.join(", ")
+                ),
+                code: ErrorCode::PolicyIncompleteHandoff,
+            });
+        }
+        if !AttemptKind::GateFailure.admits(failure.reason_category) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "declared gate failure for `{}` names `reason_category: {}`, which a gate failure cannot declare; admissible reasons are: {}",
+                    failure.gate_id,
+                    reason_wire_name(failure.reason_category),
+                    admissible_gate_failure_reasons()
+                ),
+                code: ErrorCode::PolicyIncompleteHandoff,
+            });
+        }
+        if !declared_gates.insert(failure.gate_id.as_str()) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "declared gate failure names `{}` more than once; declare each failing gate once",
+                    failure.gate_id
+                ),
+                code: ErrorCode::PolicyIncompleteHandoff,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The reason category a repair-attempt fact must inherit, if one may be
+/// recorded at all.
+///
+/// A `handoff create` answering a `changes_requested` return is a repair
+/// attempt, but nothing about *why* the work is being redelivered is
+/// declared on this command's own input, or derived from the card's state:
+/// the reviewer already declared it, as the `review_return` fact 71-R2
+/// records. Asking the actor to declare it again would let the same return
+/// be filed under two different reasons by two different people, so it is
+/// inherited instead — contrast [`ActorDeclaration::gate_failures`], where
+/// nothing else ever records why a gate went red, which is exactly why that
+/// one *is* declared here.
+///
+/// Returns `None` — meaning no repair-attempt fact is recorded — in exactly
+/// two cases, both deliberate:
+///
+/// - No `review_return` fact exists for this card at all, for instance
+///   because the policy was configured after the return happened. There is
+///   nothing to inherit, and defaulting to some category would attribute a
+///   reason the reviewer never declared.
+/// - The inherited reason is `non_blocking_improvement`: the one reason
+///   [`AttemptKind::ReviewReturn`] admits that [`AttemptKind::RepairAttempt`]
+///   does not. Polishing on request is not the convergence failure this
+///   budget exists to detect, so a return filed for that reason produces no
+///   repair attempt however many times the actor redelivers.
+///
+/// "The" `review_return` fact is the one with the greatest `event_id`, which
+/// is monotonic across the control repository's whole history; `occurred_at`
+/// is a wall clock and is never consulted.
+///
+/// # Errors
+///
+/// Returns an error when the event store cannot be read, or when the latest
+/// `review_return` fact's `reason_category` cannot be parsed — a fact this
+/// command itself wrote and cannot read back is control corruption, not an
+/// absent one.
+fn repair_attempt_reason(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<Option<ReasonCategory>, HarnessError> {
+    let events = EventStore::new(control).for_card(card_id)?;
+    let latest_return = events
+        .iter()
+        .filter(|event| {
+            event.event_type == ATTEMPT_RECORDED_EVENT
+                && event
+                    .metadata
+                    .get("attempt_kind")
+                    .and_then(|value| serde_json::from_value::<AttemptKind>(value.clone()).ok())
+                    == Some(AttemptKind::ReviewReturn)
+        })
+        .max_by_key(|event| &event.event_id);
+
+    let Some(event) = latest_return else {
+        return Ok(None);
+    };
+    let reason: ReasonCategory = event
+        .metadata
+        .get("reason_category")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "event {} is a review_return attempt fact with no readable reason_category",
+                event.event_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+
+    Ok(AttemptKind::RepairAttempt.admits(reason).then_some(reason))
+}
+
+/// Renders the "would record" / "recorded" summary lines shared by
+/// `preview_create` and `run_create`'s outcome messages.
+fn fact_summary(gate_failure_facts: usize, repair_attempt_recorded: bool, tense: &str) -> String {
+    let mut summary = String::new();
+    if gate_failure_facts > 0 {
+        let _ = write!(
+            summary,
+            "\n{tense} {gate_failure_facts} gate_failure convergence fact(s)"
+        );
+    }
+    if repair_attempt_recorded {
+        let _ = write!(summary, "\n{tense} one repair_attempt convergence fact");
+    }
+    summary
+}
+
 /// Reports what `handoff create` would bind, without binding it.
 fn preview_create(
     args: &CreateArgs,
@@ -396,8 +593,16 @@ fn preview_create(
     declaration: &ActorDeclaration,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
     state.state.check_transition(CardState::HandedOff)?;
+    // 71-R3: the same validation `run_create` performs, in the same place
+    // relative to its other checks — see `validate_declared_gate_failures`.
+    validate_declared_gate_failures(
+        config.convergence_policy.as_ref(),
+        &record.named_gates.feature,
+        &declaration.gate_failures,
+    )?;
     let (_lease, scope, head) = candidate_of(&control, card_id, &declaration.delivered_sha)?;
     let (baseline, _commits, diff) = derive_facts(&scope, &record.base_sha, &head)?;
     verify_handoff_candidate(
@@ -418,13 +623,30 @@ fn preview_create(
         &record.named_gates.feature,
         &head,
     )?;
+
+    // 71-R3: the same two counts `run_create` would actually record — see the
+    // matching fields on its own success outcome.
+    let (gate_failure_facts, repair_attempt_recorded) = if config.convergence_policy.is_some() {
+        (
+            declaration.gate_failures.len(),
+            repair_attempt_reason(&control, card_id)?.is_some(),
+        )
+    } else {
+        (0, false)
+    };
+
     Ok(CommandOutcome::new(
         "handoff.create",
-        format!("Dry run: would hand off card {card_id} at {head}; nothing was changed"),
+        format!(
+            "Dry run: would hand off card {card_id} at {head}{}; nothing was changed",
+            fact_summary(gate_failure_facts, repair_attempt_recorded, "would record")
+        ),
         serde_json::json!({
             "dry_run": true,
             "card_id": card_id.to_string(),
             "candidate_sha": head,
+            "gate_failure_facts": gate_failure_facts,
+            "repair_attempt_recorded": repair_attempt_recorded,
         }),
     ))
 }
@@ -569,6 +791,11 @@ fn candidate_of(
     Ok((lease, scope, candidate_sha))
 }
 
+// 71-R3's fact emission has to run inside this one transaction, after the
+// handoff record and its own `handoff.created` event are written and before
+// the commit — splitting it into a helper the length limit would otherwise
+// invite risks losing that ordering at a call site instead of at a glance.
+#[allow(clippy::too_many_lines)]
 fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let declaration = read_declaration(&args.declaration)?;
@@ -587,6 +814,14 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             state.state.check_transition(CardState::HandedOff)?;
+            // 71-R3: refused before any candidate resolution or write, in the
+            // same place relative to this transaction's other checks that
+            // `preview_create` uses — see `validate_declared_gate_failures`.
+            validate_declared_gate_failures(
+                config.convergence_policy.as_ref(),
+                &record.named_gates.feature,
+                &declaration.gate_failures,
+            )?;
 
             let (lease, scope, candidate_sha) =
                 candidate_of(control, &card_id, &declaration.delivered_sha)?;
@@ -662,18 +897,87 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     ),
                 clock,
             )?;
+
+            // 71-R3: gate_failure and repair_attempt convergence facts,
+            // recorded in this same transaction, after the handoff record and
+            // its own `handoff.created` event and before the commit — the
+            // same placement 069ef4c and 69c1655 established for their own
+            // dimensions. Declared gate failures land in declaration order;
+            // the repair attempt, if any, lands after all of them — see the
+            // contract's determinism requirement, and `repair_attempt_reason`
+            // for why it may legitimately be none at all.
+            let mut gate_failure_facts = 0usize;
+            let mut repair_attempt_recorded = false;
+            if let Some(policy) = config.convergence_policy.as_ref() {
+                let policy_digest = policy.digest()?;
+                for failure in &declaration.gate_failures {
+                    events.append(
+                        &config.project_id,
+                        EventDraft::new(ATTEMPT_RECORDED_EVENT, &args.common.actor)
+                            .cycle(record.cycle_id.clone())
+                            .card(
+                                card_id.clone(),
+                                state.current_revision,
+                                state.current_digest.clone(),
+                            )
+                            .head(candidate_sha.clone())
+                            .meta(
+                                "attempt_kind",
+                                serde_json::to_value(AttemptKind::GateFailure)?,
+                            )
+                            .meta(
+                                "reason_category",
+                                serde_json::to_value(failure.reason_category)?,
+                            )
+                            .meta(
+                                "evidence_ref",
+                                serde_json::json!(format!("handoff:{id}#gate:{}", failure.gate_id)),
+                            )
+                            .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                        clock,
+                    )?;
+                    gate_failure_facts += 1;
+                }
+
+                if let Some(reason) = repair_attempt_reason(control, &card_id)? {
+                    events.append(
+                        &config.project_id,
+                        EventDraft::new(ATTEMPT_RECORDED_EVENT, &args.common.actor)
+                            .cycle(record.cycle_id.clone())
+                            .card(
+                                card_id.clone(),
+                                state.current_revision,
+                                state.current_digest.clone(),
+                            )
+                            .head(candidate_sha.clone())
+                            .meta(
+                                "attempt_kind",
+                                serde_json::to_value(AttemptKind::RepairAttempt)?,
+                            )
+                            .meta("reason_category", serde_json::to_value(reason)?)
+                            .meta("evidence_ref", serde_json::json!(format!("handoff:{id}")))
+                            .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                        clock,
+                    )?;
+                    repair_attempt_recorded = true;
+                }
+            }
+
             control.commit(expected, &format!("handoff: create {id}"))?;
 
             Ok(CommandOutcome::new(
                 "handoff.create",
                 format!(
-                    "Handed off card {card_id}\nhandoff: {id}\ncandidate: {candidate_sha}\ndigest: {digest}\nchanged paths: {}\nevidence: {} receipt(s)",
+                    "Handed off card {card_id}\nhandoff: {id}\ncandidate: {candidate_sha}\ndigest: {digest}\nchanged paths: {}\nevidence: {} receipt(s){}",
                     handoff.changed_paths.len(),
-                    handoff.receipts.len()
+                    handoff.receipts.len(),
+                    fact_summary(gate_failure_facts, repair_attempt_recorded, "recorded"),
                 ),
                 serde_json::json!({
                     "handoff": handoff,
                     "handoff_digest": digest.as_str(),
+                    "gate_failure_facts": gate_failure_facts,
+                    "repair_attempt_recorded": repair_attempt_recorded,
                 }),
             )
             .with_project(config.project_id.clone()))
