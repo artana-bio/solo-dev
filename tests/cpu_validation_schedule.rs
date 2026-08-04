@@ -4,10 +4,10 @@ mod support;
 
 use std::{
     fs,
-    path::Path,
-    process::Command,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use support::Workspace;
@@ -18,10 +18,11 @@ fn profile(workspace: &Workspace) -> String {
     path.display().to_string()
 }
 
-fn slow_gate(workspace: &Workspace, gate_id: &str, marker: &Path) {
+fn slow_gate(workspace: &Workspace, gate_id: &str, marker: &Path, release: &Path) {
     let marker = serde_json::to_string(&marker.display().to_string()).unwrap();
+    let release = serde_json::to_string(&release.display().to_string()).unwrap();
     let definition = workspace.gate_definition(gate_id, &format!(
-        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [\"sh\", \"-c\", \"printf started > \\\"$MARKER\\\"; sleep 0.5\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER: {marker}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: [\"sh\", \"-c\", \"printf started > \\\"$MARKER\\\"; while [ ! -e \\\"$RELEASE\\\" ]; do sleep 0.01; done\"]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER: {marker}\n    RELEASE: {release}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
     ));
     workspace.gate(&["register", "--definition", &definition]);
 }
@@ -50,12 +51,88 @@ fn schedule_raw(
         .unwrap()
 }
 
-fn wait_for(marker: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !marker.exists() && Instant::now() < deadline {
+fn run_child(control: &Path, card: &str, gate: &str, reservation: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "gate",
+            "run",
+            "--output",
+            "json",
+            "--control",
+            control.to_str().unwrap(),
+            "--card-id",
+            card,
+            "--gate-id",
+            gate,
+            "--reservation-id",
+            reservation,
+            "--actor",
+            "holder",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn await_started(marker: &Path, child: &mut Child) {
+    while !marker.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("gate exited before writing {}: {status}", marker.display());
+        }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(marker.exists());
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "gate exited after writing {}",
+        marker.display()
+    );
+}
+
+fn assert_cpu_lanes(control: &Path, expected: &[(u8, &str)]) {
+    let mut paths = fs::read_dir(control.join("cpu-heavy-lanes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths.len(), expected.len());
+    for (path, (lane_id, reservation_id)) in paths.iter().zip(expected) {
+        let lane: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(lane["lane_id"], *lane_id);
+        assert_eq!(lane["reservation_id"], *reservation_id);
+    }
+}
+
+struct HeldGateRun {
+    release: PathBuf,
+    child: Option<Child>,
+}
+
+impl HeldGateRun {
+    fn new(release: PathBuf, child: Child) -> Self {
+        Self {
+            release,
+            child: Some(child),
+        }
+    }
+
+    fn await_started(&mut self, marker: &Path) {
+        await_started(marker, self.child.as_mut().unwrap());
+    }
+
+    fn release_and_reap(&mut self) -> Output {
+        fs::write(&self.release, "release\n").unwrap();
+        self.child.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for HeldGateRun {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = fs::write(&self.release, "release\n");
+            let _ = child.wait();
+        }
+    }
 }
 
 #[test]
@@ -67,15 +144,26 @@ fn schedule_is_fresh_read_only_and_reports_wait_with_independent_work_at_two_cpu
         workspace.root.join("two"),
         workspace.root.join("three"),
     ];
+    let releases = [
+        workspace.root.join("one.release"),
+        workspace.root.join("two.release"),
+        workspace.root.join("three.release"),
+    ];
     let independent_marker = workspace.root.join("independent");
-    for (gate, marker) in [
-        ("gate.one", &markers[0]),
-        ("gate.two", &markers[1]),
-        ("gate.three", &markers[2]),
+    let independent_release = workspace.root.join("independent.release");
+    for (gate, marker, release) in [
+        ("gate.one", &markers[0], &releases[0]),
+        ("gate.two", &markers[1], &releases[1]),
+        ("gate.three", &markers[2], &releases[2]),
     ] {
-        slow_gate(&workspace, gate, marker);
+        slow_gate(&workspace, gate, marker, release);
     }
-    slow_gate(&workspace, "gate.independent", &independent_marker);
+    slow_gate(
+        &workspace,
+        "gate.independent",
+        &independent_marker,
+        &independent_release,
+    );
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -115,35 +203,17 @@ fn schedule_is_fresh_read_only_and_reports_wait_with_independent_work_at_two_cpu
     let first = reserve("F-001", "gate.one");
     let second = reserve("F-002", "gate.two");
     let third = reserve("F-003", "gate.three");
-    let control = workspace.control.clone();
-    let run = |card: &'static str, gate: &'static str, id: String| {
-        let control = control.clone();
-        thread::spawn(move || {
-            Command::new(env!("CARGO_BIN_EXE_change-harness"))
-                .args([
-                    "gate",
-                    "run",
-                    "--output",
-                    "json",
-                    "--control",
-                    control.to_str().unwrap(),
-                    "--card-id",
-                    card,
-                    "--gate-id",
-                    gate,
-                    "--reservation-id",
-                    &id,
-                    "--actor",
-                    "holder",
-                ])
-                .output()
-                .unwrap()
-        })
-    };
-    let one = run("F-001", "gate.one", first);
-    let two = run("F-002", "gate.two", second);
-    wait_for(&markers[0]);
-    wait_for(&markers[1]);
+    let mut one = HeldGateRun::new(
+        releases[0].clone(),
+        run_child(&workspace.control, "F-001", "gate.one", &first),
+    );
+    one.await_started(&markers[0]);
+    let mut two = HeldGateRun::new(
+        releases[1].clone(),
+        run_child(&workspace.control, "F-002", "gate.two", &second),
+    );
+    two.await_started(&markers[1]);
+    assert_cpu_lanes(&workspace.control, &[(1, &first), (2, &second)]);
     let initial: serde_json::Value =
         serde_json::from_slice(&schedule_raw(&workspace.control, &third, None).stdout).unwrap();
     assert_eq!(
@@ -190,8 +260,9 @@ fn schedule_is_fresh_read_only_and_reports_wait_with_independent_work_at_two_cpu
         !stale.status.success(),
         "opaque stale state revision must refuse"
     );
-    assert!(one.join().unwrap().status.success());
-    assert!(two.join().unwrap().status.success());
+    assert!(one.release_and_reap().status.success());
+    assert!(two.release_and_reap().status.success());
+    assert_cpu_lanes(&workspace.control, &[]);
     let after_release: serde_json::Value =
         serde_json::from_slice(&schedule_raw(&workspace.control, &third, None).stdout).unwrap();
     assert_eq!(after_release["data"]["recommendation"]["kind"], "start");
@@ -206,12 +277,16 @@ fn occupied_lanes_without_independent_work_recommend_wait_without_mutation() {
     let workspace = Workspace::initialized();
     let first_marker = workspace.root.join("wait-first");
     let second_marker = workspace.root.join("wait-second");
-    slow_gate(&workspace, "gate.wait.one", &first_marker);
-    slow_gate(&workspace, "gate.wait.two", &second_marker);
+    let first_release = workspace.root.join("wait-first.release");
+    let second_release = workspace.root.join("wait-second.release");
+    let third_release = workspace.root.join("wait-third.release");
+    slow_gate(&workspace, "gate.wait.one", &first_marker, &first_release);
+    slow_gate(&workspace, "gate.wait.two", &second_marker, &second_release);
     slow_gate(
         &workspace,
         "gate.wait.three",
         &workspace.root.join("wait-third"),
+        &third_release,
     );
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "wait only"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
@@ -245,35 +320,17 @@ fn occupied_lanes_without_independent_work_recommend_wait_without_mutation() {
     let first = reserve("F-001", "gate.wait.one");
     let second = reserve("F-002", "gate.wait.two");
     let third = reserve("F-003", "gate.wait.three");
-    let control = workspace.control.clone();
-    let execute = |card: &'static str, gate: &'static str, reservation: String| {
-        let control = control.clone();
-        thread::spawn(move || {
-            Command::new(env!("CARGO_BIN_EXE_change-harness"))
-                .args([
-                    "gate",
-                    "run",
-                    "--output",
-                    "json",
-                    "--control",
-                    control.to_str().unwrap(),
-                    "--card-id",
-                    card,
-                    "--gate-id",
-                    gate,
-                    "--reservation-id",
-                    &reservation,
-                    "--actor",
-                    "holder",
-                ])
-                .output()
-                .unwrap()
-        })
-    };
-    let first_run = execute("F-001", "gate.wait.one", first);
-    let second_run = execute("F-002", "gate.wait.two", second);
-    wait_for(&first_marker);
-    wait_for(&second_marker);
+    let mut first_run = HeldGateRun::new(
+        first_release,
+        run_child(&workspace.control, "F-001", "gate.wait.one", &first),
+    );
+    first_run.await_started(&first_marker);
+    let mut second_run = HeldGateRun::new(
+        second_release,
+        run_child(&workspace.control, "F-002", "gate.wait.two", &second),
+    );
+    second_run.await_started(&second_marker);
+    assert_cpu_lanes(&workspace.control, &[(1, &first), (2, &second)]);
     let before = workspace.control_head();
     let schedule: serde_json::Value =
         serde_json::from_slice(&schedule_raw(&workspace.control, &third, None).stdout).unwrap();
@@ -281,19 +338,26 @@ fn occupied_lanes_without_independent_work_recommend_wait_without_mutation() {
     assert_eq!(schedule["data"]["blocker"]["kind"], "cpu_lanes_occupied");
     assert!(schedule["data"]["release_condition"].is_object());
     assert_eq!(workspace.control_head(), before, "schedule is read-only");
-    assert!(first_run.join().unwrap().status.success());
-    assert!(second_run.join().unwrap().status.success());
+    assert!(first_run.release_and_reap().status.success());
+    assert!(second_run.release_and_reap().status.success());
+    assert_cpu_lanes(&workspace.control, &[]);
 }
 
 #[test]
 fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
     let workspace = Workspace::initialized();
     let marker = workspace.root.join("budget-marker");
-    slow_gate(&workspace, "gate.budget", &marker);
+    slow_gate(
+        &workspace,
+        "gate.budget",
+        &marker,
+        &workspace.root.join("budget.release"),
+    );
     slow_gate(
         &workspace,
         "gate.budget.second",
         &workspace.root.join("budget-second"),
+        &workspace.root.join("budget-second.release"),
     );
     workspace.cycle(&[
         "create",
