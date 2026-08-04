@@ -3340,3 +3340,75 @@ fn a_cycle_in_a_terminal_state_does_not_block_the_install() {
         policy
     );
 }
+
+#[test]
+fn a_draft_cycle_does_not_block_while_every_unreachable_status_does() {
+    // Tests 2 and 7 pin four of the nine `CycleStatus` values against
+    // reachable-today cycles: `active` and `sealed` block,
+    // `closed` and `abandoned` do not. That leaves five unpinned —
+    // `draft`, and the four statuses no shipped command produces yet
+    // (`integrating`, `accepted`, `landed`, `blocked`). An enumeration that
+    // is only reported and not regression-protected is a claim, not a
+    // guarantee: an independent mutation removing `draft` from the
+    // non-blocking set left the whole suite green. This test pins the
+    // remaining five so `blocks_convergence_policy_change`'s full
+    // classification cannot drift silently.
+    //
+    // `draft` is exercised through the real `cycle create`, never
+    // activated — the ordinary shape of a cycle nobody has started yet, not
+    // a tampered one. `integrating`, `accepted`, `landed`, and `blocked` are
+    // exercised through `tamper_cycle_status`, the same simulate-a-future-
+    // command helper `a_cycle_in_a_terminal_state_does_not_block_the_install`
+    // uses for `closed`: no shipped command in this codebase can produce any
+    // of the four today (`CycleStatus::successors` already reserves the
+    // transitions for a later work package), so this is the only way to
+    // construct one, and this test exists so their classification is
+    // guarded before that work package ever ships.
+    let workspace = Workspace::initialized();
+
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Never activated",
+    ]);
+
+    let unreachable = [
+        ("C-002", "integrating"),
+        ("C-003", "accepted"),
+        ("C-004", "landed"),
+        ("C-005", "blocked"),
+    ];
+    for (cycle_id, status) in unreachable {
+        workspace.cycle(&["create", "--cycle-id", cycle_id, "--objective", "Probe"]);
+        workspace.cycle(&["activate", "--cycle-id", cycle_id]);
+        workspace.tamper_cycle_status(cycle_id, status);
+    }
+
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "integrating, accepted, landed, and blocked must all block: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE", "{output:?}");
+    let message = error_message(&output);
+    for (cycle_id, status) in unreachable {
+        assert!(
+            message.contains(cycle_id) && message.contains(status),
+            "the refusal must name {cycle_id} and its status `{status}`: {message}"
+        );
+    }
+    assert!(
+        !message.contains("C-001"),
+        "a draft cycle must not be named as an offender: {message}"
+    );
+}
