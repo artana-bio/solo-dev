@@ -37,6 +37,12 @@ pub enum CycleCommand {
     Status(StatusArgs),
     /// List every cycle in authoritative identifier order.
     List(ListArgs),
+    /// Replay a cycle's journaled history as the assembly-line animation.
+    ///
+    /// Read-only: derives the playback from the event store and cross-checks
+    /// the evidence along the way, flashing any discrepancy at the moment in
+    /// history it was recorded.
+    Replay(ReplayArgs),
     /// Abandon a cycle that will not be landed.
     Abandon(AbandonArgs),
 }
@@ -56,6 +62,7 @@ impl CycleCommand {
             Self::DeclareGroup(..) => "cycle.declare-group",
             Self::Status(..) => "cycle.status",
             Self::List(..) => "cycle.list",
+            Self::Replay(..) => "cycle.replay",
             Self::Abandon(..) => "cycle.abandon",
         }
     }
@@ -153,6 +160,19 @@ pub struct ListArgs {
     pub common: CommonArgs,
 }
 
+/// Arguments accepted by `cycle replay`.
+#[derive(Debug, Args)]
+pub struct ReplayArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The cycle to replay.
+    #[arg(long)]
+    pub cycle_id: String,
+    /// Skip the animation and print only the timeline, even on a terminal.
+    #[arg(long)]
+    pub no_animation: bool,
+}
+
 /// Arguments accepted by `cycle abandon`.
 #[derive(Debug, Args)]
 pub struct AbandonArgs {
@@ -182,8 +202,184 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
         CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
         CycleCommand::Status(args) => run_status(args),
         CycleCommand::List(args) => run_list(args),
+        // The process entry point routes `cycle replay` through
+        // [`execute_replay`] before this dispatcher, because the animation
+        // needs the resolved output format. This arm exists only for
+        // exhaustiveness; passing JSON here means a caller that somehow
+        // reaches it gets the timeline and never a surprise animation.
+        CycleCommand::Replay(args) => execute_replay(
+            args,
+            crate::cli::output::OutputFormat::Json,
+            &crate::cli::tty::SystemEnvironment,
+        ),
         CycleCommand::Abandon(args) => run_abandon(args, clock),
     }
+}
+
+/// How long each replay frame is shown before the next replaces it.
+const REPLAY_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(90);
+
+/// Executes `cycle replay`: derives the floor screenplay from the cycle's
+/// journaled events, cross-checks the evidence, and plays the animation on
+/// standard error when the environment allows it.
+///
+/// Read-only and lock-free, like `cycle status`. A discrepancy the
+/// cross-check finds becomes a flash in the playback and a warning on the
+/// result — not a failure. `audit cycle` is the command whose exit code
+/// enforces evidence; this one is a viewer, and a viewer that refuses to
+/// show a broken history is useless exactly when it matters most.
+///
+/// # Errors
+///
+/// Returns an error when the cycle does not exist or a record cannot be
+/// read.
+pub fn execute_replay(
+    args: &ReplayArgs,
+    format: crate::cli::output::OutputFormat,
+    environment: &dyn crate::cli::tty::Environment,
+) -> Result<CommandOutcome, HarnessError> {
+    use crate::cli::{
+        floor,
+        replay::{EvidenceFlash, derive},
+        tty::{SkipReason, skip_reason, terminal_width},
+    };
+
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let cycle = load(&control, &cycle_id)?;
+    let events = EventStore::new(&control);
+    let status = derived_status(&events, &cycle_id)?;
+    let history = events.for_cycle(&cycle_id)?;
+
+    let evidence = crate::commands::audit::cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
+    let flashes: Vec<EvidenceFlash> = evidence
+        .discrepancies
+        .iter()
+        .map(|discrepancy| EvidenceFlash {
+            // Subjects read `receipt R-000123`; the trailing token is the
+            // record identifier the event metadata carries.
+            record_id: discrepancy
+                .subject
+                .rsplit(' ')
+                .next()
+                .unwrap_or(&discrepancy.subject)
+                .to_owned(),
+            text: format!(
+                "✗ evidence: {} claims {}; found {}",
+                discrepancy.subject, discrepancy.claim, discrepancy.found
+            ),
+        })
+        .collect();
+
+    let derived = derive(
+        &cycle_id.to_string(),
+        cycle.baseline_sha.as_deref(),
+        &history,
+        &flashes,
+    );
+
+    let skip = skip_reason(format, args.no_animation, environment);
+    if skip.is_none() {
+        let width = terminal_width(environment);
+        let mut sink = floor::TerminalSink::new(std::io::stderr());
+        floor::play(
+            &floor::frames_for(&derived.script, width),
+            &mut sink,
+            REPLAY_FRAME_DELAY,
+        );
+    }
+
+    let text = if skip.is_none() {
+        format!(
+            "Replayed cycle {cycle_id} ({status}): {} event(s), {}",
+            history.len(),
+            evidence_summary(evidence.discrepancies.len()),
+        )
+    } else {
+        timeline_text(
+            &cycle_id,
+            &cycle,
+            status,
+            &derived.timeline,
+            &evidence.discrepancies,
+        )
+    };
+
+    let mut outcome = CommandOutcome::new(
+        "cycle.replay",
+        text,
+        serde_json::json!({
+            "schema": "harness.cycle-replay/v1",
+            "cycle_id": cycle_id.to_string(),
+            "status": status.name(),
+            "objective": cycle.objective,
+            "baseline_sha": cycle.baseline_sha,
+            "played": skip.is_none(),
+            "skip_reason": skip.map(SkipReason::code),
+            "event_count": history.len(),
+            "beat_count": derived.script.beats.len(),
+            "timeline": derived.timeline,
+            "discrepancies": evidence.discrepancies,
+        }),
+    )
+    .with_project(config.project_id.clone());
+
+    for discrepancy in &evidence.discrepancies {
+        outcome = outcome.with_warning(format!(
+            "evidence: {} claims {}; found {}",
+            discrepancy.subject, discrepancy.claim, discrepancy.found
+        ));
+    }
+    Ok(outcome)
+}
+
+/// The evidence clause of the replay summary line.
+fn evidence_summary(discrepancies: usize) -> String {
+    if discrepancies == 0 {
+        "evidence holds".to_owned()
+    } else {
+        format!("{discrepancies} discrepancy(ies)")
+    }
+}
+
+/// The plain-text timeline: what a piped or `--no-animation` caller gets.
+///
+/// One line per event keeps this useful in a CI log, which is the honest
+/// degradation of the animation rather than a consolation message.
+fn timeline_text(
+    cycle_id: &CycleId,
+    cycle: &CycleRecord,
+    status: CycleStatus,
+    timeline: &[crate::cli::replay::TimelineEntry],
+    discrepancies: &[crate::commands::audit::Discrepancy],
+) -> String {
+    let mut text = format!(
+        "Replay of cycle {cycle_id} ({status})\nobjective: {}\nbaseline: {}\nevents: {}",
+        cycle.objective,
+        cycle.baseline_sha.as_deref().unwrap_or("not frozen"),
+        timeline.len()
+    );
+    for entry in timeline {
+        let _ = write!(
+            text,
+            "\n  {}  {}  {} · by {}",
+            entry.at, entry.event_id, entry.description, entry.actor_id
+        );
+    }
+    if discrepancies.is_empty() {
+        text.push_str("\n\nevery recorded digest and commit still resolves");
+    } else {
+        let _ = write!(text, "\n\n{} discrepancy(ies):", discrepancies.len());
+        for discrepancy in discrepancies {
+            let _ = write!(
+                text,
+                "\n  {}\n    claims: {}\n    found:  {}",
+                discrepancy.subject, discrepancy.claim, discrepancy.found
+            );
+        }
+    }
+    text
 }
 
 /// Reads a cycle record, or reports that it does not exist.

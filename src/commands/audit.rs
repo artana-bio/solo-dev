@@ -72,14 +72,79 @@ pub struct CycleArgs {
 }
 
 /// Something the record says that the objects do not bear out.
+///
+/// Crate-visible because `cycle replay` surfaces the same findings as
+/// evidence flashes; the cross-check itself lives here so the two commands
+/// can never disagree about what a discrepancy is.
 #[derive(Clone, Debug, serde::Serialize)]
-struct Discrepancy {
+pub(crate) struct Discrepancy {
     /// The record that made the claim.
-    subject: String,
+    pub(crate) subject: String,
     /// What the record says.
-    claim: String,
+    pub(crate) claim: String,
     /// What was found instead.
-    found: String,
+    pub(crate) found: String,
+}
+
+/// One card's evidence tally from a cross-check.
+#[derive(Clone, Debug)]
+pub(crate) struct CardEvidence {
+    /// The card the tally belongs to.
+    pub(crate) card_id: CardId,
+    /// How many gate receipts it holds.
+    pub(crate) receipts: usize,
+    /// How many reviews it holds.
+    pub(crate) reviews: usize,
+}
+
+/// Everything a cycle-wide evidence cross-check finds.
+#[derive(Clone, Debug)]
+pub(crate) struct CycleEvidence {
+    /// Claims the objects did not bear out, in discovery order.
+    pub(crate) discrepancies: Vec<Discrepancy>,
+    /// Per-card evidence tallies, in the cycle's card order.
+    pub(crate) cards: Vec<CardEvidence>,
+}
+
+/// Cross-checks a cycle's recorded evidence against the objects it names.
+///
+/// # Errors
+///
+/// Returns an error when a record cannot be read. A record that reads but
+/// does not hold up is a [`Discrepancy`], not an error: the caller decides
+/// whether finding one is a failure (`audit cycle`) or a warning (`cycle
+/// replay`).
+pub(crate) fn cross_check_cycle(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    cycle_id: &CycleId,
+    cycle: &CycleRecord,
+) -> Result<CycleEvidence, HarnessError> {
+    let mut discrepancies = Vec::new();
+    if let Some(baseline) = &cycle.baseline_sha
+        && !commit_exists(&config.repository, baseline)
+    {
+        discrepancies.push(Discrepancy {
+            subject: format!("cycle {cycle_id}"),
+            claim: format!("frozen baseline {baseline}"),
+            found: "the commit is not in the candidate repository".to_owned(),
+        });
+    }
+
+    let mut cards = Vec::new();
+    for card_id in &cycle.card_ids {
+        let receipts = check_receipts(control, config, card_id, &mut discrepancies)?;
+        let reviews = check_reviews(control, config, card_id, &mut discrepancies)?;
+        cards.push(CardEvidence {
+            card_id: card_id.clone(),
+            receipts,
+            reviews,
+        });
+    }
+    Ok(CycleEvidence {
+        discrepancies,
+        cards,
+    })
 }
 
 /// Executes an `audit` subcommand.
@@ -233,27 +298,19 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()?;
 
-    let mut discrepancies = Vec::new();
-    if let Some(baseline) = &cycle.baseline_sha
-        && !commit_exists(&config.repository, baseline)
-    {
-        discrepancies.push(Discrepancy {
-            subject: format!("cycle {cycle_id}"),
-            claim: format!("frozen baseline {baseline}"),
-            found: "the commit is not in the candidate repository".to_owned(),
-        });
-    }
-
-    let mut cards = Vec::new();
-    for card_id in &cycle.card_ids {
-        let receipts = check_receipts(&control, &config, card_id, &mut discrepancies)?;
-        let reviews = check_reviews(&control, &config, card_id, &mut discrepancies)?;
-        cards.push(serde_json::json!({
-            "card_id": card_id.to_string(),
-            "receipts": receipts,
-            "reviews": reviews,
-        }));
-    }
+    let evidence = cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
+    let mut discrepancies = evidence.discrepancies;
+    let cards: Vec<serde_json::Value> = evidence
+        .cards
+        .iter()
+        .map(|card| {
+            serde_json::json!({
+                "card_id": card.card_id.to_string(),
+                "receipts": card.receipts,
+                "reviews": card.reviews,
+            })
+        })
+        .collect();
 
     let transitions = promotions(&events);
     let exceptions = audit_exceptions(&control, &raw_events, &config, &mut discrepancies)?;

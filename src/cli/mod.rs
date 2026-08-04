@@ -1,14 +1,17 @@
 //! Command-line surface.
 
 pub mod exit;
+pub mod floor;
 pub mod output;
+pub mod replay;
+pub mod tty;
 
 use clap::{Parser, Subcommand};
 
 use crate::{
     commands::{
         acceptance::AcceptanceCommand, archive::ArchiveCommand, audit::AuditCommand,
-        backup::BackupCommand, card::CardCommand, cycle::CycleCommand,
+        backup::BackupCommand, card::CardCommand, cycle::CycleCommand, demo::DemoArgs,
         disposition::DispositionCommand, doctor::DoctorArgs, gate::GateCommand,
         handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
         review::ReviewCommand, work::WorkCommand,
@@ -43,6 +46,12 @@ pub struct Cli {
 pub enum Command {
     /// Inspect the local Git environment without changing it.
     Doctor(DoctorArgs),
+
+    /// Play a self-contained assembly-line animation of the harness at work.
+    ///
+    /// Fictional cards, no control repository, no side effects — just the
+    /// shape of the lifecycle, station by station.
+    Demo(DemoArgs),
 
     /// Inspect and validate project configuration.
     Project {
