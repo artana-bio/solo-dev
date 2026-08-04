@@ -451,18 +451,43 @@ impl ProjectLock {
     /// Takes the diagnosis rather than re-deriving it, so a caller cannot skip
     /// the check by accident.
     ///
+    /// Removal is conditional on the lock file still naming the exact holder
+    /// that was diagnosed. `diagnose` and `clear_stale` are two separate
+    /// calls — in `project recover --resume` there is a whole command's
+    /// worth of work between them — and the file is free to change in that
+    /// window. The sequence that motivates this: `diagnose` reports `Stale`
+    /// for holder A, correctly, because A died and left the file behind; A's
+    /// entry is then cleared and a live process B legitimately acquires the
+    /// same path before this function runs; an unconditional delete — what
+    /// this used to do — removes B's live lock anyway, because all it
+    /// checked was that *some* diagnosis of `Stale` had been handed to it.
+    /// B keeps mutating the control repository with no lock protecting it,
+    /// and a third process is now free to acquire the same path concurrently
+    /// and mutate alongside B. That is data corruption, not a false alarm:
+    /// strictly worse than the stale-lock misdiagnosis this module was built
+    /// to fix, because it destroys a real exclusion instead of merely
+    /// reporting one that was not real. So a stale verdict about one specific
+    /// abandoned lock only ever removes that lock: if the file now names
+    /// someone else, is unreadable, or is gone, there is nothing left that
+    /// this diagnosis makes safe to clear.
+    ///
     /// # Errors
     ///
     /// Returns an error when the file cannot be removed.
     pub fn clear_stale(control: &Path, diagnosis: &LockDiagnosis) -> Result<bool, HarnessError> {
-        let LockDiagnosis::Stale { .. } = diagnosis else {
+        let LockDiagnosis::Stale { holder, .. } = diagnosis else {
             return Ok(false);
         };
         let path = control.join(LOCK_FILE);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(source) => Err(HarnessError::ControlIo { path, source }),
+        match Self::read_holder(&path) {
+            Some(current) if current == *holder => match fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(source) => Err(HarnessError::ControlIo { path, source }),
+            },
+            // Absent, unreadable, or someone else's now: the diagnosed lock
+            // no longer exists, so there is nothing safe to remove.
+            Some(_) | None => Ok(false),
         }
     }
 
@@ -701,6 +726,57 @@ mod tests {
         assert!(
             !ProjectLock::clear_stale(temp.path(), &diagnosis).unwrap(),
             "an unprovable lock must not be cleared"
+        );
+    }
+
+    #[test]
+    fn clear_stale_refuses_when_the_lock_is_no_longer_the_diagnosed_one() {
+        // `diagnose` and `clear_stale` are two separate calls, with a much
+        // wider window between them than the one closed inside
+        // `diagnose_with` itself. Diagnose a dead holder's lock as stale,
+        // then let a legitimate successor take the same path before
+        // `clear_stale` runs — exactly the sequence from issue #78's
+        // follow-up: A dies and is diagnosed stale, A's entry clears and B
+        // legitimately acquires, and an unconditional delete would strand
+        // B's live mutation unprotected and leave a third process free to
+        // acquire concurrently.
+        let temp = tempfile::tempdir().unwrap();
+        let abandoned = LockHolder {
+            pid: 99_999,
+            acquired_at: clock().now(),
+            operation: "abandoned".to_owned(),
+            process_start: Some("whenever".to_owned()),
+        };
+        fs::write(
+            temp.path().join(LOCK_FILE),
+            serde_json::to_string(&abandoned).unwrap(),
+        )
+        .unwrap();
+
+        let diagnosis = ProjectLock::diagnose(temp.path());
+        assert!(matches!(&diagnosis, LockDiagnosis::Stale { .. }));
+
+        // A legitimate successor — this process's own pid and real start
+        // time — now occupies the same path.
+        let successor = LockHolder {
+            pid: process::id(),
+            acquired_at: clock().now(),
+            operation: "live successor".to_owned(),
+            process_start: process_start_time(process::id()),
+        };
+        fs::write(
+            temp.path().join(LOCK_FILE),
+            serde_json::to_string(&successor).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !ProjectLock::clear_stale(temp.path(), &diagnosis).unwrap(),
+            "a stale verdict about one lock must not clear a different one"
+        );
+        assert!(
+            ProjectLock::is_held(temp.path()),
+            "the successor's lock must survive"
         );
     }
 
