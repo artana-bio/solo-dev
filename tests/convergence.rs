@@ -1004,6 +1004,30 @@ fn a_project_without_a_convergence_policy_records_no_fact_when_revising() {
         &["src/a.rs", "src/b.rs"],
         &["it works"],
     );
+
+    // Material but unpoliced is the one combination worth pinning here,
+    // rather than in a separate test: it is the only case where materiality
+    // and recording disagree — the revision is material, but nothing is ever
+    // recorded because no policy is configured — so it is the only case that
+    // can catch `material_scope_revision_recorded` being computed from
+    // materiality alone, with the policy condition dropped. Every other
+    // fixture in this file either has a policy configured, where the two
+    // coincide, or is not material, where both are trivially `false`.
+    let preview = revise_raw(&workspace, &widened, "widen scope", true);
+    assert!(
+        preview.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview_envelope: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let preview_recorded = preview_envelope["data"]["material_scope_revision_recorded"].as_bool();
+    assert_eq!(
+        preview_recorded,
+        Some(false),
+        "no configured policy means the preview must report no fact would be recorded, however material the revision reads: {preview_envelope}"
+    );
+
     let output = revise_raw(&workspace, &widened, "widen scope", false);
     assert!(
         output.status.success(),
@@ -1011,6 +1035,18 @@ fn a_project_without_a_convergence_policy_records_no_fact_when_revising() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let real_envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let real_recorded = real_envelope["data"]["material_scope_revision_recorded"].as_bool();
+    assert_eq!(
+        real_recorded,
+        Some(false),
+        "no configured policy means the real command must report no fact was recorded, however material the revision reads: {real_envelope}"
+    );
+    assert_eq!(
+        preview_recorded, real_recorded,
+        "the preview and the real command must agree, which is the property this field exists to make checkable"
+    );
+
     assert!(
         attempt_recorded_events(&workspace).is_empty(),
         "no configured policy means no fact, however material the revision reads"
