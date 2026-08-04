@@ -9,8 +9,8 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{integration::ResumeOutcome, transaction::with_transaction},
     config::{
-        DEFAULT_AUTHORITY_REMOTE, FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA,
-        ProjectConfig, ValidationPolicy,
+        ConvergencePolicy, DEFAULT_AUTHORITY_REMOTE, FieldError, FinalAuthorizationPolicy,
+        HostPolicy, PROJECT_SCHEMA, ProjectConfig, ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -105,6 +105,11 @@ pub struct InitArgs {
     /// cycle. Repeat for more than one declared authorizer.
     #[arg(long = "final-authorizer-actor-id")]
     pub final_authorizer_actor_ids: Vec<String>,
+    /// Path to a JSON convergence policy to install at creation, in the
+    /// shape `ConvergencePolicy` deserializes. Absent means no policy: the
+    /// project reports `legacy_unassessed`, never a budget nobody declared.
+    #[arg(long)]
+    pub convergence_policy: Option<PathBuf>,
 }
 
 /// Arguments accepted by `project validate`.
@@ -158,6 +163,33 @@ pub fn execute(
     }
 }
 
+/// Reads, parses, and validates a convergence policy named by `--convergence-policy`.
+///
+/// Called from [`config_from_args`], which `run_init` invokes before it
+/// touches the filesystem, so every rejection here — an unreadable file, a
+/// document that will not deserialize, or a policy that fails its own
+/// `validate` — happens before `project init` creates a control repository,
+/// authority, or project document. Read and parse failures share the code
+/// `--definition`, `--draft`, and `--verdict` already use for a path that
+/// will not yield a document; a policy that parses but fails its own checks
+/// carries whatever code `ConvergencePolicy::validate` already assigns.
+fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read convergence policy {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let policy: ConvergencePolicy =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("convergence policy is malformed: {source}"),
+            code: ErrorCode::ConfigMalformed,
+        })?;
+    policy.validate().map_err(FieldError::into_error)?;
+    Ok(policy)
+}
+
 /// Builds the configuration an `init` invocation describes.
 fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
     let project_id: ProjectId = args.project_id.parse()?;
@@ -167,6 +199,13 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
             .unwrap_or(&args.control)
             .join(format!("{project_id}-worktrees"))
     });
+    // Absent is not a default policy: an unassessed project stays
+    // unassessed until an operator declares a budget.
+    let convergence_policy = args
+        .convergence_policy
+        .as_ref()
+        .map(read_convergence_policy)
+        .transpose()?;
 
     Ok(ProjectConfig {
         schema: PROJECT_SCHEMA.to_owned(),
@@ -188,7 +227,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
                 exception_triggers: vec![],
             }
         }),
-        convergence_policy: None,
+        convergence_policy,
     })
 }
 

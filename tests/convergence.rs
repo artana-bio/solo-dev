@@ -2739,3 +2739,198 @@ fn blocking_and_checkpointing_an_escalated_card_are_still_permitted() {
         String::from_utf8_lossy(&checkpoint.stderr)
     );
 }
+
+// Installing a convergence policy at `project init`.
+//
+// Every fixture above this line installs its policy through
+// `Workspace::configure_convergence_policy`, a file-surgery backdoor that
+// predates any supported way to turn budgets on. These tests exercise the
+// first supported route instead: `project init --convergence-policy <path>`.
+
+/// A valid, minimal convergence policy document: `card_limit` across all
+/// four counted dimensions at all four risk levels, `integration_limit` for
+/// the one cycle-level dimension. Mirrors the shape
+/// `Workspace::configure_convergence_policy` writes directly into
+/// `project.json`, except this one is meant to live in its own file, since
+/// `--convergence-policy` takes a path and never inline JSON.
+fn convergence_policy_document(card_limit: u32, integration_limit: u32) -> serde_json::Value {
+    let card_limits = serde_json::json!({
+        "review_returns": card_limit,
+        "repair_attempts": card_limit,
+        "gate_failures": card_limit,
+        "material_scope_revisions": card_limit,
+    });
+    serde_json::json!({
+        "version": "harness.convergence-policy/v1",
+        "card_limits": {
+            "low": card_limits.clone(),
+            "medium": card_limits.clone(),
+            "high": card_limits.clone(),
+            "critical": card_limits,
+        },
+        "cycle_limits": { "integration_failures": integration_limit },
+    })
+}
+
+/// Writes a JSON document under the workspace root, returning its path as a
+/// CLI-ready string.
+fn write_json(workspace: &Workspace, name: &str, document: &serde_json::Value) -> String {
+    let path = workspace.root.join(name);
+    fs::write(&path, serde_json::to_string_pretty(document).unwrap()).unwrap();
+    path.display().to_string()
+}
+
+/// The `project init` argv this section exercises, optionally naming a
+/// convergence policy file. Deliberately independent of
+/// `Workspace::initialized`, which never passes `--convergence-policy`.
+fn convergence_init_args(workspace: &Workspace, policy_path: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "project".to_owned(),
+        "init".to_owned(),
+        "--project-id".to_owned(),
+        "example".to_owned(),
+        "--repository".to_owned(),
+        workspace.repository.display().to_string(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--authority".to_owned(),
+        workspace.authority.display().to_string(),
+        "--worktree-root".to_owned(),
+        workspace.worktrees.display().to_string(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ];
+    if let Some(path) = policy_path {
+        args.push("--convergence-policy".to_owned());
+        args.push(path.to_owned());
+    }
+    args
+}
+
+/// The project document `project init` just wrote, parsed as JSON.
+fn stored_project_document(workspace: &Workspace) -> serde_json::Value {
+    let raw = fs::read_to_string(workspace.control.join("project/project.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn project_init_installs_a_declared_convergence_policy() {
+    let workspace = Workspace::new();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let output = Workspace::run(&convergence_init_args(&workspace, Some(&policy_path)));
+    assert!(
+        output.status.success(),
+        "project init --convergence-policy failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"],
+        policy,
+        "the installed policy must reach the project document unchanged"
+    );
+
+    // The installation is worth nothing unless a cycle created afterward
+    // actually operates under it.
+    workspace.register_gate("gate.unit", &["true"]);
+    workspace.register_gate("gate.all", &["true"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+
+    let envelope = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "within" }),
+        "a card in a cycle created after installation must see the policy in effect: {envelope}"
+    );
+}
+
+#[test]
+fn project_init_without_the_flag_leaves_no_policy() {
+    let workspace = Workspace::new();
+    let output = Workspace::run(&convergence_init_args(&workspace, None));
+    assert!(
+        output.status.success(),
+        "project init failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let document = stored_project_document(&workspace);
+    assert!(
+        !document
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "omitting the flag must omit the key entirely, not write it null: {document}"
+    );
+}
+
+#[test]
+fn an_invalid_convergence_policy_refuses_before_the_project_exists() {
+    let workspace = Workspace::new();
+    // Any one of the four counted dimensions at zero is enough to fail
+    // `CardConvergenceLimits::validate`.
+    let policy = convergence_policy_document(0, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let output = Workspace::run(&convergence_init_args(&workspace, Some(&policy_path)));
+    assert!(
+        !output.status.success(),
+        "a policy with a zero limit must refuse"
+    );
+    assert_eq!(error_code(&output), "CH-CONFIG-INVALID-VALUE", "{output:?}");
+    assert!(
+        !workspace.control.exists(),
+        "a refused init must not leave the control directory behind at all"
+    );
+}
+
+#[test]
+fn an_unreadable_convergence_policy_file_refuses() {
+    let workspace = Workspace::new();
+    let missing = workspace.root.join("missing-policy.json");
+
+    let output = Workspace::run(&convergence_init_args(
+        &workspace,
+        Some(&missing.display().to_string()),
+    ));
+    assert!(
+        !output.status.success(),
+        "a nonexistent policy path must refuse"
+    );
+    assert_eq!(error_code(&output), "CH-CONFIG-MALFORMED", "{output:?}");
+    assert!(
+        !workspace.control.exists(),
+        "a refused init must not leave the control directory behind at all"
+    );
+}
+
+#[test]
+fn a_convergence_policy_with_an_unsupported_version_refuses() {
+    let workspace = Workspace::new();
+    let mut policy = convergence_policy_document(3, 3);
+    policy["version"] = serde_json::json!("harness.convergence-policy/v2");
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let output = Workspace::run(&convergence_init_args(&workspace, Some(&policy_path)));
+    assert!(
+        !output.status.success(),
+        "an unsupported version must refuse"
+    );
+    assert_eq!(error_code(&output), "CH-CONFIG-INVALID-VALUE", "{output:?}");
+    assert!(
+        !workspace.control.exists(),
+        "a refused init must not leave the control directory behind at all"
+    );
+}
