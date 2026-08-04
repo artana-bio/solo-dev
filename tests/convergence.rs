@@ -3961,3 +3961,705 @@ mod disposition_renew {
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
     }
 }
+
+// 74-4: `disposition rebaseline`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, retires the currently
+// configured convergence policy digest, installs a new one, and re-pins
+// every non-terminal cycle's `project_revision` to it — one transaction,
+// three effects. This is the emergency exit `project set-convergence-policy`
+// itself refuses to be: 79-1 and 79-2 gave that command a correct refusal
+// for exactly the situation this command exists to resolve (an open cycle,
+// or a fact already recorded under the current digest), and that refusal
+// names this card by number.
+//
+// Wrapped in its own module for the same reason `disposition_renew` is:
+// `the_dry_run_makes_every_check_and_writes_nothing` is already the name
+// used above, twice, for the same property on two other commands, and
+// neither existing test may be touched or renamed. A module gives this
+// card's instance of that recurring name a distinct path
+// (`disposition_rebaseline::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_rebaseline {
+    use super::*;
+
+    /// Identical in shape to `disposition_renew`'s own copy of this helper:
+    /// `support::Workspace` is outside this card's file scope, so each
+    /// disposition module keeps its fixture-building local rather than
+    /// reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition rebaseline`'s authorization check has
+    /// a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition rebaseline` in JSON mode, returning the raw
+    /// output. Mirrors every other per-group `_raw` helper in this file;
+    /// kept local because `support::Workspace` is outside this card's file
+    /// scope.
+    fn disposition_rebaseline_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "rebaseline".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is a rebaseline (none configures
+    /// a renewal too), so this is never filtered further by
+    /// `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    /// The stored record for one cycle, read directly from control state —
+    /// the same file `support::Workspace::tamper_cycle_status` edits, read
+    /// back rather than mutated.
+    fn stored_cycle(workspace: &Workspace, cycle_id: &str) -> serde_json::Value {
+        let raw =
+            fs::read_to_string(workspace.control.join(format!("cycles/{cycle_id}.json"))).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// A second, distinct convergence policy document — distinguishable
+    /// from whatever `configure_convergence_policy`/`convergence_policy_
+    /// document` installed by at least one limit unless `card_limit` and
+    /// `integration_limit` are passed identically on purpose — written to
+    /// its own file under the workspace root, ready for `--policy`.
+    fn other_policy(workspace: &Workspace, card_limit: u32, integration_limit: u32) -> String {
+        let policy = convergence_policy_document(card_limit, integration_limit);
+        write_json(workspace, "rebaseline-policy.json", &policy)
+    }
+
+    #[test]
+    // This is the end-to-end proof of the card's whole reason to exist, so
+    // it checks the locked exit, the transaction, the fact shape, the
+    // re-pin, the headline "still usable" claim, and the counter reset in
+    // one place rather than splitting one coherent scenario across tests
+    // that would each need to rebuild most of this fixture anyway.
+    #[allow(clippy::too_many_lines)]
+    fn a_rebaseline_retires_installs_and_repins_so_an_open_cycle_keeps_working() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        let escalating_fact = &attempt_recorded_events(&workspace)[0];
+        assert_real_policy_digest(escalating_fact);
+        let old_digest = escalating_fact["metadata"]["policy_digest"]
+            .as_str()
+            .expect("the escalating fact names the policy digest it was recorded under")
+            .to_owned();
+        let before_cycle = stored_cycle(&workspace, "C-001");
+
+        // The locked exit: today, with C-001 open and a fact already
+        // recorded against the current digest, `set-convergence-policy`
+        // refuses outright — the exact defect this card exists to resolve.
+        let new_policy_path = other_policy(&workspace, 3, 3);
+        let before_locked = workspace.control_head();
+        let locked = Workspace::run(&set_convergence_policy_args(
+            &workspace,
+            &new_policy_path,
+            false,
+        ));
+        assert!(
+            !locked.status.success(),
+            "set-convergence-policy must still refuse while C-001 is open and a fact is recorded, which is exactly the locked exit rebaseline exists to open: {}",
+            String::from_utf8_lossy(&locked.stdout)
+        );
+        assert_eq!(error_code(&locked), "CH-POLICY-INVALID-CYCLE", "{locked:?}");
+        assert_eq!(
+            workspace.control_head(),
+            before_locked,
+            "the refused install must not move the control head"
+        );
+
+        let pre_head = workspace.control_head();
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &new_policy_path,
+                "--rationale",
+                "opening the emergency exit for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "an authorized rebaseline must succeed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_head,
+            "disposition rebaseline must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful rebaseline"
+        );
+
+        // The new policy governs.
+        assert_eq!(
+            stored_project_document(&workspace)["convergence_policy"],
+            convergence_policy_document(3, 3),
+            "the new policy must reach the project document unchanged"
+        );
+
+        // Exactly one rebaseline fact, bound to C-001, no card.
+        let facts = disposition_recorded_events(&workspace);
+        assert_eq!(
+            facts.len(),
+            1,
+            "exactly one cycle is non-terminal, so exactly one rebaseline fact must be recorded: {facts:?}"
+        );
+        let fact = &facts[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert!(
+            fact["card_id"].is_null(),
+            "a rebaseline names no card: {fact}"
+        );
+        assert!(fact["card_revision"].is_null(), "{fact}");
+        assert!(fact["card_digest"].is_null(), "{fact}");
+        assert_eq!(
+            fact["head_sha"],
+            workspace.authority_head(),
+            "head must bind to the protected branch's exact commit at the moment of the decision: {fact}"
+        );
+        assert_eq!(fact["metadata"]["disposition"], "rebaseline", "{fact}");
+        assert_eq!(
+            fact["metadata"]["retired_policy_digest"], old_digest,
+            "{fact}"
+        );
+        assert_eq!(
+            fact["metadata"]["rationale"], "opening the emergency exit for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+        assert_ne!(
+            fact["metadata"]["policy_digest"], old_digest,
+            "the fact's own governing digest must be the newly installed one, not the retired one: {fact}"
+        );
+
+        // The cycle itself is re-pinned to the new project revision.
+        let after_cycle = stored_cycle(&workspace, "C-001");
+        assert_ne!(
+            after_cycle["project_revision"], before_cycle["project_revision"],
+            "C-001 must be re-pinned to the new project revision"
+        );
+
+        // The headline claim: the open cycle keeps working. A new card can
+        // be declared in it, and the gate command that actually runs
+        // gate.rs:791's `project_revision` comparison does not refuse it
+        // with `CH-POLICY-INVALID-CYCLE`.
+        // `escalate_via_review_returns` activated F-001 over `src/**`
+        // (`open_review_round`'s own fixed scope), so F-002 must claim a
+        // disjoint path or `card activate` would correctly refuse on an
+        // ownership overlap that has nothing to do with what this test
+        // checks.
+        let activation = activate_with_scope(&workspace, "F-002", &["tests/promotion.rs"]);
+        assert!(
+            activation.status.success(),
+            "a card must still be declarable in the re-pinned cycle: {}{}",
+            String::from_utf8_lossy(&activation.stdout),
+            String::from_utf8_lossy(&activation.stderr)
+        );
+        let preflight = workspace.gate_raw(&["preflight", "--card-id", "F-002"]);
+        assert!(
+            preflight.status.success(),
+            "the re-pinned cycle must not fail gate.rs:791's project_revision comparison with CH-POLICY-INVALID-CYCLE: {}{}",
+            String::from_utf8_lossy(&preflight.stdout),
+            String::from_utf8_lossy(&preflight.stderr)
+        );
+
+        // The counters count only what's after: the fact recorded under the
+        // retired digest stops counting toward F-001's budget, but stays in
+        // the record rather than being erased.
+        let status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        assert_eq!(
+            status["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the fact recorded under the retired digest must stop counting once rebaselined: {status}"
+        );
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the retired fact must remain in the record, not be erased"
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_rebaseline() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        let policy_path = other_policy(&workspace, 3, 3);
+
+        let before_head = workspace.control_head();
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            stored_project_document(&workspace)["convergence_policy"],
+            convergence_policy_document(1, 3),
+            "a refused rebaseline must leave the original policy installed, unchanged"
+        );
+    }
+
+    #[test]
+    fn rebaselining_to_an_identical_policy_is_refused() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        // Same card_limit and integration_limit as `opened_with_disposition_
+        // policies` just installed: byte-identical once serialized, so this
+        // names the same digest already in force.
+        let identical_path = other_policy(&workspace, 1, 3);
+
+        let before_head = workspace.control_head();
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &identical_path,
+                "--rationale",
+                "retiring a digest to reinstall it unchanged",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "retiring a digest to reinstall it unchanged must be refused: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn rebaselining_without_a_configured_policy_is_refused() {
+        // No `configure_convergence_policy` call: an unconfigured project
+        // has no digest to retire in the first place.
+        let workspace = initialized_with_authorizers(&["owner"]);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        let policy_path = other_policy(&workspace, 3, 3);
+
+        let before_head = workspace.control_head();
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "there is no policy at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "rebaseline must be refused when no convergence policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("project set-convergence-policy"),
+            "the refusal must name the command that installs the first policy: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_rebaseline_without_a_rationale_is_refused() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        let policy_path = other_policy(&workspace, 3, 3);
+
+        let before_head = workspace.control_head();
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn terminal_cycles_are_neither_repinned_nor_given_a_fact() {
+        let workspace = initialized_with_authorizers(&["owner"]);
+        workspace.configure_convergence_policy(1, 3);
+
+        // `closed`: no command in this codebase can produce it yet, the
+        // same limitation `a_cycle_in_a_terminal_state_does_not_block_the_
+        // install` documents for `set-convergence-policy`'s own equivalent
+        // fixture; `tamper_cycle_status` simulates the future command
+        // Section 11.1 already reserves the transition for.
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.tamper_cycle_status("C-001", "closed");
+
+        // `abandoned`: genuinely reachable today.
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        workspace.cycle(&["abandon", "--cycle-id", "C-002", "--reason", "superseded"]);
+
+        let before_c001 = stored_cycle(&workspace, "C-001");
+        let before_c002 = stored_cycle(&workspace, "C-002");
+
+        let policy_path = other_policy(&workspace, 3, 3);
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "no non-terminal cycle should be touched",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "a rebaseline with only terminal cycles present must still succeed, re-pinning none of them: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stored_project_document(&workspace)["convergence_policy"],
+            convergence_policy_document(3, 3),
+            "the new policy must still install even when no cycle needs re-pinning"
+        );
+
+        assert_eq!(
+            stored_cycle(&workspace, "C-001"),
+            before_c001,
+            "a closed cycle must not be re-pinned or otherwise touched"
+        );
+        assert_eq!(
+            stored_cycle(&workspace, "C-002"),
+            before_c002,
+            "an abandoned cycle must not be re-pinned or otherwise touched"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "with only terminal cycles present, no rebaseline fact should be recorded at all"
+        );
+    }
+
+    #[test]
+    fn a_draft_cycle_is_repinned_so_it_does_not_collide_when_it_activates() {
+        let workspace = initialized_with_authorizers(&["owner"]);
+        workspace.configure_convergence_policy(1, 3);
+
+        // A draft cycle: created under the current policy, never activated.
+        // `set_convergence_policy_refuses_while_a_cycle_could_still_break`'s
+        // own sibling test already pins that a draft cannot yet block
+        // `set-convergence-policy`, because it cannot hold a card that
+        // reaches `gate::validation_progress`'s comparison. But its
+        // `project_revision` is fixed the moment it is created, so it would
+        // collide the instant it later activates, unless this rebaseline
+        // re-pins it now.
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "Not yet started",
+        ]);
+        let before = stored_cycle(&workspace, "C-001");
+        assert_eq!(before["status"], "draft");
+
+        let policy_path = other_policy(&workspace, 3, 3);
+        let output = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "a draft must be repinned before it collides later",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "rebaseline must succeed with only a draft cycle present: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let after = stored_cycle(&workspace, "C-001");
+        assert_ne!(
+            after["project_revision"], before["project_revision"],
+            "a draft cycle's project_revision must be re-pinned even though it cannot block today"
+        );
+        let facts = disposition_recorded_events(&workspace);
+        assert_eq!(
+            facts.len(),
+            1,
+            "the draft cycle must receive its own rebaseline fact: {facts:?}"
+        );
+        assert_eq!(facts[0]["cycle_id"], "C-001", "{:?}", facts[0]);
+
+        // And now it really can activate without colliding: `cycle
+        // activate` never touches `project_revision`, so the value this
+        // rebaseline just set survives activation untouched, and the very
+        // next command that depends on it — a card declared and
+        // preflighted inside — must not hit `CH-POLICY-INVALID-CYCLE`.
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        let activation = activate_with_scope(&workspace, "F-001", &["src/policy/actors.rs"]);
+        assert!(
+            activation.status.success(),
+            "a card must be declarable once the re-pinned draft activates: {}{}",
+            String::from_utf8_lossy(&activation.stdout),
+            String::from_utf8_lossy(&activation.stderr)
+        );
+        let preflight = workspace.gate_raw(&["preflight", "--card-id", "F-001"]);
+        assert!(
+            preflight.status.success(),
+            "the re-pinned, now-active cycle must not fail gate.rs:791's project_revision comparison: {}{}",
+            String::from_utf8_lossy(&preflight.stdout),
+            String::from_utf8_lossy(&preflight.stderr)
+        );
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+
+        // For the success the real command would make.
+        let policy_path = other_policy(&workspace, 3, 3);
+        let before_head = workspace.control_head();
+        let success_preview = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "would rebaseline if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["data"]["repinned_cycles"],
+            serde_json::json!(["C-001"]),
+            "the preview must name the cycle that would be re-pinned: {envelope}"
+        );
+        assert_eq!(
+            envelope["data"]["fact_count"],
+            serde_json::json!(1),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            stored_project_document(&workspace)["convergence_policy"],
+            convergence_policy_document(1, 3),
+            "a dry run must never install the new policy"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // test 2 exercises for the real command.
+        let refusal_preview = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "would rebaseline if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real rebaseline, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &policy_path,
+                "--rationale",
+                "the real rebaseline",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+    }
+}

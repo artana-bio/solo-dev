@@ -7,21 +7,43 @@
 //! and reviewed again. `Escalated` cards otherwise have no way out —
 //! [`crate::policy::convergence::NextPermittedAction::RecordAuthorizedDisposition`]
 //! named this command before it existed; this is what satisfies it.
+//!
+//! `rebaseline` is the second, and the largest: it is a project-wide
+//! decision rather than a per-card one. 79-1 and 79-2 gave
+//! `project set-convergence-policy` a careful, correct refusal for exactly
+//! the moment this command exists to resolve — an open cycle or a recorded
+//! fact under the current digest — and that refusal names this card by
+//! number in its own message. Retiring the old digest, installing the new
+//! one, and re-pinning every non-terminal cycle's `project_revision` to it
+//! happen in one transaction, because doing only the middle step (74-3's own
+//! `refuse_orphaning_facts` doc comment calls this "the same defect as #79
+//! with another name") would leave every open cycle broken at its very next
+//! gate command.
 
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
     commands::{CONTROL_ENV, card::load_card, transaction::with_transaction},
-    config::ProjectConfig,
+    config::{ConvergencePolicy, FieldError, ProjectConfig},
     control::{
         event_store::{EventDraft, EventStore},
-        repository::ControlRepository,
+        repository::{ControlRepository, PROJECT_FILE},
     },
-    domain::{card::CardRecord, clock::Clock, digest::Digest, ids::CardId},
+    domain::{
+        card::CardRecord,
+        clock::Clock,
+        cycle::{CYCLE_DIR, CycleRecord},
+        digest::Digest,
+        ids::CardId,
+    },
     error::{ErrorCode, HarnessError},
+    git::authority::inspect_authority,
     policy::convergence::{
         CardConvergence, CardDimension, DISPOSITION_RECORDED_EVENT, DispositionKind, assess_card,
         project,
@@ -33,6 +55,10 @@ use crate::{
 pub enum DispositionCommand {
     /// Renew a card's exhausted convergence budget in one dimension.
     Renew(RenewArgs),
+    /// Retire the currently configured convergence policy digest, install a
+    /// new one, and re-pin every non-terminal cycle's `project_revision` to
+    /// it, all in one transaction.
+    Rebaseline(RebaselineArgs),
 }
 
 impl DispositionCommand {
@@ -41,6 +67,7 @@ impl DispositionCommand {
     pub const fn path(&self) -> &'static str {
         match self {
             Self::Renew(..) => "disposition.renew",
+            Self::Rebaseline(..) => "disposition.rebaseline",
         }
     }
 }
@@ -106,6 +133,23 @@ pub struct RenewArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `disposition rebaseline`.
+#[derive(Debug, Args)]
+pub struct RebaselineArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Path to the new convergence policy to install, in the shape
+    /// `ConvergencePolicy` deserializes.
+    #[arg(long)]
+    pub policy: PathBuf,
+    /// Why this rebaseline is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `disposition` subcommand.
 ///
 /// # Errors
@@ -117,6 +161,7 @@ pub fn execute(
 ) -> Result<CommandOutcome, HarnessError> {
     match command {
         DispositionCommand::Renew(args) => run_renew(args, clock),
+        DispositionCommand::Rebaseline(args) => run_rebaseline(args, clock),
     }
 }
 
@@ -396,6 +441,356 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     "dimension": dimension_wire_name(dimension),
                     "event_id": event.event_id.to_string(),
                     "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Reads, parses, and validates the convergence policy named by `--policy`.
+///
+/// Mirrors `commands::project::read_convergence_policy` step for step: same
+/// read, same parse, same validation. That function is private to
+/// `project.rs`, and #74-4's frozen contract confines this card to
+/// `disposition.rs` and `tests/convergence.rs` — widening its visibility, or
+/// otherwise editing `project.rs`, is out of scope here. Flagged rather than
+/// silently repeated, per the contract's own instruction: this is the one
+/// place `read_convergence_policy`'s shape is duplicated in this card, and
+/// it exists only because the original is unreachable from this file.
+fn read_new_policy(path: &Path) -> Result<ConvergencePolicy, HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read convergence policy {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let policy: ConvergencePolicy =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("convergence policy is malformed: {source}"),
+            code: ErrorCode::ConfigMalformed,
+        })?;
+    policy.validate().map_err(FieldError::into_error)?;
+    Ok(policy)
+}
+
+/// Every cycle in the control repository whose status is not terminal — not
+/// `closed` and not `abandoned` — sorted by identifier.
+///
+/// A different question from `project::blocks_convergence_policy_change`,
+/// which asks what would break *today* if the configured digest changed
+/// under a cycle: there, `draft` answers no, because a draft cycle cannot
+/// yet hold a card that reaches `gate::validation_progress`'s comparison at
+/// `src/commands/gate.rs:791`. This asks what would collide *once a cycle
+/// activates*: a cycle's `project_revision` is pinned once, at `cycle
+/// create`, and never moves on its own (`cycle activate` never touches it),
+/// so a draft left un-re-pinned here would still be carrying the retired
+/// digest the moment it later activates and starts accepting cards —
+/// colliding then instead of now. Re-pinning every non-terminal cycle is
+/// what closes that deferred collision. A terminal cycle's history is over
+/// and is left exactly as it was: it cannot activate again to collide with
+/// anything.
+///
+/// Mirrors the directory walk `project::all_cycles` already performs, for
+/// this different question: that function is private to `project.rs`, out
+/// of this card's file scope, so this is a fresh walk rather than a shared
+/// helper.
+///
+/// # Errors
+///
+/// Returns an error when the cycle directory cannot be read or a record is
+/// malformed.
+fn non_terminal_cycles(control: &ControlRepository) -> Result<Vec<CycleRecord>, HarnessError> {
+    let directory = control.path(CYCLE_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = fs::read_dir(&directory)
+        .map_err(|source| HarnessError::ControlIo {
+            path: directory.clone(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    names.sort();
+
+    let cycles: Vec<CycleRecord> = names
+        .into_iter()
+        .map(|name| {
+            let relative = format!("{CYCLE_DIR}/{name}");
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!("cycle record {relative} is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, HarnessError>>()?;
+
+    Ok(cycles
+        .into_iter()
+        .filter(|cycle| !cycle.status.is_terminal())
+        .collect())
+}
+
+/// What `disposition rebaseline` binds once every check passes: the new
+/// policy to install, the digest it retires, and the digest it installs.
+struct RebaselinePreflight {
+    new_policy: ConvergencePolicy,
+    retired_digest: Digest,
+    new_digest: Digest,
+}
+
+/// Runs every check `disposition rebaseline` must satisfy before it writes
+/// anything, in the fixed order #74-4's contract requires. Shared between
+/// the real command and its `--dry-run` preview, so neither can promise or
+/// refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConfigMalformed`] when the new policy cannot be read
+/// or parsed, or whatever code [`ConvergencePolicy::validate`] assigns when
+/// it fails its own checks. Returns [`ErrorCode::PolicyInvalidTransition`]
+/// when no convergence policy is configured yet — there is no digest to
+/// retire — or when the new policy's digest is identical to the one already
+/// in force. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank.
+fn require_rebaseline(
+    config: &ProjectConfig,
+    policy_path: &Path,
+    actor: &str,
+    rationale: &str,
+) -> Result<RebaselinePreflight, HarnessError> {
+    // Check 1: the new policy must be readable and pass its own validation.
+    let new_policy = read_new_policy(policy_path)?;
+    let new_digest = new_policy.digest()?;
+
+    // Check 2: a policy must already be configured, or there is no digest
+    // to retire. Named explicitly, so an operator pointed here by mistake
+    // is sent to the command that actually applies: installing the first
+    // policy is `project set-convergence-policy`, not a rebaseline.
+    let Some(current_policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "project {} has no convergence policy configured, so there is no policy digest to retire; install the first one with `project set-convergence-policy`",
+                config.project_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+    let retired_digest = current_policy.digest()?;
+
+    // Check 3: retiring a digest to reinstall it unchanged is a decision
+    // with no effect. It would still retire every non-terminal cycle's
+    // current pin and record a fact for each — pure noise in the record for
+    // zero change in what any cycle enforces.
+    if new_digest == retired_digest {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "the new convergence policy is identical to the one already installed (digest {new_digest}); retiring a policy digest to reinstall it unchanged has no effect and would only add noise to the record"
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 4: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path
+    // `require_renewable` above already resolves it through — see that
+    // function's own long note for why this set is reused rather than
+    // given its own field on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence policy rebaseline".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {actor} is not configured to authorize a convergence policy rebaseline"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 5: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition rebaseline requires a non-blank --rationale; a rebaseline with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    Ok(RebaselinePreflight {
+        new_policy,
+        retired_digest,
+        new_digest,
+    })
+}
+
+/// Renders the "N non-terminal cycle(s)[: id, id, ...]" clause shared by the
+/// dry-run preview and the real command's own report, so the two can never
+/// describe the same set of cycles differently.
+fn describe_repinned(cycle_ids: &[String]) -> String {
+    if cycle_ids.is_empty() {
+        format!("{} non-terminal cycle(s)", cycle_ids.len())
+    } else {
+        format!(
+            "{} non-terminal cycle(s): {}",
+            cycle_ids.len(),
+            cycle_ids.join(", ")
+        )
+    }
+}
+
+/// Reports what `disposition rebaseline` would retire, install, and re-pin,
+/// without doing any of it.
+fn preview_rebaseline(args: &RebaselineArgs) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let preflight = require_rebaseline(&config, &args.policy, &args.common.actor, &args.rationale)?;
+    let repinned: Vec<String> = non_terminal_cycles(&control)?
+        .iter()
+        .map(|cycle| cycle.cycle_id.to_string())
+        .collect();
+
+    Ok(CommandOutcome::new(
+        "disposition.rebaseline",
+        format!(
+            "Dry run: would retire policy digest {} and install {}\nwould re-pin {}\nwould record {} rebaseline fact(s)\nnothing was changed",
+            preflight.retired_digest,
+            preflight.new_digest,
+            describe_repinned(&repinned),
+            repinned.len(),
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "retired_policy_digest": preflight.retired_digest.as_str(),
+            "policy_digest": preflight.new_digest.as_str(),
+            "repinned_cycles": repinned,
+            "fact_count": repinned.len(),
+        }),
+    )
+    .with_project(config.project_id.clone()))
+}
+
+/// Runs `disposition rebaseline`: retires the currently configured
+/// convergence policy digest, installs the new one, and re-pins every
+/// non-terminal cycle's `project_revision` to it — all three effects inside
+/// one [`with_transaction`] call, so a failure at any point lands none of
+/// them.
+///
+/// # Errors
+///
+/// Returns whatever [`require_rebaseline`] refuses with. Returns
+/// [`ErrorCode::ConfigProtectedBranch`] when the authority's protected
+/// branch does not resolve to one exact commit. Propagates a control-write
+/// or projection failure unchanged.
+fn run_rebaseline(
+    args: &RebaselineArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    if args.dry_run {
+        return preview_rebaseline(args);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.rebaseline",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let mut config = control.project()?;
+            let preflight =
+                require_rebaseline(&config, &args.policy, &args.common.actor, &args.rationale)?;
+            let targets = non_terminal_cycles(control)?;
+
+            // The head this decision binds to is the protected branch's
+            // exact commit right now — resolved through the same
+            // `inspect_authority` call `project::authority_health` and
+            // every promotion boundary in `integration.rs` already use to
+            // read the authority's protected-branch commit, never a
+            // candidate SHA or a frozen cycle baseline: a rebaseline is a
+            // project-wide decision bound to no one card's candidate, so
+            // there is no other exact SHA it could name.
+            let authority =
+                inspect_authority(&config.authority_repository, &config.protected_branch)?;
+            let head_sha = authority.protected_sha.ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "authority branch `{}` does not resolve to one commit in {}; a rebaseline needs an exact protected-branch commit to bind its facts to",
+                    config.protected_branch,
+                    config.authority_repository.display()
+                ),
+                code: ErrorCode::ConfigProtectedBranch,
+            })?;
+
+            config.convergence_policy = Some(preflight.new_policy.clone());
+            let new_project_revision = Digest::of_canonical(&config)?;
+            control.write_atomic(PROJECT_FILE, &format!("{}\n", config.to_json()?))?;
+
+            let mut repinned = Vec::with_capacity(targets.len());
+            for mut cycle in targets {
+                cycle.project_revision = new_project_revision.clone();
+                control.write_atomic(
+                    &CycleRecord::relative_path(&cycle.cycle_id),
+                    &format!("{}\n", serde_json::to_string_pretty(&cycle)?),
+                )?;
+                events.append(
+                    &config.project_id,
+                    EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                        .cycle(cycle.cycle_id.clone())
+                        .head(head_sha.clone())
+                        .meta(
+                            "disposition",
+                            serde_json::to_value(DispositionKind::Rebaseline)?,
+                        )
+                        .meta(
+                            "retired_policy_digest",
+                            serde_json::json!(preflight.retired_digest.as_str()),
+                        )
+                        .meta("rationale", serde_json::json!(args.rationale))
+                        .meta("authorized_by", serde_json::json!(args.common.actor))
+                        .meta(
+                            "policy_digest",
+                            serde_json::json!(preflight.new_digest.as_str()),
+                        ),
+                    clock,
+                )?;
+                repinned.push(cycle.cycle_id.to_string());
+            }
+
+            control.commit(
+                expected,
+                &format!(
+                    "disposition: rebaseline {} -> {}",
+                    preflight.retired_digest, preflight.new_digest
+                ),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.rebaseline",
+                format!(
+                    "Rebaselined convergence policy: retired {} and installed {}\nre-pinned {}\nrationale: {}\nauthorized by: {}",
+                    preflight.retired_digest,
+                    preflight.new_digest,
+                    describe_repinned(&repinned),
+                    args.rationale,
+                    args.common.actor,
+                ),
+                serde_json::json!({
+                    "retired_policy_digest": preflight.retired_digest.as_str(),
+                    "policy_digest": preflight.new_digest.as_str(),
+                    "repinned_cycles": repinned,
+                    "fact_count": repinned.len(),
                 }),
             )
             .with_project(config.project_id.clone()))
