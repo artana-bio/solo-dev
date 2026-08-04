@@ -2248,6 +2248,34 @@ fn the_dry_run_preview_refuses_the_same_escalation() {
         before_head,
         "a dry run must never write"
     );
+
+    // `review begin --dry-run`.
+    let begin_preview = workspace.review_raw(&[
+        "begin",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "reviewer",
+        "--dry-run",
+    ]);
+    assert!(
+        !begin_preview.status.success(),
+        "the dry run must refuse the same escalation the real command does"
+    );
+    assert_eq!(
+        error_code(&begin_preview),
+        "CH-POLICY-CONVERGENCE-ESCALATED"
+    );
+    assert!(
+        error_message(&begin_preview).contains(&format!("review:{review_id}")),
+        "{}",
+        error_message(&begin_preview)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before_head,
+        "a dry run must never write"
+    );
 }
 
 #[test]

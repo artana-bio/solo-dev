@@ -383,7 +383,12 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let (_record, state) = load_card(&control, &card_id)?;
+        let config = control.project()?;
+        let (record, state) = load_card(&control, &card_id)?;
+        // The dry run must ask this too: a preview that skips a check the
+        // real command enforces is worse than no preview, per
+        // `preview_record`'s "Tier 3 defect 24" note.
+        require_convergence_budget(&control, &config, &record)?;
         state.state.check_transition(CardState::ReviewPending)?;
         return Ok(CommandOutcome::new(
             "review.begin",
