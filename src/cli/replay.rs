@@ -11,7 +11,7 @@
 //! its source event's ordinal, so the footer's `event k/n` counter can never
 //! present a partial picture as complete.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write as _};
 
 use crate::control::event_store::Event;
 
@@ -435,6 +435,69 @@ impl Deriver {
                 self.push(&mut first, Beat::Note { text: text.clone() });
                 text
             }
+            "cycle.sealed" => {
+                let count = event
+                    .metadata
+                    .get("card_ids")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len);
+                let text = count.map_or_else(
+                    || "cycle membership sealed".to_owned(),
+                    |count| format!("cycle membership sealed at {count} card(s)"),
+                );
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "integration.exception_raised" => {
+                // An exception is the record saying "this promotion went
+                // around a rule, on purpose, and here is why". That is a
+                // governance moment, not routine narration, so it dwells
+                // like a discrepancy does.
+                let trigger = meta_str(event, "trigger").unwrap_or("unstated trigger");
+                let text = format!("⚠ exception raised — {trigger}");
+                self.push(&mut first, Beat::Flash { text: text.clone() });
+                text
+            }
+            "integration.exception_resolved" => {
+                let text = "exception resolved".to_owned();
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.reserved" => {
+                let text = describe_validation(event, "validation lane reserved");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.reservation_settled" => {
+                let text = describe_validation(event, "validation reservation settled");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.reservation_abandoned" => {
+                let text = describe_validation(event, "validation reservation abandoned");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.execution_acquired" => {
+                let text = describe_validation(event, "governed execution acquired");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.execution_settled" => {
+                let text = describe_validation(event, "governed execution settled");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.budget_crossed" => {
+                let text = describe_validation(event, "validation budget crossed");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
+            "validation.mutation_campaign_completed" => {
+                let text = describe_validation(event, "mutation campaign completed");
+                self.push(&mut first, Beat::Note { text: text.clone() });
+                text
+            }
             other => {
                 // No set piece, but never silently dropped: the event's own
                 // name narrates it and the ordinal still advances.
@@ -544,6 +607,19 @@ fn meta_u64(event: &Event, key: &str) -> Option<u64> {
 
 fn meta_bool(event: &Event, key: &str) -> Option<bool> {
     event.metadata.get(key).and_then(serde_json::Value::as_bool)
+}
+
+/// Narrates a `validation.*` event: the base description, plus the card and
+/// reservation it names when the event carries them.
+fn describe_validation(event: &Event, base: &str) -> String {
+    let mut text = base.to_owned();
+    if let Some(card) = event.card_id.as_ref() {
+        let _ = write!(text, " for {card}");
+    }
+    if let Some(reservation) = meta_str(event, "reservation_id") {
+        let _ = write!(text, " ({reservation})");
+    }
+    text
 }
 
 fn meta_str_list(event: &Event, key: &str) -> Vec<String> {
@@ -813,6 +889,88 @@ mod tests {
         );
         assert_eq!(derived.timeline.len(), 2);
         assert_eq!(derived.script.progress_total, Some(2));
+    }
+
+    #[test]
+    fn a_sealed_cycle_reports_its_frozen_card_count() {
+        let history = vec![
+            EventBuilder::new(1, "cycle.created").build(),
+            EventBuilder::new(2, "cycle.sealed")
+                .meta("card_ids", serde_json::json!(["F-801", "F-802"]))
+                .build(),
+        ];
+        let derived = derive("C-001", None, &history, &[]);
+        assert_eq!(
+            derived.timeline[1].description,
+            "cycle membership sealed at 2 card(s)"
+        );
+    }
+
+    #[test]
+    fn an_exception_flashes_with_its_trigger_rather_than_narrating_quietly() {
+        // An exception is the record of a promotion going around a rule on
+        // purpose; a viewer that renders it as routine narration hides
+        // exactly what an auditor most needs to notice.
+        let history = vec![
+            EventBuilder::new(1, "cycle.created").build(),
+            EventBuilder::new(2, "integration.exception_raised")
+                .meta("trigger", serde_json::json!("blocked_dependency"))
+                .build(),
+            EventBuilder::new(3, "integration.exception_resolved").build(),
+        ];
+        let derived = derive("C-001", None, &history, &[]);
+        assert!(
+            beats_of(&derived).iter().any(|beat| matches!(
+                beat,
+                Beat::Flash { text } if text == "⚠ exception raised — blocked_dependency"
+            )),
+            "an exception must dwell like a discrepancy, not pass as a note"
+        );
+        assert_eq!(derived.timeline[2].description, "exception resolved");
+    }
+
+    #[test]
+    fn validation_events_name_their_card_and_reservation() {
+        let history = vec![
+            EventBuilder::new(1, "cycle.created").build(),
+            EventBuilder::new(2, "validation.reserved")
+                .card("F-801")
+                .meta("reservation_id", serde_json::json!("RES-000004"))
+                .build(),
+        ];
+        let derived = derive("C-001", None, &history, &[]);
+        assert_eq!(
+            derived.timeline[1].description,
+            "validation lane reserved for F-801 (RES-000004)"
+        );
+    }
+
+    #[test]
+    fn every_governed_validation_event_maps_to_a_specific_narration() {
+        // The fallback narrates an event as its raw type name; these are
+        // journaled by current commands, so each deserves better than that.
+        for (number, event_type) in [
+            "validation.reserved",
+            "validation.reservation_settled",
+            "validation.reservation_abandoned",
+            "validation.execution_acquired",
+            "validation.execution_settled",
+            "validation.budget_crossed",
+            "validation.mutation_campaign_completed",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let history = vec![
+                EventBuilder::new(1, "cycle.created").build(),
+                EventBuilder::new(2 + u64::try_from(number).unwrap(), event_type).build(),
+            ];
+            let derived = derive("C-001", None, &history, &[]);
+            assert_ne!(
+                derived.timeline[1].description, event_type,
+                "{event_type} should not fall through to the raw-name fallback"
+            );
+        }
     }
 
     #[test]
