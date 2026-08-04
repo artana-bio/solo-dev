@@ -23,7 +23,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     policy::allocation::{Claim, check_admissible, check_dependencies},
-    policy::convergence::ScopeBreadth,
+    policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, ScopeBreadth},
 };
 
 /// Schema identifier for a card's mutable state file.
@@ -738,6 +738,31 @@ fn write_revision(
     )
 }
 
+/// Whether a revision's canonical fields differ enough from the one it
+/// supersedes to force a reviewer to look again.
+///
+/// 71-R5: `material_scope_revisions` is not "every revision". Correcting a
+/// typo in the title is not a scope revision, and counting it would exhaust
+/// the budget on administrative work. Material is exactly what changes:
+///
+/// - `write_scope` (`include` or `exclude`);
+/// - `acceptance.behaviors` or `acceptance.regressions`;
+/// - `depends_on`;
+/// - `base_sha`.
+///
+/// Title, goal, non-goals, `review_policy`, `rollback_strategy`,
+/// `named_gates`, `risk`, `change_kind`, and every other field neither line
+/// names are deliberately not compared here. Each revision still gets its own
+/// new `card_digest`, and comparing that instead would make every edit
+/// material — the same defect under a different name: a budget that always
+/// empties on the first look is not a budget.
+fn is_material_scope_revision(previous: &CardRecord, next: &CardRecord) -> bool {
+    previous.write_scope != next.write_scope
+        || previous.acceptance != next.acceptance
+        || previous.depends_on != next.depends_on
+        || previous.base_sha != next.base_sha
+}
+
 /// Reports a policy-equivalent revision without writing a new record.
 fn preview_revise(
     args: &ReviseArgs,
@@ -750,6 +775,19 @@ fn preview_revise(
         reason: format!("card {card_id} is not activated"),
         code: ErrorCode::PreconditionNotFound,
     })?;
+    // Loaded for the same reason `run_revise` loads it: materiality, below,
+    // compares the previous revision's canonical fields against the new
+    // one's. A preview that skipped this and always reported "not material"
+    // would be exactly the preview/reality disagreement `preview_record`
+    // already documents elsewhere in this codebase — see the "Paridad de
+    // preview" note on 71-R5.
+    let previous: CardRecord = serde_json::from_str(
+        &control.read(&CardRecord::relative_path(card_id, state.current_revision))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("card {card_id} revision record is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
     let config = control.project()?;
     let preview = CardRecord::activate(
         draft,
@@ -758,21 +796,36 @@ fn preview_revise(
         clock.now(),
     )?;
     require_declared_proof(&config.validation_policy, &preview)?;
+    // The same verdict the real command reaches: a fact is recorded only when
+    // a policy is configured *and* the revision is material.
+    let material_scope_revision =
+        config.convergence_policy.is_some() && is_material_scope_revision(&previous, &preview);
     Ok(CommandOutcome::new(
         "card.revise",
         format!(
-            "Dry run: would supersede card {card_id} revision {} with revision {}; nothing was changed",
+            "Dry run: would supersede card {card_id} revision {} with revision {}{}; nothing was changed",
             state.current_revision,
-            state.current_revision + 1
+            state.current_revision + 1,
+            if material_scope_revision {
+                "\nwould record one material_scope_revision convergence fact"
+            } else {
+                ""
+            }
         ),
         serde_json::json!({
             "dry_run": true,
             "card_id": card_id.to_string(),
             "superseded_revision": state.current_revision,
+            "material_scope_revision": material_scope_revision,
         }),
     ))
 }
 
+// 71-R5's materiality check and its fact emission both have to run inside
+// this one transaction, after `card.revised` is appended and before the
+// commit — splitting either into a helper the length limit would otherwise
+// invite risks losing that ordering at a call site instead of at a glance.
+#[allow(clippy::too_many_lines)]
 fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let draft = read_draft(&args.draft)?;
@@ -845,6 +898,51 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     ),
                 clock,
             )?;
+
+            // 71-R5: a material scope revision, under a configured convergence
+            // policy, records exactly one bound `convergence.attempt_recorded`
+            // fact in the same transaction as `card.revised` — #9's ledger,
+            // written where the revision itself is written rather than
+            // reconstructed later from card history. `AttemptKind::
+            // MaterialScopeRevision` admits only `ReasonCategory::ScopeChange`
+            // (see `AttemptKind::admits`), so there is nothing for the harness
+            // to infer or the operator to declare here. `head_sha` binds to
+            // `record.base_sha`, the new revision's own declared base: `draft`
+            // was already validated — before this transaction, and before the
+            // dry-run branch too, see the top of `run_revise` — which refuses a
+            // `base_sha` that is not a full 40-character object id, so this
+            // binding is already exact by the time either path reaches here.
+            let material_scope_revision = is_material_scope_revision(&previous, &record);
+            let mut recorded_material_scope_fact = false;
+            if material_scope_revision && let Some(policy) = config.convergence_policy.as_ref() {
+                let policy_digest = policy.digest()?;
+                events.append(
+                    &config.project_id,
+                    EventDraft::new(ATTEMPT_RECORDED_EVENT, &args.common.actor)
+                        .cycle(record.cycle_id.clone())
+                        .card(card_id.clone(), record.revision, digest.clone())
+                        .head(record.base_sha.clone())
+                        .meta(
+                            "attempt_kind",
+                            serde_json::to_value(AttemptKind::MaterialScopeRevision)?,
+                        )
+                        .meta(
+                            "reason_category",
+                            serde_json::to_value(ReasonCategory::ScopeChange)?,
+                        )
+                        .meta(
+                            "evidence_ref",
+                            serde_json::json!(format!(
+                                "card-revision:{card_id}@{}",
+                                record.revision
+                            )),
+                        )
+                        .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                    clock,
+                )?;
+                recorded_material_scope_fact = true;
+            }
+
             control.commit(
                 expected,
                 &format!("card: revise {card_id} to r{}", record.revision),
@@ -853,8 +951,15 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             Ok(CommandOutcome::new(
                 "card.revise",
                 format!(
-                    "Revised card {card_id} to revision {}\ndigest: {digest}\nsuperseded revision {} with digest {}\nany handoff, review, or receipt bound to the superseded digest is now stale",
-                    record.revision, state.current_revision, state.current_digest
+                    "Revised card {card_id} to revision {}\ndigest: {digest}\nsuperseded revision {} with digest {}\nany handoff, review, or receipt bound to the superseded digest is now stale{}",
+                    record.revision,
+                    state.current_revision,
+                    state.current_digest,
+                    if recorded_material_scope_fact {
+                        "\nrecorded one material_scope_revision convergence fact"
+                    } else {
+                        ""
+                    }
                 ),
                 serde_json::json!({
                     "card_id": card_id.to_string(),
@@ -863,6 +968,7 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     "superseded_revision": state.current_revision,
                     "superseded_digest": state.current_digest.as_str(),
                     "state": CardState::Ready.name(),
+                    "material_scope_revision": recorded_material_scope_fact,
                 }),
             )
             .with_project(config.project_id.clone()))

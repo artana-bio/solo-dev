@@ -808,3 +808,304 @@ fn the_dry_run_preview_refuses_the_same_missing_reason() {
         "a dry run must not record a review either"
     );
 }
+
+// 71-R5: a material scope revision, under a configured convergence policy,
+// records exactly one bound `convergence.attempt_recorded` fact of class
+// `material_scope_revision`, in the same transaction as `card.revised`. A
+// revision that leaves every canonical field untouched — write scope,
+// acceptance, dependencies, base commit — records nothing, however different
+// its title or goal read: rewording is not a scope revision, and counting it
+// would exhaust the budget on administrative work.
+
+/// A revision draft for card `F-001`, every field steady except `title`,
+/// `goal`, the write-scope `include` list, and `acceptance.behaviors` — the
+/// only fields any fixture below needs to move. `write_scope.exclude`,
+/// `acceptance.regressions` and `depends_on` never vary in this file, so they
+/// stay fixed here rather than threaded through every call.
+fn revision_body(
+    title: &str,
+    goal: &str,
+    base_sha: &str,
+    include: &[&str],
+    behaviors: &[&str],
+) -> String {
+    let list = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "card_id: F-001\ncycle_id: C-001\ntitle: {title}\ngoal: {goal}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base_sha}\nwrite_scope:\n  include: [{inc}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [{beh}]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        inc = list(include),
+        beh = list(behaviors),
+    )
+}
+
+/// Runs `card revise` against a prepared draft body for `F-001`, returning
+/// the raw output so a test can inspect success and the JSON envelope alike.
+fn revise_raw(
+    workspace: &Workspace,
+    body: &str,
+    reason: &str,
+    dry_run: bool,
+) -> std::process::Output {
+    let path = workspace.root.join("F-001-revision.yaml");
+    fs::write(&path, body).unwrap();
+    let draft = path.display().to_string();
+    let mut args = vec![
+        "revise",
+        "--card-id",
+        "F-001",
+        "--draft",
+        draft.as_str(),
+        "--reason",
+        reason,
+    ];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    workspace.card_raw(&args)
+}
+
+#[test]
+fn a_revision_that_widens_write_scope_records_one_bound_material_scope_fact() {
+    let workspace = opened_with_policy(3, 3);
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+
+    let widened = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs", "src/b.rs"],
+        &["it works"],
+    );
+    let output = revise_raw(&workspace, &widened, "widen scope", false);
+    assert!(
+        output.status.success(),
+        "a material revision must still succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+    assert_eq!(card_status["data"]["revision"], 2, "{card_status}");
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "exactly one attempt fact must be recorded: {attempts:?}"
+    );
+    let fact = &attempts[0];
+    assert_eq!(fact["card_id"], "F-001", "{fact}");
+    assert_eq!(fact["card_revision"], 2, "{fact}");
+    assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+    assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+    assert_eq!(fact["head_sha"], base, "{fact}");
+    assert_eq!(
+        fact["metadata"]["attempt_kind"], "material_scope_revision",
+        "{fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["reason_category"], "scope_change",
+        "{fact}"
+    );
+    assert_eq!(
+        fact["metadata"]["evidence_ref"], "card-revision:F-001@2",
+        "{fact}"
+    );
+    let policy_digest = fact["metadata"]["policy_digest"]
+        .as_str()
+        .expect("policy_digest is a string");
+    assert!(
+        policy_digest.starts_with("sha256:") && policy_digest.len() == "sha256:".len() + 64,
+        "policy_digest must be a real digest, not a placeholder: {policy_digest}"
+    );
+}
+
+#[test]
+fn a_revision_that_only_rewords_the_card_records_no_fact() {
+    let workspace = opened_with_policy(3, 3);
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+
+    let reworded = revision_body(
+        "Implement F-001, take two",
+        "Deliver F-001, revisited",
+        &base,
+        &["src/a.rs"],
+        &["it works"],
+    );
+    let output = revise_raw(&workspace, &reworded, "reword only", false);
+    assert!(
+        output.status.success(),
+        "a non-material revision must still succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        workspace.card_json(&["status", "--card-id", "F-001"])["data"]["revision"],
+        2,
+        "the revision itself must still be recorded"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "same scope, acceptance, dependencies and base — only title and goal moved — must record no fact"
+    );
+}
+
+#[test]
+fn a_revision_that_changes_acceptance_behaviors_is_material() {
+    let workspace = opened_with_policy(3, 3);
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+
+    let wider_acceptance = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs"],
+        &["it works", "it also handles the edge case"],
+    );
+    let output = revise_raw(&workspace, &wider_acceptance, "widen acceptance", false);
+    assert!(
+        output.status.success(),
+        "a material revision must still succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let attempts = attempt_recorded_events(&workspace);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "an acceptance change must count even though the write scope did not move: {attempts:?}"
+    );
+    assert_eq!(
+        attempts[0]["metadata"]["attempt_kind"], "material_scope_revision",
+        "{:?}",
+        attempts[0]
+    );
+}
+
+#[test]
+fn a_project_without_a_convergence_policy_records_no_fact_when_revising() {
+    let workspace = opened();
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+
+    let widened = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs", "src/b.rs"],
+        &["it works"],
+    );
+    let output = revise_raw(&workspace, &widened, "widen scope", false);
+    assert!(
+        output.status.success(),
+        "revising without a configured policy must still succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "no configured policy means no fact, however material the revision reads"
+    );
+}
+
+#[test]
+fn the_dry_run_reports_the_same_materiality_the_real_command_records() {
+    let workspace = opened_with_policy(3, 3);
+    let base = workspace.authority_head();
+    workspace.activate_card_with_base("F-001", &["src/a.rs"], &base);
+
+    // A material revision: the preview must say so, and the real command must
+    // then actually record the one fact it promised.
+    let widened = revision_body(
+        "Implement F-001",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs", "src/b.rs"],
+        &["it works"],
+    );
+    let preview = revise_raw(&workspace, &widened, "widen scope", true);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    let preview_envelope: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview_envelope["data"]["material_scope_revision"].as_bool(),
+        Some(true),
+        "the preview must predict a material revision: {preview_envelope}"
+    );
+    assert!(
+        attempt_recorded_events(&workspace).is_empty(),
+        "a dry run must never write a fact"
+    );
+
+    let real = revise_raw(&workspace, &widened, "widen scope", false);
+    assert!(
+        real.status.success(),
+        "{}",
+        String::from_utf8_lossy(&real.stdout)
+    );
+    let real_envelope: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(
+        real_envelope["data"]["material_scope_revision"].as_bool(),
+        Some(true),
+        "the real command's own report must match what it predicted: {real_envelope}"
+    );
+    assert_eq!(
+        attempt_recorded_events(&workspace).len(),
+        1,
+        "the preview predicted a fact and the real command must have recorded exactly one"
+    );
+
+    // The non-material direction, against the card the first half just moved
+    // to revision 2: reword only.
+    let reworded = revision_body(
+        "Implement F-001, reworded",
+        "Deliver F-001",
+        &base,
+        &["src/a.rs", "src/b.rs"],
+        &["it works"],
+    );
+    let preview_reword = revise_raw(&workspace, &reworded, "reword only", true);
+    assert!(
+        preview_reword.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview_reword.stdout)
+    );
+    let preview_reword_envelope: serde_json::Value =
+        serde_json::from_slice(&preview_reword.stdout).unwrap();
+    assert_eq!(
+        preview_reword_envelope["data"]["material_scope_revision"].as_bool(),
+        Some(false),
+        "the preview must predict no fact for a reword-only revision: {preview_reword_envelope}"
+    );
+
+    let real_reword = revise_raw(&workspace, &reworded, "reword only", false);
+    assert!(
+        real_reword.status.success(),
+        "{}",
+        String::from_utf8_lossy(&real_reword.stdout)
+    );
+    let real_reword_envelope: serde_json::Value =
+        serde_json::from_slice(&real_reword.stdout).unwrap();
+    assert_eq!(
+        real_reword_envelope["data"]["material_scope_revision"].as_bool(),
+        Some(false),
+        "{real_reword_envelope}"
+    );
+    assert_eq!(
+        attempt_recorded_events(&workspace).len(),
+        1,
+        "still exactly the one fact recorded by the first, material revision"
+    );
+}
