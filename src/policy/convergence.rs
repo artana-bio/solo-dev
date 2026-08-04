@@ -2196,4 +2196,81 @@ mod tests {
             r#"{"count":1,"evidence":["receipt:1"],"renewals":1}"#
         );
     }
+
+    #[test]
+    fn an_overflowed_budget_is_exhausted_rather_than_unlimited() {
+        // The one failure mode worth a dedicated test: `assess_card`'s doc
+        // comment promises that an overflowed effective budget "fails
+        // closed... forces this dimension exhausted outright, regardless of
+        // `count`". Nothing else in this module exercises that promise,
+        // because no other test's arithmetic overflows. If the escalation
+        // condition were ever flipped to read an overflowed budget as
+        // unlimited instead — `!overflowed && count.count >= budget` rather
+        // than `overflowed || count.count >= budget` — every other test
+        // here would keep passing. Failing open on overflow does not
+        // mis-assess one card; it silently deletes this dimension's budget
+        // for good, since a multiplication that already overflows once
+        // overflows on every later assessment too.
+        //
+        // Reachable without four billion recorded facts: a base limit above
+        // `u32::MAX / 2` plus a single renewal already overflows
+        // `limit * (renewals + 1)`. `count` below is deliberately small —
+        // 3, not some large number — because the point is that count never
+        // gets compared at all once the multiplication overflows; only the
+        // overflow itself may decide the outcome.
+        let huge_limits = CardConvergenceLimits {
+            review_returns: u32::MAX / 2 + 1,
+            repair_attempts: 1,
+            gate_failures: 1,
+            material_scope_revisions: 1,
+        };
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: RiskConvergenceLimits {
+                low: huge_limits.clone(),
+                medium: huge_limits.clone(),
+                high: huge_limits.clone(),
+                critical: huge_limits,
+            },
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+
+        let card_id = CardId::from_str("F-001").unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters::default(),
+            cards: BTreeMap::from([(
+                card_id.clone(),
+                CardCounters {
+                    review_returns: DimensionCount {
+                        count: 3,
+                        evidence: BTreeSet::new(),
+                        renewals: 1,
+                    },
+                    ..CardCounters::default()
+                },
+            )]),
+        });
+
+        let CardConvergence::Escalated { exhausted, .. } =
+            assess_card(Some(&overflow_policy), &view, &card_id, Risk::Medium)
+        else {
+            panic!(
+                "an overflowed effective budget must escalate unconditionally; reading it as \
+                 unlimited would silently remove this dimension's budget entirely, with a count \
+                 of only 3 against a limit over two billion"
+            );
+        };
+        assert_eq!(
+            exhausted
+                .iter()
+                .map(|item| item.dimension)
+                .collect::<Vec<_>>(),
+            vec![CardDimension::ReviewReturns],
+            "the overflowed dimension is the one that must be reported exhausted"
+        );
+    }
 }
