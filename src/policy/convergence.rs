@@ -2745,4 +2745,24 @@ mod tests {
             "the same facts in a different order must project the same view"
         );
     }
+
+    #[test]
+    fn a_duplicate_rebaseline_identifier_is_refused() {
+        // Idempotent in effect (retiring a digest twice is a no-op `BTreeSet`
+        // insert), but pinned anyway: it is the only thing that would catch a
+        // corrupted event store replaying a rebaseline under one identifier
+        // twice, and a fail-closed rule only some fact types enforce is not
+        // fail-closed.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = rebaseline_event(1, &Digest::of_bytes(b"policy-a"));
+        let mut duplicate = rebaseline_event(2, &Digest::of_bytes(b"policy-b"));
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two rebaseline facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
 }
