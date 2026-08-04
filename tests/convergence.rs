@@ -3412,3 +3412,552 @@ fn a_draft_cycle_does_not_block_while_every_unreachable_status_does() {
         "a draft cycle must not be named as an offender: {message}"
     );
 }
+
+// 74-2: `disposition renew`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, against a card
+// currently escalated in the dimension it names, appends one bound
+// `convergence.disposition_recorded` fact and the card can be delivered and
+// reviewed again. Every other combination — no configured convergence
+// policy, a card that is not escalated, a dimension that still has budget,
+// an unauthorized actor, or a blank rationale — refuses before writing
+// anything. `escalate_via_review_returns` and `redeliver_candidate`, already
+// defined above for 72-2's own escalation tests, are reused rather than
+// duplicated: they are the shortest real path to `Escalated` this file has,
+// and `review_returns` is the first-listed of `--dimension`'s four closed
+// values.
+//
+// Wrapped in its own module because `the_dry_run_makes_every_check_and_writes_nothing`
+// is already the name `project.rs`'s own dry-run test uses above for the same
+// property on a different command (`project set-convergence-policy`), and
+// that existing test must stay exactly as it is — untouched and unrenamed.
+// A module gives this card's instance of that same, deliberately recurring
+// name a distinct path (`disposition_renew::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_renew {
+    use super::*;
+
+    /// Like `Workspace::initialized`, but also installs a final-authorization
+    /// policy naming `authorizers` as `disposition renew`'s authorized actors —
+    /// `final_authorization_policy.authorizer_actor_ids`, the same field
+    /// `commands::acceptance::validate_final_authorization` already resolves to
+    /// authorize a sealed cycle's final integration. `support::Workspace` is
+    /// outside this card's file scope and its `initialized` helper does not
+    /// accept this flag, so this mirrors its body directly rather than editing
+    /// it.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition renew`'s authorization check (#4) has a
+    /// configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the cycle is
+    /// created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition renew` in JSON mode, returning the raw output. Mirrors
+    /// every other per-group `_raw` helper in this file; kept local because
+    /// `support::Workspace` is outside this card's file scope.
+    fn disposition_renew_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "renew".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    #[test]
+    fn an_authorized_renewal_lets_an_escalated_card_deliver_again() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        let review_id = escalate_via_review_returns(&workspace, "F-001");
+        let head = redeliver_candidate(&workspace, "F-001");
+        let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+
+        let before = workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+        assert!(
+            !before.status.success(),
+            "an escalated card must not be deliverable before renewal"
+        );
+        assert_eq!(error_code(&before), "CH-POLICY-CONVERGENCE-ESCALATED");
+        assert!(
+            error_message(&before).contains(&format!("review:{review_id}")),
+            "{}",
+            error_message(&before)
+        );
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let base = workspace.authority_head();
+        let pre_renew_head = workspace.control_head();
+
+        let renew = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "authorized renewal for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            renew.status.success(),
+            "an authorized renewal of an exhausted dimension must succeed: {}{}",
+            String::from_utf8_lossy(&renew.stdout),
+            String::from_utf8_lossy(&renew.stderr)
+        );
+
+        // 79-2's lesson, restated for this card by the contract: an event
+        // written but not committed is invisible by content alone, because the
+        // very next transaction (here, the retried `handoff create`) stages the
+        // whole control tree and would sweep it in regardless. The only way to
+        // catch "wrote but did not commit" is to check, right here, that this
+        // command's own commit is what moved the head and left the tree clean —
+        // before anything else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_renew_head,
+            "disposition renew must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful renewal"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        assert_eq!(fact["metadata"]["disposition"], "renew", "{fact}");
+        assert_eq!(fact["metadata"]["dimension"], "review_returns", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized renewal for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+
+        // And now it really does deliver again, using the same candidate the
+        // refused attempt already proved was otherwise ready.
+        let after = workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+        assert!(
+            after.status.success(),
+            "after renewal the card must deliver again: {}{}",
+            String::from_utf8_lossy(&after.stdout),
+            String::from_utf8_lossy(&after.stderr)
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_renew() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_card_that_is_not_escalated_cannot_be_renewed() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-001", &["src/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "nothing has happened yet",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card that has never been escalated must not be pre-renewed"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_second_renewal_immediately_after_the_first_is_refused() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let first = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "first renewal",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first renewal must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        // 72-2's own boundary: a limit of 1, granted again once, is an effective
+        // budget of 2 — and exactly one review-return fact is on record, so the
+        // card reads `Within` again with no second attempt having occurred.
+        let before_second_head = workspace.control_head();
+        let second = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "second renewal, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "an immediate second renewal must be refused: the card is Within again, with no extra \
+         bookkeeping needed to remember the first renewal happened"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first renewal's fact may exist"
+        );
+    }
+
+    #[test]
+    fn renewing_a_dimension_that_still_has_budget_is_refused() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "gate-failures",
+                "--rationale",
+                "the wrong dimension",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "gate-failures still has budget; renewing it would grant budget ahead of exhaustion"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        let message = error_message(&output);
+        assert!(
+            message.contains("review_returns"),
+            "the refusal must name the dimension that really is exhausted: {message}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn renewing_without_a_configured_policy_is_refused() {
+        // No `configure_convergence_policy` call: an unconfigured project has no
+        // budget in the first place, so there is nothing for any dimension to
+        // renew.
+        let workspace = opened();
+        workspace.activate_card("F-001", &["src/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "there is no policy at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "renewal must be refused when no convergence policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_renewal_without_a_rationale_is_refused() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "would renew if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal test 2
+        // exercises for the real command.
+        let refusal_preview = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "would renew if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real renewal, run afterward,
+        // still succeeds exactly once.
+        let real = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "the real renewal",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+    }
+}

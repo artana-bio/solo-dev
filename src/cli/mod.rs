@@ -8,9 +8,10 @@ use clap::{Parser, Subcommand};
 use crate::{
     commands::{
         acceptance::AcceptanceCommand, archive::ArchiveCommand, audit::AuditCommand,
-        backup::BackupCommand, card::CardCommand, cycle::CycleCommand, doctor::DoctorArgs,
-        gate::GateCommand, handoff::HandoffCommand, integration::IntegrationCommand,
-        project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
+        backup::BackupCommand, card::CardCommand, cycle::CycleCommand,
+        disposition::DispositionCommand, doctor::DoctorArgs, gate::GateCommand,
+        handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
+        review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -83,6 +84,13 @@ pub enum Command {
     Review {
         #[command(subcommand)]
         command: ReviewCommand,
+    },
+
+    /// Record authorized decisions that change what an escalated card may do
+    /// next.
+    Disposition {
+        #[command(subcommand)]
+        command: DispositionCommand,
     },
 
     /// Select approved candidates into a deterministic integration plan.

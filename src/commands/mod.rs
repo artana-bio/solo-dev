@@ -14,6 +14,7 @@ pub mod audit;
 pub mod backup;
 pub mod card;
 pub mod cycle;
+pub mod disposition;
 pub mod doctor;
 pub mod gate;
 pub mod handoff;
