@@ -636,3 +636,118 @@ fn an_argument_error_without_json_keeps_claps_own_output() {
         "clap's help must survive: {stderr}"
     );
 }
+
+// --- demo ---------------------------------------------------------------
+//
+// `demo` needs no control repository and no `--control` flag: it is a
+// self-contained animation, not a lifecycle command. `Command::output()`
+// captures the child's standard error into a pipe rather than a TTY, so
+// every test here exercises the skip path by construction — the same path a
+// script or an agent piping this command's output would take. That is also
+// what makes these tests fast rather than an ~18-second real playback: the
+// frame-by-frame animation logic itself is unit-tested in
+// `src/cli/floor.rs` and `src/commands/demo.rs` against an injectable sink
+// and a zero delay, without a real terminal or a real wait. What only a
+// real subprocess can prove is what these tests check: that stdout carries
+// no escape bytes, that stderr is left completely clean rather than merely
+// "no visible animation," and that `--no-animation` is actually wired
+// through clap.
+
+#[test]
+fn help_advertises_demo() {
+    let stdout = String::from_utf8(run(&["--help"]).stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("  demo"), "help omits `demo`");
+}
+
+#[test]
+fn demo_needs_no_control_repository() {
+    let output = harness_command()
+        .args(["demo"])
+        .env_remove("CHANGE_HARNESS_CONTROL")
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn demo_over_a_pipe_skips_the_animation_and_leaves_both_streams_clean() {
+    let output = run(&["demo"]);
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("animation skipped"), "{stdout}");
+    assert!(stdout.contains("not a terminal"), "{stdout}");
+    assert!(
+        stdout.contains("No repository was read or changed"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "stdout must never carry raw escape bytes: {stdout:?}"
+    );
+
+    // The regression this pins: the animation's `TerminalSink` used to be
+    // constructed unconditionally, so even a skipped run wrote the
+    // hide-cursor escape to standard error (and immediately the show-cursor
+    // escape back on drop) before anything checked whether playback should
+    // happen at all. A caller piping standard error somewhere — a log file,
+    // a terminal multiplexer pane that is not the active one — would see
+    // stray bytes from a command that is documented to do nothing when
+    // skipped.
+    assert!(
+        output.stderr.is_empty(),
+        "a skipped run must write nothing at all to standard error: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn demo_output_json_returns_the_stable_envelope_and_touches_no_streams_it_should_not() {
+    let output = run(&["demo", "--output", "json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON mode must never write to standard error: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["schema"], "harness.command-result/v1");
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["command"], "demo");
+    assert!(envelope["project_id"].is_null());
+    assert!(envelope["operation_id"].is_null());
+    assert_eq!(envelope["warnings"].as_array().unwrap().len(), 0);
+
+    let data = &envelope["data"];
+    assert_eq!(data["schema"], "harness.demo/v1");
+    assert_eq!(data["played"], false);
+    assert_eq!(data["skip_reason"], "json_output");
+
+    let stations = data["stations"]
+        .as_array()
+        .expect("stations should be an array");
+    assert_eq!(stations.len(), 6);
+    assert_eq!(stations[0]["station"], "INTAKE");
+    assert_eq!(stations[0]["command"], "work start");
+    assert_eq!(stations[5]["station"], "SHIP");
+    assert_eq!(stations[5]["command"], "promote");
+}
+
+#[test]
+fn demo_no_animation_flag_is_wired_through_clap() {
+    // Unit tests already cover `skip_reason`'s precedence in isolation; this
+    // instead proves the flag clap parses out of `--no-animation` actually
+    // reaches it, which only a real invocation can show. Text mode, not
+    // JSON: `--output json` is itself a skip cause, so running both together
+    // would leave this proving nothing about the flag specifically.
+    let output = run(&["demo", "--no-animation"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("--no-animation was passed"), "{stdout}");
+}

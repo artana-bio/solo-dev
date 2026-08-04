@@ -15,6 +15,7 @@ use cli::{
     Cli, Command, LEGACY_FORMAT_WARNING,
     output::{CommandOutcome, OutputFormat},
     resolve_output,
+    tty::SystemEnvironment,
 };
 use commands::doctor::DoctorReport;
 use error::HarnessError;
@@ -39,7 +40,8 @@ pub struct Execution {
 pub fn failure_format(cli: &Cli) -> OutputFormat {
     let legacy = match &cli.command {
         Command::Doctor(args) => args.format,
-        Command::Project { .. }
+        Command::Demo(_)
+        | Command::Project { .. }
         | Command::Cycle { .. }
         | Command::Card { .. }
         | Command::Work { .. }
@@ -61,6 +63,7 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
 pub fn command_path(cli: &Cli) -> &'static str {
     match &cli.command {
         Command::Doctor(_) => "doctor",
+        Command::Demo(_) => "demo",
         Command::Project { command } => command.path(),
         Command::Cycle { command } => command.path(),
         Command::Card { command } => command.path(),
@@ -126,9 +129,36 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
                 format: resolved.format,
             })
         }
+        Command::Demo(args) => {
+            // Not run through `dispatch`: the animation must know the
+            // resolved format before it decides whether to play at all (JSON
+            // output skips it), and `dispatch`'s closure is never given that.
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome = commands::demo::execute(&args, resolved.format, &SystemEnvironment)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
         Command::Project { command } => dispatch(cli.output, |clock| {
             commands::project::execute(&command, clock)
         }),
+        // `cycle replay` bypasses `dispatch` for the same reason `demo`
+        // does: whether the animation plays depends on the resolved output
+        // format, which `dispatch`'s closure is never given.
+        Command::Cycle {
+            command: commands::cycle::CycleCommand::Replay(args),
+        } => {
+            let resolved = resolve_output(cli.output, None)?;
+            let outcome =
+                commands::cycle::execute_replay(&args, resolved.format, &SystemEnvironment)?;
+            Ok(Execution {
+                stdout: outcome.render(resolved.format)?,
+                warnings: outcome.warnings().to_vec(),
+                format: resolved.format,
+            })
+        }
         Command::Cycle { command } => dispatch(cli.output, |clock| {
             commands::cycle::execute(&command, clock)
         }),
