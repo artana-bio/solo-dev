@@ -188,6 +188,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
                 exception_triggers: vec![],
             }
         }),
+        convergence_policy: None,
     })
 }
 

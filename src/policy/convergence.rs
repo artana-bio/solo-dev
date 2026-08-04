@@ -16,7 +16,18 @@
 //! *lagging* — it can only speak once rounds exist, but by then it knows
 //! something the first check cannot: whether the work is actually settling.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::ConvergencePolicy,
+    control::event_store::Event,
+    domain::{
+        digest::Digest,
+        ids::{CardId, CycleId, ProjectId},
+    },
+};
 
 use crate::policy::paths::{self, CaseSensitivity};
 
@@ -172,6 +183,235 @@ pub struct Trend {
 /// where "still not settling" is a statement rather than an observation.
 pub const MIN_ROUNDS_FOR_TREND: usize = 3;
 
+/// The single append-only event type recognized by the v1 projection.
+pub const ATTEMPT_RECORDED_EVENT: &str = "convergence.attempt_recorded";
+
+/// Closed attempt classes; callers cannot make up a counter by spelling a new
+/// string in event metadata.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptKind {
+    ReviewReturn,
+    RepairAttempt,
+    GateFailure,
+    MaterialScopeRevision,
+    IntegrationFailure,
+}
+
+/// Why a bounded attempt occurred. This is intentionally descriptive rather
+/// than an enforcement decision; #72–#74 consume the counters later.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCategory {
+    ReviewFindings,
+    ImplementationRepair,
+    GateFailure,
+    ScopeRevision,
+    IntegrationFailure,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptMetadata {
+    attempt_kind: AttemptKind,
+    reason_category: ReasonCategory,
+    evidence_ref: String,
+    policy_digest: Digest,
+}
+
+/// A projection error refuses the whole view. Returning partial counters would
+/// make an attacker-controlled malformed fact look like unused budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionError {
+    pub event_id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "convergence fact {}: {}",
+            self.event_id, self.reason
+        )
+    }
+}
+
+impl std::error::Error for ProjectionError {}
+
+/// Counters derived for one exact card revision and digest.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CardCounters {
+    pub review_returns: u32,
+    pub repair_attempts: u32,
+    pub gate_failures: u32,
+    pub material_scope_revisions: u32,
+}
+
+/// Counters derived for a whole exact cycle.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CycleCounters {
+    pub integration_failures: u32,
+}
+
+/// The pure, reproducible v1 view. `BTreeMap` makes output independent of event
+/// discovery order.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ConvergenceProjection {
+    pub status: String,
+    pub policy_digest: Digest,
+    pub cycle: CycleCounters,
+    pub cards: BTreeMap<CardId, CardCounters>,
+}
+
+/// A legacy project has no implicit budget. It is visible as unassessed, not
+/// silently counted under a policy an operator never configured.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProjectConvergence {
+    LegacyUnassessed,
+    Configured(ConvergenceProjection),
+}
+
+/// Projects only events bound to the supplied project, cycle and policy.
+///
+/// Any malformed, duplicate, foreign or unbound recognized fact refuses the
+/// entire projection. Events of other types are not convergence facts and are
+/// deliberately ignored.
+#[allow(clippy::too_many_lines)] // One fail-closed fold keeps partial state impossible.
+/// # Errors
+///
+/// Returns a refusal for any recognized fact that cannot be bound exactly to
+/// this policy, project, cycle, and subject.
+pub fn project(
+    policy: Option<&ConvergencePolicy>,
+    project_id: &ProjectId,
+    cycle_id: &CycleId,
+    events: &[Event],
+) -> Result<ProjectConvergence, ProjectionError> {
+    let Some(policy) = policy else {
+        return Ok(ProjectConvergence::LegacyUnassessed);
+    };
+    let policy_digest = policy.digest().map_err(|error| ProjectionError {
+        event_id: "<policy>".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let mut result = ConvergenceProjection {
+        status: "configured".to_owned(),
+        policy_digest: policy_digest.clone(),
+        cycle: CycleCounters::default(),
+        cards: BTreeMap::new(),
+    };
+    let mut seen = BTreeSet::new();
+
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == ATTEMPT_RECORDED_EVENT)
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: AttemptMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        if metadata.evidence_ref.trim().is_empty() {
+            return Err(ProjectionError {
+                event_id,
+                reason: "evidence_ref must not be empty".to_owned(),
+            });
+        }
+        if metadata.policy_digest != policy_digest {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+
+        match metadata.attempt_kind {
+            AttemptKind::IntegrationFailure => {
+                if event.card_id.is_some()
+                    || event.card_revision.is_some()
+                    || event.card_digest.is_some()
+                    || event.head_sha.is_some()
+                {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "integration failure must be cycle-only".to_owned(),
+                    });
+                }
+                if metadata.reason_category != ReasonCategory::IntegrationFailure {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "integration failure has incompatible reason category".to_owned(),
+                    });
+                }
+                result.cycle.integration_failures = result
+                    .cycle
+                    .integration_failures
+                    .checked_add(1)
+                    .ok_or_else(|| ProjectionError {
+                        event_id: event_id.clone(),
+                        reason: "counter overflow".to_owned(),
+                    })?;
+            }
+            kind => {
+                let (Some(card_id), Some(_revision), Some(_digest), Some(_head)) = (
+                    event.card_id.as_ref(),
+                    event.card_revision,
+                    event.card_digest.as_ref(),
+                    event.head_sha.as_ref(),
+                ) else {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "card attempt lacks exact card revision, digest, or head binding"
+                            .to_owned(),
+                    });
+                };
+                let expected_reason = match kind {
+                    AttemptKind::ReviewReturn => ReasonCategory::ReviewFindings,
+                    AttemptKind::RepairAttempt => ReasonCategory::ImplementationRepair,
+                    AttemptKind::GateFailure => ReasonCategory::GateFailure,
+                    AttemptKind::MaterialScopeRevision => ReasonCategory::ScopeRevision,
+                    AttemptKind::IntegrationFailure => unreachable!(),
+                };
+                if metadata.reason_category != expected_reason {
+                    return Err(ProjectionError {
+                        event_id,
+                        reason: "card attempt has incompatible reason category".to_owned(),
+                    });
+                }
+                let counters = result.cards.entry(card_id.clone()).or_default();
+                let count = match kind {
+                    AttemptKind::ReviewReturn => &mut counters.review_returns,
+                    AttemptKind::RepairAttempt => &mut counters.repair_attempts,
+                    AttemptKind::GateFailure => &mut counters.gate_failures,
+                    AttemptKind::MaterialScopeRevision => &mut counters.material_scope_revisions,
+                    AttemptKind::IntegrationFailure => unreachable!(),
+                };
+                *count = count.checked_add(1).ok_or_else(|| ProjectionError {
+                    event_id,
+                    reason: "counter overflow".to_owned(),
+                })?;
+            }
+        }
+    }
+    Ok(ProjectConvergence::Configured(result))
+}
+
 impl Trend {
     /// Computes the trend across every round recorded for a card.
     ///
@@ -275,9 +515,82 @@ impl Trend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeMap, str::FromStr};
+
+    use crate::{
+        config::{CardConvergenceLimits, CycleConvergenceLimits, RiskConvergenceLimits},
+        control::event_store::Event,
+        domain::{clock::Timestamp, ids::EventId},
+    };
 
     fn paths(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn policy() -> ConvergencePolicy {
+        let limits = CardConvergenceLimits {
+            review_returns: 2,
+            repair_attempts: 3,
+            gate_failures: 2,
+            material_scope_revisions: 1,
+        };
+        ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: RiskConvergenceLimits {
+                low: limits.clone(),
+                medium: limits.clone(),
+                high: limits.clone(),
+                critical: limits,
+            },
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: 2,
+            },
+        }
+    }
+
+    fn event(id: u64, kind: AttemptKind) -> Event {
+        let policy = policy();
+        let reason = match kind {
+            AttemptKind::ReviewReturn => ReasonCategory::ReviewFindings,
+            AttemptKind::RepairAttempt => ReasonCategory::ImplementationRepair,
+            AttemptKind::GateFailure => ReasonCategory::GateFailure,
+            AttemptKind::MaterialScopeRevision => ReasonCategory::ScopeRevision,
+            AttemptKind::IntegrationFailure => ReasonCategory::IntegrationFailure,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "attempt_kind".to_owned(),
+            serde_json::to_value(kind).unwrap(),
+        );
+        metadata.insert(
+            "reason_category".to_owned(),
+            serde_json::to_value(reason).unwrap(),
+        );
+        metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!(format!("receipt:{id}")),
+        );
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        let integration = kind == AttemptKind::IntegrationFailure;
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: (!integration).then(|| "F-001".parse().unwrap()),
+            card_revision: (!integration).then_some(1),
+            card_digest: (!integration).then(|| Digest::of_bytes(b"card")),
+            event_type: ATTEMPT_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
+            head_sha: (!integration).then(|| "0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
     }
 
     #[test]
@@ -673,5 +986,96 @@ mod tests {
             trend.advisory().is_some(),
             "a card stuck at three open findings must not read as converging"
         );
+    }
+
+    #[test]
+    fn omitted_convergence_policy_is_legacy_unassessed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        assert_eq!(
+            project(
+                None,
+                &project_id,
+                &cycle,
+                &[event(1, AttemptKind::RepairAttempt)]
+            )
+            .unwrap(),
+            ProjectConvergence::LegacyUnassessed
+        );
+    }
+
+    #[test]
+    fn configured_convergence_policy_validates_and_has_a_stable_digest() {
+        let policy = policy();
+        policy.validate().unwrap();
+        assert_eq!(policy.digest().unwrap(), policy.digest().unwrap());
+        let mut invalid = policy.clone();
+        invalid.card_limits.low.gate_failures = 0;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn fixed_attempt_facts_project_deterministic_card_and_cycle_counters() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::ReviewReturn),
+            event(2, AttemptKind::RepairAttempt),
+            event(3, AttemptKind::GateFailure),
+            event(4, AttemptKind::MaterialScopeRevision),
+            event(5, AttemptKind::IntegrationFailure),
+        ];
+        let first = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+        let mut shuffled = facts;
+        shuffled.reverse();
+        let second = project(Some(&policy()), &project_id, &cycle, &shuffled).unwrap();
+        assert_eq!(first, second);
+        let ProjectConvergence::Configured(view) = first else {
+            panic!("configured")
+        };
+        assert_eq!(view.cycle.integration_failures, 1);
+        assert_eq!(
+            view.cards[&CardId::from_str("F-001").unwrap()],
+            CardCounters {
+                review_returns: 1,
+                repair_attempts: 1,
+                gate_failures: 1,
+                material_scope_revisions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_duplicate_or_unbound_attempt_facts_fail_closed_without_partial_counts() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let good = event(1, AttemptKind::RepairAttempt);
+        let mut malformed = event(2, AttemptKind::GateFailure);
+        malformed.metadata.remove("evidence_ref");
+        assert!(
+            project(
+                Some(&policy()),
+                &project_id,
+                &cycle,
+                &[good.clone(), malformed]
+            )
+            .is_err()
+        );
+        assert!(project(Some(&policy()), &project_id, &cycle, &[good.clone(), good]).is_err());
+        let mut unbound = event(3, AttemptKind::ReviewReturn);
+        unbound.head_sha = None;
+        assert!(project(Some(&policy()), &project_id, &cycle, &[unbound]).is_err());
+    }
+
+    #[test]
+    fn foreign_policy_fact_is_refused_instead_of_counted() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let mut foreign = event(1, AttemptKind::RepairAttempt);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        assert!(project(Some(&policy()), &project_id, &cycle, &[foreign]).is_err());
     }
 }

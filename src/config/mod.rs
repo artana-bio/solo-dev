@@ -30,6 +30,122 @@ pub const VALIDATION_POLICY_V1: &str = "harness.validation-policy/v1";
 /// than provider-verified; this policy makes the declaration auditable.
 pub const FINAL_AUTHORIZATION_POLICY_V1: &str = "harness.final-authorization-policy/v1";
 
+/// The first shipped, explicitly bounded convergence-budget policy.
+pub const CONVERGENCE_POLICY_V1: &str = "harness.convergence-policy/v1";
+
+/// Limits for the attempts a single card may consume at one risk level.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CardConvergenceLimits {
+    pub review_returns: u32,
+    pub repair_attempts: u32,
+    pub gate_failures: u32,
+    pub material_scope_revisions: u32,
+}
+
+impl CardConvergenceLimits {
+    fn validate(&self, field: &str) -> Result<(), FieldError> {
+        for (name, value) in [
+            ("review_returns", self.review_returns),
+            ("repair_attempts", self.repair_attempts),
+            ("gate_failures", self.gate_failures),
+            ("material_scope_revisions", self.material_scope_revisions),
+        ] {
+            if value == 0 {
+                return Err(FieldError::new(
+                    format!("{field}.{name}"),
+                    "must be greater than zero",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The card limits selected for each declared risk level.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskConvergenceLimits {
+    pub low: CardConvergenceLimits,
+    pub medium: CardConvergenceLimits,
+    pub high: CardConvergenceLimits,
+    pub critical: CardConvergenceLimits,
+}
+
+impl RiskConvergenceLimits {
+    fn validate(&self) -> Result<(), FieldError> {
+        self.low.validate("convergence_policy.card_limits.low")?;
+        self.medium
+            .validate("convergence_policy.card_limits.medium")?;
+        self.high.validate("convergence_policy.card_limits.high")?;
+        self.critical
+            .validate("convergence_policy.card_limits.critical")?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn for_risk(&self, risk: Risk) -> &CardConvergenceLimits {
+        match risk {
+            Risk::Low => &self.low,
+            Risk::Medium => &self.medium,
+            Risk::High => &self.high,
+            Risk::Critical => &self.critical,
+        }
+    }
+}
+
+/// Cycle-level convergence limits.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CycleConvergenceLimits {
+    pub integration_failures: u32,
+}
+
+/// Versioned limits whose digest facts bind before they may be counted.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConvergencePolicy {
+    pub version: String,
+    pub card_limits: RiskConvergenceLimits,
+    pub cycle_limits: CycleConvergenceLimits,
+}
+
+impl ConvergencePolicy {
+    /// Validates the complete policy; zero is never a hidden "unlimited" value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for an unsupported version or a zero limit.
+    pub fn validate(&self) -> Result<(), FieldError> {
+        if self.version != CONVERGENCE_POLICY_V1 {
+            return Err(FieldError::new(
+                "convergence_policy.version",
+                format!("must name `{CONVERGENCE_POLICY_V1}`"),
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        self.card_limits.validate()?;
+        if self.cycle_limits.integration_failures == 0 {
+            return Err(FieldError::new(
+                "convergence_policy.cycle_limits.integration_failures",
+                "must be greater than zero",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical digest facts must name before projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical serialization fails.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+}
+
 /// A human decision that can halt a reviewed final integration.
 ///
 /// These names are deliberately closed.  The harness never infers that an
@@ -477,6 +593,10 @@ pub struct ProjectConfig {
     /// compatible v1 default while every v2 acceptance pins its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_authorization_policy: Option<FinalAuthorizationPolicy>,
+    /// Omission is deliberately not a default: old projects are reported as
+    /// `legacy_unassessed` rather than silently receiving new budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_policy: Option<ConvergencePolicy>,
 }
 
 impl ProjectConfig {
@@ -516,6 +636,9 @@ impl ProjectConfig {
             .validate()
             .map_err(FieldError::into_error)?;
         if let Some(policy) = &config.final_authorization_policy {
+            policy.validate().map_err(FieldError::into_error)?;
+        }
+        if let Some(policy) = &config.convergence_policy {
             policy.validate().map_err(FieldError::into_error)?;
         }
         Ok(config)
