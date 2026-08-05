@@ -8,8 +8,9 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::transaction::with_transaction,
+    config::ProjectConfig,
     control::{
-        event_store::{EventDraft, EventStore},
+        event_store::{Event, EventDraft, EventStore},
         repository::ControlRepository,
     },
     domain::{
@@ -20,6 +21,9 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
+    policy::convergence::{
+        CycleConvergence, CycleDimension, NextPermittedAction, assess_cycle, project,
+    },
 };
 
 /// Subcommands under `cycle`.
@@ -706,6 +710,66 @@ fn resolve_baseline(control: &ControlRepository) -> Result<String, HarnessError>
     )
 }
 
+/// Renders a [`CycleDimension`] using the same spelling it would serialize
+/// to, so `cycle status`'s human text never hand-spells a name `serde`
+/// already owns. Mirrors `dimension_wire_name` in `card.rs`.
+fn cycle_dimension_wire_name(dimension: CycleDimension) -> String {
+    match serde_json::to_value(dimension) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{dimension:?}"),
+    }
+}
+
+/// Renders a [`NextPermittedAction`] using the same spelling it would
+/// serialize to. Mirrors `next_permitted_action_wire_name` in `card.rs`.
+fn next_permitted_action_wire_name(action: NextPermittedAction) -> String {
+    match serde_json::to_value(action) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{action:?}"),
+    }
+}
+
+/// Assesses a cycle's convergence budget for `cycle status`, without
+/// refusing.
+///
+/// 73-1: the cycle-level counterpart of `card.rs`'s `card_convergence`
+/// (72-3) — read that one first. Same projection call, same error handling,
+/// same shape of failure when a fact is malformed: a malformed, duplicate,
+/// foreign, or unbound convergence fact fails here exactly as it does
+/// there, because that is control-repository corruption, a different
+/// problem than an exhausted budget.
+///
+/// Unlike `card_convergence`, this takes the cycle's events already loaded
+/// by its one caller, `run_status`, instead of reading them again:
+/// `EventStore::for_cycle` rescans the whole event directory from disk, and
+/// `run_status` already needs that same scan for its own event-count and
+/// transition-history report, so an independent second read here would pay
+/// for a second full scan to get an answer it already has. There is also no
+/// `require_cycle_convergence_budget` this has to agree with yet, unlike
+/// `card_convergence`'s reason for reading independently — #73's first card
+/// is decision-plus-report only; a later card adds that enforcement
+/// function, and it will read its own events for the same reason
+/// `require_convergence_budget` does today.
+///
+/// # Errors
+///
+/// Returns a control error when the recorded convergence facts cannot be
+/// projected.
+fn cycle_convergence(
+    config: &ProjectConfig,
+    cycle_id: &CycleId,
+    events: &[Event],
+) -> Result<CycleConvergence, HarnessError> {
+    let policy = config.convergence_policy.as_ref();
+    let view = project(policy, &config.project_id, cycle_id, events).map_err(|error| {
+        HarnessError::Control {
+            reason: format!("convergence projection for cycle {cycle_id} is unusable: {error}"),
+            code: ErrorCode::InternalControlCorrupt,
+        }
+    })?;
+    Ok(assess_cycle(policy, &view))
+}
+
 fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let cycle_id: CycleId = args.cycle_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
@@ -714,6 +778,14 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let events = EventStore::new(&control);
     let derived = derived_status(&events, &cycle_id)?;
     let history = events.for_cycle(&cycle_id)?;
+
+    // 73-1: computed right after `history` is fetched, before `text` is
+    // built, so both the JSON below and the human text read from the one
+    // assessment — they can never disagree about whether the cycle is
+    // escalated. `cycle status` never turns an escalated budget into a
+    // refusal; see `cycle_convergence`. Mirrors how `card status` (72-3)
+    // publishes `data.convergence` from `assess_card`.
+    let convergence = cycle_convergence(&config, &cycle_id, &history)?;
 
     let drift = derived != cycle.status;
     let mut text = format!(
@@ -741,6 +813,37 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             event.next_state.as_deref().unwrap_or("none")
         );
     }
+    // The human text says the same thing the JSON does, not less: an
+    // operator reading text output must not have to ask for JSON to learn
+    // which dimension is exhausted or what they may do next. Mirrors `card
+    // status`'s own escalation report exactly.
+    if let CycleConvergence::Escalated {
+        exhausted,
+        next_permitted_action,
+    } = &convergence
+    {
+        let _ = write!(text, "\nconvergence: escalated");
+        for dimension in exhausted {
+            let _ = write!(
+                text,
+                "\n  {}: {}/{} (evidence: {})",
+                cycle_dimension_wire_name(dimension.dimension),
+                dimension.count,
+                dimension.limit,
+                dimension
+                    .evidence
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let _ = write!(
+            text,
+            "\n  next permitted action: {}",
+            next_permitted_action_wire_name(*next_permitted_action)
+        );
+    }
 
     let mut outcome = CommandOutcome::new(
         "cycle.status",
@@ -754,6 +857,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "objective": cycle.objective,
             "card_ids": cycle.card_ids,
             "event_count": history.len(),
+            "convergence": convergence,
         }),
     )
     .with_project(config.project_id.clone());

@@ -1929,6 +1929,90 @@ fn the_recorded_failure_projects_into_the_cycle_counter() {
     );
 }
 
+// 73-1: `cycle status` gains a read-only `convergence` report, mirroring
+// `card status`'s own (72-3). Neither test below asserts a refusal — that
+// is a later card's job — only that the report is present and accurate.
+
+#[test]
+fn cycle_status_reports_a_cycle_within_its_budget() {
+    let workspace = opened_with_policy(3, 3);
+
+    let envelope = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "within" }),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn cycle_status_reports_an_escalated_cycle_with_its_evidence() {
+    // A limit of one integration failure, spent by exactly one real
+    // conflict driven through the governed `integration merge` command —
+    // the same fixture
+    // `a_conflicting_integration_records_one_cycle_bound_failure_fact_and_still_refuses`
+    // uses above, just with the cycle budget tight enough that this one
+    // failure alone exhausts it.
+    let workspace = conflicting_under_policy(3, 1);
+    let id = prepare_integration(&workspace);
+
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(
+        error_code(&output),
+        "CH-CONFLICT-MERGE-FAILED",
+        "the fixture must fail on the conflict it was built to produce"
+    );
+
+    let envelope = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({
+            "status": "escalated",
+            "exhausted": [
+                {
+                    "dimension": "integration_failures",
+                    "count": 1,
+                    "limit": 1,
+                    "evidence": [format!("integration:{id}")],
+                }
+            ],
+            "next_permitted_action": "record_authorized_disposition",
+        }),
+        "data.convergence must be exactly CycleConvergence's own serialization: {envelope}"
+    );
+
+    // The human-readable text must say the same thing: which dimension is
+    // exhausted and what may happen next, without requiring JSON — the same
+    // register `card status`'s own escalation report uses.
+    let text_output = Workspace::run(&[
+        "cycle".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--cycle-id".to_owned(),
+        "C-001".to_owned(),
+    ]);
+    assert!(
+        text_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    let text = String::from_utf8_lossy(&text_output.stdout).into_owned();
+    assert!(text.contains("integration_failures"), "{text}");
+    assert!(text.contains("1/1"), "{text}");
+    assert!(text.contains(&format!("integration:{id}")), "{text}");
+    assert!(
+        text.contains("record_authorized_disposition"),
+        "the text must name the next permitted action too: {text}"
+    );
+}
+
 // 72-2: once `assess_card` reports a card `Escalated`, that card's own
 // delivery and review loop stops. `handoff create`, `review begin`, and
 // `review record` — the real commands, and the previews for the two whose
@@ -4661,5 +4745,4117 @@ mod disposition_rebaseline {
             String::from_utf8_lossy(&real.stderr)
         );
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+    }
+}
+
+// 74-5: `disposition abandon`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, permanently ends an
+// escalated card by recording one bound `convergence.disposition_recorded`
+// fact — the authorized *escalation exit* `renew` is not: instead of
+// granting the exhausted dimension one more configured limit, it retires
+// the card itself. The property this card actually exists to prove is
+// narrower than "the command works": an abandon fact names no `dimension`,
+// and `project` must keep it out of the `DispositionMetadata` parse that
+// requires one, or one abandoned card would break `card status` and every
+// budget-gated command for every *other* card sharing its cycle — #74's own
+// "preserves valid unrelated work" criterion.
+//
+// Wrapped in its own module for the same reason `disposition_rebaseline` is:
+// `the_dry_run_makes_every_check_and_writes_nothing` is already the name
+// used above, twice, for the same property on two other commands, and
+// neither existing test may be touched or renamed. A module gives this
+// card's instance of that recurring name a distinct path
+// (`disposition_abandon::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_abandon {
+    use super::*;
+
+    /// Identical in shape to `disposition_renew`'s and
+    /// `disposition_rebaseline`'s own copies of this helper:
+    /// `support::Workspace` is outside this card's file scope, so each
+    /// disposition module keeps its fixture-building local rather than
+    /// reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition abandon`'s authorization check (#4)
+    /// has a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition abandon` in JSON mode, returning the raw output.
+    /// Mirrors every other per-group `_raw` helper in this file; kept local
+    /// because `support::Workspace` is outside this card's file scope.
+    fn disposition_abandon_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "abandon".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is an abandon (none configures a
+    /// renewal or rebaseline too), so this is never filtered further by
+    /// `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    #[test]
+    fn an_authorized_abandon_ends_an_escalated_card() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let base = workspace.authority_head();
+        let pre_abandon_head = workspace.control_head();
+
+        let abandon = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "authorized abandon for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            abandon.status.success(),
+            "an authorized abandon of an escalated card must succeed: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_abandon_head,
+            "disposition abandon must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful abandon"
+        );
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned",
+            "the card must move to abandoned"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        // `escalate_via_review_returns` leaves the card `changes_requested`;
+        // this fact must record that exact transition, unlike `renew`'s own
+        // fact, which names no transition at all because renewing spends no
+        // state change.
+        assert_eq!(fact["previous_state"], "changes_requested", "{fact}");
+        assert_eq!(fact["next_state"], "abandoned", "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "abandon", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized abandon for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+        assert!(
+            !fact["metadata"]
+                .as_object()
+                .expect("metadata is an object")
+                .contains_key("dimension"),
+            "an abandon fact must name no dimension: {fact}"
+        );
+    }
+
+    #[test]
+    // This is the load-bearing test: the mutation in the contract's own
+    // §7 deletes the abandon exclusion from the card-bound
+    // `DispositionMetadata` loop's filter, which makes the abandon fact
+    // recorded below attempt a `dimension`-shaped parse it was never going
+    // to satisfy — refusing not just F-001's own projection but the whole
+    // cycle's, which is exactly what `approve_card` below would trip over
+    // for F-002, a card the abandon never touched.
+    fn an_unrelated_card_in_the_same_cycle_still_works_after_an_abandon() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let abandon = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "ending the escalated card for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            abandon.status.success(),
+            "the abandon that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        // A second, unrelated card in the same cycle, scoped away from
+        // `src/**` so the two can coexist without an ownership-overlap
+        // refusal, must be completely unaffected by F-001's abandon.
+        // `card status` alone would only prove the read-only projection
+        // path still works; `approve_card` drives F-002 through `handoff
+        // create`, `review begin`, and `review record` — three separate
+        // `require_convergence_budget` call sites — so this proves the
+        // budget-gated write path stays open too.
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        let status = workspace.card_raw(&["status", "--card-id", "F-002"]);
+        assert!(
+            status.status.success(),
+            "card status for an unrelated card must not be broken by another card's abandon: {}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        workspace.approve_card("F-002", "docs/f002/a.md");
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "approved",
+            "an unrelated card in the same cycle must still deliver and be reviewed after another \
+         card's abandon"
+        );
+    }
+
+    #[test]
+    fn a_second_abandon_of_the_same_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let first = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "first abandon",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first abandon must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        // The card's recorded facts do not disappear when it is abandoned.
+        // `card status` publishes exactly `assess_card`'s own assessment
+        // (see `card.rs`'s `card_convergence` doc comment, and
+        // `card_status_reports_the_escalation_instead_of_refusing` above,
+        // which pins that `data.convergence` is exactly `CardConvergence`'s
+        // serialization) — so this is a direct, observed answer to whether
+        // `assess_card` still reports the card `Escalated` post-abandon,
+        // not an inference from the refusal below.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "an abandoned card's recorded facts do not disappear; it must still assess as \
+         escalated"
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "second abandon, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second abandon of an already-abandoned card must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        // It is check 3 (the lifecycle transition), not check 2 (the
+        // escalation check), that refuses the repeat — the assertion above
+        // already established the card still reads `Escalated`, so if
+        // check 2 had fired instead the message would say the card is not
+        // escalated, not name a transition. `CardState::check_transition`'s
+        // own message names the exact states it refused to move between.
+        assert!(
+            error_message(&second).contains("cannot move from `abandoned` to `abandoned`"),
+            "{}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first abandon's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_not_escalated_cannot_be_abandoned_this_way() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-001", &["src/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "nothing has escalated yet",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card that has never been escalated must not be abandonable through this route"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("card abandon"),
+            "the refusal must name the route that does apply: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "ready",
+            "the refused abandon must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_abandon() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused abandon must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a convergence
+        // policy but no `final_authorization_policy` at all — the scenario
+        // `opened_with_disposition_policies` above always avoids by
+        // construction. Escalating a card only requires the convergence
+        // policy; authorizing the abandon requires the other one, which
+        // simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an abandon must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "would abandon if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "would abandon if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real abandon, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "the real abandon",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned"
+        );
+    }
+}
+
+// 74-6: `disposition accept-risk`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, accepts a disclosed
+// risk on one exhausted dimension of an escalated card so it can deliver
+// and be reviewed again — without its budget being expanded. That
+// distinction from `renew` is the entire point of this command: `renew`
+// grants the configured limit again, so a further attempt still counts and
+// can escalate the same dimension a second time; `accept-risk` grants
+// nothing at all, so the count keeps climbing past the limit forever and
+// the dimension simply stops being reported exhausted, because an
+// authorized actor accepted that risk.
+//
+// Wrapped in its own module for the same reason `disposition_abandon` is:
+// `the_dry_run_makes_every_check_and_writes_nothing` is already the name
+// used above, three times, for the same property on three other commands,
+// and none of the existing tests may be touched or renamed beyond what
+// this card's own contract requires. A module gives this card's instance
+// of that recurring name a distinct path
+// (`disposition_accept_risk::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_accept_risk {
+    use super::*;
+
+    /// Identical in shape to every sibling module's own copy of this
+    /// helper: `support::Workspace` is outside this card's file scope, so
+    /// each disposition module keeps its fixture-building local rather
+    /// than reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition accept-risk`'s authorization check
+    /// (#6) has a configured set to resolve. Order matters exactly as it
+    /// does in `opened_with_policy`: both policies must be in place before
+    /// the cycle is created, which pins the project configuration's
+    /// digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Like [`opened_with_disposition_policies`], but lets each of the
+    /// four card dimensions carry its own limit rather than one shared
+    /// value. Needed only by `an_acceptance_covers_only_the_dimension_it_
+    /// names`: that test needs two independent dimensions —
+    /// `repair_attempts` and `gate_failures` — to reach their own limits
+    /// from the very same handoff, since any gated command run after even
+    /// one dimension is already exhausted is refused outright
+    /// (`require_convergence_budget`, read by `handoff create`, `review
+    /// begin`, and `review record` alike); `review_returns` must stay
+    /// comfortably under its own limit so the review return that sets up
+    /// the scenario does not exhaust the card before that handoff runs.
+    /// Mirrors `Workspace::configure_convergence_policy`'s body directly,
+    /// for the same reason `initialized_with_authorizers` mirrors
+    /// `Workspace::initialized`'s: `support::Workspace` is outside this
+    /// card's file scope.
+    fn opened_with_disposition_policies_and_limits(
+        authorizers: &[&str],
+        review_returns: u32,
+        repair_attempts: u32,
+        gate_failures: u32,
+        material_scope_revisions: u32,
+        integration_limit: u32,
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        let path = workspace.control.join("project/project.json");
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let card_limits = serde_json::json!({
+            "review_returns": review_returns,
+            "repair_attempts": repair_attempts,
+            "gate_failures": gate_failures,
+            "material_scope_revisions": material_scope_revisions,
+        });
+        document["convergence_policy"] = serde_json::json!({
+            "version": "harness.convergence-policy/v1",
+            "card_limits": {
+                "low": card_limits.clone(),
+                "medium": card_limits.clone(),
+                "high": card_limits.clone(),
+                "critical": card_limits,
+            },
+            "cycle_limits": { "integration_failures": integration_limit },
+        });
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+        )
+        .unwrap();
+        support::git(&workspace.control, &["add", "-A"]);
+        support::git(
+            &workspace.control,
+            &["commit", "-q", "-m", "test: configure convergence policy"],
+        );
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition accept-risk` in JSON mode, returning the raw
+    /// output. Mirrors every other per-group `_raw` helper in this file;
+    /// kept local because `support::Workspace` is outside this card's file
+    /// scope.
+    fn disposition_accept_risk_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "accept-risk".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is an acceptance (none
+    /// configures a renewal, rebaseline, or abandon too), so this is never
+    /// filtered further by `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    /// Like the top-level `open_review_round`, but activates the card with
+    /// `gate.unit` declared as a feature gate — needed because
+    /// `redeliver_after_return_declaring_a_gate_failure`, below, must
+    /// declare a gate failure for that gate at handoff time, and
+    /// `validate_declared_gate_failures` refuses any `gate_id` absent from
+    /// the card's own declared feature gates. `support::Workspace` is
+    /// outside this card's file scope, so this mirrors
+    /// `open_review_round`'s body directly rather than editing it.
+    fn open_review_round_with_gate_unit(workspace: &Workspace, card_id: &str) -> String {
+        workspace.activate_card_with_gates(card_id, &["src/**"], &["gate.unit"]);
+        workspace.work(&["start", "--card-id", card_id]);
+
+        let worktree = workspace.worktrees.join(card_id);
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", "feat: implement"]);
+        workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: it works\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration.display().to_string(),
+        ]);
+        workspace.review(&["begin", "--card-id", card_id, "--actor", "reviewer"]);
+        head
+    }
+
+    /// Like the top-level `redeliver_after_return`, but also declares a
+    /// gate failure on the very same redelivery — needed only by
+    /// `an_acceptance_covers_only_the_dimension_it_names`, which needs a
+    /// second, independent dimension to reach its own limit in the same
+    /// handoff that answers the return: any gated command run afterward,
+    /// once either dimension is exhausted, is refused outright. Mirrors
+    /// `redeliver_after_return`'s body directly, using
+    /// `open_review_round_with_gate_unit` above in place of the top-level
+    /// `open_review_round`.
+    fn redeliver_after_return_declaring_a_gate_failure(
+        workspace: &Workspace,
+        card_id: &str,
+        verdict_body: &str,
+        gate_failures_yaml: &str,
+    ) -> std::process::Output {
+        open_review_round_with_gate_unit(workspace, card_id);
+        let verdict_path = write_verdict(workspace, card_id, verdict_body);
+        workspace.review(&[
+            "record",
+            "--card-id",
+            card_id,
+            "--verdict",
+            &verdict_path,
+            "--actor",
+            "reviewer",
+        ]);
+        workspace.work(&["resume", "--card-id", card_id]);
+
+        let worktree = workspace.worktrees.join(card_id);
+        fs::write(worktree.join("src/a.rs"), "fn main() { /* fixed */ }\n").unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", "fix: address review"]);
+        workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration =
+            declaration_with_gate_failures(workspace, card_id, &head, gate_failures_yaml);
+        workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration,
+        ])
+    }
+
+    #[test]
+    fn an_authorized_acceptance_lets_an_escalated_card_deliver_again() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let base = workspace.authority_head();
+        let pre_accept_head = workspace.control_head();
+
+        let accept = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "reviewer has seen this exact defect before and judges it low-impact",
+                "--rationale",
+                "authorized acceptance for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            accept.status.success(),
+            "an authorized acceptance of an exhausted dimension must succeed: {}{}",
+            String::from_utf8_lossy(&accept.stdout),
+            String::from_utf8_lossy(&accept.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_accept_head,
+            "disposition accept-risk must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful acceptance"
+        );
+
+        // Unlike `abandon`, an acceptance moves no card state at all: the
+        // card simply becomes deliverable again where it stands.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "an acceptance must not move the card's lifecycle state"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        // No transition at all, unlike `abandon`'s own fact: an acceptance
+        // moves no card state, so neither field is ever set.
+        assert!(fact["previous_state"].is_null(), "{fact}");
+        assert!(fact["next_state"].is_null(), "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "accept_risk", "{fact}");
+        assert_eq!(fact["metadata"]["dimension"], "review_returns", "{fact}");
+        assert_eq!(
+            fact["metadata"]["risk"],
+            "reviewer has seen this exact defect before and judges it low-impact",
+            "{fact}"
+        );
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized acceptance for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+
+        // And the card really is deliverable again: `card status` reports
+        // `within`, not `escalated`, even though the review-return count
+        // that exhausted it is still 1.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "an accepted risk must make the card deliverable again"
+        );
+    }
+
+    #[test]
+    // The discriminating test (contract §6.2): confirms `accept-risk`
+    // behaves nothing like `renew`. Under a renew-shaped implementation —
+    // incrementing `renewals` instead of setting `escalation_waived` — the
+    // effective budget here would become 2 and the second attempt below
+    // would escalate the card again; this asserts it does not.
+    //
+    // `repair_attempts` is deliberately given more room than
+    // `review_returns`: redelivering after `escalate_via_review_returns`
+    // answers that still-open, blocking review return, so it records a
+    // `repair_attempt` fact of its own (see `a_delivery_answering_a_
+    // review_return_records_one_repair_attempt_inheriting_its_reason`,
+    // outside this module). A uniform limit-1 policy would let that
+    // incidental fact exhaust `repair_attempts` too, refusing the very
+    // `review begin` this test needs in order to record the *second*
+    // `review_returns` attempt — a confusing failure for a reason
+    // unrelated to what this test exists to prove.
+    fn an_acceptance_grants_no_further_budget() {
+        let workspace = opened_with_disposition_policies_and_limits(&["owner"], 1, 3, 3, 3, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let accept = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "a second review return in this dimension is expected and accepted",
+                "--rationale",
+                "authorized acceptance for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            accept.status.success(),
+            "the acceptance that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&accept.stdout),
+            String::from_utf8_lossy(&accept.stderr)
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the card must be within budget immediately after the acceptance"
+        );
+
+        // Record a second attempt in the very same dimension the risk was
+        // accepted on.
+        let head = redeliver_candidate(&workspace, "F-001");
+        let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+        let handoff = workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+        assert!(
+            handoff.status.success(),
+            "delivery after acceptance must succeed: {}{}",
+            String::from_utf8_lossy(&handoff.stdout),
+            String::from_utf8_lossy(&handoff.stderr)
+        );
+        let begin = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+        assert!(
+            begin.status.success(),
+            "review begin after acceptance must succeed: {}{}",
+            String::from_utf8_lossy(&begin.stdout),
+            String::from_utf8_lossy(&begin.stderr)
+        );
+        // Unlike `escalate_via_review_returns`'s own first-round verdict,
+        // this one must also carry forward that first round's finding at
+        // `src/a.rs` as `resolved` — a re-review may not silently drop an
+        // earlier round's open finding (see `review_round`'s own doc
+        // comment, outside this module) — alongside the new finding that
+        // triggers this second return.
+        let second_return_verdict = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: acceptance_defect\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: carried forward from the previous round\n    disposition: resolved\n  - severity: medium\n    location: src/a.rs\n    detail: a second defect found on re-review\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+        let verdict = write_verdict(&workspace, "F-001", second_return_verdict);
+        let record = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &verdict,
+            "--actor",
+            "reviewer",
+        ]);
+        assert!(
+            record.status.success(),
+            "a second review return in the accepted dimension must still be permitted to \
+         record: {}{}",
+            String::from_utf8_lossy(&record.stdout),
+            String::from_utf8_lossy(&record.stderr)
+        );
+
+        // The central assertion: a renew-shaped implementation would read
+        // an effective budget of 2 here and escalate again on the second
+        // attempt. Acceptance grants nothing, so the card must still read
+        // `within`.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "acceptance grants no budget: a second attempt in the same dimension must not \
+         escalate the card again"
+        );
+        // The risk is accepted, not erased: the count must really have
+        // reached 2. A projection that silently stopped counting once a
+        // risk was accepted would make the assertion above pass for the
+        // wrong reason.
+        assert_eq!(
+            attempt_facts_of_kind(&workspace, "review_return").len(),
+            2,
+            "the second review return must still be recorded as a real attempt"
+        );
+    }
+
+    #[test]
+    fn an_acceptance_covers_only_the_dimension_it_names() {
+        let workspace = opened_with_disposition_policies_and_limits(&["owner"], 5, 1, 1, 5, 3);
+
+        let handoff = redeliver_after_return_declaring_a_gate_failure(
+            &workspace,
+            "F-001",
+            RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        assert!(
+            handoff.status.success(),
+            "the redelivery that exhausts both repair_attempts and gate_failures at once must \
+         itself succeed: {}{}",
+            String::from_utf8_lossy(&handoff.stdout),
+            String::from_utf8_lossy(&handoff.stderr)
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "both repair_attempts and gate_failures must be exhausted by the redelivery above"
+        );
+
+        let accept = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "repair-attempts",
+                "--risk",
+                "the repeated repair attempt on this exact defect is accepted",
+                "--rationale",
+                "authorized acceptance for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            accept.status.success(),
+            "accepting repair_attempts must succeed while it is exhausted: {}{}",
+            String::from_utf8_lossy(&accept.stdout),
+            String::from_utf8_lossy(&accept.stderr)
+        );
+
+        // gate_failures was never named: a second, independently exhausted
+        // dimension on the same card must still escalate it.
+        let convergence =
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"].clone();
+        assert_eq!(
+            convergence["status"], "escalated",
+            "gate_failures is still exhausted; the acceptance named only repair_attempts: \
+         {convergence}"
+        );
+        let exhausted = convergence["exhausted"]
+            .as_array()
+            .expect("exhausted is an array");
+        assert_eq!(
+            exhausted.len(),
+            1,
+            "only one dimension may remain exhausted; repair_attempts was accepted: {exhausted:?}"
+        );
+        assert_eq!(exhausted[0]["dimension"], "gate_failures", "{exhausted:?}");
+        assert_eq!(exhausted[0]["count"], 1, "{exhausted:?}");
+        assert_eq!(exhausted[0]["limit"], 1, "{exhausted:?}");
+    }
+
+    #[test]
+    fn a_second_acceptance_of_the_same_dimension_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let first = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "first accepted risk",
+                "--rationale",
+                "first acceptance",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first acceptance must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "second accepted risk, immediately",
+                "--rationale",
+                "second acceptance",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second acceptance of an already-accepted dimension must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&second).contains("already"),
+            "the refusal must name the earlier acceptance: {}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first acceptance's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_dimension_that_still_has_budget_cannot_be_pre_accepted() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "gate-failures",
+                "--risk",
+                "a risk on a dimension that still has budget",
+                "--rationale",
+                "the wrong dimension",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "gate-failures still has budget; pre-accepting its risk would be silent expansion"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        let message = error_message(&output);
+        assert!(
+            message.contains("review_returns"),
+            "the refusal must name the dimension that really is exhausted: {message}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_accept_risk() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "an actor outside the configured set",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused acceptance must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a
+        // convergence policy but no `final_authorization_policy` at all —
+        // the scenario `opened_with_disposition_policies` above always
+        // avoids by construction. Escalating a card only requires the
+        // convergence policy; authorizing the acceptance requires the
+        // other one, which simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "no authorization policy exists at all",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an acceptance must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_risk_or_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let blank_risk = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "   ",
+                "--rationale",
+                "a valid rationale",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !blank_risk.status.success(),
+            "a blank risk must be refused before anything is written"
+        );
+        assert_eq!(error_code(&blank_risk), "CH-USAGE-INVALID-ARGUMENTS");
+        let risk_message = error_message(&blank_risk);
+        assert!(risk_message.contains("--risk"), "{risk_message}");
+
+        let blank_rationale = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "a valid risk disclosure",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !blank_rationale.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&blank_rationale), "CH-USAGE-INVALID-ARGUMENTS");
+        let rationale_message = error_message(&blank_rationale);
+        assert!(
+            rationale_message.contains("--rationale"),
+            "{rationale_message}"
+        );
+
+        // Distinct messages, on purpose: an operator who left one blank
+        // should not have to guess which.
+        assert_ne!(
+            risk_message, rationale_message,
+            "a blank --risk and a blank --rationale must be refused with distinct messages"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on either refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "would accept if this were real",
+                "--rationale",
+                "would accept if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "would accept if this were real",
+                "--rationale",
+                "would accept if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real acceptance, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_accept_risk_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--risk",
+                "the real risk being accepted",
+                "--rationale",
+                "the real acceptance",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+    }
+}
+
+// 74-7: `disposition split`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, moves the remaining
+// work behind one exhausted dimension of an escalated card to an
+// already-existing follow-up card, so the original card can deliver and be
+// reviewed again — without its budget being expanded. Like `accept-risk`,
+// it grants no budget: the count keeps climbing past the limit forever and
+// the dimension simply stops being reported exhausted, because the
+// authorized actor moved the remaining work elsewhere. Unlike
+// `accept-risk`, it names exactly where that work went —
+// `follow_up_card_id` — and unlike every sibling disposition, it names a
+// *second* card, one it never creates and never mutates: the follow-up
+// card must already exist, reached through the normal governed path, and
+// `split` only records a binding to it.
+//
+// Wrapped in its own module for the same reason `disposition_abandon` and
+// `disposition_accept_risk` are: `the_dry_run_makes_every_check_and_writes_
+// nothing` is already the name used above, four times, for the same
+// property on four other commands, and none of the existing tests may be
+// touched or renamed beyond what this card's own contract requires. A
+// module gives this card's instance of that recurring name a distinct path
+// (`disposition_split::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_split {
+    use super::*;
+
+    /// Identical in shape to every sibling module's own copy of this
+    /// helper: `support::Workspace` is outside this card's file scope, so
+    /// each disposition module keeps its fixture-building local rather
+    /// than reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition split`'s authorization check (#10)
+    /// has a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Like [`opened_with_disposition_policies`], but lets each of the
+    /// four card dimensions carry its own limit rather than one shared
+    /// value. Needed only by `a_split_grants_no_further_budget` and
+    /// `a_split_covers_only_the_dimension_it_names`, for exactly the
+    /// reason 74-6's own copy of this helper is needed by its siblings of
+    /// the same name: `repair_attempts` needs more room than
+    /// `review_returns` because redelivering after
+    /// `escalate_via_review_returns` answers that still-open, blocking
+    /// review return, so it records a `repair_attempt` fact of its own —
+    /// see 74-6's copy, in `disposition_accept_risk`, for the full
+    /// explanation. Mirrors `Workspace::configure_convergence_policy`'s
+    /// body directly, for the same reason `initialized_with_authorizers`
+    /// mirrors `Workspace::initialized`'s: `support::Workspace` is outside
+    /// this card's file scope.
+    fn opened_with_disposition_policies_and_limits(
+        authorizers: &[&str],
+        review_returns: u32,
+        repair_attempts: u32,
+        gate_failures: u32,
+        material_scope_revisions: u32,
+        integration_limit: u32,
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        let path = workspace.control.join("project/project.json");
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let card_limits = serde_json::json!({
+            "review_returns": review_returns,
+            "repair_attempts": repair_attempts,
+            "gate_failures": gate_failures,
+            "material_scope_revisions": material_scope_revisions,
+        });
+        document["convergence_policy"] = serde_json::json!({
+            "version": "harness.convergence-policy/v1",
+            "card_limits": {
+                "low": card_limits.clone(),
+                "medium": card_limits.clone(),
+                "high": card_limits.clone(),
+                "critical": card_limits,
+            },
+            "cycle_limits": { "integration_failures": integration_limit },
+        });
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+        )
+        .unwrap();
+        support::git(&workspace.control, &["add", "-A"]);
+        support::git(
+            &workspace.control,
+            &["commit", "-q", "-m", "test: configure convergence policy"],
+        );
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition split` in JSON mode, returning the raw output.
+    /// Mirrors every other per-group `_raw` helper in this file; kept local
+    /// because `support::Workspace` is outside this card's file scope.
+    fn disposition_split_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "split".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is a split (none configures a
+    /// renewal, rebaseline, abandon, or acceptance too), so this is never
+    /// filtered further by `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    /// Creates and activates a card in an arbitrary cycle, not necessarily
+    /// `C-001`. Needed only by `a_follow_up_card_in_another_cycle_refuses`:
+    /// `support::Workspace::activate_card`, and every other
+    /// `activate_card_*` helper it offers, hard-codes `cycle_id: C-001`,
+    /// which that test's follow-up card cannot use since the whole point
+    /// is putting it in a different cycle. Mirrors
+    /// `activate_card_with_gates`'s body directly, for the same reason
+    /// `initialized_with_authorizers` mirrors `Workspace::initialized`'s:
+    /// `support::Workspace` is outside this card's file scope.
+    fn activate_card_in_cycle(
+        workspace: &Workspace,
+        card_id: &str,
+        cycle_id: &str,
+        include: &[&str],
+    ) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base =
+            workspace.cycle_json(&["status", "--cycle-id", cycle_id])["data"]["baseline_sha"]
+                .as_str()
+                .expect("cycle has a frozen baseline")
+                .to_owned();
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: {cycle_id}\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        );
+        let path = workspace.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        workspace.card(&["create", "--draft", &path.display().to_string()]);
+        workspace.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Like the top-level `open_review_round`, but activates the card with
+    /// `gate.unit` declared as a feature gate. Identical to 74-6's own copy
+    /// of this helper, in `disposition_accept_risk` — needed here for the
+    /// same reason: `an_split_covers_only_the_dimension_it_names` below
+    /// must declare a gate failure for that gate at handoff time, and
+    /// `validate_declared_gate_failures` refuses any `gate_id` absent from
+    /// the card's own declared feature gates. `support::Workspace` is
+    /// outside this card's file scope, so this mirrors
+    /// `open_review_round`'s body directly rather than editing it, the
+    /// same reason 74-6's copy does.
+    fn open_review_round_with_gate_unit(workspace: &Workspace, card_id: &str) -> String {
+        workspace.activate_card_with_gates(card_id, &["src/**"], &["gate.unit"]);
+        workspace.work(&["start", "--card-id", card_id]);
+
+        let worktree = workspace.worktrees.join(card_id);
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", "feat: implement"]);
+        workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = workspace.root.join(format!("{card_id}-declaration.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: it works\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration.display().to_string(),
+        ]);
+        workspace.review(&["begin", "--card-id", card_id, "--actor", "reviewer"]);
+        head
+    }
+
+    /// Like the top-level `redeliver_after_return`, but also declares a
+    /// gate failure on the very same redelivery. Identical in shape to
+    /// 74-6's own copy of this helper, in `disposition_accept_risk`, needed
+    /// here for the same reason: `a_split_covers_only_the_dimension_it_
+    /// names` needs two independent dimensions — `repair_attempts` and
+    /// `gate_failures` — to reach their own limits from the very same
+    /// handoff, since any gated command run after even one dimension is
+    /// already exhausted is refused outright. Mirrors
+    /// `redeliver_after_return`'s body directly, using
+    /// `open_review_round_with_gate_unit` above in place of the top-level
+    /// `open_review_round`.
+    fn redeliver_after_return_declaring_a_gate_failure(
+        workspace: &Workspace,
+        card_id: &str,
+        verdict_body: &str,
+        gate_failures_yaml: &str,
+    ) -> std::process::Output {
+        open_review_round_with_gate_unit(workspace, card_id);
+        let verdict_path = write_verdict(workspace, card_id, verdict_body);
+        workspace.review(&[
+            "record",
+            "--card-id",
+            card_id,
+            "--verdict",
+            &verdict_path,
+            "--actor",
+            "reviewer",
+        ]);
+        workspace.work(&["resume", "--card-id", card_id]);
+
+        let worktree = workspace.worktrees.join(card_id);
+        fs::write(worktree.join("src/a.rs"), "fn main() { /* fixed */ }\n").unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", "fix: address review"]);
+        workspace.gate(&["run", "--card-id", card_id, "--gate-id", "gate.unit"]);
+
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration =
+            declaration_with_gate_failures(workspace, card_id, &head, gate_failures_yaml);
+        workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            card_id,
+            "--declaration",
+            &declaration,
+        ])
+    }
+
+    #[test]
+    fn an_authorized_split_lets_an_escalated_card_deliver_again() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let follow_up_status_before = workspace.card_json(&["status", "--card-id", "F-002"]);
+        let base = workspace.authority_head();
+        let pre_split_head = workspace.control_head();
+
+        let split = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "authorized split for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            split.status.success(),
+            "an authorized split of an exhausted dimension must succeed: {}{}",
+            String::from_utf8_lossy(&split.stdout),
+            String::from_utf8_lossy(&split.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_split_head,
+            "disposition split must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful split"
+        );
+
+        // Neither card's lifecycle state moves: the original becomes
+        // deliverable again where it stands, and the follow-up card is
+        // named in the record, never mutated.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a split must not move the original card's lifecycle state"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            follow_up_status_before["data"]["state"],
+            "a split must not move the follow-up card's lifecycle state either"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        // No transition at all, unlike `abandon`'s own fact: a split moves
+        // no card state, so neither field is ever set.
+        assert!(fact["previous_state"].is_null(), "{fact}");
+        assert!(fact["next_state"].is_null(), "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "split", "{fact}");
+        assert_eq!(fact["metadata"]["dimension"], "review_returns", "{fact}");
+        assert_eq!(fact["metadata"]["follow_up_card_id"], "F-002", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized split for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+
+        // And the card really is deliverable again: `card status` reports
+        // `within`, not `escalated`, even though the review-return count
+        // that exhausted it is still 1.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "a split must make the card deliverable again"
+        );
+    }
+
+    #[test]
+    // The discriminating test (contract §7 item 2): confirms `split`
+    // behaves nothing like `renew`. Under a renew-shaped implementation —
+    // incrementing `renewals` instead of setting `escalation_waived` — the
+    // effective budget here would become 2 and the second attempt below
+    // would escalate the card again; this asserts it does not.
+    fn a_split_grants_no_further_budget() {
+        let workspace = opened_with_disposition_policies_and_limits(&["owner"], 1, 3, 3, 3, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let split = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "authorized split for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            split.status.success(),
+            "the split that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&split.stdout),
+            String::from_utf8_lossy(&split.stderr)
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the card must be within budget immediately after the split"
+        );
+
+        // Record a second attempt in the very same dimension the split
+        // named.
+        let head = redeliver_candidate(&workspace, "F-001");
+        let declaration = declaration_with_gate_failures(&workspace, "F-001", &head, "");
+        let handoff = workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+        assert!(
+            handoff.status.success(),
+            "delivery after split must succeed: {}{}",
+            String::from_utf8_lossy(&handoff.stdout),
+            String::from_utf8_lossy(&handoff.stderr)
+        );
+        let begin = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+        assert!(
+            begin.status.success(),
+            "review begin after split must succeed: {}{}",
+            String::from_utf8_lossy(&begin.stdout),
+            String::from_utf8_lossy(&begin.stderr)
+        );
+        // Unlike `escalate_via_review_returns`'s own first-round verdict,
+        // this one must also carry forward that first round's finding at
+        // `src/a.rs` as `resolved` — a re-review may not silently drop an
+        // earlier round's open finding.
+        let second_return_verdict = "reviewer_actor_id: reviewer\ndecision: changes_requested\nreason_category: acceptance_defect\nfindings:\n  - severity: medium\n    location: src/a.rs\n    detail: carried forward from the previous round\n    disposition: resolved\n  - severity: medium\n    location: src/a.rs\n    detail: a second defect found on re-review\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+        let verdict = write_verdict(&workspace, "F-001", second_return_verdict);
+        let record = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &verdict,
+            "--actor",
+            "reviewer",
+        ]);
+        assert!(
+            record.status.success(),
+            "a second review return in the split dimension must still be permitted to record: \
+         {}{}",
+            String::from_utf8_lossy(&record.stdout),
+            String::from_utf8_lossy(&record.stderr)
+        );
+
+        // The central assertion: a renew-shaped implementation would read
+        // an effective budget of 2 here and escalate again on the second
+        // attempt. Split grants nothing, so the card must still read
+        // `within`.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "split grants no budget: a second attempt in the same dimension must not escalate \
+         the card again"
+        );
+        // The dimension is split off, not erased: the count must really
+        // have reached 2. A projection that silently stopped counting once
+        // a dimension was split would make the assertion above pass for
+        // the wrong reason.
+        assert_eq!(
+            attempt_facts_of_kind(&workspace, "review_return").len(),
+            2,
+            "the second review return must still be recorded as a real attempt"
+        );
+    }
+
+    #[test]
+    fn a_split_covers_only_the_dimension_it_names() {
+        let workspace = opened_with_disposition_policies_and_limits(&["owner"], 5, 1, 1, 5, 3);
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let handoff = redeliver_after_return_declaring_a_gate_failure(
+            &workspace,
+            "F-001",
+            RETURN_WITH_REGRESSION_REASON_FOR_HANDOFF,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        assert!(
+            handoff.status.success(),
+            "the redelivery that exhausts both repair_attempts and gate_failures at once must \
+         itself succeed: {}{}",
+            String::from_utf8_lossy(&handoff.stdout),
+            String::from_utf8_lossy(&handoff.stderr)
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "both repair_attempts and gate_failures must be exhausted by the redelivery above"
+        );
+
+        let split = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "repair-attempts",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "authorized split for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            split.status.success(),
+            "splitting repair_attempts must succeed while it is exhausted: {}{}",
+            String::from_utf8_lossy(&split.stdout),
+            String::from_utf8_lossy(&split.stderr)
+        );
+
+        // gate_failures was never named: a second, independently exhausted
+        // dimension on the same card must still escalate it.
+        let convergence =
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"].clone();
+        assert_eq!(
+            convergence["status"], "escalated",
+            "gate_failures is still exhausted; the split named only repair_attempts: {convergence}"
+        );
+        let exhausted = convergence["exhausted"]
+            .as_array()
+            .expect("exhausted is an array");
+        assert_eq!(
+            exhausted.len(),
+            1,
+            "only one dimension may remain exhausted; repair_attempts was split off: {exhausted:?}"
+        );
+        assert_eq!(exhausted[0]["dimension"], "gate_failures", "{exhausted:?}");
+        assert_eq!(exhausted[0]["count"], 1, "{exhausted:?}");
+        assert_eq!(exhausted[0]["limit"], 1, "{exhausted:?}");
+    }
+
+    #[test]
+    fn a_second_split_of_the_same_dimension_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let first = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "first split",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first split must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "second split, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second split of an already-waived dimension must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&second).contains("already"),
+            "the refusal must name the earlier waiver: {}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first split's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_missing_follow_up_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "the follow-up card was never created",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a follow-up card that was never activated must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+        assert!(
+            error_message(&output).contains("F-002"),
+            "the refusal must name the missing follow-up card: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_card_cannot_be_its_own_follow_up() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-001",
+                "--rationale",
+                "a card cannot be its own follow-up",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card named as its own follow-up must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("own follow-up"),
+            "{}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_follow_up_card_in_another_cycle_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        activate_card_in_cycle(&workspace, "F-002", "C-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "cross-cycle follow-up should not be allowed",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a follow-up card in another cycle must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        let message = error_message(&output);
+        assert!(
+            message.contains("C-001"),
+            "the refusal must name the original card's cycle: {message}"
+        );
+        assert!(
+            message.contains("C-002"),
+            "the refusal must name the follow-up card's cycle: {message}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_follow_up_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.card(&[
+            "abandon",
+            "--card-id",
+            "F-002",
+            "--reason",
+            "superseded before it was picked up",
+        ]);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "abandoned",
+            "the fixture must really have reached a terminal state through a governed command"
+        );
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "a terminal follow-up should not be allowed",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a terminal follow-up card must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("abandoned"),
+            "the refusal must name the follow-up card's terminal state: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_split() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused split must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a
+        // convergence policy but no `final_authorization_policy` at all —
+        // the scenario `opened_with_disposition_policies` above always
+        // avoids by construction. Escalating a card only requires the
+        // convergence policy; authorizing the split requires the other
+        // one, which simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a split must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "would split if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "would split if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real split, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_split_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--follow-up-card-id",
+                "F-002",
+                "--rationale",
+                "the real split",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+    }
+}
+
+// 74-8: `disposition redesign`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, permanently ends an
+// escalated card because the approach itself was wrong, and names the
+// exact card that replaces it — the sixth and last of #74's dispositions.
+// Closest to `abandon`: both terminate the original card through the very
+// same `CardState::Abandoned` transition. What `redesign` adds is the
+// replacement binding, and — deliberately, unlike `split`'s follow-up —
+// that binding may name a card in a different cycle, recorded
+// self-describingly via `replacement_cycle_id` alongside
+// `replacement_card_id`. Unlike `split` and `accept-risk`, it waives
+// nothing and never touches `escalation_waived`: the card is terminal, so
+// there is no budget question left to answer, and there is no
+// `--dimension` either.
+//
+// Wrapped in its own module for the same reason every sibling disposition
+// module is: `the_dry_run_makes_every_check_and_writes_nothing` is already
+// the name used above, five times, for the same property on five other
+// commands, and none of the existing tests may be touched or renamed
+// beyond what this card's own contract requires. A module gives this
+// card's instance of that recurring name a distinct path
+// (`disposition_redesign::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_redesign {
+    use super::*;
+
+    /// Identical in shape to every sibling module's own copy of this
+    /// helper: `support::Workspace` is outside this card's file scope, so
+    /// each disposition module keeps its fixture-building local rather
+    /// than reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition redesign`'s authorization check (#7)
+    /// has a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition redesign` in JSON mode, returning the raw output.
+    /// Mirrors every other per-group `_raw` helper in this file; kept local
+    /// because `support::Workspace` is outside this card's file scope.
+    fn disposition_redesign_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "redesign".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is a redesign (none configures a
+    /// renewal, rebaseline, abandon, acceptance, or split too), so this is
+    /// never filtered further by `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    /// Creates and activates a card in an arbitrary cycle, not necessarily
+    /// `C-001`. Needed only by
+    /// `a_replacement_in_another_cycle_is_recorded_with_its_own_cycle`:
+    /// `support::Workspace::activate_card`, and every other
+    /// `activate_card_*` helper it offers, hard-codes `cycle_id: C-001`,
+    /// which that test's replacement card cannot use since the whole point
+    /// is putting it in a different cycle. Mirrors
+    /// `activate_card_with_gates`'s body directly, for the same reason
+    /// `initialized_with_authorizers` mirrors `Workspace::initialized`'s:
+    /// `support::Workspace` is outside this card's file scope.
+    fn activate_card_in_cycle(
+        workspace: &Workspace,
+        card_id: &str,
+        cycle_id: &str,
+        include: &[&str],
+    ) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base =
+            workspace.cycle_json(&["status", "--cycle-id", cycle_id])["data"]["baseline_sha"]
+                .as_str()
+                .expect("cycle has a frozen baseline")
+                .to_owned();
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: {cycle_id}\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        );
+        let path = workspace.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        workspace.card(&["create", "--draft", &path.display().to_string()]);
+        workspace.card(&["activate", "--card-id", card_id]);
+    }
+
+    #[test]
+    fn an_authorized_redesign_ends_a_card_and_names_its_replacement() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let replacement_status_before = workspace.card_json(&["status", "--card-id", "F-002"]);
+        let base = workspace.authority_head();
+        let pre_redesign_head = workspace.control_head();
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "authorized redesign for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "an authorized redesign of an escalated card must succeed: {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_redesign_head,
+            "disposition redesign must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful redesign"
+        );
+
+        // The original card is terminated; the replacement is named, not
+        // mutated.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned",
+            "a redesign must move the original card to abandoned"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            replacement_status_before["data"]["state"],
+            "a redesign must not move the replacement card's lifecycle state"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        assert_eq!(fact["previous_state"], "changes_requested", "{fact}");
+        assert_eq!(fact["next_state"], "abandoned", "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "redesign", "{fact}");
+        assert_eq!(fact["metadata"]["replacement_card_id"], "F-002", "{fact}");
+        assert_eq!(fact["metadata"]["replacement_cycle_id"], "C-001", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized redesign for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+        assert!(
+            !fact["metadata"]
+                .as_object()
+                .expect("metadata is an object")
+                .contains_key("dimension"),
+            "a redesign fact must name no dimension: {fact}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_in_another_cycle_is_recorded_with_its_own_cycle() {
+        // §5.2: unlike `split`, a redesign's replacement may live in a
+        // different cycle — the original card is terminal, so no
+        // dual-governance question survives. The fact must still record
+        // which cycle the replacement is actually in, not silently assume
+        // it shares the original's — 74-7b's review found exactly that gap
+        // in `split`'s own bare `follow_up_card_id`.
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        activate_card_in_cycle(&workspace, "F-002", "C-002", &["docs/f002/**"]);
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the replacement lives in a different cycle",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "a replacement card in another cycle must be permitted, unlike split's follow-up: \
+         {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(dispositions.len(), 1, "{dispositions:?}");
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["cycle_id"], "C-001",
+            "the fact itself is still bound to the original card's own cycle: {fact}"
+        );
+        assert_eq!(fact["metadata"]["replacement_card_id"], "F-002", "{fact}");
+        assert_eq!(
+            fact["metadata"]["replacement_cycle_id"], "C-002",
+            "the replacement's own cycle must be recorded, not the original's: {fact}"
+        );
+    }
+
+    #[test]
+    // This is the load-bearing test: the mutation in the contract's own
+    // §8 deletes the redesign exclusion from the card-bound
+    // `DispositionMetadata` loop's filter, which makes the redesign fact
+    // recorded below attempt a `dimension`-shaped parse it was never going
+    // to satisfy — refusing not just F-001's own projection but the whole
+    // cycle's, which is exactly what `approve_card` below would trip over
+    // for F-003, a card the redesign never touched.
+    fn an_unrelated_card_in_the_same_cycle_still_works_after_a_redesign() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "ending the escalated card for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "the redesign that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        // A third card in the same cycle, unrelated to both the original
+        // and the replacement, scoped away from both so all three can
+        // coexist without an ownership-overlap refusal, must be completely
+        // unaffected by F-001's redesign. `card status` alone would only
+        // prove the read-only projection path still works; `approve_card`
+        // drives F-003 through `handoff create`, `review begin`, and
+        // `review record` — three separate `require_convergence_budget`
+        // call sites — so this proves the budget-gated write path stays
+        // open too.
+        workspace.activate_card("F-003", &["docs/f003/**"]);
+        let status = workspace.card_raw(&["status", "--card-id", "F-003"]);
+        assert!(
+            status.status.success(),
+            "card status for an unrelated card must not be broken by another card's redesign: \
+         {}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        workspace.approve_card("F-003", "docs/f003/a.md");
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-003"])["data"]["state"],
+            "approved",
+            "an unrelated card in the same cycle must still deliver and be reviewed after \
+         another card's redesign"
+        );
+    }
+
+    #[test]
+    fn a_second_redesign_of_the_same_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.activate_card("F-003", &["docs/f003/**"]);
+
+        let first = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "first redesign",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first redesign must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        // The card's recorded facts do not disappear when it is
+        // redesigned. `card status` publishes exactly `assess_card`'s own
+        // assessment (see `card.rs`'s `card_convergence` doc comment) — so
+        // this is a direct, observed answer to whether `assess_card` still
+        // reports the card `Escalated` post-redesign, not an inference
+        // from the refusal below.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "a redesigned card's recorded facts do not disappear; it must still assess as \
+         escalated"
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-003",
+                "--rationale",
+                "second redesign, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second redesign of an already-abandoned card must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        // It is check 3 (the lifecycle transition), not check 2 (the
+        // escalation check), that refuses the repeat — the assertion above
+        // already established the card still reads `Escalated`, so if
+        // check 2 had fired instead the message would say the card is not
+        // escalated, not name a transition.
+        assert!(
+            error_message(&second).contains("cannot move from `abandoned` to `abandoned`"),
+            "{}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first redesign's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_not_escalated_cannot_be_redesigned() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-001", &["src/**"]);
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "nothing has escalated yet",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card that has never been escalated must not be redesignable"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("card abandon"),
+            "the refusal must name the route that does apply: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "ready",
+            "the refused redesign must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn a_missing_replacement_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the replacement card was never created",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a replacement card that was never activated must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+        assert!(
+            error_message(&output).contains("F-002"),
+            "the refusal must name the missing replacement card: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_card_cannot_replace_itself() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-001",
+                "--rationale",
+                "a card cannot be its own replacement",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card named as its own replacement must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("own replacement"),
+            "{}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_replacement_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.card(&[
+            "abandon",
+            "--card-id",
+            "F-002",
+            "--reason",
+            "superseded before it was picked up",
+        ]);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "abandoned",
+            "the fixture must really have reached a terminal state through a governed command"
+        );
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "a terminal replacement should not be allowed",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a terminal replacement card must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("abandoned"),
+            "the refusal must name the replacement card's terminal state: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_redesign() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused redesign must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a
+        // convergence policy but no `final_authorization_policy` at all —
+        // the scenario `opened_with_disposition_policies` above always
+        // avoids by construction. Escalating a card only requires the
+        // convergence policy; authorizing the redesign requires the other
+        // one, which simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a redesign must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "would redesign if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "ready",
+            "a dry run must never move the replacement card's state either"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "would redesign if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real redesign, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the real redesign",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned"
+        );
+    }
+}
+
+// 73-2: the enforcement half of the pattern 73-1 only reported.
+// `require_cycle_convergence_budget` (`integration.rs`) refuses every
+// governed path that advances an integration toward promotion once a
+// cycle's own convergence budget is spent — preparation, the merge/land/
+// verify/review sequence, final authorization (`acceptance record`), and
+// promotion itself — mirroring 72-2's `require_convergence_budget` at the
+// card level. It never touches `integration abandon`, `cycle abandon`, or
+// any inspect/report command: those are exits and windows, not advances.
+//
+// Unlike a card, which has six authorized dispositions (#74) to answer an
+// escalation, an escalated *cycle* has exactly two exits: every disposition
+// except `rebaseline` takes `--card-id`, so there is no cycle-scoped
+// `renew`. The refusal names both, by command, and this module's most
+// important test — `a_rebaseline_lets_an_escalated_cycle_integrate_again` —
+// proves the first one actually works, not merely that it is named.
+mod cycle_convergence_enforcement {
+    use super::*;
+
+    /// Escalates C-001's `integration_failures` budget through the governed
+    /// `integration merge` path — the same `conflicting_under_policy` /
+    /// `prepare_integration` fixture 73-1's own tests use, just with the
+    /// cycle limit tight enough that this one real conflict alone exhausts
+    /// it. Returns the still-open, never-merged integration id:
+    /// `run_merge`'s own conflict handling never sets
+    /// `record.integration_head`, so this integration keeps its lease
+    /// (`IntegrationStatus::Prepared.holds_lease()`) — the one legitimate
+    /// target every "does the gate fire first" test below reuses, rather
+    /// than each rebuilding its own conflict.
+    fn escalated_cycle(card_limit: u32) -> (Workspace, String) {
+        let workspace = conflicting_under_policy(card_limit, 1);
+        let id = prepare_integration(&workspace);
+        let output = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&output),
+            "CH-CONFLICT-MERGE-FAILED",
+            "the fixture must fail on the conflict it was built to produce, before this \
+             card's gate exists to refuse anything else"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "the fixture must actually exhaust the cycle's budget"
+        );
+        (workspace, id)
+    }
+
+    /// Creates and activates a card in an arbitrary cycle, not necessarily
+    /// `C-001`. `support::Workspace::activate_card`, and every other
+    /// `activate_card_*` helper it offers, hard-codes `cycle_id: C-001`,
+    /// which `an_unrelated_cycle_still_completes`'s second cycle cannot use.
+    /// Mirrors `activate_card_with_gates`'s body directly — the same reason
+    /// `disposition_split`'s and `disposition_redesign`'s identically-named
+    /// copies exist: `support::Workspace` is outside this card's file
+    /// scope, so each module that needs a non-`C-001` card keeps its own
+    /// copy rather than reaching into a sibling module's private helper.
+    fn activate_card_in_cycle(
+        workspace: &Workspace,
+        card_id: &str,
+        cycle_id: &str,
+        include: &[&str],
+    ) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base =
+            workspace.cycle_json(&["status", "--cycle-id", cycle_id])["data"]["baseline_sha"]
+                .as_str()
+                .expect("cycle has a frozen baseline")
+                .to_owned();
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: {cycle_id}\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        );
+        let path = workspace.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        workspace.card(&["create", "--draft", &path.display().to_string()]);
+        workspace.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Asserts that a raw command output was refused specifically for the
+    /// escalated cycle's convergence budget — by code, and by naming both
+    /// exits in the message — and that it left the control repository
+    /// untouched. Shared by every "does the gate fire first" test below, so
+    /// each one only has to say which command it drove and reuse this for
+    /// the assertions they would otherwise all repeat verbatim.
+    fn assert_refused_for_convergence(
+        workspace: &Workspace,
+        output: &std::process::Output,
+        before_head: &str,
+    ) {
+        assert!(
+            !output.status.success(),
+            "an escalated cycle must refuse this command: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(output), "CH-POLICY-CONVERGENCE-ESCALATED");
+        let message = error_message(output);
+        assert!(
+            message.contains("disposition rebaseline"),
+            "the refusal must name the first exit, by command: {message}"
+        );
+        assert!(
+            message.contains("cycle abandon"),
+            "the refusal must name the second exit, by command: {message}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_further_integration() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+
+        // The same still-open integration, tried again: this must be
+        // refused for the *cycle's* spent convergence budget now, not for
+        // the conflict that spent it in the first place — a second attempt
+        // never even reaches `integration preflight`'s own simulation.
+        let output = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+        let message = error_message(&output);
+        assert!(message.contains("integration_failures"), "{message}");
+        assert!(message.contains("1/1"), "{message}");
+
+        // No second `integration_failure` fact: the gate refused before a
+        // real merge attempt could ever be made, so there was nothing new
+        // to fail.
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the gate must refuse before a second conflict could be recorded"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_cycle_still_completes() {
+        let (workspace, _id) = escalated_cycle(3);
+
+        // A second cycle in the same project, wholly independent of C-001,
+        // must prepare and merge normally while C-001 sits escalated — #73's
+        // own acceptance criterion (contract §1): escalation is scoped to
+        // the cycle `assess_cycle` was projected against, never the project.
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second, unrelated slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        activate_card_in_cycle(&workspace, "F-101", "C-002", &["docs/f101/**"]);
+        workspace.approve_card("F-101", "docs/f101/a.md");
+
+        let before_prepare = workspace.control_head();
+        let prepared = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-002",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_ne!(
+            workspace.control_head(),
+            before_prepare,
+            "prepare must commit its own write"
+        );
+        let id = prepared["data"]["integration_id"]
+            .as_str()
+            .expect("a prepared integration id")
+            .to_owned();
+
+        let before_merge = workspace.control_head();
+        let merged = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert!(
+            merged.status.success(),
+            "an unrelated cycle's own integration must merge normally: {}{}",
+            String::from_utf8_lossy(&merged.stdout),
+            String::from_utf8_lossy(&merged.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_merge,
+            "merge must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after the unrelated cycle's merge"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-002"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the unrelated cycle's own budget must be untouched"
+        );
+
+        // And C-001 remains blocked throughout, proving the isolation runs
+        // both ways.
+        let still_blocked = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&still_blocked),
+            "CH-POLICY-CONVERGENCE-ESCALATED"
+        );
+    }
+
+    /// Like `Workspace::initialized`, but declares the final-authorization
+    /// policy's authorized actors at `project init` time — needed only by
+    /// `a_rebaseline_lets_an_escalated_cycle_integrate_again`, the one test
+    /// in this module that exercises `disposition rebaseline` and so needs
+    /// an authorizer for it to check. Mirrors
+    /// `disposition_rebaseline::initialized_with_authorizers` directly, for
+    /// the same reason `activate_card_in_cycle` mirrors its own sibling
+    /// copies: `support::Workspace` is outside this card's file scope.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Runs `disposition rebaseline` in JSON mode, returning the raw
+    /// output. Mirrors every other per-module `_raw` helper in this file;
+    /// kept local because `support::Workspace` is outside this card's file
+    /// scope.
+    fn disposition_rebaseline_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "rebaseline".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    #[test]
+    // The most important test in this card (contract §6.3): it proves the
+    // first exit the refusal above names actually works, not merely that it
+    // is named. If a rebaseline did not free the cycle, the refusal would
+    // be naming a way out that does not exist — a finding that changes the
+    // design, not something to work around.
+    #[allow(clippy::too_many_lines)]
+    fn a_rebaseline_lets_an_escalated_cycle_integrate_again() {
+        let workspace = initialized_with_authorizers(&["owner"]);
+        workspace.configure_convergence_policy(3, 1);
+
+        // The same conflict-on-the-protected-branch fixture
+        // `conflicting_under_policy` builds, assembled by hand here because
+        // that helper calls `Workspace::initialized`, which cannot declare
+        // the `--final-authorizer-actor-id` this test also needs — the same
+        // reason `disposition_rebaseline`'s own `opened_with_disposition_
+        // policies` cannot reuse the top-level `opened_with_policy` either.
+        fs::write(
+            workspace.repository.join("shared.txt"),
+            "line1\nline2\nline3\n",
+        )
+        .unwrap();
+        support::git(&workspace.repository, &["add", "-A"]);
+        support::git(&workspace.repository, &["commit", "-q", "-m", "add shared"]);
+        support::git(
+            &workspace.repository,
+            &["push", "-q", "harness-authority", "main"],
+        );
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["shared.txt"]);
+        workspace.approve_card("F-001", "shared.txt");
+        fs::write(
+            workspace.repository.join("shared.txt"),
+            "landed elsewhere\nline2\nline3\n",
+        )
+        .unwrap();
+        support::git(&workspace.repository, &["add", "-A"]);
+        support::git(&workspace.repository, &["commit", "-q", "-m", "hotfix"]);
+        support::git(
+            &workspace.repository,
+            &["push", "-q", "harness-authority", "main"],
+        );
+
+        let id = prepare_integration(&workspace);
+        let conflict = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&conflict),
+            "CH-CONFLICT-MERGE-FAILED",
+            "the fixture must fail on the conflict it was built to produce"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"]["status"],
+            "escalated"
+        );
+
+        // Clear INT-001's lease — abandon is one of the two exits, and stays
+        // ungated — then declare a fresh card whose write scope cannot
+        // possibly collide with the retired one. The point is to isolate
+        // the *cycle's* budget as the thing still blocking progress, not
+        // this one integration's own conflict.
+        workspace.integration(&[
+            "abandon",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--reason",
+            "clearing the lease to isolate the cycle-level refusal",
+        ]);
+        workspace.activate_card("F-002", &["src/f002/**"]);
+        workspace.approve_card("F-002", "src/f002/a.rs");
+
+        // The previously-refused path: a fresh `integration prepare` for
+        // *only* F-002 is still refused while the cycle stays escalated,
+        // even with the conflicting integration cleared out of the way and
+        // a clean candidate ready to go. Named explicitly with `--card-id`
+        // rather than left to select every ready card: F-001 itself is
+        // `approved` again after the abandon above, and selecting it back
+        // in would reintroduce the very conflict this test is careful to
+        // keep out of the way, for a reason unrelated to what it checks.
+        let before_rebaseline = workspace.control_head();
+        let still_refused = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--card-id",
+            "F-002",
+        ]);
+        assert_eq!(
+            error_code(&still_refused),
+            "CH-POLICY-CONVERGENCE-ESCALATED",
+            "prepare must still be refused before the exit below is exercised"
+        );
+        assert_eq!(workspace.control_head(), before_rebaseline);
+
+        // The first named exit, exercised for real, with a genuinely
+        // different policy — reinstalling the same digest unchanged is
+        // itself refused by `disposition rebaseline`'s own contract, so
+        // this is not merely a formality. The new policy keeps the same
+        // tight `integration_limit` of 1, changing only the card limit: a
+        // looser cycle limit would let the retried path succeed even if
+        // `project` failed to stop counting the retired fact, which would
+        // prove nothing about the digest retirement this test exists to
+        // check — see the assertion just below that the cycle reports
+        // `within`, not merely that it is one attempt short of `escalated`.
+        let new_policy_path = write_json(
+            &workspace,
+            "rebaseline-policy.json",
+            &convergence_policy_document(5, 1),
+        );
+        let rebaseline = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &new_policy_path,
+                "--rationale",
+                "opening the emergency exit for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            rebaseline.status.success(),
+            "an authorized rebaseline must succeed: {}{}",
+            String::from_utf8_lossy(&rebaseline.stdout),
+            String::from_utf8_lossy(&rebaseline.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_rebaseline,
+            "rebaseline must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after rebaseline"
+        );
+
+        // The cycle reports `within` again: the retired fact stops counting
+        // without being erased from the record.
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the retired fact must stop counting once rebaselined"
+        );
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the retired fact must remain in the record, not be erased"
+        );
+
+        // The headline claim: the previously-refused path now succeeds, all
+        // the way through a real merge — the cycle can integrate again.
+        // Still `--card-id F-002` alone, for the same reason as above: this
+        // proves the cycle-level budget was what was blocking, not that
+        // F-001's own conflict happened to have gone away.
+        let after_rebaseline = workspace.control_head();
+        let prepared = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--card-id",
+            "F-002",
+        ]);
+        assert_ne!(
+            workspace.control_head(),
+            after_rebaseline,
+            "prepare must commit its own write"
+        );
+        let new_id = prepared["data"]["integration_id"]
+            .as_str()
+            .expect("a prepared integration id")
+            .to_owned();
+
+        let before_merge = workspace.control_head();
+        let merged = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &new_id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert!(
+            merged.status.success(),
+            "the exit named in the refusal must actually let the cycle integrate again: {}{}",
+            String::from_utf8_lossy(&merged.stdout),
+            String::from_utf8_lossy(&merged.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_merge,
+            "merge must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after the post-rebaseline merge"
+        );
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the clean post-rebaseline merge must not add a new failure fact"
+        );
+    }
+
+    #[test]
+    fn an_escalated_cycle_can_still_be_abandoned() {
+        let (workspace, _id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.cycle_raw(&[
+            "abandon",
+            "--cycle-id",
+            "C-001",
+            "--reason",
+            "closing the escalated cycle",
+        ]);
+        assert!(
+            output.status.success(),
+            "cycle abandon must stay usable on an escalated cycle: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_head,
+            "cycle abandon must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after abandoning an escalated cycle"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["status"],
+            "abandoned"
+        );
+    }
+
+    #[test]
+    fn an_escalated_cycle_is_still_inspectable() {
+        let (workspace, id) = escalated_cycle(3);
+
+        let status = workspace.cycle_raw(&["status", "--cycle-id", "C-001"]);
+        assert!(
+            status.status.success(),
+            "cycle status must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status_envelope: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(
+            status_envelope["data"]["convergence"]["status"],
+            "escalated"
+        );
+
+        let list = workspace.cycle_raw(&["list"]);
+        assert!(
+            list.status.success(),
+            "cycle list must stay readable on an escalated cycle"
+        );
+
+        let inspect = workspace.integration_raw(&["inspect", "--integration-id", &id]);
+        assert!(
+            inspect.status.success(),
+            "integration inspect must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+
+        let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+        assert!(
+            ready.status.success(),
+            "integration ready must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&ready.stderr)
+        );
+
+        // `decision-packet` only ever answers for a `--final` integration;
+        // this fixture's is an ordinary per-card one, so its refusal here
+        // must be the pre-existing "not the final integration" reason —
+        // never the convergence gate, proving decision-packet was never
+        // wired into the gated set at all.
+        let packet = workspace.integration_raw(&["decision-packet", "--integration-id", &id]);
+        assert!(!packet.status.success());
+        assert_eq!(error_code(&packet), "CH-POLICY-DECISION-PACKET-FINAL-ONLY");
+    }
+
+    // Contract §6 item 6: one test per additional gated call site beyond
+    // `integration merge` (already covered above). Every test below reuses
+    // `escalated_cycle`'s still-open, never-merged integration and drives
+    // exactly one more command against it, proving `require_cycle_
+    // convergence_budget` is the first check each of these commands makes —
+    // the refusal is `CH-POLICY-CONVERGENCE-ESCALATED`, never whichever
+    // other precondition that command would otherwise report first (a
+    // missing landing commit, an illegal status transition, and so on),
+    // which is exactly what would surface if the gate were missing. None of
+    // these integrations are otherwise ready for the command under test —
+    // that is deliberate: it proves the gate runs before anything else does,
+    // not only when every other precondition happens to already hold.
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_a_new_integration_prepare() {
+        let (workspace, id) = escalated_cycle(3);
+
+        // `integration abandon` stays ungated — it is one of the exits —
+        // so clearing the escalating integration's lease first proves this
+        // refusal is about the cycle's spent budget, not merely about
+        // `PolicyIntegrationOpen`'s pre-existing "one integration at a
+        // time" rule.
+        let abandon = workspace.integration_raw(&[
+            "abandon",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--reason",
+            "clearing the lease to prove prepare is still gated",
+        ]);
+        assert!(
+            abandon.status.success(),
+            "integration abandon must stay usable on an escalated cycle: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_land() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "land",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_verify() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "verify",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "verifier",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_review() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "review",
+            "--integration-id",
+            &id,
+            "--reviewer-actor-id",
+            "reviewer",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_promote() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "promote",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "release-agent",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_acceptance_record() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.acceptance_raw(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--authorizer-actor-id",
+            "owner",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
     }
 }

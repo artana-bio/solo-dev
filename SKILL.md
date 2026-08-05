@@ -279,6 +279,121 @@ change-harness archive close --integration-id INT-001
 Acceptance is bound to one landing SHA. Promotion uses compare-and-swap.
 Archive before close so the landed work remains reachable.
 
+## Convergence budgets and escalation
+
+A convergence policy is optional. Once a project configures one, every
+review return, repair attempt, gate failure, and material scope revision on
+a card — and every integration failure on its cycle — becomes a counted
+attempt against a budget. Running out is called escalation, and escalation
+is designed to be answered, not worked around.
+
+### Budgets
+
+A convergence policy registers per-risk limits on four card dimensions —
+review returns, repair attempts, gate failures, and material scope
+revisions — plus one cycle dimension, integration failures. A card's
+declared `risk` selects which set of limits applies to it. No budget exists
+unless a policy is configured: a project without one reports
+`legacy_unassessed`, and nothing is enforced.
+
+### Escalation
+
+A dimension is exhausted at `count >= limit` — the limit is how many
+attempts you get, and the last one spends it. An escalated card refuses
+delivery and review; an escalated cycle refuses integration preparation, the
+merge/land path, verification, integration review, final authorization, and
+promotion.
+
+Read the state before guessing at it. `card status` and `cycle status`
+report the budget, the evidence behind each count, and the next permitted
+action:
+
+```bash
+change-harness card status --card-id F-001
+change-harness cycle status --cycle-id C-001
+```
+
+### The six card dispositions
+
+An escalated card has exactly six authorized ways forward. Get the
+distinctions right — they are the whole point.
+
+- `renew` grants exactly one more configured budget in the one dimension
+  that is exhausted. Further attempts still count, and can escalate the
+  same dimension again.
+
+  ```bash
+  change-harness disposition renew --card-id F-001 --dimension repair-attempts --actor coordinator --rationale "one more repair attempt is warranted"
+  ```
+
+- `accept-risk` lets the card proceed with **no** further budget. The count
+  keeps climbing, but the dimension stops escalating, because an authorized
+  actor accepted that risk. It requires both what risk is accepted and why.
+
+  ```bash
+  change-harness disposition accept-risk --card-id F-001 --dimension gate-failures --risk "the flaky integration gate may fail once more" --rationale "shipping now is safer than another repair cycle" --actor coordinator
+  ```
+
+- `split` moves the remaining work behind one exhausted dimension to an
+  **already-existing** follow-up card in the same cycle, and waives that
+  dimension the same way `accept-risk` does. Create the follow-up card
+  first:
+
+  ```bash
+  change-harness card create --draft F-002.yaml
+  change-harness disposition split --card-id F-001 --dimension material-scope-revisions --follow-up-card-id F-002 --actor coordinator --rationale "the remaining scope is a distinct outcome"
+  ```
+
+- `abandon` permanently ends an escalated card. There is no way back.
+
+  ```bash
+  change-harness disposition abandon --card-id F-001 --actor coordinator --rationale "the approach will not converge"
+  ```
+
+- `redesign` also permanently ends the card, because the approach itself was
+  wrong, and names the exact card that replaces it. The replacement may sit
+  in a different cycle.
+
+  ```bash
+  change-harness disposition redesign --card-id F-001 --replacement-card-id F-010 --actor coordinator --rationale "the approach was wrong; replaced by F-010"
+  ```
+
+- `rebaseline` is project-wide, not per-card: it retires the currently
+  configured convergence policy digest, installs a new one, and re-pins
+  every non-terminal cycle to it, all in one transaction.
+
+  ```bash
+  change-harness disposition rebaseline --policy new-policy.json --actor coordinator --rationale "the configured limits were miscalibrated project-wide"
+  ```
+
+### Who may record a disposition
+
+Authorization is `final_authorization_policy.authorizer_actor_ids` — the
+same set that authorizes a sealed cycle's final acceptance. Every
+disposition needs a non-blank `--rationale`.
+
+Four of the six refuse a repeat: `accept-risk` and `split` each refuse a
+second call on a dimension whose escalation is already waived, and `abandon`
+and `redesign` refuse a second call outright, because the card is already
+terminal. `renew` is the exception by design — the same dimension can be
+renewed again the next time it escalates.
+
+### The cycle-level budget
+
+A cycle carries its own budget, on integration failures, and there is no
+cycle-scoped `renew` — every disposition except `rebaseline` takes
+`--card-id`, not `--cycle-id`. An escalated cycle has exactly two exits:
+
+```bash
+change-harness disposition rebaseline --policy new-policy.json --actor coordinator --rationale "retire the digest so the old integration failures stop counting"
+change-harness cycle abandon --cycle-id C-001 --actor coordinator --reason "the cycle cannot integrate; ending it"
+```
+
+`rebaseline` retires the digest so the old `integration_failure` facts stop
+counting; `cycle abandon` ends the cycle outright. Both are heavy by design:
+a cycle that cannot integrate is a design signal, not something to patch
+indefinitely.
+
 ## Recovery and safe refusals
 
 Common responses are simple:

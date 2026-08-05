@@ -19,6 +19,84 @@
 //! `refuse_orphaning_facts` doc comment calls this "the same defect as #79
 //! with another name") would leave every open cycle broken at its very next
 //! gate command.
+//!
+//! `abandon` is the third: an authorized actor permanently ends an escalated
+//! card instead of granting it another attempt. There is no way back —
+//! `CardState::Abandoned` has no successors, so a repeated `disposition
+//! abandon` against the same card is refused by the ordinary lifecycle
+//! transition check itself, the same check `card abandon` already relies on
+//! for its own, *unauthorized* exit from a card that was never escalated in
+//! the first place. What actually has to hold, and is easy to get wrong: an
+//! abandon fact names no `dimension`, and `project` must keep it away from
+//! the `DispositionMetadata` parse that requires one — otherwise one
+//! abandoned card would refuse `card status` and every budget-gated command
+//! for every *other* card sharing its cycle, which is exactly the isolation
+//! #74 promises.
+//!
+//! `accept-risk` is the fourth: an authorized actor accepts a **disclosed**
+//! risk on one exhausted dimension of an escalated card, so the card can be
+//! delivered and reviewed again — without its budget being expanded. That
+//! distinction from `renew` is the entire point of this command: `renew`
+//! grants the configured limit again, so a further attempt still counts and
+//! can escalate the same dimension a second time; `accept-risk` grants
+//! nothing, so the count keeps climbing past the limit forever and the
+//! dimension simply stops being reported exhausted, because an authorized
+//! actor accepted that risk. `--risk` and `--rationale` are both required
+//! and distinct on purpose: `--risk` is *what* is being accepted — the
+//! disclosure, without which "disclosed risk" means nothing — and
+//! `--rationale` is *why* accepting it is justified.
+//!
+//! `split` is the fifth: an authorized actor moves the remaining work
+//! behind one exhausted dimension to an **already-existing** follow-up
+//! card, so the current card can be delivered and reviewed again — the
+//! authorized route for #9's own criterion that "non-blocking improvements
+//! can be moved to follow-up cards without holding the current card open."
+//! `split` does not create the follow-up card itself: `card create`
+//! refuses outside an `Active` cycle, and an escalated card is very often
+//! sitting in a `Sealed` one, where card membership is deliberately
+//! frozen, so a self-creating split would fail exactly where it is most
+//! needed, and would stand up a second, competing implementation of card
+//! creation. So the operator creates the follow-up card first, through the
+//! normal governed path that already enforces every cycle rule, and
+//! `split` only binds to it by id — recording an exact binding between the
+//! two, which is #74's "exact target" criterion. Like `accept-risk`,
+//! `split` grants no budget back: it waives the named dimension's
+//! escalation through the very same `DimensionCount::escalation_waived`
+//! flag `accept-risk` sets, recording *which* decision waived it in the
+//! fact's own `disposition` field rather than adding a second flag next to
+//! the first. Also like `accept-risk`, it moves no card state at all — not
+//! the original card's, and not the follow-up's either: the follow-up card
+//! is named in the record, never mutated, so a card's lifecycle state only
+//! ever changes in one place.
+//!
+//! `redesign` is the sixth and last: an authorized actor ends an escalated
+//! card because the approach itself was wrong, and names the exact card
+//! that replaces it — #9's own criterion to "treat fundamental repeated
+//! failures as a design or scope signal, not as an invitation to patch
+//! indefinitely." Closest to `abandon`: both terminate the original card,
+//! through the very same `CardState::Abandoned` transition and the very
+//! same "a repeated disposition refuses" property that transition gives
+//! for free, since `Abandoned` has no successors. What `redesign` adds is
+//! the replacement binding — the record shows the work continued
+//! elsewhere, not merely stopped — and that binding may name a card in a
+//! **different** cycle, deliberately, unlike `split`'s follow-up: `split`
+//! leaves the original card alive and governed, so a cross-cycle follow-up
+//! would create two cycles with a live claim on one decision, while
+//! `redesign` terminates the original, so no dual-governance question
+//! survives. 74-7b's review found the cost of naming a foreign cycle only
+//! implicitly, through `split`'s bare `follow_up_card_id`: a cross-cycle
+//! fact reads as though it named a card in its own cycle unless something
+//! says otherwise. So `redesign` records `replacement_cycle_id` alongside
+//! `replacement_card_id`, taken from the replacement's own loaded record,
+//! keeping the binding self-describing. Closest to `split` in one other
+//! way and no more: `redesign`, like `split`, does not create the
+//! replacement card, for the same reason — the operator names an
+//! already-existing card, reached through the normal governed path, and
+//! `redesign` only binds to it. Unlike `split` and `accept-risk`,
+//! `redesign` waives nothing and never touches
+//! `DimensionCount::escalation_waived`: the card is terminal, so there is
+//! no budget question left to answer, and there is no `--dimension`
+//! either — a redesign answers the whole card, not one dimension of it.
 
 use std::{
     fs,
@@ -29,14 +107,18 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
-    commands::{CONTROL_ENV, card::load_card, transaction::with_transaction},
+    commands::{
+        CONTROL_ENV,
+        card::{load_card, store_card_state},
+        transaction::with_transaction,
+    },
     config::{ConvergencePolicy, FieldError, ProjectConfig},
     control::{
         event_store::{EventDraft, EventStore},
         repository::{ControlRepository, PROJECT_FILE},
     },
     domain::{
-        card::CardRecord,
+        card::{CardRecord, CardState},
         clock::Clock,
         cycle::{CYCLE_DIR, CycleRecord},
         digest::Digest,
@@ -45,8 +127,8 @@ use crate::{
     error::{ErrorCode, HarnessError},
     git::authority::inspect_authority,
     policy::convergence::{
-        CardConvergence, CardDimension, DISPOSITION_RECORDED_EVENT, DispositionKind, assess_card,
-        project,
+        CardConvergence, CardCounters, CardDimension, DISPOSITION_RECORDED_EVENT, DispositionKind,
+        ProjectConvergence, assess_card, project,
     },
 };
 
@@ -59,6 +141,23 @@ pub enum DispositionCommand {
     /// new one, and re-pin every non-terminal cycle's `project_revision` to
     /// it, all in one transaction.
     Rebaseline(RebaselineArgs),
+    /// Permanently end an escalated card — the authorized exit from an
+    /// escalation, in place of another renewal.
+    Abandon(AbandonArgs),
+    /// Accept a disclosed risk on one exhausted dimension of an escalated
+    /// card, without expanding its budget — the authorized exit from an
+    /// escalation that grants no further attempts, in place of a renewal.
+    AcceptRisk(AcceptRiskArgs),
+    /// Move the remaining work behind one exhausted dimension to an
+    /// already-existing follow-up card, without expanding the original
+    /// card's budget — the authorized exit from an escalation that records
+    /// exactly where the deferred work went, in place of a renewal.
+    Split(SplitArgs),
+    /// Permanently end an escalated card because the approach itself was
+    /// wrong, and name the exact card that replaces it — the authorized
+    /// exit from an escalation that ends the original attempt rather than
+    /// granting it another one, in place of a renewal.
+    Redesign(RedesignArgs),
 }
 
 impl DispositionCommand {
@@ -68,6 +167,10 @@ impl DispositionCommand {
         match self {
             Self::Renew(..) => "disposition.renew",
             Self::Rebaseline(..) => "disposition.rebaseline",
+            Self::Abandon(..) => "disposition.abandon",
+            Self::AcceptRisk(..) => "disposition.accept-risk",
+            Self::Split(..) => "disposition.split",
+            Self::Redesign(..) => "disposition.redesign",
         }
     }
 }
@@ -150,6 +253,97 @@ pub struct RebaselineArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `disposition abandon`.
+#[derive(Debug, Args)]
+pub struct AbandonArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The escalated card being permanently abandoned.
+    #[arg(long)]
+    pub card_id: String,
+    /// Why this abandonment is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `disposition accept-risk`.
+#[derive(Debug, Args)]
+pub struct AcceptRiskArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card whose disclosed risk is being accepted.
+    #[arg(long)]
+    pub card_id: String,
+    /// The exhausted dimension whose risk is being accepted.
+    #[arg(long, value_enum)]
+    pub dimension: DimensionArg,
+    /// The disclosed risk being accepted — *what* is being accepted, not
+    /// *why*; see `rationale` for the latter.
+    #[arg(long)]
+    pub risk: String,
+    /// Why accepting this disclosed risk is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `disposition split`.
+#[derive(Debug, Args)]
+pub struct SplitArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The escalated card whose exhausted dimension is being split off.
+    #[arg(long)]
+    pub card_id: String,
+    /// The exhausted dimension whose remaining work is moving to the
+    /// follow-up card.
+    #[arg(long, value_enum)]
+    pub dimension: DimensionArg,
+    /// The already-existing card the deferred work is moving to. `split`
+    /// binds to it; it does not create it — see the module doc comment for
+    /// why.
+    #[arg(long)]
+    pub follow_up_card_id: String,
+    /// Why this split is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `disposition redesign`.
+///
+/// Deliberately carries no `--dimension`, unlike `renew`, `accept-risk`, and
+/// `split`: a redesign answers the whole card, not one dimension of it —
+/// see the module doc comment.
+#[derive(Debug, Args)]
+pub struct RedesignArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The escalated card whose approach was wrong and is being ended.
+    #[arg(long)]
+    pub card_id: String,
+    /// The already-existing card that replaces it. `redesign` binds to it;
+    /// it does not create it — see the module doc comment for why, the
+    /// same reason `split` does not create its own follow-up card. Unlike
+    /// `split`'s follow-up, this may name a card in a different cycle; see
+    /// the module doc comment.
+    #[arg(long)]
+    pub replacement_card_id: String,
+    /// Why this redesign is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `disposition` subcommand.
 ///
 /// # Errors
@@ -162,6 +356,10 @@ pub fn execute(
     match command {
         DispositionCommand::Renew(args) => run_renew(args, clock),
         DispositionCommand::Rebaseline(args) => run_rebaseline(args, clock),
+        DispositionCommand::Abandon(args) => run_abandon(args, clock),
+        DispositionCommand::AcceptRisk(args) => run_accept_risk(args, clock),
+        DispositionCommand::Split(args) => run_split(args, clock),
+        DispositionCommand::Redesign(args) => run_redesign(args, clock),
     }
 }
 
@@ -791,6 +989,1202 @@ fn run_rebaseline(
                     "policy_digest": preflight.new_digest.as_str(),
                     "repinned_cycles": repinned,
                     "fact_count": repinned.len(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Runs every check `disposition abandon` must satisfy before it writes
+/// anything, in the fixed order #74-5's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when the card is not currently escalated,
+/// or when its current lifecycle state does not permit the transition to
+/// `CardState::Abandoned` — whatever [`CardState::check_transition`] itself
+/// returns for that. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank. Propagates a control-read or projection
+/// failure unchanged.
+fn require_abandonable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    current_state: CardState,
+    actor: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none, no
+    // card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so no card can ever be escalated,
+    // and there is no digest to bind the recorded fact to.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be abandoned this way: no convergence policy is configured for this project, so no card can be escalated",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 2: the card must be escalated *right now* — read the same way
+    // `require_renewable` reads it: a fresh `EventStore::new(control).
+    // for_cycle(...)` projected and assessed, so this command can never
+    // disagree with the check it exists to release a card from.
+    // `disposition abandon` is the authorized *escalation exit*, not a
+    // general-purpose abandon — a card that is `Within` is refused here and
+    // pointed at `card abandon`, the ordinary route that already covers it,
+    // so an operator refused here is never left with nowhere to go.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+    let CardConvergence::Escalated { .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; `disposition abandon` only ends an active escalation — to abandon a card that is not escalated, use `card abandon` instead",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 3: the card's lifecycle state must permit the transition to
+    // `Abandoned`. This is where "a repeated disposition refuses" comes
+    // from, and it comes for free: `Abandoned` has no successors, so a
+    // second `disposition abandon` against the same card reaches this exact
+    // check and is refused by it. An already-abandoned card's recorded
+    // facts do not disappear, so it still assesses as `Escalated` and still
+    // passes check 2 above every time — it is this check, not check 2, that
+    // stops a repeat.
+    current_state.check_transition(CardState::Abandoned)?;
+
+    // Check 4: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path
+    // `require_renewable` and `require_rebaseline` already resolve it
+    // through — see `require_renewable`'s own long note for why this set is
+    // reused rather than given its own field on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence disposition abandon".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {actor} is not configured to authorize a convergence disposition abandon"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 5: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition abandon requires a non-blank --rationale; an abandon with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition abandon` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_abandonable`], so a caller can never be told an abandon would
+/// succeed (or told why it would fail) and then have the real command
+/// disagree.
+fn preview_abandon(args: &AbandonArgs, card_id: &CardId) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_abandonable(
+        &control,
+        &config,
+        &record,
+        state.state,
+        &args.common.actor,
+        &args.rationale,
+    )?;
+    Ok(CommandOutcome::new(
+        "disposition.abandon",
+        format!("Dry run: would abandon card {card_id}; nothing was changed"),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+
+    if args.dry_run {
+        return preview_abandon(args, &card_id);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.abandon",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let previous = state.state;
+            let config = control.project()?;
+            let policy_digest = require_abandonable(
+                control,
+                &config,
+                &record,
+                previous,
+                &args.common.actor,
+                &args.rationale,
+            )?;
+
+            store_card_state(control, &record, &state, CardState::Abandoned)?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding `renew` uses, and for the same reason: it is the
+            // only exact commit SHA an escalated card is guaranteed to
+            // carry in any lifecycle state.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .transition(Some(previous.name()), CardState::Abandoned.name())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::Abandon)?,
+                    )
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(expected, &format!("disposition: abandon {card_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "disposition.abandon",
+                format!(
+                    "Abandoned card {card_id}\nrationale: {}\nauthorized by: {}",
+                    args.rationale, args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Abandoned.name(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Whether `counters` already carries a waived escalation on `dimension`,
+/// however it was waived.
+///
+/// Reads the raw per-dimension `escalation_waived` flag rather than going
+/// through `assess_card`: once an escalation is waived, `assess_card` never
+/// reports that dimension exhausted again (see its own doc comment), so its
+/// output cannot tell "this dimension was never exhausted" apart from
+/// "this dimension was exhausted, and its escalation was already waived" —
+/// and both `require_risk_acceptable`'s own check 3 and
+/// `require_splittable`'s own check 3 need exactly that distinction. One
+/// shared helper, not two near-identical copies, because both checks are
+/// the same question asked by two different commands: `accept-risk` and
+/// `split` waive the very same flag, so whether it is already waived does
+/// not depend on which of the two is asking. Kept as its own match rather
+/// than shared with `project`'s identically-shaped one: that function's
+/// copy operates on `&mut` references while folding a fact, and
+/// `policy::convergence` is not this card's file scope to widen.
+fn escalation_already_waived(counters: &CardCounters, dimension: CardDimension) -> bool {
+    match dimension {
+        CardDimension::ReviewReturns => counters.review_returns.escalation_waived,
+        CardDimension::RepairAttempts => counters.repair_attempts.escalation_waived,
+        CardDimension::GateFailures => counters.gate_failures.escalation_waived,
+        CardDimension::MaterialScopeRevisions => {
+            counters.material_scope_revisions.escalation_waived
+        }
+    }
+}
+
+/// Runs every check `disposition accept-risk` must satisfy before it writes
+/// anything, in the fixed order #74-6's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when this dimension already carries an
+/// accepted risk, when the card is not currently escalated, or when the
+/// named dimension is not among the ones that are exhausted. Returns
+/// [`ErrorCode::PolicyNotAccepted`] when no final-authorization policy is
+/// configured, or when the acting actor is not in its authorized set.
+/// Returns [`ErrorCode::UsageInvalidArguments`] when `risk` or `rationale`
+/// is blank. Propagates a control-read or projection failure unchanged.
+fn require_risk_acceptable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    dimension: CardDimension,
+    actor: &str,
+    risk: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none,
+    // no card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so there is no exhausted
+    // dimension whose risk could ever be accepted.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot have a risk accepted: no convergence policy is configured for this project, so no dimension can be exhausted",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Checks 2, 3, 4, and 5 all read the same fresh projection and
+    // assessment: the same `EventStore::new(control).for_cycle(...)` →
+    // `project(...)` → `assess_card(...)` sequence `require_renewable` and
+    // `require_abandonable` already use, so this command can never
+    // disagree with the checks it exists to release a card from. Both the
+    // raw projected `view` and the derived `convergence` assessment are
+    // kept: check 3 needs the former (`assess_card`'s own output cannot
+    // distinguish "never exhausted" from "exhausted, then accepted" — see
+    // `escalation_already_waived`), and checks 4 and 5 need the latter.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+
+    // Check 3: this dimension must not already carry an accepted risk.
+    // Checked *before* checks 4 and 5, on purpose: once a risk is accepted,
+    // `assess_card` never reports that dimension exhausted again, so a
+    // repeated acceptance would otherwise fall through to check 4 or 5 and
+    // be refused with "the card is not escalated" or "that dimension still
+    // has budget" — both true-sounding, and both misleading about what
+    // actually happened. This check names the earlier acceptance instead.
+    let already_accepted = match &view {
+        ProjectConvergence::Configured(projection) => projection
+            .cards
+            .get(&record.card_id)
+            .is_some_and(|counters| escalation_already_waived(counters, dimension)),
+        ProjectConvergence::LegacyUnassessed => false,
+    };
+    if already_accepted {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} already has an accepted risk on `{}`; a dimension's risk can only be accepted once",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 4: the card must be escalated *right now* — the same "response
+    // to escalation, not a blank cheque" property `require_renewable`'s
+    // own check 2 documents.
+    let CardConvergence::Escalated { exhausted, .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; there is no exhausted risk to accept",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 5: the *named* dimension specifically must be one of the
+    // exhausted ones — the same reasoning as `require_renewable`'s own
+    // check 3: a dimension that still has budget cannot have its risk
+    // pre-accepted, because that is silent expansion by another name. The
+    // refusal names every dimension that really is exhausted.
+    if !exhausted.iter().any(|item| item.dimension == dimension) {
+        let actually_exhausted = exhausted
+            .iter()
+            .map(|item| dimension_wire_name(item.dimension))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot pre-accept risk on `{}`: that dimension still has budget; the exhausted dimension(s) are: {actually_exhausted}",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 6: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path
+    // `require_renewable`, `require_rebaseline`, and `require_abandonable`
+    // already resolve it through — see `require_renewable`'s own long note
+    // for why this set is reused rather than given its own field on
+    // `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence risk acceptance".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {actor} is not configured to authorize a convergence risk acceptance"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 7: `--risk` and `--rationale` are refused separately, with
+    // distinct messages, even though both land on the same error code —
+    // deliberately, so an operator who left one blank does not have to
+    // guess which. `--risk` is checked first: it is *what* is being
+    // accepted, without which "disclosed risk" means nothing, and reads
+    // naturally as the first thing an operator would fix.
+    if risk.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition accept-risk requires a non-blank --risk; an accepted risk with no declared disclosure cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition accept-risk requires a non-blank --rationale; an accepted risk with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition accept-risk` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_risk_acceptable`], so a caller can never be told an
+/// acceptance would succeed (or told why it would fail) and then have the
+/// real command disagree.
+fn preview_accept_risk(
+    args: &AcceptRiskArgs,
+    card_id: &CardId,
+    dimension: CardDimension,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, _state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_risk_acceptable(
+        &control,
+        &config,
+        &record,
+        dimension,
+        &args.common.actor,
+        &args.risk,
+        &args.rationale,
+    )?;
+    Ok(CommandOutcome::new(
+        "disposition.accept-risk",
+        format!(
+            "Dry run: would accept risk on card {card_id}'s {} dimension; nothing was changed",
+            dimension_wire_name(dimension)
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "dimension": dimension_wire_name(dimension),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_accept_risk(
+    args: &AcceptRiskArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let dimension: CardDimension = args.dimension.into();
+
+    if args.dry_run {
+        return preview_accept_risk(args, &card_id, dimension);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.accept-risk",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let config = control.project()?;
+            let policy_digest = require_risk_acceptable(
+                control,
+                &config,
+                &record,
+                dimension,
+                &args.common.actor,
+                &args.risk,
+                &args.rationale,
+            )?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding `renew` and `abandon` use, and for the same
+            // reason: it is the only exact commit SHA an escalated card is
+            // guaranteed to carry in any lifecycle state. No
+            // `store_card_state` call and no `.transition(...)` on this
+            // event: unlike `abandon`, an acceptance moves no card state —
+            // the card simply becomes deliverable again where it stands.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::AcceptRisk)?,
+                    )
+                    .meta("dimension", serde_json::to_value(dimension)?)
+                    .meta("risk", serde_json::json!(args.risk))
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(
+                expected,
+                &format!(
+                    "disposition: accept-risk {card_id} {}",
+                    dimension_wire_name(dimension)
+                ),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.accept-risk",
+                format!(
+                    "Accepted risk on card {card_id}'s {} dimension\nrisk: {}\nrationale: {}\nauthorized by: {}",
+                    dimension_wire_name(dimension),
+                    args.risk,
+                    args.rationale,
+                    args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "dimension": dimension_wire_name(dimension),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Runs every check `disposition split` must satisfy before it writes
+/// anything, in the fixed order #74-7's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when this dimension's escalation is
+/// already waived, when the card is not currently escalated, when the
+/// named dimension is not among the ones that are exhausted, when the
+/// follow-up card is the card being split, when the follow-up card is in a
+/// different cycle, or when the follow-up card is terminal. Returns
+/// whatever [`load_card`] returns when the follow-up card cannot be
+/// loaded — ordinarily [`ErrorCode::PreconditionNotFound`] for one that was
+/// never activated. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank. Propagates a control-read or projection
+/// failure unchanged.
+// Eleven checks, each with its own explanatory comment, run past the
+// default line limit — the same reason `project`, in `policy::convergence`,
+// and `run_status`, in `card.rs`, both carry this same allow.
+#[allow(clippy::too_many_lines)]
+fn require_splittable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    dimension: CardDimension,
+    follow_up_card_id: &CardId,
+    actor: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none,
+    // no card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so there is no exhausted
+    // dimension whose work could ever be split off.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be split: no convergence policy is configured for this project, so no dimension can be exhausted",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Checks 2, 3, 4, and 5 all read the same fresh projection and
+    // assessment — the same `EventStore::new(control).for_cycle(...)` →
+    // `project(...)` → `assess_card(...)` sequence every sibling disposition
+    // above already uses — so this command can never disagree with the
+    // checks it exists to release a card from. Both the raw projected
+    // `view` and the derived `convergence` assessment are kept, for exactly
+    // the reason `require_risk_acceptable` keeps both: check 3 needs the
+    // former (`assess_card`'s own output cannot distinguish "never
+    // exhausted" from "exhausted, then waived" — see
+    // `escalation_already_waived`), and checks 4 and 5 need the latter.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+
+    // Check 3: this dimension's escalation must not already be waived —
+    // by an earlier split *or* an earlier accept-risk, since both set the
+    // very same flag and this check cannot tell which. Checked *before*
+    // checks 4 and 5, for the same reason `require_risk_acceptable` checks
+    // its own equivalent there: once a dimension's escalation is waived,
+    // `assess_card` never reports it exhausted again, so a repeat would
+    // otherwise fall through to check 4 or 5 and be refused with "the card
+    // is not escalated" or "that dimension still has budget" — both
+    // true-sounding, and both misleading about what actually happened.
+    // This check names the earlier waiver instead.
+    let already_waived = match &view {
+        ProjectConvergence::Configured(projection) => projection
+            .cards
+            .get(&record.card_id)
+            .is_some_and(|counters| escalation_already_waived(counters, dimension)),
+        ProjectConvergence::LegacyUnassessed => false,
+    };
+    if already_waived {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} already has its `{}` escalation waived; a dimension's escalation can only be waived once",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 4: the card must be escalated *right now* — the same "response
+    // to escalation, not a blank cheque" property `require_renewable`'s own
+    // check 2 documents.
+    let CardConvergence::Escalated { exhausted, .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; there is nothing to split",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 5: the *named* dimension specifically must be one of the
+    // exhausted ones — the same reasoning as `require_renewable`'s own
+    // check 3 and `require_risk_acceptable`'s own check 5: a dimension that
+    // still has budget cannot have its remaining work split off, because
+    // that is silent expansion by another name. The refusal names every
+    // dimension that really is exhausted.
+    if !exhausted.iter().any(|item| item.dimension == dimension) {
+        let actually_exhausted = exhausted
+            .iter()
+            .map(|item| dimension_wire_name(item.dimension))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot split `{}`: that dimension still has budget; the exhausted dimension(s) are: {actually_exhausted}",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 6: the follow-up card must exist — loaded through the very same
+    // `load_card` every sibling disposition above uses to load the card
+    // being acted on, so a missing or never-activated follow-up card is
+    // refused exactly the way a missing or never-activated card being
+    // renewed, abandoned, or risk-accepted would be, rather than through a
+    // second, hand-rolled existence check.
+    let (follow_up_record, follow_up_state) = load_card(control, follow_up_card_id)?;
+
+    // Check 7: a card cannot be its own follow-up. Binding a card to itself
+    // would record a disposition that resolves nothing and reads, in the
+    // audit trail, as work moved somewhere when it moved nowhere.
+    if follow_up_card_id == &record.card_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be its own follow-up; split moves work to a different, already-existing card",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 8: the follow-up card must be in the same cycle as the
+    // original. Cross-cycle follow-up is a real workflow but a different
+    // decision with different rules (#24, cross-cycle ownership); this card
+    // does not open it. Both cycles are named plainly, so an operator is
+    // told the constraint rather than left guessing which card, or which
+    // cycle, is the odd one out.
+    if follow_up_record.cycle_id != record.cycle_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is in cycle {}, but follow-up card {follow_up_card_id} is in cycle {}; split only binds a follow-up card in the same cycle as the original — cross-cycle follow-up is a different decision with its own rules (#24)",
+                record.card_id, record.cycle_id, follow_up_record.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 9: the follow-up card must not be terminal. Moving work onto a
+    // closed or abandoned card silently discards it: nobody would ever
+    // work that card again, so the "moved work" the recorded fact claims
+    // happened would in fact go nowhere.
+    if follow_up_state.state.is_terminal() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "follow-up card {follow_up_card_id} is {}; a terminal card cannot receive work moved by a split",
+                follow_up_state.state.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 10: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path every sibling
+    // disposition above resolves it through — see `require_renewable`'s own
+    // long note for why this set is reused rather than given its own field
+    // on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence split".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!("actor {actor} is not configured to authorize a convergence split"),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 11: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition split requires a non-blank --rationale; a split with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition split` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_splittable`], so a caller can never be told a split would
+/// succeed (or told why it would fail) and then have the real command
+/// disagree.
+fn preview_split(
+    args: &SplitArgs,
+    card_id: &CardId,
+    dimension: CardDimension,
+    follow_up_card_id: &CardId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, _state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_splittable(
+        &control,
+        &config,
+        &record,
+        dimension,
+        follow_up_card_id,
+        &args.common.actor,
+        &args.rationale,
+    )?;
+    Ok(CommandOutcome::new(
+        "disposition.split",
+        format!(
+            "Dry run: would split card {card_id}'s {} work to follow-up card {follow_up_card_id}; nothing was changed",
+            dimension_wire_name(dimension)
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "dimension": dimension_wire_name(dimension),
+            "follow_up_card_id": follow_up_card_id.to_string(),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_split(args: &SplitArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let dimension: CardDimension = args.dimension.into();
+    let follow_up_card_id: CardId = args.follow_up_card_id.parse()?;
+
+    if args.dry_run {
+        return preview_split(args, &card_id, dimension, &follow_up_card_id);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.split",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let config = control.project()?;
+            let policy_digest = require_splittable(
+                control,
+                &config,
+                &record,
+                dimension,
+                &follow_up_card_id,
+                &args.common.actor,
+                &args.rationale,
+            )?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding every sibling disposition above uses, and for
+            // the same reason: it is the only exact commit SHA an
+            // escalated card is guaranteed to carry in any lifecycle
+            // state. No `store_card_state` call and no `.transition(...)`
+            // on this event, and nothing at all is written to the
+            // follow-up card: a split moves no card state, for either
+            // card. The follow-up card is named, in `follow_up_card_id`
+            // below, not mutated — the binding lives entirely in this one
+            // record, because mutating a second card inside a disposition
+            // would put card lifecycle changes in two places instead of
+            // one.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .meta("disposition", serde_json::to_value(DispositionKind::Split)?)
+                    .meta("dimension", serde_json::to_value(dimension)?)
+                    .meta(
+                        "follow_up_card_id",
+                        serde_json::json!(follow_up_card_id.to_string()),
+                    )
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(
+                expected,
+                &format!("disposition: split {card_id} -> {follow_up_card_id}"),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.split",
+                format!(
+                    "Split card {card_id}'s {} work to follow-up card {follow_up_card_id}\nrationale: {}\nauthorized by: {}",
+                    dimension_wire_name(dimension),
+                    args.rationale,
+                    args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "dimension": dimension_wire_name(dimension),
+                    "follow_up_card_id": follow_up_card_id.to_string(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Runs every check `disposition redesign` must satisfy before it writes
+/// anything, in the fixed order #74-8's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to, matching every sibling disposition's own
+/// check function.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when the card is not currently escalated,
+/// when its current lifecycle state does not permit the transition to
+/// `CardState::Abandoned` — whatever [`CardState::check_transition`] itself
+/// returns for that — when the replacement card is the card being
+/// redesigned, or when the replacement card is terminal. Returns whatever
+/// [`load_card`] returns when the replacement card cannot be loaded —
+/// ordinarily [`ErrorCode::PreconditionNotFound`] for one that was never
+/// activated. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank. Propagates a control-read or projection
+/// failure unchanged.
+fn require_redesignable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    current_state: CardState,
+    replacement_card_id: &CardId,
+    actor: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none, no
+    // card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so no card can ever be escalated,
+    // and there is no digest to bind the recorded fact to. Identical to
+    // `require_abandonable`'s own check 1: a redesign, like an abandon,
+    // terminates the card outright, so both need exactly the same escape
+    // hatch when there is no budget to have escalated it in the first
+    // place.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be redesigned: no convergence policy is configured for this project, so no card can be escalated",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 2: the card must be escalated *right now* — read exactly the
+    // way `require_abandonable`'s own check 2 reads it: a fresh
+    // `EventStore::new(control).for_cycle(...)` projected and assessed, so
+    // this command can never disagree with the check it exists to release a
+    // card from. `disposition redesign` is an authorized *escalation exit*,
+    // like `disposition abandon`, not a general-purpose way to end a card —
+    // a card that is `Within` is refused here and pointed at `card abandon`,
+    // the ordinary route that already covers it, so an operator refused
+    // here is never left with nowhere to go.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+    let CardConvergence::Escalated { .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; `disposition redesign` only ends an active escalation — to abandon a card that is not escalated, use `card abandon` instead",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 3: the card's lifecycle state must permit the transition to
+    // `Abandoned`. This is where "a repeated disposition refuses" comes
+    // from, exactly as it does for `abandon`, and it comes for free:
+    // `Abandoned` has no successors, so a second `disposition redesign`
+    // against the same card reaches this exact check and is refused by it.
+    // An already-redesigned card's recorded facts do not disappear, so it
+    // still assesses as `Escalated` and still passes check 2 above every
+    // time — it is this check, not check 2, that stops a repeat.
+    current_state.check_transition(CardState::Abandoned)?;
+
+    // Check 4: the replacement card must exist — loaded through the very
+    // same `load_card` every sibling disposition uses to load the card
+    // being acted on, and the way `require_splittable`'s own check 6 loads
+    // its follow-up card, so a missing or never-activated replacement is
+    // refused exactly the way a missing or never-activated card being
+    // renewed, abandoned, or split to would be, rather than through a
+    // second, hand-rolled existence check. The loaded record is discarded
+    // here: this function returns only the policy digest, matching every
+    // sibling disposition's own check function, so `replacement_cycle_id`
+    // — needed only for the fact `run_redesign` is about to write, not for
+    // any check — is read again there, fresh, once every check below has
+    // passed.
+    let (_replacement_record, replacement_state) = load_card(control, replacement_card_id)?;
+
+    // Check 5: a card cannot replace itself. Naming a card as its own
+    // replacement would record a decision that resolves nothing and reads,
+    // in the audit trail, as work continuing somewhere when it moved
+    // nowhere — the same reasoning `require_splittable`'s own check 7
+    // applies to a follow-up card.
+    if replacement_card_id == &record.card_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be its own replacement; redesign points at a different, already-existing card",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 6: the replacement card must not be terminal. Naming a closed
+    // or abandoned card as the successor records a continuation that
+    // cannot continue — the same reasoning `require_splittable`'s own
+    // check 9 applies to a follow-up card, and for the same reason: nobody
+    // would ever work a terminal card again.
+    if replacement_state.state.is_terminal() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "replacement card {replacement_card_id} is {}; a terminal card cannot be named as a redesign's replacement",
+                replacement_state.state.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 7: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path every sibling
+    // disposition above resolves it through — see `require_renewable`'s
+    // own long note for why this set is reused rather than given its own
+    // field on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence redesign".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!("actor {actor} is not configured to authorize a convergence redesign"),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 8: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition redesign requires a non-blank --rationale; a redesign with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition redesign` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_redesignable`], so a caller can never be told a redesign
+/// would succeed (or told why it would fail) and then have the real
+/// command disagree.
+fn preview_redesign(
+    args: &RedesignArgs,
+    card_id: &CardId,
+    replacement_card_id: &CardId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_redesignable(
+        &control,
+        &config,
+        &record,
+        state.state,
+        replacement_card_id,
+        &args.common.actor,
+        &args.rationale,
+    )?;
+    // Read once more, purely to report the replacement's cycle in the
+    // preview — see `require_redesignable`'s own note on check 4 for why
+    // this is a fresh read rather than data threaded out of that function.
+    let (replacement_record, _replacement_state) = load_card(&control, replacement_card_id)?;
+    Ok(CommandOutcome::new(
+        "disposition.redesign",
+        format!(
+            "Dry run: would redesign card {card_id}, naming replacement {replacement_card_id}; nothing was changed"
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "replacement_card_id": replacement_card_id.to_string(),
+            "replacement_cycle_id": replacement_record.cycle_id.to_string(),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_redesign(args: &RedesignArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let replacement_card_id: CardId = args.replacement_card_id.parse()?;
+
+    if args.dry_run {
+        return preview_redesign(args, &card_id, &replacement_card_id);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.redesign",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let previous = state.state;
+            let config = control.project()?;
+            let policy_digest = require_redesignable(
+                control,
+                &config,
+                &record,
+                previous,
+                &replacement_card_id,
+                &args.common.actor,
+                &args.rationale,
+            )?;
+
+            // Loaded again, now that every check has passed: see
+            // `require_redesignable`'s own note on check 4 for why
+            // `replacement_cycle_id` — needed only for the fact below, not
+            // for any check — is read here rather than threaded out of
+            // that function. Safe to re-read: nothing else touches the
+            // control repository between the two reads inside this one
+            // transaction.
+            let (replacement_record, _replacement_state) =
+                load_card(control, &replacement_card_id)?;
+
+            store_card_state(control, &record, &state, CardState::Abandoned)?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding every sibling disposition above uses, and for
+            // the same reason: it is the only exact commit SHA an
+            // escalated card is guaranteed to carry in any lifecycle
+            // state. The replacement card is named, in
+            // `replacement_card_id` and `replacement_cycle_id` below, not
+            // mutated — the same posture `split` takes toward its own
+            // follow-up card, for the same reason: mutating a second card
+            // inside a disposition would put card lifecycle changes in two
+            // places instead of one.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .transition(Some(previous.name()), CardState::Abandoned.name())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::Redesign)?,
+                    )
+                    .meta(
+                        "replacement_card_id",
+                        serde_json::json!(replacement_card_id.to_string()),
+                    )
+                    .meta(
+                        "replacement_cycle_id",
+                        serde_json::json!(replacement_record.cycle_id.to_string()),
+                    )
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(
+                expected,
+                &format!("disposition: redesign {card_id} -> {replacement_card_id}"),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.redesign",
+                format!(
+                    "Redesigned card {card_id}, replaced by {replacement_card_id}\nrationale: {}\nauthorized by: {}",
+                    args.rationale, args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Abandoned.name(),
+                    "replacement_card_id": replacement_card_id.to_string(),
+                    "replacement_cycle_id": replacement_record.cycle_id.to_string(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
                 }),
             )
             .with_project(config.project_id.clone()))

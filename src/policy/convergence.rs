@@ -239,8 +239,7 @@ impl AttemptKind {
 /// The single append-only disposition fact the v1 projection recognizes.
 pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
 
-/// Closed set of authorized dispositions. The two #74 has implemented so
-/// far are here; the rest arrive with their own bounded effects.
+/// Closed set of authorized dispositions — the six #74 defines, all landed.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DispositionKind {
@@ -248,6 +247,38 @@ pub enum DispositionKind {
     /// Retires a policy digest so facts recorded under it stop counting
     /// toward the current budget, without erasing them from the record.
     Rebaseline,
+    /// Permanently ends an escalated card. Unlike `Renew`, there is no way
+    /// back: `CardState::Abandoned` has no successors, so a second
+    /// `disposition abandon` against the same card is refused by the
+    /// ordinary lifecycle transition check, not by anything this
+    /// projection tracks.
+    Abandon,
+    /// Accepts a disclosed risk on one exhausted dimension instead of
+    /// granting the card another attempt at all. Unlike `Renew`, this
+    /// grants no budget: the count keeps climbing past the limit forever,
+    /// and the dimension simply stops being reported exhausted. See
+    /// `DimensionCount::escalation_waived` and `assess_card`.
+    AcceptRisk,
+    /// Moves the remaining work behind one exhausted dimension to an
+    /// already-existing follow-up card instead of granting the card
+    /// another attempt at all. Unlike `Renew`, this grants no budget
+    /// either — the count keeps climbing past the limit forever, and the
+    /// dimension simply stops being reported exhausted, exactly like
+    /// `AcceptRisk`. Unlike `AcceptRisk`, it records *where* the deferred
+    /// work went: `follow_up_card_id`. See
+    /// `DimensionCount::escalation_waived` and `assess_card`.
+    Split,
+    /// Permanently ends an escalated card because the approach itself was
+    /// wrong, and names the exact card that replaces it. Like `Abandon`,
+    /// there is no way back, for the same reason: `CardState::Abandoned`
+    /// has no successors. Unlike `Abandon`, it records where the work
+    /// continued — `replacement_card_id`, together with
+    /// `replacement_cycle_id` so a replacement in another cycle (see
+    /// `RedesignMetadata`) is self-describing rather than silently
+    /// misleading. Unlike `AcceptRisk` and `Split`, it waives nothing and
+    /// never touches `DimensionCount::escalation_waived`: the card is
+    /// terminal, so no budget question remains to answer.
+    Redesign,
 }
 
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
@@ -306,6 +337,125 @@ struct RebaselineMetadata {
     policy_digest: Digest,
 }
 
+/// Metadata an abandon fact must declare, with the same closed-set rigor as
+/// `DispositionMetadata` and `RebaselineMetadata`.
+///
+/// A separate shape for the same reason `RebaselineMetadata` is: an abandon
+/// fact permanently ends one escalated card and names no dimension within
+/// it, so making `dimension` optional on `DispositionMetadata` would let a
+/// malformed fact of *either* kind pass by simply omitting the field that
+/// tells them apart. `policy_digest` here is the digest this fact is itself
+/// recorded under — checked in `project` exactly like any other fact's —
+/// not a digest it retires; an abandon retires nothing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbandonMetadata {
+    disposition: DispositionKind,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata an accept-risk fact must declare, with the same closed-set
+/// rigor as `DispositionMetadata` and `AbandonMetadata`.
+///
+/// A separate shape for the same reason `AbandonMetadata` is: an
+/// accept-risk fact carries `risk` — the disclosure being accepted, without
+/// which "disclosed risk" means nothing — and `DispositionMetadata`'s
+/// `deny_unknown_fields` would reject that field outright. Unlike an
+/// abandon, an acceptance *does* name a `dimension`: it is a decision about
+/// one exact bounded dimension, not about the card as a whole.
+/// `policy_digest` here is the digest this fact is itself recorded under —
+/// checked in `project` exactly like any other fact's — never a digest it
+/// retires or a budget it expands; an acceptance retires nothing and
+/// grants nothing back. See `disposition accept-risk` in
+/// `commands::disposition` and `DimensionCount::escalation_waived`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptRiskMetadata {
+    disposition: DispositionKind,
+    dimension: CardDimension,
+    risk: String,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata a split fact must declare, with the same closed-set rigor as
+/// `DispositionMetadata` and `AcceptRiskMetadata`.
+///
+/// A separate shape for a related but distinct reason: a split fact names
+/// no `risk` — the operator is not disclosing a risk being accepted, they
+/// are naming exactly which already-existing card the deferred work moved
+/// to — so it carries `follow_up_card_id` instead, and
+/// `DispositionMetadata`'s `deny_unknown_fields` would reject that field
+/// outright, the same reason `AcceptRiskMetadata` is its own shape rather
+/// than an optional field bolted onto `DispositionMetadata`.
+/// `follow_up_card_id` is kept as a plain `String` here, not `CardId`: this
+/// projection validates facts, not cross-references between cards, so it
+/// asks only that *some* identifier was declared (non-blank, alongside
+/// `rationale` and `authorized_by`), the same posture `evidence_ref`
+/// already takes in `AttemptMetadata` — whether that identifier really
+/// names an eligible follow-up card is `disposition split`'s own job, in
+/// `commands::disposition`, before the fact is ever written. Like
+/// `AcceptRiskMetadata`, and unlike `AbandonMetadata`, a split fact *does*
+/// name a `dimension`: it is a decision about one exact bounded dimension,
+/// not about the card as a whole. `policy_digest` here is the digest this
+/// fact is itself recorded under — checked in `project` exactly like any
+/// other fact's — never a digest it retires or a budget it expands; a
+/// split retires nothing and grants nothing back, exactly like an
+/// accept-risk. See `disposition split` in `commands::disposition` and
+/// `DimensionCount::escalation_waived`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitMetadata {
+    disposition: DispositionKind,
+    dimension: CardDimension,
+    follow_up_card_id: String,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata a redesign fact must declare, with the same closed-set rigor as
+/// `DispositionMetadata`, `AbandonMetadata`, `AcceptRiskMetadata`, and
+/// `SplitMetadata`.
+///
+/// Closest in shape to `AbandonMetadata`: a redesign, like an abandon,
+/// permanently ends the card and names no `dimension` — a redesign answers
+/// the whole card, not one dimension of it, so there is no per-dimension
+/// question left to distinguish. What a redesign adds instead is the
+/// replacement: `replacement_card_id`, kept as a plain `String` for the
+/// same reason `SplitMetadata::follow_up_card_id` is — this projection
+/// validates facts, not cross-references between cards, so it asks only
+/// that *some* identifier was declared (non-blank, alongside `rationale`
+/// and `authorized_by`); whether that identifier really names an eligible
+/// replacement card is `disposition redesign`'s own job, in
+/// `commands::disposition`, before the fact is ever written. Unlike a
+/// split, a redesign's replacement may live in a different cycle: the
+/// original card is terminal, so no dual-governance question survives (see
+/// `disposition redesign` in `commands::disposition` for the full
+/// reasoning). `replacement_cycle_id` is recorded alongside
+/// `replacement_card_id`, taken from the replacement's own loaded record,
+/// precisely so a cross-cycle binding is self-describing rather than
+/// reading as though it named a card in its own cycle — the cost an
+/// earlier review found in `SplitMetadata::follow_up_card_id`'s own bare,
+/// uncross-referenced id. `policy_digest` here is the digest this fact is
+/// itself recorded under — checked in `project` exactly like any other
+/// fact's — never a digest it retires or a budget it expands; a redesign,
+/// like an abandon, retires nothing and grants nothing back — there is no
+/// budget left on a terminal card to grant.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedesignMetadata {
+    disposition: DispositionKind,
+    replacement_card_id: String,
+    replacement_cycle_id: String,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
 /// A projection error refuses the whole view. Returning partial counters would
 /// make an attacker-controlled malformed fact look like unused budget.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,6 +496,18 @@ pub struct DimensionCount {
     /// Not evidence and not a count of facts: this is how many times an
     /// authorized actor decided to grant the configured budget again.
     pub renewals: u32,
+    /// Whether an authorized actor has waived this dimension's escalation
+    /// by accepting it as a disclosed risk.
+    ///
+    /// Not a budget grant, unlike `renewals` above: waiving an escalation
+    /// raises no effective budget and resets no count — the count keeps
+    /// climbing past the limit forever. It only changes whether
+    /// `assess_card` still reports this dimension exhausted.
+    /// `#[serde(default)]` so a projection snapshot serialized before this
+    /// field existed still deserializes, defaulting to `false` — a fact
+    /// recorded under the old shape could not have waived anything.
+    #[serde(default)]
+    pub escalation_waived: bool,
 }
 
 /// Counters derived for a card, accumulated over every fact recorded against
@@ -673,16 +835,40 @@ pub fn project(
     // always about one card in one exact state, so the card binding below
     // is unconditional rather than selected by a match arm.
     //
-    // Rebaselines are excluded here: they are cycle-only, not card-bound,
-    // and the first pass above already collected, validated, and accounted
-    // for every one of them. Visiting one again here would both attempt a
-    // `dimension`-shaped parse a rebaseline's metadata was never going to
-    // satisfy and double-insert its event identifier into `seen`,
-    // misreporting a lone valid rebaseline as a duplicate.
-    for event in events
-        .iter()
-        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && !is_rebaseline(event))
-    {
+    // Rebaselines, abandons, accept-risk facts, splits, and redesigns are
+    // all excluded here, for related but distinct reasons. Rebaselines are
+    // cycle-only, not card-bound, and the first pass above already
+    // collected, validated, and accounted for every one of them. Abandons
+    // *are* card-bound, but carry no `dimension` — that is the whole point
+    // of `AbandonMetadata` being a separate shape — and fold into no
+    // counter, so they get their own pass below instead. Accept-risk facts
+    // *are* card-bound and *do* name a `dimension`, unlike an abandon, but
+    // they carry `risk` too, which this loop's `DispositionMetadata`
+    // `deny_unknown_fields` would reject outright — the same reason
+    // `AbandonMetadata` is its own shape rather than an optional field
+    // bolted onto this one — and they fold into a flag, not a counter, so
+    // they get their own pass as well. Splits *are* card-bound and *do*
+    // name a `dimension` too, but they carry `follow_up_card_id` instead of
+    // `risk`, for the same `deny_unknown_fields` reason, and they fold into
+    // the very same flag an accept-risk does, not a counter, so they get
+    // their own pass too. Redesigns *are* card-bound too, but — like
+    // abandons, and unlike accept-risk facts and splits — carry no
+    // `dimension` at all: a redesign answers the whole card, not one
+    // dimension of it. They carry `replacement_card_id` and
+    // `replacement_cycle_id` instead, for the same `deny_unknown_fields`
+    // reason, and — like an abandon — they fold into no counter and no
+    // flag at all, so they get their own pass too. Visiting any of the
+    // five here would attempt a parse its metadata was never going to
+    // satisfy, and double-insert its event identifier into `seen`,
+    // misreporting a lone valid fact as a duplicate.
+    for event in events.iter().filter(|event| {
+        event.event_type == DISPOSITION_RECORDED_EVENT
+            && !is_rebaseline(event)
+            && !is_abandon(event)
+            && !is_accept_risk(event)
+            && !is_split(event)
+            && !is_redesign(event)
+    }) {
         let event_id = event.event_id.as_str().to_owned();
         if !seen.insert(event_id.clone()) {
             return Err(ProjectionError {
@@ -774,6 +960,395 @@ pub fn project(
             // fact, and the first pass above is the only place one is ever
             // folded.
             DispositionKind::Rebaseline => unreachable!("rebaseline facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every abandon fact
+            // too. The pass below is the only place one is ever validated,
+            // and it folds into no counter at all.
+            DispositionKind::Abandon => unreachable!("abandon facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every accept-risk
+            // fact too. Its own pass below is the only place one is ever
+            // validated, and it folds into a flag, never this counter.
+            DispositionKind::AcceptRisk => {
+                unreachable!("accept-risk facts are filtered out above")
+            }
+            // Unreachable: this loop's filter excludes every split fact
+            // too. Its own pass below is the only place one is ever
+            // validated, and it folds into the very same flag an
+            // accept-risk does, never this counter.
+            DispositionKind::Split => unreachable!("split facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every redesign fact
+            // too. Its own pass below is the only place one is ever
+            // validated, and — like abandon, and unlike accept-risk and
+            // split — it folds into no counter and no flag at all.
+            DispositionKind::Redesign => unreachable!("redesign facts are filtered out above"),
+        }
+    }
+
+    // Abandon facts validate with the same fail-closed rigor as an ordinary
+    // disposition — project/cycle, duplicate identifier, metadata parse,
+    // non-blank rationale and authorized_by, the same three-way
+    // policy-digest rule, and an exact card_id/card_revision/card_digest/
+    // head binding — but fold into no counter. An abandon does not spend a
+    // dimension and does not grant one back; it permanently retires the
+    // card itself (`CardState::Abandoned` has no successors), so there is
+    // nothing here for `assess_card` to read differently before and after
+    // one is recorded — the card's other, already-recorded facts keep
+    // counting exactly as they did. Its event id is still inserted into
+    // `seen`, exactly once, so a genuinely duplicated abandon fact is
+    // still caught even though nothing else about it is folded.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_abandon(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: AbandonMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_abandon` already selected only abandon-tagged events, so this
+        // can never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Abandon);
+        if metadata.rationale.trim().is_empty() || metadata.authorized_by.trim().is_empty() {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared rationale and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind: current digest is
+        // fine and a digest an authorized rebaseline explicitly retired is
+        // fine — and since nothing is folded either way, those two cases
+        // are indistinguishable in the result — while anything else refuses
+        // the whole view. See the longer note above the equivalent check in
+        // the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(_), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+    }
+
+    // Accept-risk facts validate with the same fail-closed rigor as an
+    // abandon fact — project/cycle, duplicate identifier, metadata parse,
+    // the same three-way policy-digest rule, and an exact
+    // card_id/card_revision/card_digest/head binding — with two
+    // differences. First, the non-blank check also covers `risk`, not just
+    // `rationale` and `authorized_by`: a disclosure that says nothing
+    // discloses nothing. Second, unlike an abandon, an acceptance *does*
+    // fold into the projection — it sets a flag, never a counter, so
+    // idempotency needs no bookkeeping: two facts naming the same
+    // dimension simply set the same flag twice. See
+    // `DimensionCount::escalation_waived` and `assess_card` for what the flag
+    // changes downstream.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_accept_risk(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: AcceptRiskMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_accept_risk` already selected only accept-risk-tagged events,
+        // so this can never actually fire; it exists so `disposition`
+        // stays a meaningfully-checked field of this shape rather than
+        // dead weight that `deny_unknown_fields` forces us to declare
+        // regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::AcceptRisk);
+        if metadata.risk.trim().is_empty()
+            || metadata.rationale.trim().is_empty()
+            || metadata.authorized_by.trim().is_empty()
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared risk, rationale, and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind. See the longer
+        // note above the equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(card_id), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+        if under_retired_digest {
+            continue;
+        }
+
+        // Idempotent by construction: setting the same dimension's flag to
+        // `true` twice, from two separate facts, changes nothing the
+        // second time — no counter, so no overflow to guard against
+        // either.
+        let counters = result.cards.entry(card_id.clone()).or_default();
+        match metadata.dimension {
+            CardDimension::ReviewReturns => counters.review_returns.escalation_waived = true,
+            CardDimension::RepairAttempts => counters.repair_attempts.escalation_waived = true,
+            CardDimension::GateFailures => counters.gate_failures.escalation_waived = true,
+            CardDimension::MaterialScopeRevisions => {
+                counters.material_scope_revisions.escalation_waived = true;
+            }
+        }
+    }
+
+    // Split facts validate with the same fail-closed rigor as an
+    // accept-risk fact — project/cycle, duplicate identifier, metadata
+    // parse, the same three-way policy-digest rule, and an exact
+    // card_id/card_revision/card_digest/head binding — with the analogous
+    // difference: the non-blank check covers `follow_up_card_id` in place
+    // of `risk`, because a split with no declared follow-up is not a
+    // decision either. And, like an accept-risk and unlike an abandon, a
+    // split *does* fold into the projection — into the very same flag,
+    // `escalation_waived`, not a separate counter of its own. That is
+    // deliberate, not an accident of implementation: `assess_card` reads
+    // one boolean per dimension, and a card's exhausted dimension either
+    // has an authorized disposition standing behind it or it does not —
+    // which command produced that disposition is recorded in the fact
+    // itself (`metadata.disposition`), never re-derived from which flag was
+    // set, because there is only the one flag. Idempotency needs no
+    // bookkeeping for the same reason it needs none for accept-risk: two
+    // facts naming the same dimension, whether both splits, both
+    // accept-risks, or one of each, simply set the same flag twice. See
+    // `DimensionCount::escalation_waived` and `assess_card` for what the
+    // flag changes downstream.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_split(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: SplitMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_split` already selected only split-tagged events, so this can
+        // never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Split);
+        if metadata.follow_up_card_id.trim().is_empty()
+            || metadata.rationale.trim().is_empty()
+            || metadata.authorized_by.trim().is_empty()
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared follow-up card, rationale, and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind. See the longer
+        // note above the equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(card_id), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+        if under_retired_digest {
+            continue;
+        }
+
+        // Idempotent by construction, exactly like the accept-risk pass
+        // above: setting the same dimension's flag to `true` twice changes
+        // nothing the second time — no counter, so no overflow to guard
+        // against either.
+        let counters = result.cards.entry(card_id.clone()).or_default();
+        match metadata.dimension {
+            CardDimension::ReviewReturns => counters.review_returns.escalation_waived = true,
+            CardDimension::RepairAttempts => counters.repair_attempts.escalation_waived = true,
+            CardDimension::GateFailures => counters.gate_failures.escalation_waived = true,
+            CardDimension::MaterialScopeRevisions => {
+                counters.material_scope_revisions.escalation_waived = true;
+            }
+        }
+    }
+
+    // Redesign facts validate with the same fail-closed rigor as an
+    // abandon fact — project/cycle, duplicate identifier, metadata parse,
+    // the same three-way policy-digest rule, and an exact
+    // card_id/card_revision/card_digest/head binding — with one addition:
+    // the non-blank check also covers `replacement_card_id` and
+    // `replacement_cycle_id`, not just `rationale` and `authorized_by`,
+    // because a redesign with no declared replacement is not a decision.
+    // Like an abandon, and unlike an accept-risk or a split, a redesign
+    // folds into no counter and no flag at all: it permanently retires the
+    // card itself (`CardState::Abandoned` has no successors), touches no
+    // `DimensionCount`, and sets no `escalation_waived` — the card is
+    // terminal, so there is nothing left for `assess_card` to read
+    // differently before and after one is recorded. Its event id is still
+    // inserted into `seen`, exactly once, so a genuinely duplicated
+    // redesign fact is still caught even though nothing else about it is
+    // folded.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_redesign(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: RedesignMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_redesign` already selected only redesign-tagged events, so
+        // this can never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Redesign);
+        if metadata.replacement_card_id.trim().is_empty()
+            || metadata.replacement_cycle_id.trim().is_empty()
+            || metadata.rationale.trim().is_empty()
+            || metadata.authorized_by.trim().is_empty()
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared replacement card, replacement cycle, rationale, and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind: current digest is
+        // fine and a digest an authorized rebaseline explicitly retired is
+        // fine — and since nothing is folded either way, those two cases
+        // are indistinguishable in the result — while anything else
+        // refuses the whole view. See the longer note above the
+        // equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(_), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
         }
     }
 
@@ -801,6 +1376,81 @@ fn is_rebaseline(event: &Event) -> bool {
         .get("disposition")
         .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
         == Some(DispositionKind::Rebaseline)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is an abandon, decided from
+/// its raw `disposition` field rather than by committing to either full
+/// metadata shape first — mirrors `is_rebaseline` exactly, and for the same
+/// reason: `AbandonMetadata` and `DispositionMetadata` disagree on almost
+/// every other field, and `deny_unknown_fields` turns a wrong guess into a
+/// spurious refusal rather than a graceful fallback. A fact that is not
+/// recognizably an abandon — including one with a missing or malformed
+/// `disposition` field — answers `false` here and is left for the ordinary
+/// `DispositionMetadata` parse to accept or, correctly, refuse.
+fn is_abandon(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Abandon)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is an accept-risk, decided
+/// from its raw `disposition` field rather than by committing to any one
+/// full metadata shape first — mirrors `is_rebaseline` and `is_abandon`
+/// exactly, and for the same reason: `AcceptRiskMetadata` disagrees with
+/// `DispositionMetadata` on almost every other field (it carries `risk`,
+/// which the other's `deny_unknown_fields` would reject), and a wrong
+/// guess would turn into a spurious refusal rather than a graceful
+/// fallback. A fact that is not recognizably an accept-risk — including
+/// one with a missing or malformed `disposition` field — answers `false`
+/// here and is left for the ordinary `DispositionMetadata` parse to accept
+/// or, correctly, refuse.
+fn is_accept_risk(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::AcceptRisk)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is a split, decided from its
+/// raw `disposition` field rather than by committing to any one full
+/// metadata shape first — mirrors `is_rebaseline`, `is_abandon`, and
+/// `is_accept_risk` exactly, and for the same reason: `SplitMetadata`
+/// disagrees with `DispositionMetadata` on one field (it carries
+/// `follow_up_card_id`, which the other's `deny_unknown_fields` would
+/// reject), and a wrong guess would turn into a spurious refusal rather
+/// than a graceful fallback. A fact that is not recognizably a split —
+/// including one with a missing or malformed `disposition` field — answers
+/// `false` here and is left for the ordinary `DispositionMetadata` parse to
+/// accept or, correctly, refuse.
+fn is_split(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Split)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is a redesign, decided from
+/// its raw `disposition` field rather than by committing to any one full
+/// metadata shape first — mirrors `is_rebaseline`, `is_abandon`,
+/// `is_accept_risk`, and `is_split` exactly, and for the same reason:
+/// `RedesignMetadata` disagrees with `DispositionMetadata` on almost every
+/// other field (it carries `replacement_card_id` and
+/// `replacement_cycle_id`, which the other's `deny_unknown_fields` would
+/// reject), and a wrong guess would turn into a spurious refusal rather
+/// than a graceful fallback. A fact that is not recognizably a redesign —
+/// including one with a missing or malformed `disposition` field — answers
+/// `false` here and is left for the ordinary `DispositionMetadata` parse to
+/// accept or, correctly, refuse.
+fn is_redesign(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Redesign)
 }
 
 /// Which bounded card dimension a budget covers.
@@ -886,6 +1536,10 @@ pub enum NextPermittedAction {
 /// dimension a partial answer happened to mention, then meets a second
 /// dimension hiding behind it on the next attempt, has lost a whole review
 /// cycle to a check that already knew about both.
+///
+/// A dimension whose `escalation_waived` is set is never reported exhausted,
+/// whatever its count and effective budget say — see the loop below for
+/// why an explicit acceptance outranks even the overflow default.
 #[must_use]
 pub fn assess_card(
     policy: Option<&ConvergencePolicy>,
@@ -958,7 +1612,18 @@ pub fn assess_card(
         // See the doc comment above. An overflowed budget is exhausted
         // unconditionally: there is no safe number left to compare `count`
         // against, so escalating is the only fail-closed answer.
-        if overflowed || count.count >= effective_budget {
+        //
+        // `escalation_waived` wins over that overflow default, and over an
+        // ordinary spent budget too: an overflow is a defensive fallback
+        // for when there is no safe number left, but an accepted risk is
+        // an explicit authorized decision about this exact dimension, and
+        // a specific decision outranks a defensive default. Acceptance
+        // grants no budget of its own — `count` and `effective_budget`
+        // above are computed exactly as they would be without it, so a
+        // renewal stacked on the same dimension still behaves normally,
+        // and any *other*, still-exhausted dimension on this card is still
+        // reported accurately.
+        if !count.escalation_waived && (overflowed || count.count >= effective_budget) {
             exhausted.push(ExhaustedDimension {
                 dimension,
                 count: count.count,
@@ -975,6 +1640,149 @@ pub fn assess_card(
             exhausted,
             next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
         }
+    }
+}
+
+/// Which bounded cycle dimension a budget covers.
+///
+/// A single-variant enum on purpose — the same justification
+/// `NextPermittedAction` already carries in this file: a closed value
+/// programs compare against, not a prose string whose wording can drift
+/// between call sites. There is exactly one cycle dimension today because
+/// that is the only one `CycleConvergenceLimits` declares; a second cycle
+/// dimension is a policy change, not a rewording of this one's name.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleDimension {
+    IntegrationFailures,
+}
+
+/// One cycle dimension whose budget is spent, and what spent it.
+///
+/// Field for field, this is `ExhaustedDimension`'s cycle-level twin,
+/// including the same caveat: `count` is authoritative, not `evidence` —
+/// two facts may cite the same reference, so `evidence.len()` can be less
+/// than `count`, and that is expected rather than a defect.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ExhaustedCycleDimension {
+    pub dimension: CycleDimension,
+    pub count: u32,
+    /// The effective budget this dimension was actually compared against —
+    /// the configured limit already multiplied by `renewals + 1` — never
+    /// the bare configuration limit. Reporting the base limit here would
+    /// read as "no renewal was ever granted" even when one was, exactly as
+    /// `ExhaustedDimension::limit`'s own note says.
+    pub limit: u32,
+    pub evidence: BTreeSet<String>,
+}
+
+/// What the recorded facts say about one cycle's integration-failure
+/// budget.
+///
+/// `CardConvergence`'s cycle-level twin, shape for shape: the same three
+/// statuses, and the same `NextPermittedAction` — reused, not redeclared,
+/// because the action an operator takes next is identical regardless of
+/// which budget escalated: an authorized actor records a disposition.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CycleConvergence {
+    /// No policy configured: nothing to enforce, and no budget implied.
+    LegacyUnassessed,
+    /// A policy is configured and the integration-failure budget still has
+    /// room.
+    Within,
+    /// The integration-failure budget is spent.
+    Escalated {
+        exhausted: Vec<ExhaustedCycleDimension>,
+        next_permitted_action: NextPermittedAction,
+    },
+}
+
+/// Assesses one cycle against its configured integration-failure budget.
+///
+/// 73-1: the cycle-level counterpart of `assess_card`, deliberately built to
+/// answer identically wherever the two questions overlap — read that
+/// function's doc comment first; this one calls out only where the cycle
+/// case is not simply a smaller copy of the card case. This is a pure
+/// decision function and nothing more: it refuses nothing, and nothing
+/// downstream of it does either. Only `cycle status` (`commands::cycle`)
+/// reads its answer, to report it — enforcement is a later card.
+///
+/// A missing policy, or a project still in `LegacyUnassessed`, answers
+/// `LegacyUnassessed` rather than inferring a budget nobody configured —
+/// same rule, same reason as `assess_card`. Unlike `assess_card`, there is
+/// no "subject the projection never mentions" case to handle separately:
+/// `assess_card` falls back to `CardCounters::default()` because
+/// `view.cards` is a map keyed by card, and a card with no facts has no
+/// entry in it. `view.cycle` is not a map lookup — a `Configured`
+/// projection carries exactly one `CycleCounters`, defaulted by `project`
+/// itself the moment it creates one — so a cycle with no integration
+/// failures already reads as zero, with nothing extra to arrange for it.
+///
+/// The dimension is exhausted at `count >= effective budget`, not
+/// `count > effective budget` — the same boundary `assess_card` draws, for
+/// the same reason: a limit of 2 grants two attempts, and it is the second
+/// one that spends the budget. The effective budget is the configured limit
+/// multiplied by `renewals + 1`, computed with the same checked, chained
+/// arithmetic as `assess_card`, and an overflow fails closed — exhausted
+/// unconditionally — for the same reason: once there is no safe number left
+/// to compare `count` against, escalating is the only fail-closed answer.
+/// `escalation_waived` outranks that overflow default, exactly as it does
+/// on the card side: an overflow is a defensive fallback for when there is
+/// no safe number left, and a specific authorized decision about this exact
+/// dimension outranks a defensive default.
+///
+/// `renewals` and `escalation_waived` are read here even though no
+/// disposition command folds either into `CycleCounters` yet: both fields
+/// already exist on `DimensionCount`, which `CycleCounters` reuses, and a
+/// decision function that silently ignored half of its own input would be a
+/// trap for whoever adds the cycle-level disposition later — it would look
+/// finished right up until the day it quietly did the wrong thing.
+///
+/// No cycle id parameter: `view` is already the projection of exactly one
+/// cycle, the same one `project` was called with.
+#[must_use]
+pub fn assess_cycle(
+    policy: Option<&ConvergencePolicy>,
+    view: &ProjectConvergence,
+) -> CycleConvergence {
+    let Some(policy) = policy else {
+        return CycleConvergence::LegacyUnassessed;
+    };
+    let ProjectConvergence::Configured(view) = view else {
+        return CycleConvergence::LegacyUnassessed;
+    };
+    let count = &view.cycle.integration_failures;
+    let base_limit = policy.cycle_limits.integration_failures;
+
+    // Same checked, chained arithmetic as `assess_card`: `renewals + 1`
+    // first, then multiplied by the configured limit, so an overflow in
+    // either step is caught rather than silently wrapping into a small or
+    // enormous budget. Fail closed, never open — see `assess_card` for the
+    // full reasoning, which applies here unchanged.
+    let effective_budget = count
+        .renewals
+        .checked_add(1)
+        .and_then(|multiplier| base_limit.checked_mul(multiplier));
+    let overflowed = effective_budget.is_none();
+    let effective_budget = effective_budget.unwrap_or(u32::MAX);
+
+    // `>=`, not `>` — the boundary this card exists to get right, mirroring
+    // `assess_card` exactly. `escalation_waived` wins over the overflow
+    // default too, for the same reason it does there: a specific authorized
+    // decision outranks a defensive fallback.
+    if !count.escalation_waived && (overflowed || count.count >= effective_budget) {
+        CycleConvergence::Escalated {
+            exhausted: vec![ExhaustedCycleDimension {
+                dimension: CycleDimension::IntegrationFailures,
+                count: count.count,
+                limit: effective_budget,
+                evidence: count.evidence.clone(),
+            }],
+            next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+        }
+    } else {
+        CycleConvergence::Within
     }
 }
 
@@ -1238,6 +2046,189 @@ mod tests {
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: None,
             next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `abandon` disposition fact for `F-001`, card-bound
+    /// like `disposition_event` and unlike `rebaseline_event`. Tests that
+    /// need an invalid or differently bound abandon mutate the returned
+    /// event, exactly as `disposition_event` is mutated elsewhere in this
+    /// module.
+    fn abandon_event(id: u64) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Abandon).unwrap(),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("abandon:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: Some("active".to_owned()),
+            next_state: Some("abandoned".to_owned()),
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `accept_risk` disposition fact for `F-001`, naming
+    /// the given dimension. Card-bound like `disposition_event` and
+    /// `abandon_event`, and carrying no state transition like
+    /// `disposition_event` (renew): an acceptance moves no card state,
+    /// unlike an abandon. Tests that need an invalid or differently bound
+    /// acceptance mutate the returned event, exactly as `disposition_event`
+    /// is mutated elsewhere in this module.
+    fn accept_risk_event(id: u64, dimension: CardDimension) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::AcceptRisk).unwrap(),
+        );
+        metadata.insert(
+            "dimension".to_owned(),
+            serde_json::to_value(dimension).unwrap(),
+        );
+        metadata.insert("risk".to_owned(), serde_json::json!(format!("risk:{id}")));
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("acceptance:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `split` disposition fact for `F-001`, naming the
+    /// given dimension and follow-up card. Card-bound like
+    /// `disposition_event`, `abandon_event`, and `accept_risk_event`, and
+    /// carrying no state transition like `accept_risk_event`: a split moves
+    /// no card state, unlike an abandon. Tests that need an invalid or
+    /// differently bound split mutate the returned event, exactly as
+    /// `disposition_event` is mutated elsewhere in this module.
+    fn split_event(id: u64, dimension: CardDimension, follow_up_card_id: &str) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Split).unwrap(),
+        );
+        metadata.insert(
+            "dimension".to_owned(),
+            serde_json::to_value(dimension).unwrap(),
+        );
+        metadata.insert(
+            "follow_up_card_id".to_owned(),
+            serde_json::json!(follow_up_card_id),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("split:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `redesign` disposition fact for `F-001`, naming the
+    /// given replacement card and cycle. Card-bound like every sibling
+    /// fixture above, and carrying a state transition like `abandon_event`
+    /// and unlike `accept_risk_event`/`split_event`: a redesign, like an
+    /// abandon, ends the card outright. Tests that need an invalid or
+    /// differently bound redesign mutate the returned event, exactly as
+    /// `disposition_event` is mutated elsewhere in this module.
+    fn redesign_event(id: u64, replacement_card_id: &str, replacement_cycle_id: &str) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Redesign).unwrap(),
+        );
+        metadata.insert(
+            "replacement_card_id".to_owned(),
+            serde_json::json!(replacement_card_id),
+        );
+        metadata.insert(
+            "replacement_cycle_id".to_owned(),
+            serde_json::json!(replacement_cycle_id),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("redesign:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: Some("active".to_owned()),
+            next_state: Some("abandoned".to_owned()),
             head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
             metadata,
         }
@@ -1702,28 +2693,32 @@ mod tests {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:1".to_owned()]),
                     renewals: 0,
+                    escalation_waived: false,
                 },
                 repair_attempts: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:2".to_owned()]),
                     renewals: 0,
+                    escalation_waived: false,
                 },
                 gate_failures: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:3".to_owned()]),
                     renewals: 0,
+                    escalation_waived: false,
                 },
                 material_scope_revisions: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:4".to_owned()]),
                     renewals: 0,
+                    escalation_waived: false,
                 },
             }
         );
         assert_eq!(
             serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
             format!(
-                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0}}}}}}}}"#,
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0,"escalation_waived":false}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0,"escalation_waived":false}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0,"escalation_waived":false}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0,"escalation_waived":false}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0,"escalation_waived":false}}}}}}}}"#,
                 view.policy_digest
             )
         );
@@ -1906,6 +2901,7 @@ mod tests {
                 count: 1,
                 evidence: BTreeSet::from(["receipt:6".to_owned()]),
                 renewals: 0,
+                escalation_waived: false,
             },
         );
         assert_eq!(f002.repair_attempts, DimensionCount::default());
@@ -2048,6 +3044,7 @@ mod tests {
                         count: 1,
                         evidence: BTreeSet::from(["receipt:1".to_owned()]),
                         renewals: 0,
+                        escalation_waived: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2408,7 +3405,7 @@ mod tests {
         let dimension = &configured.cards[&CardId::from_str("F-001").unwrap()].review_returns;
         assert_eq!(
             serde_json::to_string(dimension).unwrap(),
-            r#"{"count":1,"evidence":["receipt:1"],"renewals":1}"#
+            r#"{"count":1,"evidence":["receipt:1"],"renewals":1,"escalation_waived":false}"#
         );
     }
 
@@ -2464,6 +3461,7 @@ mod tests {
                         count: 3,
                         evidence: BTreeSet::new(),
                         renewals: 1,
+                        escalation_waived: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2486,6 +3484,342 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![CardDimension::ReviewReturns],
             "the overflowed dimension is the one that must be reported exhausted"
+        );
+    }
+
+    #[test]
+    fn an_accepted_risk_outranks_an_overflowed_budget() {
+        // Sibling of the test above, with the one field that test pins at
+        // `false` now set to `true`: same huge base limit, same single
+        // renewal, same small `count`. `assess_card`'s doc comment promises
+        // `escalation_waived` wins even over the overflow default; nothing
+        // before this test exercised that promise, because every other
+        // test's arithmetic never overflows in the first place.
+        let huge_limits = CardConvergenceLimits {
+            review_returns: u32::MAX / 2 + 1,
+            repair_attempts: 1,
+            gate_failures: 1,
+            material_scope_revisions: 1,
+        };
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: RiskConvergenceLimits {
+                low: huge_limits.clone(),
+                medium: huge_limits.clone(),
+                high: huge_limits.clone(),
+                critical: huge_limits,
+            },
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+
+        let card_id = CardId::from_str("F-001").unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters::default(),
+            cards: BTreeMap::from([(
+                card_id.clone(),
+                CardCounters {
+                    review_returns: DimensionCount {
+                        count: 3,
+                        evidence: BTreeSet::new(),
+                        renewals: 1,
+                        escalation_waived: true,
+                    },
+                    ..CardCounters::default()
+                },
+            )]),
+        });
+
+        assert_eq!(
+            assess_card(Some(&overflow_policy), &view, &card_id, Risk::Medium),
+            CardConvergence::Within,
+            "an accepted risk must outrank the overflow default; the dimension must not be \
+             reported exhausted even though its effective budget overflows"
+        );
+    }
+
+    // 73-1: `assess_cycle` is the cycle-level counterpart of `assess_card`
+    // above — same boundary, same checked arithmetic, same
+    // `escalation_waived` precedence. Each test below pins one property
+    // `assess_card`'s own tests already pin for the card case, so the two
+    // can never silently drift apart.
+
+    #[test]
+    fn a_cycle_with_no_recorded_failures_is_within_budget() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let view = project(Some(&policy()), &project_id, &cycle, &[]).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Within,
+            "absence of integration failures is not absence of budget"
+        );
+    }
+
+    #[test]
+    fn a_cycle_dimension_exactly_at_its_limit_is_exhausted() {
+        // The boundary this card exists to get right: two integration
+        // failures against a limit of two is the budget spent, not one
+        // short of spent.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::IntegrationFailure),
+            event(2, AttemptKind::IntegrationFailure),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Escalated {
+                exhausted: vec![ExhaustedCycleDimension {
+                    dimension: CycleDimension::IntegrationFailures,
+                    count: 2,
+                    limit: 2,
+                    evidence: BTreeSet::from(["receipt:1".to_owned(), "receipt:2".to_owned()]),
+                }],
+                next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_one_below_its_limit_still_has_budget() {
+        // The other half of the same boundary, in its own test so neither
+        // side can drift without the other noticing.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![event(1, AttemptKind::IntegrationFailure)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Within,
+            "one integration failure against a limit of two is one attempt still available"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_policy_assesses_the_cycle_as_legacy_unassessed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::IntegrationFailure),
+            event(2, AttemptKind::IntegrationFailure),
+        ];
+        let configured_view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(None, &configured_view),
+            CycleConvergence::LegacyUnassessed,
+            "no configured policy means nothing to enforce, even though these \
+             facts would otherwise exhaust the budget"
+        );
+        assert_eq!(
+            assess_cycle(Some(&policy()), &ProjectConvergence::LegacyUnassessed),
+            CycleConvergence::LegacyUnassessed,
+            "a legacy project has no implicit budget even once a policy exists"
+        );
+    }
+
+    #[test]
+    fn a_renewal_extends_the_cycle_budget() {
+        // No disposition command folds a renewal into `CycleCounters` yet —
+        // a later card adds that — so this constructs the projection
+        // directly instead of folding real facts through `project`, exactly
+        // as `an_overflowed_budget_is_exhausted_rather_than_unlimited` and
+        // `an_accepted_risk_outranks_an_overflowed_budget` do above for the
+        // same reason: exercising a `DimensionCount` combination no
+        // fact-folding path can produce today.
+        let policy = policy();
+        let digest = policy.digest().unwrap();
+        let cycle_view = |count: u32, renewals: u32| {
+            ProjectConvergence::Configured(ConvergenceProjection {
+                policy_digest: digest.clone(),
+                cycle: CycleCounters {
+                    integration_failures: DimensionCount {
+                        count,
+                        evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                        renewals,
+                        escalation_waived: false,
+                    },
+                },
+                cards: BTreeMap::new(),
+            })
+        };
+
+        assert!(
+            matches!(
+                assess_cycle(Some(&policy), &cycle_view(2, 0)),
+                CycleConvergence::Escalated { .. }
+            ),
+            "two integration failures against a limit of two, with no renewal, must escalate"
+        );
+        assert_eq!(
+            assess_cycle(Some(&policy), &cycle_view(2, 1)),
+            CycleConvergence::Within,
+            "one renewal doubles the effective budget to 2 * (1 + 1) = 4, and two failures fit"
+        );
+
+        let CycleConvergence::Escalated { exhausted, .. } =
+            assess_cycle(Some(&policy), &cycle_view(4, 1))
+        else {
+            panic!("four integration failures against an effective budget of four must escalate");
+        };
+        assert_eq!(
+            exhausted[0].limit, 4,
+            "limit reports the effective budget (2 * (1 renewal + 1)), not the base 2"
+        );
+    }
+
+    #[test]
+    fn a_waived_cycle_escalation_is_not_reported_exhausted() {
+        // No disposition command sets `escalation_waived` on
+        // `CycleCounters` yet either — same reason, same directly
+        // constructed projection as the test above.
+        let policy = policy();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 5,
+                    evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                    renewals: 0,
+                    escalation_waived: true,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            assess_cycle(Some(&policy), &view),
+            CycleConvergence::Within,
+            "an accepted risk must suppress exhaustion, however far past the limit the count \
+             climbed"
+        );
+    }
+
+    #[test]
+    fn an_overflowed_cycle_budget_is_exhausted_rather_than_unlimited() {
+        // Mirrors `an_overflowed_budget_is_exhausted_rather_than_unlimited`
+        // above: a base limit above `u32::MAX / 2` plus one renewal already
+        // overflows `limit * (renewals + 1)`, reachable without four
+        // billion recorded facts. `count` is deliberately small — 3 — since
+        // the point is that `count` never gets compared at all once the
+        // multiplication overflows; only the overflow itself may decide the
+        // outcome.
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: policy().card_limits,
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: u32::MAX / 2 + 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 3,
+                    evidence: BTreeSet::new(),
+                    renewals: 1,
+                    escalation_waived: false,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        let CycleConvergence::Escalated { exhausted, .. } =
+            assess_cycle(Some(&overflow_policy), &view)
+        else {
+            panic!(
+                "an overflowed effective budget must escalate unconditionally; reading it as \
+                 unlimited would silently remove this dimension's budget entirely, with a count \
+                 of only 3 against a limit over two billion"
+            );
+        };
+        assert_eq!(
+            exhausted[0].count, 3,
+            "count is copied through unchanged; only the overflow itself may decide the outcome"
+        );
+        assert_eq!(
+            exhausted[0].limit,
+            u32::MAX,
+            "an overflowed budget has no safe number to report, so it falls back to u32::MAX, \
+             the same fallback `assess_card` uses"
+        );
+    }
+
+    #[test]
+    fn a_waived_cycle_escalation_outranks_an_overflowed_budget() {
+        // Sibling of the test above, with the one field it pins at `false`
+        // now set to `true`: same huge base limit, same single renewal,
+        // same small `count`. `assess_cycle`'s doc comment promises
+        // `escalation_waived` wins even over the overflow default — on the
+        // card side that precedence shipped undefended and cost a repair
+        // round; this test pins it here from the start.
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: policy().card_limits,
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: u32::MAX / 2 + 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 3,
+                    evidence: BTreeSet::new(),
+                    renewals: 1,
+                    escalation_waived: true,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            assess_cycle(Some(&overflow_policy), &view),
+            CycleConvergence::Within,
+            "an accepted risk must outrank the overflow default; the dimension must not be \
+             reported exhausted even though its effective budget overflows"
+        );
+    }
+
+    #[test]
+    fn the_cycle_shapes_serialize_exactly() {
+        assert_eq!(
+            serde_json::to_string(&CycleConvergence::LegacyUnassessed).unwrap(),
+            r#"{"status":"legacy_unassessed"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CycleConvergence::Within).unwrap(),
+            r#"{"status":"within"}"#
+        );
+
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let mut first = event(1, AttemptKind::IntegrationFailure);
+        first.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("integration:INT-000001"),
+        );
+        let mut second = event(2, AttemptKind::IntegrationFailure);
+        second.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("integration:INT-000002"),
+        );
+        let view = project(Some(&policy()), &project_id, &cycle, &[first, second]).unwrap();
+
+        let escalated = assess_cycle(Some(&policy()), &view);
+        assert_eq!(
+            serde_json::to_string(&escalated).unwrap(),
+            r#"{"status":"escalated","exhausted":[{"dimension":"integration_failures","count":2,"limit":2,"evidence":["integration:INT-000001","integration:INT-000002"]}],"next_permitted_action":"record_authorized_disposition"}"#
         );
     }
 
@@ -2764,5 +4098,696 @@ mod tests {
             "two rebaseline facts sharing one event identifier must refuse the whole view",
         );
         assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_abandon_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // 74-5's version of `an_unretired_foreign_digest_still_refuses_the_
+        // whole_view`: an abandon folds into no counter, but it still has to
+        // obey the same three-way digest rule as every other fact kind — a
+        // digest nobody ever decided about must not pass just because
+        // nothing would have been folded anyway.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = abandon_event(1);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[foreign]).is_err(),
+            "an abandon naming a digest nobody ever decided about must refuse the whole view"
+        );
+    }
+
+    #[test]
+    fn an_abandon_recorded_under_a_retired_digest_is_skipped_rather_than_refused() {
+        // 74-5's version of `facts_under_a_retired_digest_are_ignored_
+        // rather_than_refused`. An abandon folds into no counter either way,
+        // so "skipped" here proves only one thing, but it is the thing that
+        // matters: the view still succeeds, and the card gets no
+        // `CardCounters` entry from this fact — the mutation a fold that
+        // forgot "no counter" would produce.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut old_abandon = abandon_event(1);
+        old_abandon.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(retired_digest.as_str()),
+        );
+
+        let facts = vec![old_abandon, rebaseline_event(2, &retired_digest)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts)
+            .expect("an abandon recorded under a retired digest must not refuse the view");
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        assert!(
+            !view.cards.contains_key(&card_id),
+            "an abandon fact must never create a card counters entry, retired digest or not"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_abandon_identifier_is_refused() {
+        // 74-5's version of `a_duplicate_rebaseline_identifier_is_refused`:
+        // the abandon pass inserts its event id into `seen` exactly once,
+        // so a genuinely duplicated abandon fact is still caught even
+        // though nothing else about it is folded into any counter. Without
+        // this test the guard is a comment, not a behaviour.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = abandon_event(1);
+        let mut duplicate = abandon_event(2);
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two abandon facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_abandon_bound_to_another_project_or_cycle_is_refused() {
+        // The abandon pass checks project/cycle binding with the same `||`
+        // the ordinary disposition loop uses. Naming a foreign project or a
+        // foreign cycle must refuse the whole view rather than being
+        // silently skipped the way a retired-digest fact is.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = abandon_event(1);
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("an abandon naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = abandon_event(2);
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("an abandon naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn an_abandon_without_a_rationale_or_an_authorizing_actor_is_refused() {
+        // 74-5's version of
+        // `a_disposition_without_a_rationale_or_an_authorizing_actor_is_refused`:
+        // an abandon is a decision like any other disposition, so it must
+        // carry the same non-blank rationale and authorizing actor.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_rationale = abandon_event(1);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("an abandon with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared rationale and an authorizing actor"
+        );
+
+        let mut blank_actor = abandon_event(2);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("an abandon with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared rationale and an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn an_abandon_without_an_exact_card_and_head_binding_is_refused() {
+        // 74-5's version of
+        // `a_disposition_bound_to_a_foreign_policy_or_no_card_is_refused`,
+        // but asserting the exact reason for each case rather than a bare
+        // `is_err()`: a missing binding and a malformed head are different
+        // guards with different messages, and only the exact string proves
+        // the right one fired.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = abandon_event(1);
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("an abandon with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = abandon_event(2);
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("an abandon with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = abandon_event(3);
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("an abandon with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
+    }
+
+    // 74-6: `disposition accept-risk`'s own projection pass carries the same
+    // six guards as the abandon pass above, and this time every one of them
+    // gets its own test, asserting the exact `error.reason` rather than a
+    // bare `is_err()`. 74-5's abandon pass shipped with one of its six —
+    // the metadata parse guard — undefended by any test at all; a review
+    // mutation could have deleted it with the whole suite still green. The
+    // six below are, in order: duplicate event id, project/cycle binding,
+    // metadata parse, non-blank risk/rationale/authorized_by, the
+    // three-way policy-digest rule, and exact card/revision/digest/head
+    // binding including `is_exact_sha`.
+
+    #[test]
+    fn a_duplicate_accept_risk_identifier_is_refused() {
+        // Guard 1: duplicate event id. 74-5's version is
+        // `a_duplicate_abandon_identifier_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = accept_risk_event(1, CardDimension::ReviewReturns);
+        let mut duplicate = accept_risk_event(2, CardDimension::ReviewReturns);
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two accept-risk facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_accept_risk_bound_to_another_project_or_cycle_is_refused() {
+        // Guard 2: project/cycle binding. 74-5's version is
+        // `an_abandon_bound_to_another_project_or_cycle_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = accept_risk_event(1, CardDimension::ReviewReturns);
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("an accept-risk naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = accept_risk_event(2, CardDimension::ReviewReturns);
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("an accept-risk naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn an_accept_risk_with_malformed_metadata_is_refused() {
+        // Guard 3: metadata parse. The one guard 74-5's abandon pass shipped
+        // with no dedicated test at all, not even the bare-`is_err()` kind:
+        // a fact whose `disposition` field really does say `accept_risk`,
+        // so `is_accept_risk` routes it into this pass, but whose metadata
+        // cannot fill `AcceptRiskMetadata` — missing its own required
+        // `risk` field — must refuse with the parse error, not panic or
+        // silently default it to blank.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut missing_risk = accept_risk_event(1, CardDimension::ReviewReturns);
+        missing_risk.metadata.remove("risk");
+        let error = project(Some(&policy()), &project_id, &cycle, &[missing_risk]).expect_err(
+            "an accept-risk fact missing its own required `risk` field must refuse the whole view",
+        );
+        assert_eq!(error.reason, "malformed metadata: missing field `risk`");
+    }
+
+    #[test]
+    fn an_accept_risk_without_a_risk_a_rationale_or_an_authorizing_actor_is_refused() {
+        // Guard 4: non-blank risk/rationale/authorized_by. 74-5's version,
+        // covering two of these three fields, is
+        // `an_abandon_without_a_rationale_or_an_authorizing_actor_is_refused`.
+        // `risk` joins the same one check here: a disclosure that says
+        // nothing discloses nothing, so a blank `risk` is refused exactly
+        // like a blank `rationale` or `authorized_by`, with the same
+        // message naming all three.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_risk = accept_risk_event(1, CardDimension::ReviewReturns);
+        blank_risk
+            .metadata
+            .insert("risk".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_risk])
+            .expect_err("an accept-risk with no declared risk is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+
+        let mut blank_rationale = accept_risk_event(2, CardDimension::ReviewReturns);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("an accept-risk with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+
+        let mut blank_actor = accept_risk_event(3, CardDimension::ReviewReturns);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("an accept-risk with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn an_accept_risk_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // Guard 5: the three-way policy-digest rule. 74-5's version is
+        // `an_abandon_bound_to_a_foreign_policy_digest_refuses_the_whole_
+        // view`: an acceptance folds no counter, only a flag, but it still
+        // has to obey the same three-way digest rule as every other fact
+        // kind — a digest nobody ever decided about must not pass just
+        // because nothing would have been folded anyway.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = accept_risk_event(1, CardDimension::ReviewReturns);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign]).expect_err(
+            "an accept-risk naming a digest nobody ever decided about must refuse the whole view",
+        );
+        assert_eq!(error.reason, "fact names a foreign policy digest");
+    }
+
+    #[test]
+    fn an_accept_risk_without_an_exact_card_and_head_binding_is_refused() {
+        // Guard 6: exact card/revision/digest/head binding including
+        // `is_exact_sha`. 74-5's version is
+        // `an_abandon_without_an_exact_card_and_head_binding_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = accept_risk_event(1, CardDimension::ReviewReturns);
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("an accept-risk with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = accept_risk_event(2, CardDimension::ReviewReturns);
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("an accept-risk with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = accept_risk_event(3, CardDimension::ReviewReturns);
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("an accept-risk with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
+    }
+
+    // 74-7: `disposition split`'s own projection pass carries the same six
+    // guards as the accept-risk pass above, and this time too every one of
+    // them gets its own test, asserting the exact `error.reason` rather
+    // than a bare `is_err()` — the lesson this project has paid for twice
+    // now (74-5's abandon pass shipped with its metadata-parse guard
+    // undefended by any test at all, and a review mutation can delete a
+    // guard with no test noticing while the rest of the suite stays
+    // green). The six below are, in order: duplicate event id,
+    // project/cycle binding, metadata parse, non-blank
+    // follow_up_card_id/rationale/authorized_by, the three-way
+    // policy-digest rule, and exact card/revision/digest/head binding
+    // including `is_exact_sha`.
+
+    #[test]
+    fn a_duplicate_split_identifier_is_refused() {
+        // Guard 1: duplicate event id. 74-6's version is
+        // `a_duplicate_accept_risk_identifier_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = split_event(1, CardDimension::ReviewReturns, "F-002");
+        let mut duplicate = split_event(2, CardDimension::ReviewReturns, "F-002");
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate])
+            .expect_err("two split facts sharing one event identifier must refuse the whole view");
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn a_split_bound_to_another_project_or_cycle_is_refused() {
+        // Guard 2: project/cycle binding. 74-6's version is
+        // `an_accept_risk_bound_to_another_project_or_cycle_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = split_event(1, CardDimension::ReviewReturns, "F-002");
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("a split naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = split_event(2, CardDimension::ReviewReturns, "F-002");
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("a split naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn a_split_with_malformed_metadata_is_refused() {
+        // Guard 3: metadata parse — the guard 74-5's abandon pass shipped
+        // with no dedicated test at all, not even the bare-`is_err()` kind.
+        // A fact whose `disposition` field really does say `split`, so
+        // `is_split` routes it into this pass, but whose metadata cannot
+        // fill `SplitMetadata` — missing its own required
+        // `follow_up_card_id` field — must refuse with the parse error, not
+        // panic or silently default it to blank.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut missing_follow_up = split_event(1, CardDimension::ReviewReturns, "F-002");
+        missing_follow_up.metadata.remove("follow_up_card_id");
+        let error = project(Some(&policy()), &project_id, &cycle, &[missing_follow_up]).expect_err(
+            "a split fact missing its own required `follow_up_card_id` field must refuse the \
+             whole view",
+        );
+        assert_eq!(
+            error.reason,
+            "malformed metadata: missing field `follow_up_card_id`"
+        );
+    }
+
+    #[test]
+    fn a_split_without_a_follow_up_card_id_a_rationale_or_an_authorizing_actor_is_refused() {
+        // Guard 4: non-blank follow_up_card_id/rationale/authorized_by.
+        // 74-6's version, covering the analogous three fields, is
+        // `an_accept_risk_without_a_risk_a_rationale_or_an_authorizing_actor_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_follow_up = split_event(1, CardDimension::ReviewReturns, "F-002");
+        blank_follow_up
+            .metadata
+            .insert("follow_up_card_id".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_follow_up])
+            .expect_err("a split with no declared follow-up card is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared follow-up card, rationale, and an authorizing actor"
+        );
+
+        let mut blank_rationale = split_event(2, CardDimension::ReviewReturns, "F-002");
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("a split with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared follow-up card, rationale, and an authorizing actor"
+        );
+
+        let mut blank_actor = split_event(3, CardDimension::ReviewReturns, "F-002");
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("a split with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared follow-up card, rationale, and an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn a_split_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // Guard 5: the three-way policy-digest rule. 74-6's version is
+        // `an_accept_risk_bound_to_a_foreign_policy_digest_refuses_the_whole_view`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = split_event(1, CardDimension::ReviewReturns, "F-002");
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign]).expect_err(
+            "a split naming a digest nobody ever decided about must refuse the whole view",
+        );
+        assert_eq!(error.reason, "fact names a foreign policy digest");
+    }
+
+    #[test]
+    fn a_split_without_an_exact_card_and_head_binding_is_refused() {
+        // Guard 6: exact card/revision/digest/head binding including
+        // `is_exact_sha`. 74-6's version is
+        // `an_accept_risk_without_an_exact_card_and_head_binding_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = split_event(1, CardDimension::ReviewReturns, "F-002");
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("a split with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = split_event(2, CardDimension::ReviewReturns, "F-002");
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("a split with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = split_event(3, CardDimension::ReviewReturns, "F-002");
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("a split with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
+    }
+
+    // 74-8: `disposition redesign`'s own projection pass carries the same
+    // six guards as the split pass above, and every one of them gets its
+    // own test too, asserting the exact `error.reason` rather than a bare
+    // `is_err()` — the same lesson 74-6 and 74-7 both restate: a guard
+    // with no dedicated test is a comment, not a behaviour, and a review
+    // mutation can delete one with the rest of the suite staying green.
+    // The six below are, in order: duplicate event id, project/cycle
+    // binding, metadata parse, non-blank
+    // replacement_card_id/replacement_cycle_id/rationale/authorized_by,
+    // the three-way policy-digest rule, and exact card/revision/digest/head
+    // binding including `is_exact_sha`.
+
+    #[test]
+    fn a_duplicate_redesign_identifier_is_refused() {
+        // Guard 1: duplicate event id. 74-7's version is
+        // `a_duplicate_split_identifier_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = redesign_event(1, "F-002", "C-001");
+        let mut duplicate = redesign_event(2, "F-002", "C-001");
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two redesign facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn a_redesign_bound_to_another_project_or_cycle_is_refused() {
+        // Guard 2: project/cycle binding. 74-7's version is
+        // `a_split_bound_to_another_project_or_cycle_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = redesign_event(1, "F-002", "C-001");
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("a redesign naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = redesign_event(2, "F-002", "C-001");
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("a redesign naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn a_redesign_with_malformed_metadata_is_refused() {
+        // Guard 3: metadata parse — the guard 74-5's abandon pass shipped
+        // with no dedicated test at all, not even the bare-`is_err()` kind.
+        // A fact whose `disposition` field really does say `redesign`, so
+        // `is_redesign` routes it into this pass, but whose metadata
+        // cannot fill `RedesignMetadata` — missing its own required
+        // `replacement_card_id` field — must refuse with the parse error,
+        // not panic or silently default it to blank.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut missing_replacement = redesign_event(1, "F-002", "C-001");
+        missing_replacement.metadata.remove("replacement_card_id");
+        let error = project(Some(&policy()), &project_id, &cycle, &[missing_replacement])
+            .expect_err(
+                "a redesign fact missing its own required `replacement_card_id` field must \
+                 refuse the whole view",
+            );
+        assert_eq!(
+            error.reason,
+            "malformed metadata: missing field `replacement_card_id`"
+        );
+    }
+
+    #[test]
+    fn a_redesign_without_a_replacement_card_a_replacement_cycle_a_rationale_or_an_authorizing_actor_is_refused()
+     {
+        // Guard 4: non-blank
+        // replacement_card_id/replacement_cycle_id/rationale/authorized_by.
+        // 74-7's version, covering the analogous three fields, is
+        // `a_split_without_a_follow_up_card_id_a_rationale_or_an_authorizing_actor_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_replacement_card = redesign_event(1, "F-002", "C-001");
+        blank_replacement_card
+            .metadata
+            .insert("replacement_card_id".to_owned(), serde_json::json!("   "));
+        let error = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[blank_replacement_card],
+        )
+        .expect_err("a redesign with no declared replacement card is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_replacement_cycle = redesign_event(2, "F-002", "C-001");
+        blank_replacement_cycle
+            .metadata
+            .insert("replacement_cycle_id".to_owned(), serde_json::json!("   "));
+        let error = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[blank_replacement_cycle],
+        )
+        .expect_err("a redesign with no declared replacement cycle is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_rationale = redesign_event(3, "F-002", "C-001");
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("a redesign with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_actor = redesign_event(4, "F-002", "C-001");
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("a redesign with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn a_redesign_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // Guard 5: the three-way policy-digest rule. 74-7's version is
+        // `a_split_bound_to_a_foreign_policy_digest_refuses_the_whole_view`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = redesign_event(1, "F-002", "C-001");
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign]).expect_err(
+            "a redesign naming a digest nobody ever decided about must refuse the whole view",
+        );
+        assert_eq!(error.reason, "fact names a foreign policy digest");
+    }
+
+    #[test]
+    fn a_redesign_without_an_exact_card_and_head_binding_is_refused() {
+        // Guard 6: exact card/revision/digest/head binding including
+        // `is_exact_sha`. 74-7's version is
+        // `a_split_without_an_exact_card_and_head_binding_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = redesign_event(1, "F-002", "C-001");
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("a redesign with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = redesign_event(2, "F-002", "C-001");
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("a redesign with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = redesign_event(3, "F-002", "C-001");
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("a redesign with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
     }
 }
