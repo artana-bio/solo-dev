@@ -10,7 +10,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,9 @@ use crate::{
         transaction::with_transaction,
         work::held_lease,
     },
-    control::{event_store::EventDraft, repository::ControlRepository},
+    control::{
+        event_store::EventDraft, lock::retry_while_lock_held, repository::ControlRepository,
+    },
     domain::{
         card::CardRecord,
         clock::Clock,
@@ -1813,17 +1814,9 @@ fn run_reserve(args: &ReserveArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     // A reservation is intentionally tiny, and a simultaneous request should
     // observe the durable winner rather than leak the project lock's transient
     // fail-fast implementation detail to an agent. This is not a general lock
-    // queue (#20): after a short bounded retry window the honest lock refusal
+    // queue (#20): after a bounded retry window the honest lock refusal
     // still wins.
-    for attempt in 0..20 {
-        match reserve_once(args, clock) {
-            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            outcome => return outcome,
-        }
-    }
-    unreachable!("the bounded retry loop always returns")
+    retry_while_lock_held(|| reserve_once(args, clock))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2818,15 +2811,7 @@ fn settle_governed_gate_execution_with_retry(
     outcome: &AttemptOutcome,
     clock: &dyn Clock,
 ) -> Result<CommandOutcome, HarnessError> {
-    for attempt in 0..20 {
-        match settle_governed_gate_execution(args, execution, outcome, clock) {
-            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
-    unreachable!("the bounded settlement retry always returns")
+    retry_while_lock_held(|| settle_governed_gate_execution(args, execution, outcome, clock))
 }
 
 fn run_governed_gate(
@@ -2838,23 +2823,8 @@ fn run_governed_gate(
     // independently reserved runs pass the short control mutation boundary,
     // while preserving the project's normal fail-fast lock semantics for
     // every other command and for terminal settlement.
-    let mut acquired = None;
-    for attempt in 0..20 {
-        match acquire_governed_gate_execution(args, card_id, clock) {
-            Err(error) if error.code() == ErrorCode::PolicyLockHeld && attempt < 19 => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(execution) => {
-                acquired = Some(execution);
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let execution = acquired.ok_or_else(|| HarnessError::Control {
-        reason: "governed execution permit acquisition exhausted its bounded retry".to_owned(),
-        code: ErrorCode::PolicyLockHeld,
-    })?;
+    let execution =
+        retry_while_lock_held(|| acquire_governed_gate_execution(args, card_id, clock))?;
     // A crash after this point must not make the reservation reusable: the
     // committed permit is the recovery-visible state. This injectable boundary
     // exercises precisely that otherwise hard-to-reproduce phase split.

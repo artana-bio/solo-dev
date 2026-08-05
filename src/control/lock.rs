@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -506,6 +507,85 @@ impl Drop for ProjectLock {
     }
 }
 
+/// Total time budget for [`retry_while_lock_held`].
+///
+/// Issue #20: `gate.rs` used to run this same retry three times over, copied
+/// rather than shared, each bounded to 20 attempts of 10ms (about 200ms
+/// total). That window covers nothing on purpose and everything by luck: it
+/// was sized for a fast failure, not for outlasting a holder that is still
+/// legitimately working. Measured on one machine, in sequence, five runs
+/// each: `b1fb371` (5 green / 0 red), `c16b978` (4 green / 1 red) on
+/// `tests/validation_economy_composition.rs`. Neither commit touched the
+/// locking logic — the binary simply grew, so a holder's `gate.run.acquire`
+/// critical section (control reads and writes plus a Git commit) ran a
+/// little longer, and a window that never had slack stopped covering it.
+/// Ten seconds comfortably outlasts that hold under two or three concurrent
+/// gates, while still failing within a wait a person at a terminal will
+/// tolerate when the lock is genuinely stuck rather than merely busy.
+const RETRY_BUDGET: Duration = Duration::from_secs(10);
+
+/// First backoff wait for [`retry_while_lock_held`]; doubles on every
+/// subsequent attempt, capped at [`RETRY_MAX_WAIT`].
+const RETRY_FIRST_WAIT: Duration = Duration::from_millis(10);
+
+/// Backoff cap for [`retry_while_lock_held`].
+const RETRY_MAX_WAIT: Duration = Duration::from_millis(250);
+
+/// Retries `operation` while the project lock is held by someone else.
+///
+/// Bounded on purpose: this is not a lock queue (#20). When the window is
+/// spent, the honest `PolicyLockHeld` refusal wins — the caller is told to
+/// wait and retry, which is true. What changed is only the size of the
+/// window: 20 attempts of 10ms could not cover a holder doing a control
+/// commit, so a contended-but-healthy project reported a hard refusal.
+///
+/// # Errors
+///
+/// Returns whatever `operation` last returned: any non-`PolicyLockHeld`
+/// error immediately, including `PolicyStaleLock`, which is never retried —
+/// an abandoned lock needs `project recover`, not waiting, and retrying it
+/// would bury that correct diagnosis behind a long delay. A `PolicyLockHeld`
+/// error is returned once the time budget is spent.
+pub fn retry_while_lock_held<T>(
+    operation: impl FnMut() -> Result<T, HarnessError>,
+) -> Result<T, HarnessError> {
+    retry_while_lock_held_within(operation, RETRY_BUDGET, RETRY_FIRST_WAIT, RETRY_MAX_WAIT)
+}
+
+/// [`retry_while_lock_held`], with the budget and backoff shape injected so
+/// tests can drive the boundary conditions without waiting out the real
+/// ten-second window.
+///
+/// Bounded by total elapsed time, not by attempt count: what matters to a
+/// caller is how long it waits, and the number of attempts is only a
+/// consequence of that. The wait before each retry starts at `first_wait`
+/// and doubles, capped at `max_wait`. Nothing here is randomized — the same
+/// inputs always retry the same number of times, which is what makes the
+/// injected-budget tests reproducible instead of merely probable.
+fn retry_while_lock_held_within<T>(
+    mut operation: impl FnMut() -> Result<T, HarnessError>,
+    budget: Duration,
+    first_wait: Duration,
+    max_wait: Duration,
+) -> Result<T, HarnessError> {
+    let deadline = Instant::now() + budget;
+    let mut wait = first_wait;
+    loop {
+        let error = match operation() {
+            // Only a live contender is worth waiting out. Every other
+            // outcome — success, or a refusal that no amount of waiting
+            // fixes — is returned immediately.
+            Err(error) if error.code() == ErrorCode::PolicyLockHeld => error,
+            result => return result,
+        };
+        if Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(wait);
+        wait = std::cmp::min(wait * 2, max_wait);
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -906,6 +986,179 @@ mod tests {
                 process_start: Some(format!("start {last_generation}")),
             },
             "must be held by the last generation observed, not the first"
+        );
+    }
+
+    // --- retry_while_lock_held ---------------------------------------
+    //
+    // `retry_while_lock_held_within` takes the budget and backoff shape as
+    // parameters exactly so these can drive the boundary conditions in
+    // milliseconds instead of waiting out the real ten-second window.
+
+    fn lock_held_error() -> HarnessError {
+        HarnessError::Control {
+            reason: "locked".to_owned(),
+            code: ErrorCode::PolicyLockHeld,
+        }
+    }
+
+    fn stale_lock_error() -> HarnessError {
+        HarnessError::Control {
+            reason: "stale".to_owned(),
+            code: ErrorCode::PolicyStaleLock,
+        }
+    }
+
+    #[test]
+    fn a_lock_held_a_few_times_then_free_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = retry_while_lock_held_within(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n <= 3 {
+                    Err(lock_held_error())
+                } else {
+                    Ok(42)
+                }
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            calls.get(),
+            4,
+            "must call once per attempt, including the one that finally succeeds"
+        );
+    }
+
+    #[test]
+    fn a_lock_held_for_the_whole_window_returns_the_refusal() {
+        let calls = std::cell::Cell::new(0u32);
+        let budget = Duration::from_millis(50);
+        let max_wait = Duration::from_millis(20);
+        let start = Instant::now();
+        let result: Result<(), HarnessError> = retry_while_lock_held_within(
+            || {
+                calls.set(calls.get() + 1);
+                Err(lock_held_error())
+            },
+            budget,
+            Duration::from_millis(5),
+            max_wait,
+        );
+        let elapsed = start.elapsed();
+        let error = result.expect_err("a lock held for the whole window must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyLockHeld);
+        assert!(
+            calls.get() >= 2,
+            "must have retried at least once: {}",
+            calls.get()
+        );
+        // Bounded by elapsed time, not by an attempt count (generous slack
+        // for scheduler jitter): a 50ms budget must not silently turn into
+        // hundreds of milliseconds of retrying.
+        assert!(
+            elapsed < budget + max_wait + Duration::from_millis(150),
+            "must respect the injected budget instead of looping unboundedly: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_lock_is_not_retried() {
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<(), HarnessError> = retry_while_lock_held_within(
+            || {
+                calls.set(calls.get() + 1);
+                Err(stale_lock_error())
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+        );
+        let error = result.expect_err("a stale lock must surface, not retry");
+        assert_eq!(error.code(), ErrorCode::PolicyStaleLock);
+        assert_eq!(
+            calls.get(),
+            1,
+            "an abandoned lock needs `project recover`, not a wait that hides the diagnosis"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_retried() {
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<(), HarnessError> = retry_while_lock_held_within(
+            || {
+                calls.set(calls.get() + 1);
+                Err(HarnessError::Control {
+                    reason: "disposition cannot be established".to_owned(),
+                    code: ErrorCode::PolicyLockAmbiguous,
+                })
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+        );
+        let error = result.expect_err("an unrelated code must surface, not retry");
+        assert_eq!(error.code(), ErrorCode::PolicyLockAmbiguous);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_wait_grows_and_is_capped() {
+        let timestamps = std::cell::RefCell::new(Vec::new());
+        let first_wait = Duration::from_millis(20);
+        let max_wait = Duration::from_millis(160);
+        let result: Result<(), HarnessError> = retry_while_lock_held_within(
+            || {
+                timestamps.borrow_mut().push(Instant::now());
+                Err(lock_held_error())
+            },
+            Duration::from_millis(400),
+            first_wait,
+            max_wait,
+        );
+        assert!(result.is_err());
+        let stamps = timestamps.borrow();
+        assert!(
+            stamps.len() >= 4,
+            "need several attempts to observe both growth and the cap, got {}",
+            stamps.len()
+        );
+        let deltas: Vec<Duration> = stamps.windows(2).map(|pair| pair[1] - pair[0]).collect();
+
+        // `thread::sleep` guarantees *at least* the requested duration and
+        // nothing about the upper bound, so two independently-jittered
+        // observations cannot be compared to each other without risking
+        // exactly the flake this used to produce: a later, equally-capped
+        // wait sampled with less scheduler overshoot than the one before it,
+        // making a healthy capped sequence look like it "shrank". Comparing
+        // each observed wait only to its own expected floor sidesteps that:
+        // the floor can never be violated by overshoot, only by a wait that
+        // was requested too short in the first place (mutation M2).
+        let mut expected = first_wait;
+        for delta in &deltas {
+            assert!(
+                *delta + Duration::from_millis(3) >= expected,
+                "wait shorter than requested: expected at least {expected:?}, saw {delta:?}"
+            );
+            assert!(
+                *delta <= expected + Duration::from_millis(300),
+                "wait far exceeded its expected value: expected ~{expected:?}, saw {delta:?}"
+            );
+            expected = std::cmp::min(expected * 2, max_wait);
+        }
+
+        // The cap is actually reached, rather than the wait growing forever
+        // or plateauing short of it.
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| *delta + Duration::from_millis(3) >= max_wait),
+            "wait must reach the cap of {max_wait:?} at least once: {deltas:?}"
         );
     }
 }
