@@ -4663,3 +4663,587 @@ mod disposition_rebaseline {
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
     }
 }
+
+// 74-5: `disposition abandon`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, permanently ends an
+// escalated card by recording one bound `convergence.disposition_recorded`
+// fact — the authorized *escalation exit* `renew` is not: instead of
+// granting the exhausted dimension one more configured limit, it retires
+// the card itself. The property this card actually exists to prove is
+// narrower than "the command works": an abandon fact names no `dimension`,
+// and `project` must keep it out of the `DispositionMetadata` parse that
+// requires one, or one abandoned card would break `card status` and every
+// budget-gated command for every *other* card sharing its cycle — #74's own
+// "preserves valid unrelated work" criterion.
+//
+// Wrapped in its own module for the same reason `disposition_rebaseline` is:
+// `the_dry_run_makes_every_check_and_writes_nothing` is already the name
+// used above, twice, for the same property on two other commands, and
+// neither existing test may be touched or renamed. A module gives this
+// card's instance of that recurring name a distinct path
+// (`disposition_abandon::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_abandon {
+    use super::*;
+
+    /// Identical in shape to `disposition_renew`'s and
+    /// `disposition_rebaseline`'s own copies of this helper:
+    /// `support::Workspace` is outside this card's file scope, so each
+    /// disposition module keeps its fixture-building local rather than
+    /// reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition abandon`'s authorization check (#4)
+    /// has a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition abandon` in JSON mode, returning the raw output.
+    /// Mirrors every other per-group `_raw` helper in this file; kept local
+    /// because `support::Workspace` is outside this card's file scope.
+    fn disposition_abandon_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "abandon".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is an abandon (none configures a
+    /// renewal or rebaseline too), so this is never filtered further by
+    /// `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    #[test]
+    fn an_authorized_abandon_ends_an_escalated_card() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let base = workspace.authority_head();
+        let pre_abandon_head = workspace.control_head();
+
+        let abandon = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "authorized abandon for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            abandon.status.success(),
+            "an authorized abandon of an escalated card must succeed: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_abandon_head,
+            "disposition abandon must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful abandon"
+        );
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned",
+            "the card must move to abandoned"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        // `escalate_via_review_returns` leaves the card `changes_requested`;
+        // this fact must record that exact transition, unlike `renew`'s own
+        // fact, which names no transition at all because renewing spends no
+        // state change.
+        assert_eq!(fact["previous_state"], "changes_requested", "{fact}");
+        assert_eq!(fact["next_state"], "abandoned", "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "abandon", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized abandon for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+        assert!(
+            !fact["metadata"]
+                .as_object()
+                .expect("metadata is an object")
+                .contains_key("dimension"),
+            "an abandon fact must name no dimension: {fact}"
+        );
+    }
+
+    #[test]
+    // This is the load-bearing test: the mutation in the contract's own
+    // §7 deletes the abandon exclusion from the card-bound
+    // `DispositionMetadata` loop's filter, which makes the abandon fact
+    // recorded below attempt a `dimension`-shaped parse it was never going
+    // to satisfy — refusing not just F-001's own projection but the whole
+    // cycle's, which is exactly what `approve_card` below would trip over
+    // for F-002, a card the abandon never touched.
+    fn an_unrelated_card_in_the_same_cycle_still_works_after_an_abandon() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let abandon = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "ending the escalated card for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            abandon.status.success(),
+            "the abandon that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        // A second, unrelated card in the same cycle, scoped away from
+        // `src/**` so the two can coexist without an ownership-overlap
+        // refusal, must be completely unaffected by F-001's abandon.
+        // `card status` alone would only prove the read-only projection
+        // path still works; `approve_card` drives F-002 through `handoff
+        // create`, `review begin`, and `review record` — three separate
+        // `require_convergence_budget` call sites — so this proves the
+        // budget-gated write path stays open too.
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        let status = workspace.card_raw(&["status", "--card-id", "F-002"]);
+        assert!(
+            status.status.success(),
+            "card status for an unrelated card must not be broken by another card's abandon: {}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        workspace.approve_card("F-002", "docs/f002/a.md");
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "approved",
+            "an unrelated card in the same cycle must still deliver and be reviewed after another \
+         card's abandon"
+        );
+    }
+
+    #[test]
+    fn a_second_abandon_of_the_same_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let first = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "first abandon",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first abandon must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        // The card's recorded facts do not disappear when it is abandoned.
+        // `card status` publishes exactly `assess_card`'s own assessment
+        // (see `card.rs`'s `card_convergence` doc comment, and
+        // `card_status_reports_the_escalation_instead_of_refusing` above,
+        // which pins that `data.convergence` is exactly `CardConvergence`'s
+        // serialization) — so this is a direct, observed answer to whether
+        // `assess_card` still reports the card `Escalated` post-abandon,
+        // not an inference from the refusal below.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "an abandoned card's recorded facts do not disappear; it must still assess as \
+         escalated"
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "second abandon, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second abandon of an already-abandoned card must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        // It is check 3 (the lifecycle transition), not check 2 (the
+        // escalation check), that refuses the repeat — the assertion above
+        // already established the card still reads `Escalated`, so if
+        // check 2 had fired instead the message would say the card is not
+        // escalated, not name a transition. `CardState::check_transition`'s
+        // own message names the exact states it refused to move between.
+        assert!(
+            error_message(&second).contains("cannot move from `abandoned` to `abandoned`"),
+            "{}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first abandon's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_not_escalated_cannot_be_abandoned_this_way() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-001", &["src/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "nothing has escalated yet",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card that has never been escalated must not be abandonable through this route"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("card abandon"),
+            "the refusal must name the route that does apply: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "ready",
+            "the refused abandon must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_abandon() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused abandon must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a convergence
+        // policy but no `final_authorization_policy` at all — the scenario
+        // `opened_with_disposition_policies` above always avoids by
+        // construction. Escalating a card only requires the convergence
+        // policy; authorizing the abandon requires the other one, which
+        // simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an abandon must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "would abandon if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "would abandon if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real abandon, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_abandon_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--rationale",
+                "the real abandon",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned"
+        );
+    }
+}

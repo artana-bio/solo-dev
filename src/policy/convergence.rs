@@ -239,7 +239,7 @@ impl AttemptKind {
 /// The single append-only disposition fact the v1 projection recognizes.
 pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
 
-/// Closed set of authorized dispositions. The two #74 has implemented so
+/// Closed set of authorized dispositions. The three #74 has implemented so
 /// far are here; the rest arrive with their own bounded effects.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -248,6 +248,12 @@ pub enum DispositionKind {
     /// Retires a policy digest so facts recorded under it stop counting
     /// toward the current budget, without erasing them from the record.
     Rebaseline,
+    /// Permanently ends an escalated card. Unlike `Renew`, there is no way
+    /// back: `CardState::Abandoned` has no successors, so a second
+    /// `disposition abandon` against the same card is refused by the
+    /// ordinary lifecycle transition check, not by anything this
+    /// projection tracks.
+    Abandon,
 }
 
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
@@ -301,6 +307,25 @@ struct DispositionMetadata {
 struct RebaselineMetadata {
     disposition: DispositionKind,
     retired_policy_digest: Digest,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata an abandon fact must declare, with the same closed-set rigor as
+/// `DispositionMetadata` and `RebaselineMetadata`.
+///
+/// A separate shape for the same reason `RebaselineMetadata` is: an abandon
+/// fact permanently ends one escalated card and names no dimension within
+/// it, so making `dimension` optional on `DispositionMetadata` would let a
+/// malformed fact of *either* kind pass by simply omitting the field that
+/// tells them apart. `policy_digest` here is the digest this fact is itself
+/// recorded under — checked in `project` exactly like any other fact's —
+/// not a digest it retires; an abandon retires nothing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbandonMetadata {
+    disposition: DispositionKind,
     rationale: String,
     authorized_by: String,
     policy_digest: Digest,
@@ -673,16 +698,21 @@ pub fn project(
     // always about one card in one exact state, so the card binding below
     // is unconditional rather than selected by a match arm.
     //
-    // Rebaselines are excluded here: they are cycle-only, not card-bound,
-    // and the first pass above already collected, validated, and accounted
-    // for every one of them. Visiting one again here would both attempt a
-    // `dimension`-shaped parse a rebaseline's metadata was never going to
-    // satisfy and double-insert its event identifier into `seen`,
-    // misreporting a lone valid rebaseline as a duplicate.
-    for event in events
-        .iter()
-        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && !is_rebaseline(event))
-    {
+    // Rebaselines and abandons are both excluded here, for related but
+    // distinct reasons. Rebaselines are cycle-only, not card-bound, and the
+    // first pass above already collected, validated, and accounted for
+    // every one of them. Abandons *are* card-bound, but carry no
+    // `dimension` — that is the whole point of `AbandonMetadata` being a
+    // separate shape — and fold into no counter, so they get their own pass
+    // below instead. Visiting either kind here would attempt a
+    // `dimension`-shaped parse its metadata was never going to satisfy, and
+    // double-insert its event identifier into `seen`, misreporting a lone
+    // valid fact as a duplicate.
+    for event in events.iter().filter(|event| {
+        event.event_type == DISPOSITION_RECORDED_EVENT
+            && !is_rebaseline(event)
+            && !is_abandon(event)
+    }) {
         let event_id = event.event_id.as_str().to_owned();
         if !seen.insert(event_id.clone()) {
             return Err(ProjectionError {
@@ -774,6 +804,90 @@ pub fn project(
             // fact, and the first pass above is the only place one is ever
             // folded.
             DispositionKind::Rebaseline => unreachable!("rebaseline facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every abandon fact
+            // too. The pass below is the only place one is ever validated,
+            // and it folds into no counter at all.
+            DispositionKind::Abandon => unreachable!("abandon facts are filtered out above"),
+        }
+    }
+
+    // Abandon facts validate with the same fail-closed rigor as an ordinary
+    // disposition — project/cycle, duplicate identifier, metadata parse,
+    // non-blank rationale and authorized_by, the same three-way
+    // policy-digest rule, and an exact card_id/card_revision/card_digest/
+    // head binding — but fold into no counter. An abandon does not spend a
+    // dimension and does not grant one back; it permanently retires the
+    // card itself (`CardState::Abandoned` has no successors), so there is
+    // nothing here for `assess_card` to read differently before and after
+    // one is recorded — the card's other, already-recorded facts keep
+    // counting exactly as they did. Its event id is still inserted into
+    // `seen`, exactly once, so a genuinely duplicated abandon fact is
+    // still caught even though nothing else about it is folded.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_abandon(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: AbandonMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_abandon` already selected only abandon-tagged events, so this
+        // can never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Abandon);
+        if metadata.rationale.trim().is_empty() || metadata.authorized_by.trim().is_empty() {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared rationale and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind: current digest is
+        // fine and a digest an authorized rebaseline explicitly retired is
+        // fine — and since nothing is folded either way, those two cases
+        // are indistinguishable in the result — while anything else refuses
+        // the whole view. See the longer note above the equivalent check in
+        // the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(_), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
         }
     }
 
@@ -801,6 +915,23 @@ fn is_rebaseline(event: &Event) -> bool {
         .get("disposition")
         .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
         == Some(DispositionKind::Rebaseline)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is an abandon, decided from
+/// its raw `disposition` field rather than by committing to either full
+/// metadata shape first — mirrors `is_rebaseline` exactly, and for the same
+/// reason: `AbandonMetadata` and `DispositionMetadata` disagree on almost
+/// every other field, and `deny_unknown_fields` turns a wrong guess into a
+/// spurious refusal rather than a graceful fallback. A fact that is not
+/// recognizably an abandon — including one with a missing or malformed
+/// `disposition` field — answers `false` here and is left for the ordinary
+/// `DispositionMetadata` parse to accept or, correctly, refuse.
+fn is_abandon(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Abandon)
 }
 
 /// Which bounded card dimension a budget covers.
@@ -1238,6 +1369,45 @@ mod tests {
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: None,
             next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `abandon` disposition fact for `F-001`, card-bound
+    /// like `disposition_event` and unlike `rebaseline_event`. Tests that
+    /// need an invalid or differently bound abandon mutate the returned
+    /// event, exactly as `disposition_event` is mutated elsewhere in this
+    /// module.
+    fn abandon_event(id: u64) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Abandon).unwrap(),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("abandon:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: Some("active".to_owned()),
+            next_state: Some("abandoned".to_owned()),
             head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
             metadata,
         }
@@ -2764,5 +2934,167 @@ mod tests {
             "two rebaseline facts sharing one event identifier must refuse the whole view",
         );
         assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_abandon_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // 74-5's version of `an_unretired_foreign_digest_still_refuses_the_
+        // whole_view`: an abandon folds into no counter, but it still has to
+        // obey the same three-way digest rule as every other fact kind — a
+        // digest nobody ever decided about must not pass just because
+        // nothing would have been folded anyway.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = abandon_event(1);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        assert!(
+            project(Some(&policy()), &project_id, &cycle, &[foreign]).is_err(),
+            "an abandon naming a digest nobody ever decided about must refuse the whole view"
+        );
+    }
+
+    #[test]
+    fn an_abandon_recorded_under_a_retired_digest_is_skipped_rather_than_refused() {
+        // 74-5's version of `facts_under_a_retired_digest_are_ignored_
+        // rather_than_refused`. An abandon folds into no counter either way,
+        // so "skipped" here proves only one thing, but it is the thing that
+        // matters: the view still succeeds, and the card gets no
+        // `CardCounters` entry from this fact — the mutation a fold that
+        // forgot "no counter" would produce.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let card_id = CardId::from_str("F-001").unwrap();
+        let retired_digest = Digest::of_bytes(b"policy-a");
+
+        let mut old_abandon = abandon_event(1);
+        old_abandon.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(retired_digest.as_str()),
+        );
+
+        let facts = vec![old_abandon, rebaseline_event(2, &retired_digest)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts)
+            .expect("an abandon recorded under a retired digest must not refuse the view");
+        let ProjectConvergence::Configured(view) = view else {
+            panic!("configured")
+        };
+        assert!(
+            !view.cards.contains_key(&card_id),
+            "an abandon fact must never create a card counters entry, retired digest or not"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_abandon_identifier_is_refused() {
+        // 74-5's version of `a_duplicate_rebaseline_identifier_is_refused`:
+        // the abandon pass inserts its event id into `seen` exactly once,
+        // so a genuinely duplicated abandon fact is still caught even
+        // though nothing else about it is folded into any counter. Without
+        // this test the guard is a comment, not a behaviour.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = abandon_event(1);
+        let mut duplicate = abandon_event(2);
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two abandon facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_abandon_bound_to_another_project_or_cycle_is_refused() {
+        // The abandon pass checks project/cycle binding with the same `||`
+        // the ordinary disposition loop uses. Naming a foreign project or a
+        // foreign cycle must refuse the whole view rather than being
+        // silently skipped the way a retired-digest fact is.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = abandon_event(1);
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("an abandon naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = abandon_event(2);
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("an abandon naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn an_abandon_without_a_rationale_or_an_authorizing_actor_is_refused() {
+        // 74-5's version of
+        // `a_disposition_without_a_rationale_or_an_authorizing_actor_is_refused`:
+        // an abandon is a decision like any other disposition, so it must
+        // carry the same non-blank rationale and authorizing actor.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_rationale = abandon_event(1);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("an abandon with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared rationale and an authorizing actor"
+        );
+
+        let mut blank_actor = abandon_event(2);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("an abandon with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared rationale and an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn an_abandon_without_an_exact_card_and_head_binding_is_refused() {
+        // 74-5's version of
+        // `a_disposition_bound_to_a_foreign_policy_or_no_card_is_refused`,
+        // but asserting the exact reason for each case rather than a bare
+        // `is_err()`: a missing binding and a malformed head are different
+        // guards with different messages, and only the exact string proves
+        // the right one fired.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = abandon_event(1);
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("an abandon with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = abandon_event(2);
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("an abandon with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = abandon_event(3);
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("an abandon with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
     }
 }

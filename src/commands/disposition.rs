@@ -19,6 +19,19 @@
 //! `refuse_orphaning_facts` doc comment calls this "the same defect as #79
 //! with another name") would leave every open cycle broken at its very next
 //! gate command.
+//!
+//! `abandon` is the third: an authorized actor permanently ends an escalated
+//! card instead of granting it another attempt. There is no way back —
+//! `CardState::Abandoned` has no successors, so a repeated `disposition
+//! abandon` against the same card is refused by the ordinary lifecycle
+//! transition check itself, the same check `card abandon` already relies on
+//! for its own, *unauthorized* exit from a card that was never escalated in
+//! the first place. What actually has to hold, and is easy to get wrong: an
+//! abandon fact names no `dimension`, and `project` must keep it away from
+//! the `DispositionMetadata` parse that requires one — otherwise one
+//! abandoned card would refuse `card status` and every budget-gated command
+//! for every *other* card sharing its cycle, which is exactly the isolation
+//! #74 promises.
 
 use std::{
     fs,
@@ -29,14 +42,18 @@ use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
-    commands::{CONTROL_ENV, card::load_card, transaction::with_transaction},
+    commands::{
+        CONTROL_ENV,
+        card::{load_card, store_card_state},
+        transaction::with_transaction,
+    },
     config::{ConvergencePolicy, FieldError, ProjectConfig},
     control::{
         event_store::{EventDraft, EventStore},
         repository::{ControlRepository, PROJECT_FILE},
     },
     domain::{
-        card::CardRecord,
+        card::{CardRecord, CardState},
         clock::Clock,
         cycle::{CYCLE_DIR, CycleRecord},
         digest::Digest,
@@ -59,6 +76,9 @@ pub enum DispositionCommand {
     /// new one, and re-pin every non-terminal cycle's `project_revision` to
     /// it, all in one transaction.
     Rebaseline(RebaselineArgs),
+    /// Permanently end an escalated card — the authorized exit from an
+    /// escalation, in place of another renewal.
+    Abandon(AbandonArgs),
 }
 
 impl DispositionCommand {
@@ -68,6 +88,7 @@ impl DispositionCommand {
         match self {
             Self::Renew(..) => "disposition.renew",
             Self::Rebaseline(..) => "disposition.rebaseline",
+            Self::Abandon(..) => "disposition.abandon",
         }
     }
 }
@@ -150,6 +171,22 @@ pub struct RebaselineArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `disposition abandon`.
+#[derive(Debug, Args)]
+pub struct AbandonArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The escalated card being permanently abandoned.
+    #[arg(long)]
+    pub card_id: String,
+    /// Why this abandonment is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `disposition` subcommand.
 ///
 /// # Errors
@@ -162,6 +199,7 @@ pub fn execute(
     match command {
         DispositionCommand::Renew(args) => run_renew(args, clock),
         DispositionCommand::Rebaseline(args) => run_rebaseline(args, clock),
+        DispositionCommand::Abandon(args) => run_abandon(args, clock),
     }
 }
 
@@ -791,6 +829,222 @@ fn run_rebaseline(
                     "policy_digest": preflight.new_digest.as_str(),
                     "repinned_cycles": repinned,
                     "fact_count": repinned.len(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Runs every check `disposition abandon` must satisfy before it writes
+/// anything, in the fixed order #74-5's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when the card is not currently escalated,
+/// or when its current lifecycle state does not permit the transition to
+/// `CardState::Abandoned` — whatever [`CardState::check_transition`] itself
+/// returns for that. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank. Propagates a control-read or projection
+/// failure unchanged.
+fn require_abandonable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    current_state: CardState,
+    actor: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none, no
+    // card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so no card can ever be escalated,
+    // and there is no digest to bind the recorded fact to.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be abandoned this way: no convergence policy is configured for this project, so no card can be escalated",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 2: the card must be escalated *right now* — read the same way
+    // `require_renewable` reads it: a fresh `EventStore::new(control).
+    // for_cycle(...)` projected and assessed, so this command can never
+    // disagree with the check it exists to release a card from.
+    // `disposition abandon` is the authorized *escalation exit*, not a
+    // general-purpose abandon — a card that is `Within` is refused here and
+    // pointed at `card abandon`, the ordinary route that already covers it,
+    // so an operator refused here is never left with nowhere to go.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+    let CardConvergence::Escalated { .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; `disposition abandon` only ends an active escalation — to abandon a card that is not escalated, use `card abandon` instead",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 3: the card's lifecycle state must permit the transition to
+    // `Abandoned`. This is where "a repeated disposition refuses" comes
+    // from, and it comes for free: `Abandoned` has no successors, so a
+    // second `disposition abandon` against the same card reaches this exact
+    // check and is refused by it. An already-abandoned card's recorded
+    // facts do not disappear, so it still assesses as `Escalated` and still
+    // passes check 2 above every time — it is this check, not check 2, that
+    // stops a repeat.
+    current_state.check_transition(CardState::Abandoned)?;
+
+    // Check 4: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path
+    // `require_renewable` and `require_rebaseline` already resolve it
+    // through — see `require_renewable`'s own long note for why this set is
+    // reused rather than given its own field on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence disposition abandon".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {actor} is not configured to authorize a convergence disposition abandon"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 5: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition abandon requires a non-blank --rationale; an abandon with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition abandon` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_abandonable`], so a caller can never be told an abandon would
+/// succeed (or told why it would fail) and then have the real command
+/// disagree.
+fn preview_abandon(args: &AbandonArgs, card_id: &CardId) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_abandonable(
+        &control,
+        &config,
+        &record,
+        state.state,
+        &args.common.actor,
+        &args.rationale,
+    )?;
+    Ok(CommandOutcome::new(
+        "disposition.abandon",
+        format!("Dry run: would abandon card {card_id}; nothing was changed"),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+
+    if args.dry_run {
+        return preview_abandon(args, &card_id);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.abandon",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let previous = state.state;
+            let config = control.project()?;
+            let policy_digest = require_abandonable(
+                control,
+                &config,
+                &record,
+                previous,
+                &args.common.actor,
+                &args.rationale,
+            )?;
+
+            store_card_state(control, &record, &state, CardState::Abandoned)?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding `renew` uses, and for the same reason: it is the
+            // only exact commit SHA an escalated card is guaranteed to
+            // carry in any lifecycle state.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .transition(Some(previous.name()), CardState::Abandoned.name())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::Abandon)?,
+                    )
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(expected, &format!("disposition: abandon {card_id}"))?;
+
+            Ok(CommandOutcome::new(
+                "disposition.abandon",
+                format!(
+                    "Abandoned card {card_id}\nrationale: {}\nauthorized by: {}",
+                    args.rationale, args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Abandoned.name(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
                 }),
             )
             .with_project(config.project_id.clone()))
