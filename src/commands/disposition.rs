@@ -32,6 +32,19 @@
 //! abandoned card would refuse `card status` and every budget-gated command
 //! for every *other* card sharing its cycle, which is exactly the isolation
 //! #74 promises.
+//!
+//! `accept-risk` is the fourth: an authorized actor accepts a **disclosed**
+//! risk on one exhausted dimension of an escalated card, so the card can be
+//! delivered and reviewed again — without its budget being expanded. That
+//! distinction from `renew` is the entire point of this command: `renew`
+//! grants the configured limit again, so a further attempt still counts and
+//! can escalate the same dimension a second time; `accept-risk` grants
+//! nothing, so the count keeps climbing past the limit forever and the
+//! dimension simply stops being reported exhausted, because an authorized
+//! actor accepted that risk. `--risk` and `--rationale` are both required
+//! and distinct on purpose: `--risk` is *what* is being accepted — the
+//! disclosure, without which "disclosed risk" means nothing — and
+//! `--rationale` is *why* accepting it is justified.
 
 use std::{
     fs,
@@ -62,8 +75,8 @@ use crate::{
     error::{ErrorCode, HarnessError},
     git::authority::inspect_authority,
     policy::convergence::{
-        CardConvergence, CardDimension, DISPOSITION_RECORDED_EVENT, DispositionKind, assess_card,
-        project,
+        CardConvergence, CardCounters, CardDimension, DISPOSITION_RECORDED_EVENT, DispositionKind,
+        ProjectConvergence, assess_card, project,
     },
 };
 
@@ -79,6 +92,10 @@ pub enum DispositionCommand {
     /// Permanently end an escalated card — the authorized exit from an
     /// escalation, in place of another renewal.
     Abandon(AbandonArgs),
+    /// Accept a disclosed risk on one exhausted dimension of an escalated
+    /// card, without expanding its budget — the authorized exit from an
+    /// escalation that grants no further attempts, in place of a renewal.
+    AcceptRisk(AcceptRiskArgs),
 }
 
 impl DispositionCommand {
@@ -89,6 +106,7 @@ impl DispositionCommand {
             Self::Renew(..) => "disposition.renew",
             Self::Rebaseline(..) => "disposition.rebaseline",
             Self::Abandon(..) => "disposition.abandon",
+            Self::AcceptRisk(..) => "disposition.accept-risk",
         }
     }
 }
@@ -187,6 +205,29 @@ pub struct AbandonArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `disposition accept-risk`.
+#[derive(Debug, Args)]
+pub struct AcceptRiskArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The card whose disclosed risk is being accepted.
+    #[arg(long)]
+    pub card_id: String,
+    /// The exhausted dimension whose risk is being accepted.
+    #[arg(long, value_enum)]
+    pub dimension: DimensionArg,
+    /// The disclosed risk being accepted — *what* is being accepted, not
+    /// *why*; see `rationale` for the latter.
+    #[arg(long)]
+    pub risk: String,
+    /// Why accepting this disclosed risk is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `disposition` subcommand.
 ///
 /// # Errors
@@ -200,6 +241,7 @@ pub fn execute(
         DispositionCommand::Renew(args) => run_renew(args, clock),
         DispositionCommand::Rebaseline(args) => run_rebaseline(args, clock),
         DispositionCommand::Abandon(args) => run_abandon(args, clock),
+        DispositionCommand::AcceptRisk(args) => run_accept_risk(args, clock),
     }
 }
 
@@ -1043,6 +1085,319 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                 serde_json::json!({
                     "card_id": card_id.to_string(),
                     "state": CardState::Abandoned.name(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Whether `counters` already carries an accepted risk on `dimension`.
+///
+/// Reads the raw per-dimension `risk_accepted` flag rather than going
+/// through `assess_card`: once a risk is accepted, `assess_card` never
+/// reports that dimension exhausted again (see its own doc comment), so its
+/// output cannot tell "this dimension was never exhausted" apart from
+/// "this dimension was exhausted, and the risk was already accepted" — and
+/// check 3 below needs exactly that distinction. Kept as its own match
+/// rather than shared with `project`'s identically-shaped one: that
+/// function's copy operates on `&mut` references while folding a fact, and
+/// `policy::convergence` is not this card's file scope to widen.
+fn risk_already_accepted(counters: &CardCounters, dimension: CardDimension) -> bool {
+    match dimension {
+        CardDimension::ReviewReturns => counters.review_returns.risk_accepted,
+        CardDimension::RepairAttempts => counters.repair_attempts.risk_accepted,
+        CardDimension::GateFailures => counters.gate_failures.risk_accepted,
+        CardDimension::MaterialScopeRevisions => counters.material_scope_revisions.risk_accepted,
+    }
+}
+
+/// Runs every check `disposition accept-risk` must satisfy before it writes
+/// anything, in the fixed order #74-6's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when this dimension already carries an
+/// accepted risk, when the card is not currently escalated, or when the
+/// named dimension is not among the ones that are exhausted. Returns
+/// [`ErrorCode::PolicyNotAccepted`] when no final-authorization policy is
+/// configured, or when the acting actor is not in its authorized set.
+/// Returns [`ErrorCode::UsageInvalidArguments`] when `risk` or `rationale`
+/// is blank. Propagates a control-read or projection failure unchanged.
+fn require_risk_acceptable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    dimension: CardDimension,
+    actor: &str,
+    risk: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none,
+    // no card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so there is no exhausted
+    // dimension whose risk could ever be accepted.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot have a risk accepted: no convergence policy is configured for this project, so no dimension can be exhausted",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Checks 2, 3, 4, and 5 all read the same fresh projection and
+    // assessment: the same `EventStore::new(control).for_cycle(...)` →
+    // `project(...)` → `assess_card(...)` sequence `require_renewable` and
+    // `require_abandonable` already use, so this command can never
+    // disagree with the checks it exists to release a card from. Both the
+    // raw projected `view` and the derived `convergence` assessment are
+    // kept: check 3 needs the former (`assess_card`'s own output cannot
+    // distinguish "never exhausted" from "exhausted, then accepted" — see
+    // `risk_already_accepted`), and checks 4 and 5 need the latter.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+
+    // Check 3: this dimension must not already carry an accepted risk.
+    // Checked *before* checks 4 and 5, on purpose: once a risk is accepted,
+    // `assess_card` never reports that dimension exhausted again, so a
+    // repeated acceptance would otherwise fall through to check 4 or 5 and
+    // be refused with "the card is not escalated" or "that dimension still
+    // has budget" — both true-sounding, and both misleading about what
+    // actually happened. This check names the earlier acceptance instead.
+    let already_accepted = match &view {
+        ProjectConvergence::Configured(projection) => projection
+            .cards
+            .get(&record.card_id)
+            .is_some_and(|counters| risk_already_accepted(counters, dimension)),
+        ProjectConvergence::LegacyUnassessed => false,
+    };
+    if already_accepted {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} already has an accepted risk on `{}`; a dimension's risk can only be accepted once",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 4: the card must be escalated *right now* — the same "response
+    // to escalation, not a blank cheque" property `require_renewable`'s
+    // own check 2 documents.
+    let CardConvergence::Escalated { exhausted, .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; there is no exhausted risk to accept",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 5: the *named* dimension specifically must be one of the
+    // exhausted ones — the same reasoning as `require_renewable`'s own
+    // check 3: a dimension that still has budget cannot have its risk
+    // pre-accepted, because that is silent expansion by another name. The
+    // refusal names every dimension that really is exhausted.
+    if !exhausted.iter().any(|item| item.dimension == dimension) {
+        let actually_exhausted = exhausted
+            .iter()
+            .map(|item| dimension_wire_name(item.dimension))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot pre-accept risk on `{}`: that dimension still has budget; the exhausted dimension(s) are: {actually_exhausted}",
+                record.card_id,
+                dimension_wire_name(dimension)
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 6: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path
+    // `require_renewable`, `require_rebaseline`, and `require_abandonable`
+    // already resolve it through — see `require_renewable`'s own long note
+    // for why this set is reused rather than given its own field on
+    // `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence risk acceptance".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "actor {actor} is not configured to authorize a convergence risk acceptance"
+            ),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 7: `--risk` and `--rationale` are refused separately, with
+    // distinct messages, even though both land on the same error code —
+    // deliberately, so an operator who left one blank does not have to
+    // guess which. `--risk` is checked first: it is *what* is being
+    // accepted, without which "disclosed risk" means nothing, and reads
+    // naturally as the first thing an operator would fix.
+    if risk.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition accept-risk requires a non-blank --risk; an accepted risk with no declared disclosure cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition accept-risk requires a non-blank --rationale; an accepted risk with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition accept-risk` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_risk_acceptable`], so a caller can never be told an
+/// acceptance would succeed (or told why it would fail) and then have the
+/// real command disagree.
+fn preview_accept_risk(
+    args: &AcceptRiskArgs,
+    card_id: &CardId,
+    dimension: CardDimension,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, _state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_risk_acceptable(
+        &control,
+        &config,
+        &record,
+        dimension,
+        &args.common.actor,
+        &args.risk,
+        &args.rationale,
+    )?;
+    Ok(CommandOutcome::new(
+        "disposition.accept-risk",
+        format!(
+            "Dry run: would accept risk on card {card_id}'s {} dimension; nothing was changed",
+            dimension_wire_name(dimension)
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "dimension": dimension_wire_name(dimension),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_accept_risk(
+    args: &AcceptRiskArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let dimension: CardDimension = args.dimension.into();
+
+    if args.dry_run {
+        return preview_accept_risk(args, &card_id, dimension);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.accept-risk",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let config = control.project()?;
+            let policy_digest = require_risk_acceptable(
+                control,
+                &config,
+                &record,
+                dimension,
+                &args.common.actor,
+                &args.risk,
+                &args.rationale,
+            )?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding `renew` and `abandon` use, and for the same
+            // reason: it is the only exact commit SHA an escalated card is
+            // guaranteed to carry in any lifecycle state. No
+            // `store_card_state` call and no `.transition(...)` on this
+            // event: unlike `abandon`, an acceptance moves no card state —
+            // the card simply becomes deliverable again where it stands.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::AcceptRisk)?,
+                    )
+                    .meta("dimension", serde_json::to_value(dimension)?)
+                    .meta("risk", serde_json::json!(args.risk))
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(
+                expected,
+                &format!(
+                    "disposition: accept-risk {card_id} {}",
+                    dimension_wire_name(dimension)
+                ),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.accept-risk",
+                format!(
+                    "Accepted risk on card {card_id}'s {} dimension\nrisk: {}\nrationale: {}\nauthorized by: {}",
+                    dimension_wire_name(dimension),
+                    args.risk,
+                    args.rationale,
+                    args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "dimension": dimension_wire_name(dimension),
                     "event_id": event.event_id.to_string(),
                     "policy_digest": policy_digest.as_str(),
                 }),

@@ -239,7 +239,7 @@ impl AttemptKind {
 /// The single append-only disposition fact the v1 projection recognizes.
 pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
 
-/// Closed set of authorized dispositions. The three #74 has implemented so
+/// Closed set of authorized dispositions. The four #74 has implemented so
 /// far are here; the rest arrive with their own bounded effects.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +254,12 @@ pub enum DispositionKind {
     /// ordinary lifecycle transition check, not by anything this
     /// projection tracks.
     Abandon,
+    /// Accepts a disclosed risk on one exhausted dimension instead of
+    /// granting the card another attempt at all. Unlike `Renew`, this
+    /// grants no budget: the count keeps climbing past the limit forever,
+    /// and the dimension simply stops being reported exhausted. See
+    /// `DimensionCount::risk_accepted` and `assess_card`.
+    AcceptRisk,
 }
 
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
@@ -331,6 +337,31 @@ struct AbandonMetadata {
     policy_digest: Digest,
 }
 
+/// Metadata an accept-risk fact must declare, with the same closed-set
+/// rigor as `DispositionMetadata` and `AbandonMetadata`.
+///
+/// A separate shape for the same reason `AbandonMetadata` is: an
+/// accept-risk fact carries `risk` — the disclosure being accepted, without
+/// which "disclosed risk" means nothing — and `DispositionMetadata`'s
+/// `deny_unknown_fields` would reject that field outright. Unlike an
+/// abandon, an acceptance *does* name a `dimension`: it is a decision about
+/// one exact bounded dimension, not about the card as a whole.
+/// `policy_digest` here is the digest this fact is itself recorded under —
+/// checked in `project` exactly like any other fact's — never a digest it
+/// retires or a budget it expands; an acceptance retires nothing and
+/// grants nothing back. See `disposition accept-risk` in
+/// `commands::disposition` and `DimensionCount::risk_accepted`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptRiskMetadata {
+    disposition: DispositionKind,
+    dimension: CardDimension,
+    risk: String,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
 /// A projection error refuses the whole view. Returning partial counters would
 /// make an attacker-controlled malformed fact look like unused budget.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -371,6 +402,18 @@ pub struct DimensionCount {
     /// Not evidence and not a count of facts: this is how many times an
     /// authorized actor decided to grant the configured budget again.
     pub renewals: u32,
+    /// Whether an authorized actor has accepted this dimension's
+    /// exhaustion as a disclosed risk.
+    ///
+    /// Not a budget grant, unlike `renewals` above: accepting a risk raises
+    /// no effective budget and resets no count — the count keeps climbing
+    /// past the limit forever. It only changes whether `assess_card` still
+    /// reports this dimension exhausted. `#[serde(default)]` so a
+    /// projection snapshot serialized before this field existed still
+    /// deserializes, defaulting to `false` — a fact recorded under the old
+    /// shape could not have accepted anything.
+    #[serde(default)]
+    pub risk_accepted: bool,
 }
 
 /// Counters derived for a card, accumulated over every fact recorded against
@@ -698,20 +741,26 @@ pub fn project(
     // always about one card in one exact state, so the card binding below
     // is unconditional rather than selected by a match arm.
     //
-    // Rebaselines and abandons are both excluded here, for related but
-    // distinct reasons. Rebaselines are cycle-only, not card-bound, and the
-    // first pass above already collected, validated, and accounted for
-    // every one of them. Abandons *are* card-bound, but carry no
-    // `dimension` — that is the whole point of `AbandonMetadata` being a
-    // separate shape — and fold into no counter, so they get their own pass
-    // below instead. Visiting either kind here would attempt a
-    // `dimension`-shaped parse its metadata was never going to satisfy, and
-    // double-insert its event identifier into `seen`, misreporting a lone
-    // valid fact as a duplicate.
+    // Rebaselines, abandons, and accept-risk facts are all excluded here,
+    // for related but distinct reasons. Rebaselines are cycle-only, not
+    // card-bound, and the first pass above already collected, validated,
+    // and accounted for every one of them. Abandons *are* card-bound, but
+    // carry no `dimension` — that is the whole point of `AbandonMetadata`
+    // being a separate shape — and fold into no counter, so they get their
+    // own pass below instead. Accept-risk facts *are* card-bound and *do*
+    // name a `dimension`, unlike an abandon, but they carry `risk` too,
+    // which this loop's `DispositionMetadata` `deny_unknown_fields` would
+    // reject outright — the same reason `AbandonMetadata` is its own shape
+    // rather than an optional field bolted onto this one — and they fold
+    // into a flag, not a counter, so they get their own pass as well.
+    // Visiting any of the three here would attempt a parse its metadata was
+    // never going to satisfy, and double-insert its event identifier into
+    // `seen`, misreporting a lone valid fact as a duplicate.
     for event in events.iter().filter(|event| {
         event.event_type == DISPOSITION_RECORDED_EVENT
             && !is_rebaseline(event)
             && !is_abandon(event)
+            && !is_accept_risk(event)
     }) {
         let event_id = event.event_id.as_str().to_owned();
         if !seen.insert(event_id.clone()) {
@@ -808,6 +857,12 @@ pub fn project(
             // too. The pass below is the only place one is ever validated,
             // and it folds into no counter at all.
             DispositionKind::Abandon => unreachable!("abandon facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every accept-risk
+            // fact too. Its own pass below is the only place one is ever
+            // validated, and it folds into a flag, never this counter.
+            DispositionKind::AcceptRisk => {
+                unreachable!("accept-risk facts are filtered out above")
+            }
         }
     }
 
@@ -891,6 +946,103 @@ pub fn project(
         }
     }
 
+    // Accept-risk facts validate with the same fail-closed rigor as an
+    // abandon fact — project/cycle, duplicate identifier, metadata parse,
+    // the same three-way policy-digest rule, and an exact
+    // card_id/card_revision/card_digest/head binding — with two
+    // differences. First, the non-blank check also covers `risk`, not just
+    // `rationale` and `authorized_by`: a disclosure that says nothing
+    // discloses nothing. Second, unlike an abandon, an acceptance *does*
+    // fold into the projection — it sets a flag, never a counter, so
+    // idempotency needs no bookkeeping: two facts naming the same
+    // dimension simply set the same flag twice. See
+    // `DimensionCount::risk_accepted` and `assess_card` for what the flag
+    // changes downstream.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_accept_risk(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: AcceptRiskMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_accept_risk` already selected only accept-risk-tagged events,
+        // so this can never actually fire; it exists so `disposition`
+        // stays a meaningfully-checked field of this shape rather than
+        // dead weight that `deny_unknown_fields` forces us to declare
+        // regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::AcceptRisk);
+        if metadata.risk.trim().is_empty()
+            || metadata.rationale.trim().is_empty()
+            || metadata.authorized_by.trim().is_empty()
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared risk, rationale, and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind. See the longer
+        // note above the equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(card_id), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+        if under_retired_digest {
+            continue;
+        }
+
+        // Idempotent by construction: setting the same dimension's flag to
+        // `true` twice, from two separate facts, changes nothing the
+        // second time — no counter, so no overflow to guard against
+        // either.
+        let counters = result.cards.entry(card_id.clone()).or_default();
+        match metadata.dimension {
+            CardDimension::ReviewReturns => counters.review_returns.risk_accepted = true,
+            CardDimension::RepairAttempts => counters.repair_attempts.risk_accepted = true,
+            CardDimension::GateFailures => counters.gate_failures.risk_accepted = true,
+            CardDimension::MaterialScopeRevisions => {
+                counters.material_scope_revisions.risk_accepted = true;
+            }
+        }
+    }
+
     Ok(ProjectConvergence::Configured(result))
 }
 
@@ -932,6 +1084,25 @@ fn is_abandon(event: &Event) -> bool {
         .get("disposition")
         .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
         == Some(DispositionKind::Abandon)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is an accept-risk, decided
+/// from its raw `disposition` field rather than by committing to any one
+/// full metadata shape first — mirrors `is_rebaseline` and `is_abandon`
+/// exactly, and for the same reason: `AcceptRiskMetadata` disagrees with
+/// `DispositionMetadata` on almost every other field (it carries `risk`,
+/// which the other's `deny_unknown_fields` would reject), and a wrong
+/// guess would turn into a spurious refusal rather than a graceful
+/// fallback. A fact that is not recognizably an accept-risk — including
+/// one with a missing or malformed `disposition` field — answers `false`
+/// here and is left for the ordinary `DispositionMetadata` parse to accept
+/// or, correctly, refuse.
+fn is_accept_risk(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::AcceptRisk)
 }
 
 /// Which bounded card dimension a budget covers.
@@ -1017,6 +1188,10 @@ pub enum NextPermittedAction {
 /// dimension a partial answer happened to mention, then meets a second
 /// dimension hiding behind it on the next attempt, has lost a whole review
 /// cycle to a check that already knew about both.
+///
+/// A dimension whose `risk_accepted` is set is never reported exhausted,
+/// whatever its count and effective budget say — see the loop below for
+/// why an explicit acceptance outranks even the overflow default.
 #[must_use]
 pub fn assess_card(
     policy: Option<&ConvergencePolicy>,
@@ -1089,7 +1264,18 @@ pub fn assess_card(
         // See the doc comment above. An overflowed budget is exhausted
         // unconditionally: there is no safe number left to compare `count`
         // against, so escalating is the only fail-closed answer.
-        if overflowed || count.count >= effective_budget {
+        //
+        // `risk_accepted` wins over that overflow default, and over an
+        // ordinary spent budget too: an overflow is a defensive fallback
+        // for when there is no safe number left, but an accepted risk is
+        // an explicit authorized decision about this exact dimension, and
+        // a specific decision outranks a defensive default. Acceptance
+        // grants no budget of its own — `count` and `effective_budget`
+        // above are computed exactly as they would be without it, so a
+        // renewal stacked on the same dimension still behaves normally,
+        // and any *other*, still-exhausted dimension on this card is still
+        // reported accurately.
+        if !count.risk_accepted && (overflowed || count.count >= effective_budget) {
             exhausted.push(ExhaustedDimension {
                 dimension,
                 count: count.count,
@@ -1408,6 +1594,52 @@ mod tests {
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: Some("active".to_owned()),
             next_state: Some("abandoned".to_owned()),
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `accept_risk` disposition fact for `F-001`, naming
+    /// the given dimension. Card-bound like `disposition_event` and
+    /// `abandon_event`, and carrying no state transition like
+    /// `disposition_event` (renew): an acceptance moves no card state,
+    /// unlike an abandon. Tests that need an invalid or differently bound
+    /// acceptance mutate the returned event, exactly as `disposition_event`
+    /// is mutated elsewhere in this module.
+    fn accept_risk_event(id: u64, dimension: CardDimension) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::AcceptRisk).unwrap(),
+        );
+        metadata.insert(
+            "dimension".to_owned(),
+            serde_json::to_value(dimension).unwrap(),
+        );
+        metadata.insert("risk".to_owned(), serde_json::json!(format!("risk:{id}")));
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("acceptance:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: None,
+            next_state: None,
             head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
             metadata,
         }
@@ -1872,28 +2104,32 @@ mod tests {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:1".to_owned()]),
                     renewals: 0,
+                    risk_accepted: false,
                 },
                 repair_attempts: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:2".to_owned()]),
                     renewals: 0,
+                    risk_accepted: false,
                 },
                 gate_failures: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:3".to_owned()]),
                     renewals: 0,
+                    risk_accepted: false,
                 },
                 material_scope_revisions: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:4".to_owned()]),
                     renewals: 0,
+                    risk_accepted: false,
                 },
             }
         );
         assert_eq!(
             serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
             format!(
-                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0}}}}}}}}"#,
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0,"risk_accepted":false}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0,"risk_accepted":false}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0,"risk_accepted":false}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0,"risk_accepted":false}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0,"risk_accepted":false}}}}}}}}"#,
                 view.policy_digest
             )
         );
@@ -2076,6 +2312,7 @@ mod tests {
                 count: 1,
                 evidence: BTreeSet::from(["receipt:6".to_owned()]),
                 renewals: 0,
+                risk_accepted: false,
             },
         );
         assert_eq!(f002.repair_attempts, DimensionCount::default());
@@ -2218,6 +2455,7 @@ mod tests {
                         count: 1,
                         evidence: BTreeSet::from(["receipt:1".to_owned()]),
                         renewals: 0,
+                        risk_accepted: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2578,7 +2816,7 @@ mod tests {
         let dimension = &configured.cards[&CardId::from_str("F-001").unwrap()].review_returns;
         assert_eq!(
             serde_json::to_string(dimension).unwrap(),
-            r#"{"count":1,"evidence":["receipt:1"],"renewals":1}"#
+            r#"{"count":1,"evidence":["receipt:1"],"renewals":1,"risk_accepted":false}"#
         );
     }
 
@@ -2634,6 +2872,7 @@ mod tests {
                         count: 3,
                         evidence: BTreeSet::new(),
                         renewals: 1,
+                        risk_accepted: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2656,6 +2895,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![CardDimension::ReviewReturns],
             "the overflowed dimension is the one that must be reported exhausted"
+        );
+    }
+
+    #[test]
+    fn an_accepted_risk_outranks_an_overflowed_budget() {
+        // Sibling of the test above, with the one field that test pins at
+        // `false` now set to `true`: same huge base limit, same single
+        // renewal, same small `count`. `assess_card`'s doc comment promises
+        // `risk_accepted` wins even over the overflow default; nothing
+        // before this test exercised that promise, because every other
+        // test's arithmetic never overflows in the first place.
+        let huge_limits = CardConvergenceLimits {
+            review_returns: u32::MAX / 2 + 1,
+            repair_attempts: 1,
+            gate_failures: 1,
+            material_scope_revisions: 1,
+        };
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: RiskConvergenceLimits {
+                low: huge_limits.clone(),
+                medium: huge_limits.clone(),
+                high: huge_limits.clone(),
+                critical: huge_limits,
+            },
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+
+        let card_id = CardId::from_str("F-001").unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters::default(),
+            cards: BTreeMap::from([(
+                card_id.clone(),
+                CardCounters {
+                    review_returns: DimensionCount {
+                        count: 3,
+                        evidence: BTreeSet::new(),
+                        renewals: 1,
+                        risk_accepted: true,
+                    },
+                    ..CardCounters::default()
+                },
+            )]),
+        });
+
+        assert_eq!(
+            assess_card(Some(&overflow_policy), &view, &card_id, Risk::Medium),
+            CardConvergence::Within,
+            "an accepted risk must outrank the overflow default; the dimension must not be \
+             reported exhausted even though its effective budget overflows"
         );
     }
 
@@ -3095,6 +3388,175 @@ mod tests {
         malformed_head.head_sha = Some("not-a-sha".to_owned());
         let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
             .expect_err("an abandon with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
+    }
+
+    // 74-6: `disposition accept-risk`'s own projection pass carries the same
+    // six guards as the abandon pass above, and this time every one of them
+    // gets its own test, asserting the exact `error.reason` rather than a
+    // bare `is_err()`. 74-5's abandon pass shipped with one of its six —
+    // the metadata parse guard — undefended by any test at all; a review
+    // mutation could have deleted it with the whole suite still green. The
+    // six below are, in order: duplicate event id, project/cycle binding,
+    // metadata parse, non-blank risk/rationale/authorized_by, the
+    // three-way policy-digest rule, and exact card/revision/digest/head
+    // binding including `is_exact_sha`.
+
+    #[test]
+    fn a_duplicate_accept_risk_identifier_is_refused() {
+        // Guard 1: duplicate event id. 74-5's version is
+        // `a_duplicate_abandon_identifier_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = accept_risk_event(1, CardDimension::ReviewReturns);
+        let mut duplicate = accept_risk_event(2, CardDimension::ReviewReturns);
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two accept-risk facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn an_accept_risk_bound_to_another_project_or_cycle_is_refused() {
+        // Guard 2: project/cycle binding. 74-5's version is
+        // `an_abandon_bound_to_another_project_or_cycle_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = accept_risk_event(1, CardDimension::ReviewReturns);
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("an accept-risk naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = accept_risk_event(2, CardDimension::ReviewReturns);
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("an accept-risk naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn an_accept_risk_with_malformed_metadata_is_refused() {
+        // Guard 3: metadata parse. The one guard 74-5's abandon pass shipped
+        // with no dedicated test at all, not even the bare-`is_err()` kind:
+        // a fact whose `disposition` field really does say `accept_risk`,
+        // so `is_accept_risk` routes it into this pass, but whose metadata
+        // cannot fill `AcceptRiskMetadata` — missing its own required
+        // `risk` field — must refuse with the parse error, not panic or
+        // silently default it to blank.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut missing_risk = accept_risk_event(1, CardDimension::ReviewReturns);
+        missing_risk.metadata.remove("risk");
+        let error = project(Some(&policy()), &project_id, &cycle, &[missing_risk]).expect_err(
+            "an accept-risk fact missing its own required `risk` field must refuse the whole view",
+        );
+        assert_eq!(error.reason, "malformed metadata: missing field `risk`");
+    }
+
+    #[test]
+    fn an_accept_risk_without_a_risk_a_rationale_or_an_authorizing_actor_is_refused() {
+        // Guard 4: non-blank risk/rationale/authorized_by. 74-5's version,
+        // covering two of these three fields, is
+        // `an_abandon_without_a_rationale_or_an_authorizing_actor_is_refused`.
+        // `risk` joins the same one check here: a disclosure that says
+        // nothing discloses nothing, so a blank `risk` is refused exactly
+        // like a blank `rationale` or `authorized_by`, with the same
+        // message naming all three.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_risk = accept_risk_event(1, CardDimension::ReviewReturns);
+        blank_risk
+            .metadata
+            .insert("risk".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_risk])
+            .expect_err("an accept-risk with no declared risk is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+
+        let mut blank_rationale = accept_risk_event(2, CardDimension::ReviewReturns);
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("an accept-risk with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+
+        let mut blank_actor = accept_risk_event(3, CardDimension::ReviewReturns);
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("an accept-risk with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared risk, rationale, and an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn an_accept_risk_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // Guard 5: the three-way policy-digest rule. 74-5's version is
+        // `an_abandon_bound_to_a_foreign_policy_digest_refuses_the_whole_
+        // view`: an acceptance folds no counter, only a flag, but it still
+        // has to obey the same three-way digest rule as every other fact
+        // kind — a digest nobody ever decided about must not pass just
+        // because nothing would have been folded anyway.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = accept_risk_event(1, CardDimension::ReviewReturns);
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign]).expect_err(
+            "an accept-risk naming a digest nobody ever decided about must refuse the whole view",
+        );
+        assert_eq!(error.reason, "fact names a foreign policy digest");
+    }
+
+    #[test]
+    fn an_accept_risk_without_an_exact_card_and_head_binding_is_refused() {
+        // Guard 6: exact card/revision/digest/head binding including
+        // `is_exact_sha`. 74-5's version is
+        // `an_abandon_without_an_exact_card_and_head_binding_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = accept_risk_event(1, CardDimension::ReviewReturns);
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("an accept-risk with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = accept_risk_event(2, CardDimension::ReviewReturns);
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("an accept-risk with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = accept_risk_event(3, CardDimension::ReviewReturns);
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("an accept-risk with a malformed head must refuse the whole view");
         assert_eq!(error.reason, "disposition head is not an exact commit SHA");
     }
 }
