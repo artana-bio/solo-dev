@@ -8154,3 +8154,708 @@ mod disposition_redesign {
         );
     }
 }
+
+// 73-2: the enforcement half of the pattern 73-1 only reported.
+// `require_cycle_convergence_budget` (`integration.rs`) refuses every
+// governed path that advances an integration toward promotion once a
+// cycle's own convergence budget is spent — preparation, the merge/land/
+// verify/review sequence, final authorization (`acceptance record`), and
+// promotion itself — mirroring 72-2's `require_convergence_budget` at the
+// card level. It never touches `integration abandon`, `cycle abandon`, or
+// any inspect/report command: those are exits and windows, not advances.
+//
+// Unlike a card, which has six authorized dispositions (#74) to answer an
+// escalation, an escalated *cycle* has exactly two exits: every disposition
+// except `rebaseline` takes `--card-id`, so there is no cycle-scoped
+// `renew`. The refusal names both, by command, and this module's most
+// important test — `a_rebaseline_lets_an_escalated_cycle_integrate_again` —
+// proves the first one actually works, not merely that it is named.
+mod cycle_convergence_enforcement {
+    use super::*;
+
+    /// Escalates C-001's `integration_failures` budget through the governed
+    /// `integration merge` path — the same `conflicting_under_policy` /
+    /// `prepare_integration` fixture 73-1's own tests use, just with the
+    /// cycle limit tight enough that this one real conflict alone exhausts
+    /// it. Returns the still-open, never-merged integration id:
+    /// `run_merge`'s own conflict handling never sets
+    /// `record.integration_head`, so this integration keeps its lease
+    /// (`IntegrationStatus::Prepared.holds_lease()`) — the one legitimate
+    /// target every "does the gate fire first" test below reuses, rather
+    /// than each rebuilding its own conflict.
+    fn escalated_cycle(card_limit: u32) -> (Workspace, String) {
+        let workspace = conflicting_under_policy(card_limit, 1);
+        let id = prepare_integration(&workspace);
+        let output = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&output),
+            "CH-CONFLICT-MERGE-FAILED",
+            "the fixture must fail on the conflict it was built to produce, before this \
+             card's gate exists to refuse anything else"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "the fixture must actually exhaust the cycle's budget"
+        );
+        (workspace, id)
+    }
+
+    /// Creates and activates a card in an arbitrary cycle, not necessarily
+    /// `C-001`. `support::Workspace::activate_card`, and every other
+    /// `activate_card_*` helper it offers, hard-codes `cycle_id: C-001`,
+    /// which `an_unrelated_cycle_still_completes`'s second cycle cannot use.
+    /// Mirrors `activate_card_with_gates`'s body directly — the same reason
+    /// `disposition_split`'s and `disposition_redesign`'s identically-named
+    /// copies exist: `support::Workspace` is outside this card's file
+    /// scope, so each module that needs a non-`C-001` card keeps its own
+    /// copy rather than reaching into a sibling module's private helper.
+    fn activate_card_in_cycle(
+        workspace: &Workspace,
+        card_id: &str,
+        cycle_id: &str,
+        include: &[&str],
+    ) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base =
+            workspace.cycle_json(&["status", "--cycle-id", cycle_id])["data"]["baseline_sha"]
+                .as_str()
+                .expect("cycle has a frozen baseline")
+                .to_owned();
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: {cycle_id}\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        );
+        let path = workspace.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        workspace.card(&["create", "--draft", &path.display().to_string()]);
+        workspace.card(&["activate", "--card-id", card_id]);
+    }
+
+    /// Asserts that a raw command output was refused specifically for the
+    /// escalated cycle's convergence budget — by code, and by naming both
+    /// exits in the message — and that it left the control repository
+    /// untouched. Shared by every "does the gate fire first" test below, so
+    /// each one only has to say which command it drove and reuse this for
+    /// the assertions they would otherwise all repeat verbatim.
+    fn assert_refused_for_convergence(
+        workspace: &Workspace,
+        output: &std::process::Output,
+        before_head: &str,
+    ) {
+        assert!(
+            !output.status.success(),
+            "an escalated cycle must refuse this command: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(output), "CH-POLICY-CONVERGENCE-ESCALATED");
+        let message = error_message(output);
+        assert!(
+            message.contains("disposition rebaseline"),
+            "the refusal must name the first exit, by command: {message}"
+        );
+        assert!(
+            message.contains("cycle abandon"),
+            "the refusal must name the second exit, by command: {message}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_further_integration() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+
+        // The same still-open integration, tried again: this must be
+        // refused for the *cycle's* spent convergence budget now, not for
+        // the conflict that spent it in the first place — a second attempt
+        // never even reaches `integration preflight`'s own simulation.
+        let output = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+        let message = error_message(&output);
+        assert!(message.contains("integration_failures"), "{message}");
+        assert!(message.contains("1/1"), "{message}");
+
+        // No second `integration_failure` fact: the gate refused before a
+        // real merge attempt could ever be made, so there was nothing new
+        // to fail.
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the gate must refuse before a second conflict could be recorded"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_cycle_still_completes() {
+        let (workspace, _id) = escalated_cycle(3);
+
+        // A second cycle in the same project, wholly independent of C-001,
+        // must prepare and merge normally while C-001 sits escalated — #73's
+        // own acceptance criterion (contract §1): escalation is scoped to
+        // the cycle `assess_cycle` was projected against, never the project.
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second, unrelated slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        activate_card_in_cycle(&workspace, "F-101", "C-002", &["docs/f101/**"]);
+        workspace.approve_card("F-101", "docs/f101/a.md");
+
+        let before_prepare = workspace.control_head();
+        let prepared = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-002",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_ne!(
+            workspace.control_head(),
+            before_prepare,
+            "prepare must commit its own write"
+        );
+        let id = prepared["data"]["integration_id"]
+            .as_str()
+            .expect("a prepared integration id")
+            .to_owned();
+
+        let before_merge = workspace.control_head();
+        let merged = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert!(
+            merged.status.success(),
+            "an unrelated cycle's own integration must merge normally: {}{}",
+            String::from_utf8_lossy(&merged.stdout),
+            String::from_utf8_lossy(&merged.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_merge,
+            "merge must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after the unrelated cycle's merge"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-002"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the unrelated cycle's own budget must be untouched"
+        );
+
+        // And C-001 remains blocked throughout, proving the isolation runs
+        // both ways.
+        let still_blocked = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&still_blocked),
+            "CH-POLICY-CONVERGENCE-ESCALATED"
+        );
+    }
+
+    /// Like `Workspace::initialized`, but declares the final-authorization
+    /// policy's authorized actors at `project init` time — needed only by
+    /// `a_rebaseline_lets_an_escalated_cycle_integrate_again`, the one test
+    /// in this module that exercises `disposition rebaseline` and so needs
+    /// an authorizer for it to check. Mirrors
+    /// `disposition_rebaseline::initialized_with_authorizers` directly, for
+    /// the same reason `activate_card_in_cycle` mirrors its own sibling
+    /// copies: `support::Workspace` is outside this card's file scope.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Runs `disposition rebaseline` in JSON mode, returning the raw
+    /// output. Mirrors every other per-module `_raw` helper in this file;
+    /// kept local because `support::Workspace` is outside this card's file
+    /// scope.
+    fn disposition_rebaseline_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "rebaseline".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    #[test]
+    // The most important test in this card (contract §6.3): it proves the
+    // first exit the refusal above names actually works, not merely that it
+    // is named. If a rebaseline did not free the cycle, the refusal would
+    // be naming a way out that does not exist — a finding that changes the
+    // design, not something to work around.
+    #[allow(clippy::too_many_lines)]
+    fn a_rebaseline_lets_an_escalated_cycle_integrate_again() {
+        let workspace = initialized_with_authorizers(&["owner"]);
+        workspace.configure_convergence_policy(3, 1);
+
+        // The same conflict-on-the-protected-branch fixture
+        // `conflicting_under_policy` builds, assembled by hand here because
+        // that helper calls `Workspace::initialized`, which cannot declare
+        // the `--final-authorizer-actor-id` this test also needs — the same
+        // reason `disposition_rebaseline`'s own `opened_with_disposition_
+        // policies` cannot reuse the top-level `opened_with_policy` either.
+        fs::write(
+            workspace.repository.join("shared.txt"),
+            "line1\nline2\nline3\n",
+        )
+        .unwrap();
+        support::git(&workspace.repository, &["add", "-A"]);
+        support::git(&workspace.repository, &["commit", "-q", "-m", "add shared"]);
+        support::git(
+            &workspace.repository,
+            &["push", "-q", "harness-authority", "main"],
+        );
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["shared.txt"]);
+        workspace.approve_card("F-001", "shared.txt");
+        fs::write(
+            workspace.repository.join("shared.txt"),
+            "landed elsewhere\nline2\nline3\n",
+        )
+        .unwrap();
+        support::git(&workspace.repository, &["add", "-A"]);
+        support::git(&workspace.repository, &["commit", "-q", "-m", "hotfix"]);
+        support::git(
+            &workspace.repository,
+            &["push", "-q", "harness-authority", "main"],
+        );
+
+        let id = prepare_integration(&workspace);
+        let conflict = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_eq!(
+            error_code(&conflict),
+            "CH-CONFLICT-MERGE-FAILED",
+            "the fixture must fail on the conflict it was built to produce"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"]["status"],
+            "escalated"
+        );
+
+        // Clear INT-001's lease — abandon is one of the two exits, and stays
+        // ungated — then declare a fresh card whose write scope cannot
+        // possibly collide with the retired one. The point is to isolate
+        // the *cycle's* budget as the thing still blocking progress, not
+        // this one integration's own conflict.
+        workspace.integration(&[
+            "abandon",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--reason",
+            "clearing the lease to isolate the cycle-level refusal",
+        ]);
+        workspace.activate_card("F-002", &["src/f002/**"]);
+        workspace.approve_card("F-002", "src/f002/a.rs");
+
+        // The previously-refused path: a fresh `integration prepare` for
+        // *only* F-002 is still refused while the cycle stays escalated,
+        // even with the conflicting integration cleared out of the way and
+        // a clean candidate ready to go. Named explicitly with `--card-id`
+        // rather than left to select every ready card: F-001 itself is
+        // `approved` again after the abandon above, and selecting it back
+        // in would reintroduce the very conflict this test is careful to
+        // keep out of the way, for a reason unrelated to what it checks.
+        let before_rebaseline = workspace.control_head();
+        let still_refused = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--card-id",
+            "F-002",
+        ]);
+        assert_eq!(
+            error_code(&still_refused),
+            "CH-POLICY-CONVERGENCE-ESCALATED",
+            "prepare must still be refused before the exit below is exercised"
+        );
+        assert_eq!(workspace.control_head(), before_rebaseline);
+
+        // The first named exit, exercised for real, with a genuinely
+        // different policy — reinstalling the same digest unchanged is
+        // itself refused by `disposition rebaseline`'s own contract, so
+        // this is not merely a formality. The new policy keeps the same
+        // tight `integration_limit` of 1, changing only the card limit: a
+        // looser cycle limit would let the retried path succeed even if
+        // `project` failed to stop counting the retired fact, which would
+        // prove nothing about the digest retirement this test exists to
+        // check — see the assertion just below that the cycle reports
+        // `within`, not merely that it is one attempt short of `escalated`.
+        let new_policy_path = write_json(
+            &workspace,
+            "rebaseline-policy.json",
+            &convergence_policy_document(5, 1),
+        );
+        let rebaseline = disposition_rebaseline_raw(
+            &workspace,
+            &[
+                "--policy",
+                &new_policy_path,
+                "--rationale",
+                "opening the emergency exit for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            rebaseline.status.success(),
+            "an authorized rebaseline must succeed: {}{}",
+            String::from_utf8_lossy(&rebaseline.stdout),
+            String::from_utf8_lossy(&rebaseline.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_rebaseline,
+            "rebaseline must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after rebaseline"
+        );
+
+        // The cycle reports `within` again: the retired fact stops counting
+        // without being erased from the record.
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["convergence"],
+            serde_json::json!({ "status": "within" }),
+            "the retired fact must stop counting once rebaselined"
+        );
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the retired fact must remain in the record, not be erased"
+        );
+
+        // The headline claim: the previously-refused path now succeeds, all
+        // the way through a real merge — the cycle can integrate again.
+        // Still `--card-id F-002` alone, for the same reason as above: this
+        // proves the cycle-level budget was what was blocking, not that
+        // F-001's own conflict happened to have gone away.
+        let after_rebaseline = workspace.control_head();
+        let prepared = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--card-id",
+            "F-002",
+        ]);
+        assert_ne!(
+            workspace.control_head(),
+            after_rebaseline,
+            "prepare must commit its own write"
+        );
+        let new_id = prepared["data"]["integration_id"]
+            .as_str()
+            .expect("a prepared integration id")
+            .to_owned();
+
+        let before_merge = workspace.control_head();
+        let merged = workspace.integration_raw(&[
+            "merge",
+            "--integration-id",
+            &new_id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert!(
+            merged.status.success(),
+            "the exit named in the refusal must actually let the cycle integrate again: {}{}",
+            String::from_utf8_lossy(&merged.stdout),
+            String::from_utf8_lossy(&merged.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_merge,
+            "merge must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after the post-rebaseline merge"
+        );
+        assert_eq!(
+            attempt_recorded_events(&workspace).len(),
+            1,
+            "the clean post-rebaseline merge must not add a new failure fact"
+        );
+    }
+
+    #[test]
+    fn an_escalated_cycle_can_still_be_abandoned() {
+        let (workspace, _id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.cycle_raw(&[
+            "abandon",
+            "--cycle-id",
+            "C-001",
+            "--reason",
+            "closing the escalated cycle",
+        ]);
+        assert!(
+            output.status.success(),
+            "cycle abandon must stay usable on an escalated cycle: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            workspace.control_head(),
+            before_head,
+            "cycle abandon must commit its own write"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean after abandoning an escalated cycle"
+        );
+        assert_eq!(
+            workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["status"],
+            "abandoned"
+        );
+    }
+
+    #[test]
+    fn an_escalated_cycle_is_still_inspectable() {
+        let (workspace, id) = escalated_cycle(3);
+
+        let status = workspace.cycle_raw(&["status", "--cycle-id", "C-001"]);
+        assert!(
+            status.status.success(),
+            "cycle status must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status_envelope: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(
+            status_envelope["data"]["convergence"]["status"],
+            "escalated"
+        );
+
+        let list = workspace.cycle_raw(&["list"]);
+        assert!(
+            list.status.success(),
+            "cycle list must stay readable on an escalated cycle"
+        );
+
+        let inspect = workspace.integration_raw(&["inspect", "--integration-id", &id]);
+        assert!(
+            inspect.status.success(),
+            "integration inspect must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+
+        let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+        assert!(
+            ready.status.success(),
+            "integration ready must stay readable on an escalated cycle: {}",
+            String::from_utf8_lossy(&ready.stderr)
+        );
+
+        // `decision-packet` only ever answers for a `--final` integration;
+        // this fixture's is an ordinary per-card one, so its refusal here
+        // must be the pre-existing "not the final integration" reason —
+        // never the convergence gate, proving decision-packet was never
+        // wired into the gated set at all.
+        let packet = workspace.integration_raw(&["decision-packet", "--integration-id", &id]);
+        assert!(!packet.status.success());
+        assert_eq!(error_code(&packet), "CH-POLICY-DECISION-PACKET-FINAL-ONLY");
+    }
+
+    // Contract §6 item 6: one test per additional gated call site beyond
+    // `integration merge` (already covered above). Every test below reuses
+    // `escalated_cycle`'s still-open, never-merged integration and drives
+    // exactly one more command against it, proving `require_cycle_
+    // convergence_budget` is the first check each of these commands makes —
+    // the refusal is `CH-POLICY-CONVERGENCE-ESCALATED`, never whichever
+    // other precondition that command would otherwise report first (a
+    // missing landing commit, an illegal status transition, and so on),
+    // which is exactly what would surface if the gate were missing. None of
+    // these integrations are otherwise ready for the command under test —
+    // that is deliberate: it proves the gate runs before anything else does,
+    // not only when every other precondition happens to already hold.
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_a_new_integration_prepare() {
+        let (workspace, id) = escalated_cycle(3);
+
+        // `integration abandon` stays ungated — it is one of the exits —
+        // so clearing the escalating integration's lease first proves this
+        // refusal is about the cycle's spent budget, not merely about
+        // `PolicyIntegrationOpen`'s pre-existing "one integration at a
+        // time" rule.
+        let abandon = workspace.integration_raw(&[
+            "abandon",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+            "--reason",
+            "clearing the lease to prove prepare is still gated",
+        ]);
+        assert!(
+            abandon.status.success(),
+            "integration abandon must stay usable on an escalated cycle: {}{}",
+            String::from_utf8_lossy(&abandon.stdout),
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_land() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "land",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "coordinator",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_verify() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "verify",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "verifier",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_review() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "review",
+            "--integration-id",
+            &id,
+            "--reviewer-actor-id",
+            "reviewer",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_integration_promote() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "promote",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "release-agent",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn an_exhausted_cycle_budget_refuses_acceptance_record() {
+        let (workspace, id) = escalated_cycle(3);
+        let before_head = workspace.control_head();
+        let output = workspace.acceptance_raw(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--authorizer-actor-id",
+            "owner",
+        ]);
+        assert_refused_for_convergence(&workspace, &output, &before_head);
+    }
+}

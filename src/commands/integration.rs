@@ -24,7 +24,10 @@ use crate::{
         transaction::{Steps, with_transaction},
         work::held_lease,
     },
-    control::{event_store::EventDraft, repository::ControlRepository},
+    control::{
+        event_store::{EventDraft, EventStore},
+        repository::ControlRepository,
+    },
     domain::{
         card::{CardRecord, CardState},
         clock::Clock,
@@ -50,7 +53,10 @@ use crate::{
     },
     policy::{
         actors,
-        convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory},
+        convergence::{
+            ATTEMPT_RECORDED_EVENT, AttemptKind, CycleConvergence, CycleDimension, ReasonCategory,
+            assess_cycle, project,
+        },
     },
     runner::{
         environment_fingerprint,
@@ -308,6 +314,115 @@ pub(crate) fn load_cycle(
     serde_json::from_str(&control.read(&relative)?).map_err(|source| HarnessError::Control {
         reason: format!("cycle {cycle_id} is malformed: {source}"),
         code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+/// Renders a [`CycleDimension`] using the same spelling it would serialize
+/// to, so a refusal message never hand-spells a name `serde` already owns.
+/// Mirrors `dimension_wire_name` in `card.rs`; kept as its own copy rather
+/// than shared, the same reason `disposition.rs` keeps its own — this card's
+/// file scope does not extend to `card.rs` or `cycle.rs`, which each already
+/// keep a copy of this exact function for the same reason.
+fn cycle_dimension_wire_name(dimension: CycleDimension) -> String {
+    match serde_json::to_value(dimension) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{dimension:?}"),
+    }
+}
+
+/// Refuses a controlled action on a cycle whose integration-failure
+/// convergence budget is spent.
+///
+/// 73-2: the cycle-level counterpart of `card.rs`'s `require_convergence_
+/// budget` (72-2) — read that function's doc comment first; this one calls
+/// out only where the cycle case differs. Every governed path in this file
+/// and in `acceptance.rs` that advances an integration toward promotion —
+/// preparation, the merge/land/verify/review sequence, final authorization,
+/// and promotion itself — calls this before writing anything, so a raw retry
+/// cannot dodge the escalation through the ordinary CLI surface. It is
+/// deliberately *not* called from `integration abandon`, `cycle abandon`, or
+/// any inspect/report command: those are exits and windows, never advances,
+/// and gating either is the dead end #73 exists to avoid.
+///
+/// `config.convergence_policy` is read exactly once, into `policy`, and that
+/// same value feeds both [`project`] and [`assess_cycle`] below, for the same
+/// reason `require_convergence_budget` reads it once: `assess_cycle` never
+/// checks that the projection it is handed was built under the policy
+/// supplying its limits, so this is the one place that has to guarantee they
+/// agree.
+///
+/// A malformed, duplicate, foreign, or unbound convergence fact makes
+/// `project` refuse the whole projection, propagated as-is rather than
+/// treated as an unspent budget — a cycle whose recorded history cannot be
+/// trusted does not get to proceed as though it were `Within`.
+///
+/// Where this genuinely differs from the card case: a card escalation has
+/// six authorized dispositions (#74) to answer it, most of them card-scoped.
+/// A cycle escalation has exactly two, neither of them a per-dimension
+/// renewal — every disposition except `rebaseline` takes `--card-id`, so
+/// there is no cycle-scoped `renew`. `disposition rebaseline` retires the
+/// policy digest under which the exhausted `integration_failure` facts were
+/// recorded, so `project` stops counting them (see the `under_retired_digest`
+/// handling there) without erasing them from the record; `cycle abandon` ends
+/// the cycle outright. An enforcement that leaves an operator with no exit
+/// they can act on immediately is the #79 failure in another form, so both
+/// are named, by command, in the refusal below — not left to a generic
+/// pointer the way `NextPermittedAction::RecordAuthorizedDisposition` alone
+/// would.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyConvergenceEscalated`] — the same code
+/// `require_convergence_budget` uses; this enforcement does not invent a
+/// second one — when the cycle's integration-failure dimension is at or over
+/// its configured limit. Propagates a control-read or projection failure
+/// unchanged otherwise.
+pub(crate) fn require_cycle_convergence_budget(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+    cycle_id: &CycleId,
+) -> Result<(), HarnessError> {
+    let policy = config.convergence_policy.as_ref();
+    let cycle_events = EventStore::new(control).for_cycle(cycle_id)?;
+    let view = project(policy, &config.project_id, cycle_id, &cycle_events).map_err(|error| {
+        HarnessError::Control {
+            reason: format!("convergence projection for cycle {cycle_id} is unusable: {error}"),
+            code: ErrorCode::InternalControlCorrupt,
+        }
+    })?;
+
+    let CycleConvergence::Escalated { exhausted, .. } = assess_cycle(policy, &view) else {
+        return Ok(());
+    };
+
+    let detail = exhausted
+        .iter()
+        .map(|dimension| {
+            format!(
+                "{}: {}/{} (evidence: {})",
+                cycle_dimension_wire_name(dimension.dimension),
+                dimension.count,
+                dimension.limit,
+                dimension
+                    .evidence
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Err(HarnessError::Control {
+        reason: format!(
+            "cycle {cycle_id} is escalated; convergence budget exhausted: {detail}. An \
+             escalated cycle cannot be advanced toward promotion; its only two exits are \
+             `disposition rebaseline`, which retires the current policy digest so these \
+             integration_failure facts stop counting, and `cycle abandon`, which ends the \
+             cycle."
+        ),
+        code: ErrorCode::PolicyConvergenceEscalated,
     })
 }
 
@@ -843,6 +958,11 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         |control, events, expected, steps| {
             steps.at("control-write")?;
             let config = control.project()?;
+            // 73-2: the first check able to refuse once the project config
+            // exists — a prepared plan is this file's own entry point onto
+            // the path toward promotion, so it is where the gate has to
+            // start. See `require_cycle_convergence_budget`.
+            require_cycle_convergence_budget(control, &config, &cycle_id)?;
             let cycle = load_cycle(control, &cycle_id)?;
             let plan = build_plan(control, &cycle, &requested, args)?;
             let deferred = plan.deferred.clone();
@@ -1145,6 +1265,11 @@ fn preview_prepare(
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
+    // 73-2: same placement as `run_prepare` — right after `config` exists,
+    // before anything else — so a preview can never promise a plan the real
+    // command would refuse for an escalated cycle. See
+    // `require_cycle_convergence_budget`.
+    require_cycle_convergence_budget(&control, &config, cycle_id)?;
     let cycle = load_cycle(&control, cycle_id)?;
     let plan = build_plan(&control, &cycle, requested, args)?;
 
@@ -2243,6 +2368,11 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         let control = ControlRepository::open(&args.control)?;
         let config = control.project()?;
         let record = load_integration(&control, &integration_id)?;
+        // 73-2: the first check able to refuse once the integration record
+        // and project config both exist — see `require_cycle_convergence_
+        // budget`. A preview must never promise a merge the real command
+        // would refuse for an escalated cycle.
+        require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
         require_fresh_authority(&config, &record)?;
         require_pinned_candidates(&config.repository, &record)?;
         let preflight = simulate(&config.repository, &record)?;
@@ -2263,6 +2393,11 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            // 73-2: the first check able to refuse once the record and
+            // config both exist, before any write — a raw retry of a merge
+            // that already exhausted the cycle's budget must not be able to
+            // try again. See `require_cycle_convergence_budget`.
+            require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
             if record.status != IntegrationStatus::Prepared {
                 return Err(HarnessError::Control {
                     reason: format!(
@@ -2680,6 +2815,9 @@ fn preview_land(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    // 73-2: the first check able to refuse, before anything else — see
+    // `require_cycle_convergence_budget`.
+    require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
     require_no_generated_artifacts(&control, &record)?;
     let (head, tree) = landing_inputs(&config, &record)?;
 
@@ -2749,6 +2887,9 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
         |control, events, expected, steps| {
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            // 73-2: the first check able to refuse, before any write — see
+            // `require_cycle_convergence_budget`.
+            require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
             if let Some(existing) = &record.landing_sha {
                 return Err(HarnessError::Control {
                     reason: format!(
@@ -3033,6 +3174,9 @@ fn preview_verify(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    // 73-2: the first check able to refuse, before anything else — see
+    // `require_cycle_convergence_budget`.
+    require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
     record
         .status
         .check_transition(IntegrationStatus::Verified)?;
@@ -3079,6 +3223,9 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            // 73-2: the first check able to refuse, before any write — see
+            // `require_cycle_convergence_budget`.
+            require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
             record
                 .status
                 .check_transition(IntegrationStatus::Verified)?;
@@ -3397,6 +3544,9 @@ fn run_integration_review(
         let control = ControlRepository::open(&args.control)?;
         let config = control.project()?;
         let record = load_integration(&control, &integration_id)?;
+        // 73-2: the first check able to refuse, before anything else — see
+        // `require_cycle_convergence_budget`.
+        require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
         record
             .status
             .check_transition(IntegrationStatus::Reviewed)?;
@@ -3425,6 +3575,9 @@ fn run_integration_review(
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            // 73-2: the first check able to refuse, before any write — see
+            // `require_cycle_convergence_budget`.
+            require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
             record
                 .status
                 .check_transition(IntegrationStatus::Reviewed)?;
@@ -3543,12 +3696,19 @@ fn refuse_author_promoting(
 }
 
 /// Verifies everything Section 13.6 requires before the authority is touched.
+///
+/// Shared between `preview_promote` and `run_promote`, so both check the
+/// cycle's convergence budget through this one call rather than each risking
+/// its own copy drifting from the other's.
 fn check_promotion(
     control: &ControlRepository,
     config: &crate::config::ProjectConfig,
     record: &IntegrationRecord,
     actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
+    // 73-2: the first check this shared helper makes, before any of Section
+    // 13.6's own preconditions — see `require_cycle_convergence_budget`.
+    require_cycle_convergence_budget(control, config, &record.cycle_id)?;
     if record.status != IntegrationStatus::Accepted {
         return Err(HarnessError::Control {
             reason: format!(
