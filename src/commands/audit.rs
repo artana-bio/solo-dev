@@ -8,7 +8,7 @@
 //! commit a receipt refers to that no longer exists, is a *finding* — never a
 //! line quietly left out because it could not be resolved.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 
@@ -30,7 +30,11 @@ use crate::{
         ids::{CardId, CycleId},
     },
     error::{ErrorCode, HarnessError},
-    git::{command::GitScope, inspect},
+    git::{
+        authority::inspect_authority,
+        command::{GitScope, run_ok},
+        inspect, landing,
+    },
     policy::receipt_compatibility::{IntegrationCompatibilityRequestV1, evaluate},
     runner::receipt::ProvenanceSubject,
 };
@@ -40,6 +44,9 @@ use crate::{
 pub enum AuditCommand {
     /// Reconstruct a cycle from control state and cross-check its evidence.
     Cycle(CycleArgs),
+    /// Verify that every control head a landing commit anchored is still an
+    /// ancestor of the control record.
+    Anchors(AnchorsArgs),
 }
 
 impl AuditCommand {
@@ -52,6 +59,7 @@ impl AuditCommand {
     pub const fn path(&self) -> &'static str {
         match self {
             Self::Cycle(..) => "audit.cycle",
+            Self::Anchors(..) => "audit.anchors",
         }
     }
 }
@@ -69,6 +77,14 @@ pub struct CycleArgs {
     /// audit. It is evaluated read-only and never changes workflow authority.
     #[arg(long)]
     pub compatibility_request: Option<PathBuf>,
+}
+
+/// Arguments accepted by `audit anchors`.
+#[derive(Debug, Args)]
+pub struct AnchorsArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: std::path::PathBuf,
 }
 
 /// Something the record says that the objects do not bear out.
@@ -147,6 +163,166 @@ pub(crate) fn cross_check_cycle(
     })
 }
 
+/// Everything a control-anchor audit finds.
+struct AnchorEvidence {
+    /// How many landing commits reachable from the protected branch carried
+    /// at least one control anchor.
+    landing_commits_examined: usize,
+    /// How many anchored control heads were checked across them.
+    anchors_checked: usize,
+    /// Claims the objects did not bear out, in discovery order.
+    discrepancies: Vec<Discrepancy>,
+}
+
+/// Cross-checks every control head a landing commit has anchored against the
+/// control repository's own history.
+///
+/// #87 anchors the trailer on every landing commit, `run_anchors` decides
+/// what finding one means; this only reports.
+///
+/// # Errors
+///
+/// Returns an error when the authority or control repository cannot be read.
+/// An anchor that fails to hold up — orphaned by a rewrite, or altogether
+/// missing — is a [`Discrepancy`], never an error.
+fn check_control_anchors(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+) -> Result<AnchorEvidence, HarnessError> {
+    let authority = inspect_authority(&config.authority_repository, &config.protected_branch)?;
+    let Some(protected_sha) = authority.protected_sha else {
+        // Nothing has ever landed, so there is nothing to anchor — not a
+        // discrepancy, just an empty result.
+        return Ok(AnchorEvidence {
+            landing_commits_examined: 0,
+            anchors_checked: 0,
+            discrepancies: Vec::new(),
+        });
+    };
+    // Read once, not once per anchor: unlike the anchors themselves, which
+    // can each individually turn out to be missing or orphaned, the current
+    // control head is a single fact every one of them is checked against.
+    let control_head = control.head()?;
+
+    let mut discrepancies = Vec::new();
+    let mut landing_commits_examined = 0usize;
+    let mut anchors_checked = 0usize;
+    for landing_sha in landing_commits(&config.authority_repository, &protected_sha)? {
+        let object = landing::inspect(&config.authority_repository, &landing_sha)?;
+        let anchors: Vec<&str> = object.trailer_values(landing::TRAILER_CONTROL).collect();
+        if anchors.is_empty() {
+            // Most commits on the protected branch are not landing commits at
+            // all — `project init`'s own bootstrap commit, or anything pushed
+            // directly — and this is how they are told apart from the ones
+            // this check cares about: not by classifying what a landing
+            // commit is in general, but by whether this specific trailer is
+            // present. A commit that carries it is exactly what this check
+            // needs to examine, and nothing else is.
+            continue;
+        }
+        landing_commits_examined += 1;
+
+        let Some(head) = control_head.as_deref() else {
+            // `landing_trailers` refuses to build this very trailer against
+            // an unborn control history (see its own doc comment: reaching a
+            // landing commit requires a chain of earlier control commits).
+            // Finding one here anyway means that invariant broke elsewhere,
+            // not that there is vacuously nothing to compare against, so this
+            // refuses rather than silently passing every anchor as healthy.
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "landing commit {landing_sha} anchors control history, but the control repository has no commits at all"
+                ),
+                code: ErrorCode::InternalControlCorrupt,
+            });
+        };
+        for anchored in anchors {
+            anchors_checked += 1;
+            check_anchor(control, head, &landing_sha, anchored, &mut discrepancies)?;
+        }
+    }
+    Ok(AnchorEvidence {
+        landing_commits_examined,
+        anchors_checked,
+        discrepancies,
+    })
+}
+
+/// Checks one anchored control head, telling "orphaned" apart from "missing"
+/// the way #88's work card requires: by asking the control repository
+/// directly whether the object exists at all, rather than reading that fact
+/// out of `merge-base --is-ancestor`'s exit code.
+///
+/// Both cases exit `merge-base --is-ancestor` non-zero. Per `git-merge-base(1)`
+/// — and confirmed directly against Git 2.50.1 rather than assumed — exit 1
+/// means "resolved fine, just not an ancestor"; anything else (128 in
+/// practice, with a `fatal: Not a valid commit name` diagnostic on stderr)
+/// means Git could not resolve one side at all. Leaning on that split would
+/// mean trusting that a code answering a different question (did the process
+/// succeed) forever stays a reliable proxy for this one (does the object
+/// exist). Existence is answered first instead, independently, with the same
+/// `rev-parse --verify` this file already uses for that question against the
+/// candidate repository, in `commit_exists` above.
+fn check_anchor(
+    control: &ControlRepository,
+    control_head: &str,
+    landing_sha: &str,
+    anchored: &str,
+    found: &mut Vec<Discrepancy>,
+) -> Result<(), HarnessError> {
+    if inspect::resolve_commit(&control.scope(), anchored).is_err() {
+        found.push(Discrepancy {
+            subject: format!("landing commit {landing_sha}"),
+            claim: format!("control anchor {anchored}"),
+            found: format!("{anchored} is not present in the control repository at all"),
+        });
+        return Ok(());
+    }
+
+    if inspect::is_ancestor(&control.scope(), anchored, control_head)? {
+        return Ok(());
+    }
+
+    found.push(Discrepancy {
+        subject: format!("landing commit {landing_sha}"),
+        claim: format!("control anchor {anchored}"),
+        found: format!(
+            "{anchored} exists in the control repository but is not an ancestor of control head {control_head}; control history was rewritten"
+        ),
+    });
+    Ok(())
+}
+
+/// Every commit the protected branch has ever pointed at, walked back from
+/// its current tip.
+///
+/// `--first-parent`, deliberately, not merely for speed. A landing commit's
+/// *second* parent is the integration head, which carries the candidate
+/// repository's own commit history — transferred into the authority wholesale
+/// so the landing object it carries is complete — and no commit reachable
+/// only that way was ever itself the tip of the protected branch. Walking it
+/// too would grow this check's cost with the *candidate* repository's history
+/// rather than with how many times something has landed, for no commit it
+/// would find that the first-parent walk does not already find: every
+/// landing's first parent is the previous tip (see `landing_trailers`), and a
+/// directly pushed commit is single-parent and trivially its own
+/// first-parent chain. So `--first-parent` already reaches everything that
+/// was ever `<protected branch>` and nothing that was not.
+///
+/// # Errors
+///
+/// Returns an external-tool error when Git cannot be executed.
+fn landing_commits(authority: &Path, protected_sha: &str) -> Result<Vec<String>, HarnessError> {
+    let scope = GitScope::git_dir(authority);
+    Ok(
+        run_ok(&scope, ["rev-list", "--first-parent", protected_sha])?
+            .trimmed_stdout()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
 /// Executes an `audit` subcommand.
 ///
 /// # Errors
@@ -156,6 +332,7 @@ pub(crate) fn cross_check_cycle(
 pub fn execute(command: &AuditCommand, _clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     match command {
         AuditCommand::Cycle(args) => run_cycle(args),
+        AuditCommand::Anchors(args) => run_anchors(args),
     }
 }
 
@@ -351,6 +528,76 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
                 .map(|entry| entry.subject.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
+        ),
+        code: ErrorCode::PolicyAuditDiscrepancy,
+    })
+}
+
+/// Executes `audit anchors`.
+///
+/// Read-only by construction: nothing here calls `with_transaction`, writes
+/// through `control`, or changes the authority. It only reads the protected
+/// branch and reports. Refusing a promotion built on a bad anchor is a
+/// separate card (#89); merging that into this one would make neither half
+/// testable on its own.
+///
+/// # Errors
+///
+/// Returns a configuration error when the control or authority repository
+/// cannot be read, or a policy error when the report found discrepancies.
+fn run_anchors(args: &AnchorsArgs) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+
+    let AnchorEvidence {
+        landing_commits_examined,
+        anchors_checked,
+        discrepancies,
+    } = check_control_anchors(&control, &config)?;
+
+    let report = serde_json::json!({
+        "protected_branch": config.protected_branch,
+        "landing_commits_examined": landing_commits_examined,
+        "anchors_checked": anchors_checked,
+        "discrepancies": discrepancies,
+    });
+
+    if discrepancies.is_empty() {
+        return Ok(CommandOutcome::new(
+            "audit.anchors",
+            format!(
+                "Audit of control anchors on `{}`\nlanding commits examined: {landing_commits_examined}\nanchors checked: {anchors_checked}\n\nevery anchored control head is still an ancestor of the control record",
+                config.protected_branch,
+            ),
+            report,
+        )
+        .with_project(config.project_id));
+    }
+
+    // As in `run_cycle`, a report that found problems exits non-zero rather
+    // than making a reader parse prose to learn the answer. Unlike
+    // `run_cycle`'s message, this one folds each discrepancy's claim and
+    // found text into the summary, not just its subject: the two facts §6.4
+    // of the work card requires this report to name — the anchored SHA and
+    // the landing commit that claimed it — live in different `Discrepancy`
+    // fields, and only the joined `reason` string below reaches the error
+    // envelope's `message` (`HarnessError::Control::details` only echoes the
+    // same `reason`, and there is no companion "replay"-style command here to
+    // surface the full structured list on a non-failing path the way `cycle
+    // replay` does for `audit cycle`'s findings).
+    Err(HarnessError::Control {
+        reason: format!(
+            "audit of control anchors on `{}` found {} discrepancy(ies): {}",
+            config.protected_branch,
+            discrepancies.len(),
+            discrepancies
+                .iter()
+                .map(|entry| format!(
+                    "{} claims {}, found {}",
+                    entry.subject, entry.claim, entry.found
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
         ),
         code: ErrorCode::PolicyAuditDiscrepancy,
     })
