@@ -956,30 +956,73 @@ pub fn project(
                             reason: "counter overflow".to_owned(),
                         })?;
             }
-            // Unreachable: this loop's filter excludes every rebaseline
-            // fact, and the first pass above is the only place one is ever
-            // folded.
-            DispositionKind::Rebaseline => unreachable!("rebaseline facts are filtered out above"),
-            // Unreachable: this loop's filter excludes every abandon fact
-            // too. The pass below is the only place one is ever validated,
-            // and it folds into no counter at all.
-            DispositionKind::Abandon => unreachable!("abandon facts are filtered out above"),
-            // Unreachable: this loop's filter excludes every accept-risk
-            // fact too. Its own pass below is the only place one is ever
-            // validated, and it folds into a flag, never this counter.
-            DispositionKind::AcceptRisk => {
-                unreachable!("accept-risk facts are filtered out above")
+            // The five arms below refuse instead of counting, should this
+            // match ever run for a disposition kind its filter was meant to
+            // keep out. The filter above and this match look at the same
+            // fact from two different angles that have to be kept in
+            // agreement by hand: the filter reads the raw `disposition`
+            // field before any shape is chosen, this match reads
+            // `metadata.disposition` after `DispositionMetadata` has
+            // already parsed successfully. `AcceptRiskMetadata` and
+            // `SplitMetadata` are supersets of `DispositionMetadata` (see
+            // the field-set comparison on each shape above), so a fact of
+            // either kind that is missing just the one field distinguishing
+            // it — `risk`, `follow_up_card_id` — parses here even while its
+            // own filter stays intact; a desynced filter only makes that
+            // worse, turning a parse that should have been rejected earlier
+            // into one this match now has to catch. `AbandonMetadata`,
+            // `RebaselineMetadata`, and `RedesignMetadata` carry no
+            // `dimension` at all, so no desync can land one of those here —
+            // the ordinary parse above always refuses them first, and
+            // nothing about this change touches that. See #84.
+            //
+            // No test can reach these arms honestly. The only way in is to
+            // disable the filter that exists to keep them unreachable, and
+            // a test built that way would be proving the filter works, not
+            // that the line below is right — green and uninformative
+            // either way, precisely the assertion-that-cannot-fail this
+            // project's testing standard warns is worse than no assertion.
+            // The proof for this card was a one-time manual mutation
+            // instead: each filter term removed in turn, a fact built
+            // missing its distinguishing field, `cargo test` run by hand to
+            // watch the panic become a refusal, filter restored, full
+            // suite green again. Do not replace this comment with a test
+            // that disables a filter to "cover" the code below it.
+            DispositionKind::Rebaseline => {
+                return Err(ProjectionError {
+                    event_id,
+                    reason: "projection defect: a rebaseline fact reached the ordinary disposition counter, which the rebaseline filter should have excluded before this match ever ran"
+                        .to_owned(),
+                });
             }
-            // Unreachable: this loop's filter excludes every split fact
-            // too. Its own pass below is the only place one is ever
-            // validated, and it folds into the very same flag an
-            // accept-risk does, never this counter.
-            DispositionKind::Split => unreachable!("split facts are filtered out above"),
-            // Unreachable: this loop's filter excludes every redesign fact
-            // too. Its own pass below is the only place one is ever
-            // validated, and — like abandon, and unlike accept-risk and
-            // split — it folds into no counter and no flag at all.
-            DispositionKind::Redesign => unreachable!("redesign facts are filtered out above"),
+            DispositionKind::Abandon => {
+                return Err(ProjectionError {
+                    event_id,
+                    reason: "projection defect: an abandon fact reached the ordinary disposition counter, which the abandon filter should have excluded before this match ever ran"
+                        .to_owned(),
+                });
+            }
+            DispositionKind::AcceptRisk => {
+                return Err(ProjectionError {
+                    event_id,
+                    reason: "projection defect: an accept-risk fact reached the ordinary disposition counter, which the accept-risk filter should have excluded before this match ever ran"
+                        .to_owned(),
+                });
+            }
+            DispositionKind::Split => {
+                return Err(ProjectionError {
+                    event_id,
+                    reason: "projection defect: a split fact reached the ordinary disposition counter, which the split filter should have excluded before this match ever ran"
+                        .to_owned(),
+                });
+            }
+            DispositionKind::Redesign => {
+                return Err(ProjectionError {
+                    event_id,
+                    reason: "projection defect: a redesign fact reached the ordinary disposition counter, which the redesign filter should have excluded before this match ever ran"
+                        .to_owned(),
+                });
+            }
         }
     }
 
