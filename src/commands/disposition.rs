@@ -1096,7 +1096,7 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 
 /// Whether `counters` already carries an accepted risk on `dimension`.
 ///
-/// Reads the raw per-dimension `risk_accepted` flag rather than going
+/// Reads the raw per-dimension `escalation_waived` flag rather than going
 /// through `assess_card`: once a risk is accepted, `assess_card` never
 /// reports that dimension exhausted again (see its own doc comment), so its
 /// output cannot tell "this dimension was never exhausted" apart from
@@ -1107,10 +1107,12 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 /// `policy::convergence` is not this card's file scope to widen.
 fn risk_already_accepted(counters: &CardCounters, dimension: CardDimension) -> bool {
     match dimension {
-        CardDimension::ReviewReturns => counters.review_returns.risk_accepted,
-        CardDimension::RepairAttempts => counters.repair_attempts.risk_accepted,
-        CardDimension::GateFailures => counters.gate_failures.risk_accepted,
-        CardDimension::MaterialScopeRevisions => counters.material_scope_revisions.risk_accepted,
+        CardDimension::ReviewReturns => counters.review_returns.escalation_waived,
+        CardDimension::RepairAttempts => counters.repair_attempts.escalation_waived,
+        CardDimension::GateFailures => counters.gate_failures.escalation_waived,
+        CardDimension::MaterialScopeRevisions => {
+            counters.material_scope_revisions.escalation_waived
+        }
     }
 }
 

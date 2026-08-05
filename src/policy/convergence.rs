@@ -258,7 +258,7 @@ pub enum DispositionKind {
     /// granting the card another attempt at all. Unlike `Renew`, this
     /// grants no budget: the count keeps climbing past the limit forever,
     /// and the dimension simply stops being reported exhausted. See
-    /// `DimensionCount::risk_accepted` and `assess_card`.
+    /// `DimensionCount::escalation_waived` and `assess_card`.
     AcceptRisk,
 }
 
@@ -350,7 +350,7 @@ struct AbandonMetadata {
 /// checked in `project` exactly like any other fact's — never a digest it
 /// retires or a budget it expands; an acceptance retires nothing and
 /// grants nothing back. See `disposition accept-risk` in
-/// `commands::disposition` and `DimensionCount::risk_accepted`.
+/// `commands::disposition` and `DimensionCount::escalation_waived`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptRiskMetadata {
@@ -402,18 +402,18 @@ pub struct DimensionCount {
     /// Not evidence and not a count of facts: this is how many times an
     /// authorized actor decided to grant the configured budget again.
     pub renewals: u32,
-    /// Whether an authorized actor has accepted this dimension's
-    /// exhaustion as a disclosed risk.
+    /// Whether an authorized actor has waived this dimension's escalation
+    /// by accepting it as a disclosed risk.
     ///
-    /// Not a budget grant, unlike `renewals` above: accepting a risk raises
-    /// no effective budget and resets no count — the count keeps climbing
-    /// past the limit forever. It only changes whether `assess_card` still
-    /// reports this dimension exhausted. `#[serde(default)]` so a
-    /// projection snapshot serialized before this field existed still
-    /// deserializes, defaulting to `false` — a fact recorded under the old
-    /// shape could not have accepted anything.
+    /// Not a budget grant, unlike `renewals` above: waiving an escalation
+    /// raises no effective budget and resets no count — the count keeps
+    /// climbing past the limit forever. It only changes whether
+    /// `assess_card` still reports this dimension exhausted.
+    /// `#[serde(default)]` so a projection snapshot serialized before this
+    /// field existed still deserializes, defaulting to `false` — a fact
+    /// recorded under the old shape could not have waived anything.
     #[serde(default)]
-    pub risk_accepted: bool,
+    pub escalation_waived: bool,
 }
 
 /// Counters derived for a card, accumulated over every fact recorded against
@@ -956,7 +956,7 @@ pub fn project(
     // fold into the projection — it sets a flag, never a counter, so
     // idempotency needs no bookkeeping: two facts naming the same
     // dimension simply set the same flag twice. See
-    // `DimensionCount::risk_accepted` and `assess_card` for what the flag
+    // `DimensionCount::escalation_waived` and `assess_card` for what the flag
     // changes downstream.
     for event in events
         .iter()
@@ -1034,11 +1034,11 @@ pub fn project(
         // either.
         let counters = result.cards.entry(card_id.clone()).or_default();
         match metadata.dimension {
-            CardDimension::ReviewReturns => counters.review_returns.risk_accepted = true,
-            CardDimension::RepairAttempts => counters.repair_attempts.risk_accepted = true,
-            CardDimension::GateFailures => counters.gate_failures.risk_accepted = true,
+            CardDimension::ReviewReturns => counters.review_returns.escalation_waived = true,
+            CardDimension::RepairAttempts => counters.repair_attempts.escalation_waived = true,
+            CardDimension::GateFailures => counters.gate_failures.escalation_waived = true,
             CardDimension::MaterialScopeRevisions => {
-                counters.material_scope_revisions.risk_accepted = true;
+                counters.material_scope_revisions.escalation_waived = true;
             }
         }
     }
@@ -1189,7 +1189,7 @@ pub enum NextPermittedAction {
 /// dimension hiding behind it on the next attempt, has lost a whole review
 /// cycle to a check that already knew about both.
 ///
-/// A dimension whose `risk_accepted` is set is never reported exhausted,
+/// A dimension whose `escalation_waived` is set is never reported exhausted,
 /// whatever its count and effective budget say — see the loop below for
 /// why an explicit acceptance outranks even the overflow default.
 #[must_use]
@@ -1265,7 +1265,7 @@ pub fn assess_card(
         // unconditionally: there is no safe number left to compare `count`
         // against, so escalating is the only fail-closed answer.
         //
-        // `risk_accepted` wins over that overflow default, and over an
+        // `escalation_waived` wins over that overflow default, and over an
         // ordinary spent budget too: an overflow is a defensive fallback
         // for when there is no safe number left, but an accepted risk is
         // an explicit authorized decision about this exact dimension, and
@@ -1275,7 +1275,7 @@ pub fn assess_card(
         // renewal stacked on the same dimension still behaves normally,
         // and any *other*, still-exhausted dimension on this card is still
         // reported accurately.
-        if !count.risk_accepted && (overflowed || count.count >= effective_budget) {
+        if !count.escalation_waived && (overflowed || count.count >= effective_budget) {
             exhausted.push(ExhaustedDimension {
                 dimension,
                 count: count.count,
@@ -2104,32 +2104,32 @@ mod tests {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:1".to_owned()]),
                     renewals: 0,
-                    risk_accepted: false,
+                    escalation_waived: false,
                 },
                 repair_attempts: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:2".to_owned()]),
                     renewals: 0,
-                    risk_accepted: false,
+                    escalation_waived: false,
                 },
                 gate_failures: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:3".to_owned()]),
                     renewals: 0,
-                    risk_accepted: false,
+                    escalation_waived: false,
                 },
                 material_scope_revisions: DimensionCount {
                     count: 1,
                     evidence: BTreeSet::from(["receipt:4".to_owned()]),
                     renewals: 0,
-                    risk_accepted: false,
+                    escalation_waived: false,
                 },
             }
         );
         assert_eq!(
             serde_json::to_string(&ProjectConvergence::Configured(view.clone())).unwrap(),
             format!(
-                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0,"risk_accepted":false}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0,"risk_accepted":false}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0,"risk_accepted":false}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0,"risk_accepted":false}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0,"risk_accepted":false}}}}}}}}"#,
+                r#"{{"status":"configured","policy_digest":"{}","cycle":{{"integration_failures":{{"count":1,"evidence":["receipt:5"],"renewals":0,"escalation_waived":false}}}},"cards":{{"F-001":{{"review_returns":{{"count":1,"evidence":["receipt:1"],"renewals":0,"escalation_waived":false}},"repair_attempts":{{"count":1,"evidence":["receipt:2"],"renewals":0,"escalation_waived":false}},"gate_failures":{{"count":1,"evidence":["receipt:3"],"renewals":0,"escalation_waived":false}},"material_scope_revisions":{{"count":1,"evidence":["receipt:4"],"renewals":0,"escalation_waived":false}}}}}}}}"#,
                 view.policy_digest
             )
         );
@@ -2312,7 +2312,7 @@ mod tests {
                 count: 1,
                 evidence: BTreeSet::from(["receipt:6".to_owned()]),
                 renewals: 0,
-                risk_accepted: false,
+                escalation_waived: false,
             },
         );
         assert_eq!(f002.repair_attempts, DimensionCount::default());
@@ -2455,7 +2455,7 @@ mod tests {
                         count: 1,
                         evidence: BTreeSet::from(["receipt:1".to_owned()]),
                         renewals: 0,
-                        risk_accepted: false,
+                        escalation_waived: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2816,7 +2816,7 @@ mod tests {
         let dimension = &configured.cards[&CardId::from_str("F-001").unwrap()].review_returns;
         assert_eq!(
             serde_json::to_string(dimension).unwrap(),
-            r#"{"count":1,"evidence":["receipt:1"],"renewals":1,"risk_accepted":false}"#
+            r#"{"count":1,"evidence":["receipt:1"],"renewals":1,"escalation_waived":false}"#
         );
     }
 
@@ -2872,7 +2872,7 @@ mod tests {
                         count: 3,
                         evidence: BTreeSet::new(),
                         renewals: 1,
-                        risk_accepted: false,
+                        escalation_waived: false,
                     },
                     ..CardCounters::default()
                 },
@@ -2903,7 +2903,7 @@ mod tests {
         // Sibling of the test above, with the one field that test pins at
         // `false` now set to `true`: same huge base limit, same single
         // renewal, same small `count`. `assess_card`'s doc comment promises
-        // `risk_accepted` wins even over the overflow default; nothing
+        // `escalation_waived` wins even over the overflow default; nothing
         // before this test exercised that promise, because every other
         // test's arithmetic never overflows in the first place.
         let huge_limits = CardConvergenceLimits {
@@ -2937,7 +2937,7 @@ mod tests {
                         count: 3,
                         evidence: BTreeSet::new(),
                         renewals: 1,
-                        risk_accepted: true,
+                        escalation_waived: true,
                     },
                     ..CardCounters::default()
                 },

@@ -5618,7 +5618,7 @@ mod disposition_accept_risk {
     #[test]
     // The discriminating test (contract §6.2): confirms `accept-risk`
     // behaves nothing like `renew`. Under a renew-shaped implementation —
-    // incrementing `renewals` instead of setting `risk_accepted` — the
+    // incrementing `renewals` instead of setting `escalation_waived` — the
     // effective budget here would become 2 and the second attempt below
     // would escalate the card again; this asserts it does not.
     //
