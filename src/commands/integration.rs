@@ -17,6 +17,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         acceptance::{acceptance_for, validate_final_authorization_for_promotion},
+        audit::check_control_anchors,
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
         handoff::latest_handoff,
@@ -2691,6 +2692,38 @@ fn landing_trailers(
     record: &IntegrationRecord,
     digest: &crate::domain::digest::Digest,
 ) -> Result<Vec<(String, String)>, HarnessError> {
+    // Read here, before `run_land` reaches its own `control.commit` later in
+    // the same transaction — so this is the control head the landing was
+    // actually built from, not the one landing this integration will
+    // eventually produce. Confirmed by reading the flow rather than assuming
+    // it from the name: nothing between `with_transaction` opening the
+    // control repository and this call ever mutates control (`write_atomic`,
+    // `EventStore::append`, and every `Journal` write only touch the working
+    // tree; `ControlRepository::commit` is the sole place control's HEAD
+    // moves, and `run_land` does not call it until after the landing message,
+    // which embeds this trailer, is composed).
+    //
+    // `None` means control has no commits at all. That cannot happen here:
+    // reaching a `Prepared`, merged integration record requires a chain of
+    // earlier successful control commits (at minimum `project init`'s own —
+    // `write_project` pairs writing `project/project.json` with an
+    // unconditional `control.commit`, and that first write can never be the
+    // "nothing to commit" no-op case), and `Journal::require_settled`, which
+    // every mutating command checks first, refuses all further work while any
+    // of those commands failed to reach a clean terminal state. So the
+    // refusal below is insurance against that invariant breaking, not a case
+    // this card expects to exercise — an anchor that cannot be established
+    // must still refuse rather than emit a placeholder.
+    let Some(control_head) = control.head()? else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "control repository has no commits yet; integration {} cannot be anchored to an unborn control history",
+                record.integration_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+
     let mut trailers = vec![
         (
             landing::TRAILER_INTEGRATION.to_owned(),
@@ -2704,6 +2737,7 @@ fn landing_trailers(
             landing::TRAILER_CYCLE.to_owned(),
             record.cycle_id.to_string(),
         ),
+        (landing::TRAILER_CONTROL.to_owned(), control_head),
     ];
     for member in &record.members {
         trailers.push((
@@ -3695,6 +3729,76 @@ fn refuse_author_promoting(
     )
 }
 
+/// Refuses promotion when a previously-anchored control head is no longer an
+/// ancestor of the control record.
+///
+/// #87 writes the control repository's head into every landing commit as a
+/// `Change-Harness-Control` trailer; #88 built `check_control_anchors` to
+/// verify each one still holds, but left it reachable only through `audit
+/// anchors` — a check living in a command an operator has to remember to run
+/// protects nothing on the path that matters. This calls that exact check at
+/// the one boundary where the record's integrity decides whether work may
+/// proceed, so a rewrite that erased an inconvenient fact cannot go on to
+/// authorize the very promotion it was meant to enable.
+///
+/// Reuses `check_control_anchors` rather than a second copy of its walk, the
+/// same reason `cross_check_cycle` is shared between `audit cycle` and `cycle
+/// replay` instead of duplicated: two callers must never be able to disagree
+/// about what counts as a discrepancy.
+///
+/// No override, deliberately. #88's design work already established why: no
+/// command in this harness rewrites control history — `archive` only creates
+/// refs and removes worktrees and branches, `backup` has only `create` and
+/// `verify` — so a broken anchor has exactly two causes, tampering or an
+/// out-of-band restore to an earlier control state, and both mean the
+/// control record no longer contains history that already-landed work was
+/// built on. An override would let promotion proceed onto that anyway,
+/// compounding the corruption instead of surfacing it. The refusal below
+/// says so explicitly, so nobody later reads the absence of a bypass flag as
+/// an oversight and adds one. The remedy is not a flag but an operation:
+/// restore the control repository from a `backup create` archive that
+/// contains the anchored commit.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyAuditDiscrepancy`] — the same code `audit
+/// anchors` itself returns for the identical finding — when
+/// `check_control_anchors` reports any anchor orphaned or missing.
+/// Propagates an authority- or control-read failure unchanged otherwise.
+fn require_control_anchors_intact(
+    control: &ControlRepository,
+    config: &crate::config::ProjectConfig,
+) -> Result<(), HarnessError> {
+    let evidence = check_control_anchors(control, config)?;
+    if evidence.discrepancies.is_empty() {
+        return Ok(());
+    }
+
+    Err(HarnessError::Control {
+        reason: format!(
+            "promotion refuses: control history no longer supports {} previously-anchored \
+             control head(s), so the record cannot be trusted to authorize this promotion: {}. \
+             No command in this harness rewrites control history, so this means either \
+             tampering or an out-of-band restore to an earlier control state — either way, the \
+             control record no longer contains the history that already-landed work was built \
+             on. The remedy is to restore the control repository from a `backup create` archive \
+             that contains the anchored commit; there is deliberately no override for this \
+             refusal.",
+            evidence.discrepancies.len(),
+            evidence
+                .discrepancies
+                .iter()
+                .map(|entry| format!(
+                    "{} claims {}, found {}",
+                    entry.subject, entry.claim, entry.found
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        code: ErrorCode::PolicyAuditDiscrepancy,
+    })
+}
+
 /// Verifies everything Section 13.6 requires before the authority is touched.
 ///
 /// Shared between `preview_promote` and `run_promote`, so both check the
@@ -3706,8 +3810,16 @@ fn check_promotion(
     record: &IntegrationRecord,
     actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
-    // 73-2: the first check this shared helper makes, before any of Section
-    // 13.6's own preconditions — see `require_cycle_convergence_budget`.
+    // #89: refused before anything else in this function, including the
+    // convergence budget below. A rewritten control record makes every
+    // later check's *inputs* untrustworthy — `require_cycle_convergence_
+    // budget` projects the cycle's convergence facts from exactly the
+    // control history this verifies, and every check after it reads records
+    // out of that same repository. Integrity of the record precedes any
+    // policy computed from it.
+    require_control_anchors_intact(control, config)?;
+    // 73-2: the first of Section 13.6's own preconditions — see
+    // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(control, config, &record.cycle_id)?;
     if record.status != IntegrationStatus::Accepted {
         return Err(HarnessError::Control {

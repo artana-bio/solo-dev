@@ -63,6 +63,21 @@ fn trailer_values(envelope: &serde_json::Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `ancestor` is `descendant` itself or reachable from it.
+///
+/// `git merge-base --is-ancestor` treats a commit as its own ancestor, which
+/// is exactly the "or equal to" half of the relationship the anchor trailer
+/// is required to have with the control head after land completes.
+fn is_ancestor(repository: &std::path::Path, ancestor: &str, descendant: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .expect("git should run")
+        .success()
+}
+
 #[test]
 fn the_landing_commit_has_the_authority_baseline_as_first_parent() {
     let (workspace, id) = merged(2);
@@ -209,6 +224,107 @@ fn trailers_carry_the_cycle_cards_record_and_receipts() {
     assert!(
         receipts[0].contains("gate.unit"),
         "unexpected: {receipts:?}"
+    );
+}
+
+#[test]
+fn a_landing_commit_anchors_the_control_head() {
+    let (workspace, id) = merged(2);
+    // Read before invoking `land`: nothing else touches control between this
+    // call and the `land` process opening it, so this is exactly the head
+    // that process will observe while building the trailer.
+    let control_head_before_land = workspace.control_head();
+
+    let envelope =
+        workspace.integration_json(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+
+    // The actual value, not its shape: a mutation anchoring some other real
+    // SHA (the authority head, say) would still produce 40 hex characters and
+    // pass a shape check, but must fail this one.
+    assert_eq!(
+        trailer_values(&envelope, "Change-Harness-Control"),
+        [control_head_before_land],
+        "the trailer must carry the exact control head the landing was built from"
+    );
+}
+
+#[test]
+fn the_anchored_head_is_the_control_state_the_landing_was_built_from() {
+    let (workspace, id) = merged(2);
+
+    let envelope =
+        workspace.integration_json(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+    let anchored = trailer_values(&envelope, "Change-Harness-Control");
+    assert_eq!(anchored.len(), 1, "exactly one control anchor trailer");
+    let anchored = &anchored[0];
+
+    // Land's own control commit — recording the landing SHA into the
+    // integration record and the `integration.landing-built` event — lands
+    // after the trailer is built, so the control head has moved past the
+    // anchor by the time land returns. Never equal: this is the relationship
+    // #88's ancestor check depends on, so it must fail if a mutation makes
+    // the anchor equal to (or beyond) the post-land head instead of a strict
+    // ancestor of it.
+    let control_after = workspace.control_head();
+    assert_ne!(
+        anchored, &control_after,
+        "the anchored head must be strictly behind the control head land itself advances to"
+    );
+    assert!(
+        is_ancestor(&workspace.control, anchored, &control_after),
+        "anchored control head {anchored} must be an ancestor of the post-land control head {control_after}"
+    );
+}
+
+#[test]
+fn the_existing_five_trailers_are_unchanged_by_the_new_anchor() {
+    let (workspace, id) = merged(2);
+    let envelope =
+        workspace.integration_json(&["land", "--integration-id", &id, "--actor-id", "coordinator"]);
+
+    // Same keys, same values as `trailers_carry_the_cycle_cards_record_and_receipts`
+    // establishes independently — reasserted here, on a commit that also
+    // carries the new anchor, so a mutation that let building the anchor
+    // disturb one of these (an off-by-one in the vec, an accidental
+    // overwrite) fails here even if it happened to dodge the other test.
+    assert_eq!(
+        trailer_values(&envelope, "Change-Harness-Integration"),
+        [id]
+    );
+    assert_eq!(trailer_values(&envelope, "Change-Harness-Cycle"), ["C-001"]);
+
+    let cards = trailer_values(&envelope, "Change-Harness-Card");
+    assert_eq!(cards.len(), 2);
+    assert!(cards[0].starts_with("F-001 r1 "), "unexpected: {cards:?}");
+    assert!(cards[1].starts_with("F-002 r1 "), "unexpected: {cards:?}");
+
+    let digests = trailer_values(&envelope, "Change-Harness-Integration-Digest");
+    assert_eq!(digests.len(), 1);
+    assert!(digests[0].starts_with("sha256:"), "unexpected: {digests:?}");
+
+    let receipts = trailer_values(&envelope, "Change-Harness-Receipt");
+    assert!(
+        !receipts.is_empty(),
+        "the gates the landing rests on must be named"
+    );
+    assert!(
+        receipts[0].contains("gate.unit"),
+        "unexpected: {receipts:?}"
+    );
+
+    let control = trailer_values(&envelope, "Change-Harness-Control");
+    assert_eq!(control.len(), 1, "exactly one control anchor trailer");
+
+    // Every trailer in the commit falls under one of these six known keys —
+    // proving the card added exactly one trailer and altered no other. A
+    // mutation that dropped one of the five while still adding the anchor
+    // (or duplicated a trailer under a stray key) changes this sum without
+    // necessarily changing any single key's count above.
+    let all = envelope["data"]["trailers"].as_array().expect("trailers");
+    assert_eq!(
+        all.len(),
+        1 + 1 + cards.len() + digests.len() + receipts.len() + control.len(),
+        "trailer count must be exactly the five existing plus the new anchor: {all:?}"
     );
 }
 
