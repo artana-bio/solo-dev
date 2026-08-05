@@ -1643,6 +1643,149 @@ pub fn assess_card(
     }
 }
 
+/// Which bounded cycle dimension a budget covers.
+///
+/// A single-variant enum on purpose — the same justification
+/// `NextPermittedAction` already carries in this file: a closed value
+/// programs compare against, not a prose string whose wording can drift
+/// between call sites. There is exactly one cycle dimension today because
+/// that is the only one `CycleConvergenceLimits` declares; a second cycle
+/// dimension is a policy change, not a rewording of this one's name.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleDimension {
+    IntegrationFailures,
+}
+
+/// One cycle dimension whose budget is spent, and what spent it.
+///
+/// Field for field, this is `ExhaustedDimension`'s cycle-level twin,
+/// including the same caveat: `count` is authoritative, not `evidence` —
+/// two facts may cite the same reference, so `evidence.len()` can be less
+/// than `count`, and that is expected rather than a defect.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ExhaustedCycleDimension {
+    pub dimension: CycleDimension,
+    pub count: u32,
+    /// The effective budget this dimension was actually compared against —
+    /// the configured limit already multiplied by `renewals + 1` — never
+    /// the bare configuration limit. Reporting the base limit here would
+    /// read as "no renewal was ever granted" even when one was, exactly as
+    /// `ExhaustedDimension::limit`'s own note says.
+    pub limit: u32,
+    pub evidence: BTreeSet<String>,
+}
+
+/// What the recorded facts say about one cycle's integration-failure
+/// budget.
+///
+/// `CardConvergence`'s cycle-level twin, shape for shape: the same three
+/// statuses, and the same `NextPermittedAction` — reused, not redeclared,
+/// because the action an operator takes next is identical regardless of
+/// which budget escalated: an authorized actor records a disposition.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CycleConvergence {
+    /// No policy configured: nothing to enforce, and no budget implied.
+    LegacyUnassessed,
+    /// A policy is configured and the integration-failure budget still has
+    /// room.
+    Within,
+    /// The integration-failure budget is spent.
+    Escalated {
+        exhausted: Vec<ExhaustedCycleDimension>,
+        next_permitted_action: NextPermittedAction,
+    },
+}
+
+/// Assesses one cycle against its configured integration-failure budget.
+///
+/// 73-1: the cycle-level counterpart of `assess_card`, deliberately built to
+/// answer identically wherever the two questions overlap — read that
+/// function's doc comment first; this one calls out only where the cycle
+/// case is not simply a smaller copy of the card case. This is a pure
+/// decision function and nothing more: it refuses nothing, and nothing
+/// downstream of it does either. Only `cycle status` (`commands::cycle`)
+/// reads its answer, to report it — enforcement is a later card.
+///
+/// A missing policy, or a project still in `LegacyUnassessed`, answers
+/// `LegacyUnassessed` rather than inferring a budget nobody configured —
+/// same rule, same reason as `assess_card`. Unlike `assess_card`, there is
+/// no "subject the projection never mentions" case to handle separately:
+/// `assess_card` falls back to `CardCounters::default()` because
+/// `view.cards` is a map keyed by card, and a card with no facts has no
+/// entry in it. `view.cycle` is not a map lookup — a `Configured`
+/// projection carries exactly one `CycleCounters`, defaulted by `project`
+/// itself the moment it creates one — so a cycle with no integration
+/// failures already reads as zero, with nothing extra to arrange for it.
+///
+/// The dimension is exhausted at `count >= effective budget`, not
+/// `count > effective budget` — the same boundary `assess_card` draws, for
+/// the same reason: a limit of 2 grants two attempts, and it is the second
+/// one that spends the budget. The effective budget is the configured limit
+/// multiplied by `renewals + 1`, computed with the same checked, chained
+/// arithmetic as `assess_card`, and an overflow fails closed — exhausted
+/// unconditionally — for the same reason: once there is no safe number left
+/// to compare `count` against, escalating is the only fail-closed answer.
+/// `escalation_waived` outranks that overflow default, exactly as it does
+/// on the card side: an overflow is a defensive fallback for when there is
+/// no safe number left, and a specific authorized decision about this exact
+/// dimension outranks a defensive default.
+///
+/// `renewals` and `escalation_waived` are read here even though no
+/// disposition command folds either into `CycleCounters` yet: both fields
+/// already exist on `DimensionCount`, which `CycleCounters` reuses, and a
+/// decision function that silently ignored half of its own input would be a
+/// trap for whoever adds the cycle-level disposition later — it would look
+/// finished right up until the day it quietly did the wrong thing.
+///
+/// No cycle id parameter: `view` is already the projection of exactly one
+/// cycle, the same one `project` was called with.
+#[must_use]
+pub fn assess_cycle(
+    policy: Option<&ConvergencePolicy>,
+    view: &ProjectConvergence,
+) -> CycleConvergence {
+    let Some(policy) = policy else {
+        return CycleConvergence::LegacyUnassessed;
+    };
+    let ProjectConvergence::Configured(view) = view else {
+        return CycleConvergence::LegacyUnassessed;
+    };
+    let count = &view.cycle.integration_failures;
+    let base_limit = policy.cycle_limits.integration_failures;
+
+    // Same checked, chained arithmetic as `assess_card`: `renewals + 1`
+    // first, then multiplied by the configured limit, so an overflow in
+    // either step is caught rather than silently wrapping into a small or
+    // enormous budget. Fail closed, never open — see `assess_card` for the
+    // full reasoning, which applies here unchanged.
+    let effective_budget = count
+        .renewals
+        .checked_add(1)
+        .and_then(|multiplier| base_limit.checked_mul(multiplier));
+    let overflowed = effective_budget.is_none();
+    let effective_budget = effective_budget.unwrap_or(u32::MAX);
+
+    // `>=`, not `>` — the boundary this card exists to get right, mirroring
+    // `assess_card` exactly. `escalation_waived` wins over the overflow
+    // default too, for the same reason it does there: a specific authorized
+    // decision outranks a defensive fallback.
+    if !count.escalation_waived && (overflowed || count.count >= effective_budget) {
+        CycleConvergence::Escalated {
+            exhausted: vec![ExhaustedCycleDimension {
+                dimension: CycleDimension::IntegrationFailures,
+                count: count.count,
+                limit: effective_budget,
+                evidence: count.evidence.clone(),
+            }],
+            next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+        }
+    } else {
+        CycleConvergence::Within
+    }
+}
+
 impl Trend {
     /// Computes the trend across every round recorded for a card.
     ///
@@ -3395,6 +3538,288 @@ mod tests {
             CardConvergence::Within,
             "an accepted risk must outrank the overflow default; the dimension must not be \
              reported exhausted even though its effective budget overflows"
+        );
+    }
+
+    // 73-1: `assess_cycle` is the cycle-level counterpart of `assess_card`
+    // above — same boundary, same checked arithmetic, same
+    // `escalation_waived` precedence. Each test below pins one property
+    // `assess_card`'s own tests already pin for the card case, so the two
+    // can never silently drift apart.
+
+    #[test]
+    fn a_cycle_with_no_recorded_failures_is_within_budget() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let view = project(Some(&policy()), &project_id, &cycle, &[]).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Within,
+            "absence of integration failures is not absence of budget"
+        );
+    }
+
+    #[test]
+    fn a_cycle_dimension_exactly_at_its_limit_is_exhausted() {
+        // The boundary this card exists to get right: two integration
+        // failures against a limit of two is the budget spent, not one
+        // short of spent.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::IntegrationFailure),
+            event(2, AttemptKind::IntegrationFailure),
+        ];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Escalated {
+                exhausted: vec![ExhaustedCycleDimension {
+                    dimension: CycleDimension::IntegrationFailures,
+                    count: 2,
+                    limit: 2,
+                    evidence: BTreeSet::from(["receipt:1".to_owned(), "receipt:2".to_owned()]),
+                }],
+                next_permitted_action: NextPermittedAction::RecordAuthorizedDisposition,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_one_below_its_limit_still_has_budget() {
+        // The other half of the same boundary, in its own test so neither
+        // side can drift without the other noticing.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![event(1, AttemptKind::IntegrationFailure)];
+        let view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(Some(&policy()), &view),
+            CycleConvergence::Within,
+            "one integration failure against a limit of two is one attempt still available"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_policy_assesses_the_cycle_as_legacy_unassessed() {
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let facts = vec![
+            event(1, AttemptKind::IntegrationFailure),
+            event(2, AttemptKind::IntegrationFailure),
+        ];
+        let configured_view = project(Some(&policy()), &project_id, &cycle, &facts).unwrap();
+
+        assert_eq!(
+            assess_cycle(None, &configured_view),
+            CycleConvergence::LegacyUnassessed,
+            "no configured policy means nothing to enforce, even though these \
+             facts would otherwise exhaust the budget"
+        );
+        assert_eq!(
+            assess_cycle(Some(&policy()), &ProjectConvergence::LegacyUnassessed),
+            CycleConvergence::LegacyUnassessed,
+            "a legacy project has no implicit budget even once a policy exists"
+        );
+    }
+
+    #[test]
+    fn a_renewal_extends_the_cycle_budget() {
+        // No disposition command folds a renewal into `CycleCounters` yet —
+        // a later card adds that — so this constructs the projection
+        // directly instead of folding real facts through `project`, exactly
+        // as `an_overflowed_budget_is_exhausted_rather_than_unlimited` and
+        // `an_accepted_risk_outranks_an_overflowed_budget` do above for the
+        // same reason: exercising a `DimensionCount` combination no
+        // fact-folding path can produce today.
+        let policy = policy();
+        let digest = policy.digest().unwrap();
+        let cycle_view = |count: u32, renewals: u32| {
+            ProjectConvergence::Configured(ConvergenceProjection {
+                policy_digest: digest.clone(),
+                cycle: CycleCounters {
+                    integration_failures: DimensionCount {
+                        count,
+                        evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                        renewals,
+                        escalation_waived: false,
+                    },
+                },
+                cards: BTreeMap::new(),
+            })
+        };
+
+        assert!(
+            matches!(
+                assess_cycle(Some(&policy), &cycle_view(2, 0)),
+                CycleConvergence::Escalated { .. }
+            ),
+            "two integration failures against a limit of two, with no renewal, must escalate"
+        );
+        assert_eq!(
+            assess_cycle(Some(&policy), &cycle_view(2, 1)),
+            CycleConvergence::Within,
+            "one renewal doubles the effective budget to 2 * (1 + 1) = 4, and two failures fit"
+        );
+
+        let CycleConvergence::Escalated { exhausted, .. } =
+            assess_cycle(Some(&policy), &cycle_view(4, 1))
+        else {
+            panic!("four integration failures against an effective budget of four must escalate");
+        };
+        assert_eq!(
+            exhausted[0].limit, 4,
+            "limit reports the effective budget (2 * (1 renewal + 1)), not the base 2"
+        );
+    }
+
+    #[test]
+    fn a_waived_cycle_escalation_is_not_reported_exhausted() {
+        // No disposition command sets `escalation_waived` on
+        // `CycleCounters` yet either — same reason, same directly
+        // constructed projection as the test above.
+        let policy = policy();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 5,
+                    evidence: BTreeSet::from(["receipt:1".to_owned()]),
+                    renewals: 0,
+                    escalation_waived: true,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            assess_cycle(Some(&policy), &view),
+            CycleConvergence::Within,
+            "an accepted risk must suppress exhaustion, however far past the limit the count \
+             climbed"
+        );
+    }
+
+    #[test]
+    fn an_overflowed_cycle_budget_is_exhausted_rather_than_unlimited() {
+        // Mirrors `an_overflowed_budget_is_exhausted_rather_than_unlimited`
+        // above: a base limit above `u32::MAX / 2` plus one renewal already
+        // overflows `limit * (renewals + 1)`, reachable without four
+        // billion recorded facts. `count` is deliberately small — 3 — since
+        // the point is that `count` never gets compared at all once the
+        // multiplication overflows; only the overflow itself may decide the
+        // outcome.
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: policy().card_limits,
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: u32::MAX / 2 + 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 3,
+                    evidence: BTreeSet::new(),
+                    renewals: 1,
+                    escalation_waived: false,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        let CycleConvergence::Escalated { exhausted, .. } =
+            assess_cycle(Some(&overflow_policy), &view)
+        else {
+            panic!(
+                "an overflowed effective budget must escalate unconditionally; reading it as \
+                 unlimited would silently remove this dimension's budget entirely, with a count \
+                 of only 3 against a limit over two billion"
+            );
+        };
+        assert_eq!(
+            exhausted[0].count, 3,
+            "count is copied through unchanged; only the overflow itself may decide the outcome"
+        );
+        assert_eq!(
+            exhausted[0].limit,
+            u32::MAX,
+            "an overflowed budget has no safe number to report, so it falls back to u32::MAX, \
+             the same fallback `assess_card` uses"
+        );
+    }
+
+    #[test]
+    fn a_waived_cycle_escalation_outranks_an_overflowed_budget() {
+        // Sibling of the test above, with the one field it pins at `false`
+        // now set to `true`: same huge base limit, same single renewal,
+        // same small `count`. `assess_cycle`'s doc comment promises
+        // `escalation_waived` wins even over the overflow default — on the
+        // card side that precedence shipped undefended and cost a repair
+        // round; this test pins it here from the start.
+        let overflow_policy = ConvergencePolicy {
+            version: crate::config::CONVERGENCE_POLICY_V1.to_owned(),
+            card_limits: policy().card_limits,
+            cycle_limits: CycleConvergenceLimits {
+                integration_failures: u32::MAX / 2 + 1,
+            },
+        };
+        overflow_policy.validate().unwrap();
+        let view = ProjectConvergence::Configured(ConvergenceProjection {
+            policy_digest: overflow_policy.digest().unwrap(),
+            cycle: CycleCounters {
+                integration_failures: DimensionCount {
+                    count: 3,
+                    evidence: BTreeSet::new(),
+                    renewals: 1,
+                    escalation_waived: true,
+                },
+            },
+            cards: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            assess_cycle(Some(&overflow_policy), &view),
+            CycleConvergence::Within,
+            "an accepted risk must outrank the overflow default; the dimension must not be \
+             reported exhausted even though its effective budget overflows"
+        );
+    }
+
+    #[test]
+    fn the_cycle_shapes_serialize_exactly() {
+        assert_eq!(
+            serde_json::to_string(&CycleConvergence::LegacyUnassessed).unwrap(),
+            r#"{"status":"legacy_unassessed"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CycleConvergence::Within).unwrap(),
+            r#"{"status":"within"}"#
+        );
+
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+        let mut first = event(1, AttemptKind::IntegrationFailure);
+        first.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("integration:INT-000001"),
+        );
+        let mut second = event(2, AttemptKind::IntegrationFailure);
+        second.metadata.insert(
+            "evidence_ref".to_owned(),
+            serde_json::json!("integration:INT-000002"),
+        );
+        let view = project(Some(&policy()), &project_id, &cycle, &[first, second]).unwrap();
+
+        let escalated = assess_cycle(Some(&policy()), &view);
+        assert_eq!(
+            serde_json::to_string(&escalated).unwrap(),
+            r#"{"status":"escalated","exhausted":[{"dimension":"integration_failures","count":2,"limit":2,"evidence":["integration:INT-000001","integration:INT-000002"]}],"next_permitted_action":"record_authorized_disposition"}"#
         );
     }
 

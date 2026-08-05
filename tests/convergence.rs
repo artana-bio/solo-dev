@@ -1929,6 +1929,90 @@ fn the_recorded_failure_projects_into_the_cycle_counter() {
     );
 }
 
+// 73-1: `cycle status` gains a read-only `convergence` report, mirroring
+// `card status`'s own (72-3). Neither test below asserts a refusal — that
+// is a later card's job — only that the report is present and accurate.
+
+#[test]
+fn cycle_status_reports_a_cycle_within_its_budget() {
+    let workspace = opened_with_policy(3, 3);
+
+    let envelope = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({ "status": "within" }),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn cycle_status_reports_an_escalated_cycle_with_its_evidence() {
+    // A limit of one integration failure, spent by exactly one real
+    // conflict driven through the governed `integration merge` command —
+    // the same fixture
+    // `a_conflicting_integration_records_one_cycle_bound_failure_fact_and_still_refuses`
+    // uses above, just with the cycle budget tight enough that this one
+    // failure alone exhausts it.
+    let workspace = conflicting_under_policy(3, 1);
+    let id = prepare_integration(&workspace);
+
+    let output = workspace.integration_raw(&[
+        "merge",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(
+        error_code(&output),
+        "CH-CONFLICT-MERGE-FAILED",
+        "the fixture must fail on the conflict it was built to produce"
+    );
+
+    let envelope = workspace.cycle_json(&["status", "--cycle-id", "C-001"]);
+    assert_eq!(
+        envelope["data"]["convergence"],
+        serde_json::json!({
+            "status": "escalated",
+            "exhausted": [
+                {
+                    "dimension": "integration_failures",
+                    "count": 1,
+                    "limit": 1,
+                    "evidence": [format!("integration:{id}")],
+                }
+            ],
+            "next_permitted_action": "record_authorized_disposition",
+        }),
+        "data.convergence must be exactly CycleConvergence's own serialization: {envelope}"
+    );
+
+    // The human-readable text must say the same thing: which dimension is
+    // exhausted and what may happen next, without requiring JSON — the same
+    // register `card status`'s own escalation report uses.
+    let text_output = Workspace::run(&[
+        "cycle".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--cycle-id".to_owned(),
+        "C-001".to_owned(),
+    ]);
+    assert!(
+        text_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    let text = String::from_utf8_lossy(&text_output.stdout).into_owned();
+    assert!(text.contains("integration_failures"), "{text}");
+    assert!(text.contains("1/1"), "{text}");
+    assert!(text.contains(&format!("integration:{id}")), "{text}");
+    assert!(
+        text.contains("record_authorized_disposition"),
+        "the text must name the next permitted action too: {text}"
+    );
+}
+
 // 72-2: once `assess_card` reports a card `Escalated`, that card's own
 // delivery and review loop stops. `handoff create`, `review begin`, and
 // `review record` — the real commands, and the previews for the two whose
