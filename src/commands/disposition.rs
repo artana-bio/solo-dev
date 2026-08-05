@@ -68,6 +68,35 @@
 //! the original card's, and not the follow-up's either: the follow-up card
 //! is named in the record, never mutated, so a card's lifecycle state only
 //! ever changes in one place.
+//!
+//! `redesign` is the sixth and last: an authorized actor ends an escalated
+//! card because the approach itself was wrong, and names the exact card
+//! that replaces it — #9's own criterion to "treat fundamental repeated
+//! failures as a design or scope signal, not as an invitation to patch
+//! indefinitely." Closest to `abandon`: both terminate the original card,
+//! through the very same `CardState::Abandoned` transition and the very
+//! same "a repeated disposition refuses" property that transition gives
+//! for free, since `Abandoned` has no successors. What `redesign` adds is
+//! the replacement binding — the record shows the work continued
+//! elsewhere, not merely stopped — and that binding may name a card in a
+//! **different** cycle, deliberately, unlike `split`'s follow-up: `split`
+//! leaves the original card alive and governed, so a cross-cycle follow-up
+//! would create two cycles with a live claim on one decision, while
+//! `redesign` terminates the original, so no dual-governance question
+//! survives. 74-7b's review found the cost of naming a foreign cycle only
+//! implicitly, through `split`'s bare `follow_up_card_id`: a cross-cycle
+//! fact reads as though it named a card in its own cycle unless something
+//! says otherwise. So `redesign` records `replacement_cycle_id` alongside
+//! `replacement_card_id`, taken from the replacement's own loaded record,
+//! keeping the binding self-describing. Closest to `split` in one other
+//! way and no more: `redesign`, like `split`, does not create the
+//! replacement card, for the same reason — the operator names an
+//! already-existing card, reached through the normal governed path, and
+//! `redesign` only binds to it. Unlike `split` and `accept-risk`,
+//! `redesign` waives nothing and never touches
+//! `DimensionCount::escalation_waived`: the card is terminal, so there is
+//! no budget question left to answer, and there is no `--dimension`
+//! either — a redesign answers the whole card, not one dimension of it.
 
 use std::{
     fs,
@@ -124,6 +153,11 @@ pub enum DispositionCommand {
     /// card's budget — the authorized exit from an escalation that records
     /// exactly where the deferred work went, in place of a renewal.
     Split(SplitArgs),
+    /// Permanently end an escalated card because the approach itself was
+    /// wrong, and name the exact card that replaces it — the authorized
+    /// exit from an escalation that ends the original attempt rather than
+    /// granting it another one, in place of a renewal.
+    Redesign(RedesignArgs),
 }
 
 impl DispositionCommand {
@@ -136,6 +170,7 @@ impl DispositionCommand {
             Self::Abandon(..) => "disposition.abandon",
             Self::AcceptRisk(..) => "disposition.accept-risk",
             Self::Split(..) => "disposition.split",
+            Self::Redesign(..) => "disposition.redesign",
         }
     }
 }
@@ -282,6 +317,33 @@ pub struct SplitArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `disposition redesign`.
+///
+/// Deliberately carries no `--dimension`, unlike `renew`, `accept-risk`, and
+/// `split`: a redesign answers the whole card, not one dimension of it —
+/// see the module doc comment.
+#[derive(Debug, Args)]
+pub struct RedesignArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// The escalated card whose approach was wrong and is being ended.
+    #[arg(long)]
+    pub card_id: String,
+    /// The already-existing card that replaces it. `redesign` binds to it;
+    /// it does not create it — see the module doc comment for why, the
+    /// same reason `split` does not create its own follow-up card. Unlike
+    /// `split`'s follow-up, this may name a card in a different cycle; see
+    /// the module doc comment.
+    #[arg(long)]
+    pub replacement_card_id: String,
+    /// Why this redesign is authorized.
+    #[arg(long)]
+    pub rationale: String,
+    /// Report every check without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `disposition` subcommand.
 ///
 /// # Errors
@@ -297,6 +359,7 @@ pub fn execute(
         DispositionCommand::Abandon(args) => run_abandon(args, clock),
         DispositionCommand::AcceptRisk(args) => run_accept_risk(args, clock),
         DispositionCommand::Split(args) => run_split(args, clock),
+        DispositionCommand::Redesign(args) => run_redesign(args, clock),
     }
 }
 
@@ -1807,6 +1870,319 @@ fn run_split(args: &SplitArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     "card_id": card_id.to_string(),
                     "dimension": dimension_wire_name(dimension),
                     "follow_up_card_id": follow_up_card_id.to_string(),
+                    "event_id": event.event_id.to_string(),
+                    "policy_digest": policy_digest.as_str(),
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Runs every check `disposition redesign` must satisfy before it writes
+/// anything, in the fixed order #74-8's contract requires, and returns the
+/// configured convergence policy's digest on success — the exact value the
+/// recorded fact must bind to, matching every sibling disposition's own
+/// check function.
+///
+/// Shared between the real command and its `--dry-run` preview, so neither
+/// can promise or refuse something the other disagrees with.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyInvalidTransition`] when there is no
+/// convergence policy configured, when the card is not currently escalated,
+/// when its current lifecycle state does not permit the transition to
+/// `CardState::Abandoned` — whatever [`CardState::check_transition`] itself
+/// returns for that — when the replacement card is the card being
+/// redesigned, or when the replacement card is terminal. Returns whatever
+/// [`load_card`] returns when the replacement card cannot be loaded —
+/// ordinarily [`ErrorCode::PreconditionNotFound`] for one that was never
+/// activated. Returns [`ErrorCode::PolicyNotAccepted`] when no
+/// final-authorization policy is configured, or when the acting actor is
+/// not in its authorized set. Returns [`ErrorCode::UsageInvalidArguments`]
+/// when `rationale` is blank. Propagates a control-read or projection
+/// failure unchanged.
+fn require_redesignable(
+    control: &ControlRepository,
+    config: &ProjectConfig,
+    record: &CardRecord,
+    current_state: CardState,
+    replacement_card_id: &CardId,
+    actor: &str,
+    rationale: &str,
+) -> Result<Digest, HarnessError> {
+    // Check 1: a convergence policy must be configured at all. With none, no
+    // card carries a budget in the first place (`assess_card` answers
+    // `LegacyUnassessed` for every card), so no card can ever be escalated,
+    // and there is no digest to bind the recorded fact to. Identical to
+    // `require_abandonable`'s own check 1: a redesign, like an abandon,
+    // terminates the card outright, so both need exactly the same escape
+    // hatch when there is no budget to have escalated it in the first
+    // place.
+    let Some(policy) = config.convergence_policy.as_ref() else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be redesigned: no convergence policy is configured for this project, so no card can be escalated",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 2: the card must be escalated *right now* — read exactly the
+    // way `require_abandonable`'s own check 2 reads it: a fresh
+    // `EventStore::new(control).for_cycle(...)` projected and assessed, so
+    // this command can never disagree with the check it exists to release a
+    // card from. `disposition redesign` is an authorized *escalation exit*,
+    // like `disposition abandon`, not a general-purpose way to end a card —
+    // a card that is `Within` is refused here and pointed at `card abandon`,
+    // the ordinary route that already covers it, so an operator refused
+    // here is never left with nowhere to go.
+    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
+    let view = project(
+        Some(policy),
+        &config.project_id,
+        &record.cycle_id,
+        &cycle_events,
+    )
+    .map_err(|error| HarnessError::Control {
+        reason: format!(
+            "convergence projection for cycle {} is unusable: {error}",
+            record.cycle_id
+        ),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let convergence = assess_card(Some(policy), &view, &record.card_id, record.risk);
+    let CardConvergence::Escalated { .. } = &convergence else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} is not currently escalated; `disposition redesign` only ends an active escalation — to abandon a card that is not escalated, use `card abandon` instead",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    };
+
+    // Check 3: the card's lifecycle state must permit the transition to
+    // `Abandoned`. This is where "a repeated disposition refuses" comes
+    // from, exactly as it does for `abandon`, and it comes for free:
+    // `Abandoned` has no successors, so a second `disposition redesign`
+    // against the same card reaches this exact check and is refused by it.
+    // An already-redesigned card's recorded facts do not disappear, so it
+    // still assesses as `Escalated` and still passes check 2 above every
+    // time — it is this check, not check 2, that stops a repeat.
+    current_state.check_transition(CardState::Abandoned)?;
+
+    // Check 4: the replacement card must exist — loaded through the very
+    // same `load_card` every sibling disposition uses to load the card
+    // being acted on, and the way `require_splittable`'s own check 6 loads
+    // its follow-up card, so a missing or never-activated replacement is
+    // refused exactly the way a missing or never-activated card being
+    // renewed, abandoned, or split to would be, rather than through a
+    // second, hand-rolled existence check. The loaded record is discarded
+    // here: this function returns only the policy digest, matching every
+    // sibling disposition's own check function, so `replacement_cycle_id`
+    // — needed only for the fact `run_redesign` is about to write, not for
+    // any check — is read again there, fresh, once every check below has
+    // passed.
+    let (_replacement_record, replacement_state) = load_card(control, replacement_card_id)?;
+
+    // Check 5: a card cannot replace itself. Naming a card as its own
+    // replacement would record a decision that resolves nothing and reads,
+    // in the audit trail, as work continuing somewhere when it moved
+    // nowhere — the same reasoning `require_splittable`'s own check 7
+    // applies to a follow-up card.
+    if replacement_card_id == &record.card_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {} cannot be its own replacement; redesign points at a different, already-existing card",
+                record.card_id
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 6: the replacement card must not be terminal. Naming a closed
+    // or abandoned card as the successor records a continuation that
+    // cannot continue — the same reasoning `require_splittable`'s own
+    // check 9 applies to a follow-up card, and for the same reason: nobody
+    // would ever work a terminal card again.
+    if replacement_state.state.is_terminal() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "replacement card {replacement_card_id} is {}; a terminal card cannot be named as a redesign's replacement",
+                replacement_state.state.name()
+            ),
+            code: ErrorCode::PolicyInvalidTransition,
+        });
+    }
+
+    // Check 7: the actor must be authorized, by the same
+    // `final_authorization_policy.authorizer_actor_ids` path every sibling
+    // disposition above resolves it through — see `require_renewable`'s
+    // own long note for why this set is reused rather than given its own
+    // field on `ConvergencePolicy`.
+    let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence redesign".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+        }
+    })?;
+    if !authorization.authorizes(actor) {
+        return Err(HarnessError::Control {
+            reason: format!("actor {actor} is not configured to authorize a convergence redesign"),
+            code: ErrorCode::PolicyNotAccepted,
+        });
+    }
+
+    // Check 8: a disposition with no declared reason is not a decision.
+    if rationale.trim().is_empty() {
+        return Err(HarnessError::Control {
+            reason: "disposition redesign requires a non-blank --rationale; a redesign with no declared reason cannot be recorded".to_owned(),
+            code: ErrorCode::UsageInvalidArguments,
+        });
+    }
+
+    policy.digest()
+}
+
+/// Reports what `disposition redesign` would bind, without binding it.
+///
+/// Runs every check the real command makes, through the same
+/// [`require_redesignable`], so a caller can never be told a redesign
+/// would succeed (or told why it would fail) and then have the real
+/// command disagree.
+fn preview_redesign(
+    args: &RedesignArgs,
+    card_id: &CardId,
+    replacement_card_id: &CardId,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let (record, state) = load_card(&control, card_id)?;
+    let config = control.project()?;
+    let policy_digest = require_redesignable(
+        &control,
+        &config,
+        &record,
+        state.state,
+        replacement_card_id,
+        &args.common.actor,
+        &args.rationale,
+    )?;
+    // Read once more, purely to report the replacement's cycle in the
+    // preview — see `require_redesignable`'s own note on check 4 for why
+    // this is a fresh read rather than data threaded out of that function.
+    let (replacement_record, _replacement_state) = load_card(&control, replacement_card_id)?;
+    Ok(CommandOutcome::new(
+        "disposition.redesign",
+        format!(
+            "Dry run: would redesign card {card_id}, naming replacement {replacement_card_id}; nothing was changed"
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "card_id": card_id.to_string(),
+            "replacement_card_id": replacement_card_id.to_string(),
+            "replacement_cycle_id": replacement_record.cycle_id.to_string(),
+            "policy_digest": policy_digest.as_str(),
+        }),
+    ))
+}
+
+fn run_redesign(args: &RedesignArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let replacement_card_id: CardId = args.replacement_card_id.parse()?;
+
+    if args.dry_run {
+        return preview_redesign(args, &card_id, &replacement_card_id);
+    }
+
+    with_transaction(
+        &args.common.control,
+        "disposition.redesign",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let (record, state) = load_card(control, &card_id)?;
+            let previous = state.state;
+            let config = control.project()?;
+            let policy_digest = require_redesignable(
+                control,
+                &config,
+                &record,
+                previous,
+                &replacement_card_id,
+                &args.common.actor,
+                &args.rationale,
+            )?;
+
+            // Loaded again, now that every check has passed: see
+            // `require_redesignable`'s own note on check 4 for why
+            // `replacement_cycle_id` — needed only for the fact below, not
+            // for any check — is read here rather than threaded out of
+            // that function. Safe to re-read: nothing else touches the
+            // control repository between the two reads inside this one
+            // transaction.
+            let (replacement_record, _replacement_state) =
+                load_card(control, &replacement_card_id)?;
+
+            store_card_state(control, &record, &state, CardState::Abandoned)?;
+
+            // `head` binds to the current revision's own `base_sha` — the
+            // same binding every sibling disposition above uses, and for
+            // the same reason: it is the only exact commit SHA an
+            // escalated card is guaranteed to carry in any lifecycle
+            // state. The replacement card is named, in
+            // `replacement_card_id` and `replacement_cycle_id` below, not
+            // mutated — the same posture `split` takes toward its own
+            // follow-up card, for the same reason: mutating a second card
+            // inside a disposition would put card lifecycle changes in two
+            // places instead of one.
+            let event = events.append(
+                &config.project_id,
+                EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
+                    .cycle(record.cycle_id.clone())
+                    .card(
+                        card_id.clone(),
+                        state.current_revision,
+                        state.current_digest.clone(),
+                    )
+                    .head(record.base_sha.clone())
+                    .transition(Some(previous.name()), CardState::Abandoned.name())
+                    .meta(
+                        "disposition",
+                        serde_json::to_value(DispositionKind::Redesign)?,
+                    )
+                    .meta(
+                        "replacement_card_id",
+                        serde_json::json!(replacement_card_id.to_string()),
+                    )
+                    .meta(
+                        "replacement_cycle_id",
+                        serde_json::json!(replacement_record.cycle_id.to_string()),
+                    )
+                    .meta("rationale", serde_json::json!(args.rationale))
+                    .meta("authorized_by", serde_json::json!(args.common.actor))
+                    .meta("policy_digest", serde_json::json!(policy_digest.as_str())),
+                clock,
+            )?;
+
+            control.commit(
+                expected,
+                &format!("disposition: redesign {card_id} -> {replacement_card_id}"),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "disposition.redesign",
+                format!(
+                    "Redesigned card {card_id}, replaced by {replacement_card_id}\nrationale: {}\nauthorized by: {}",
+                    args.rationale, args.common.actor
+                ),
+                serde_json::json!({
+                    "card_id": card_id.to_string(),
+                    "state": CardState::Abandoned.name(),
+                    "replacement_card_id": replacement_card_id.to_string(),
+                    "replacement_cycle_id": replacement_record.cycle_id.to_string(),
                     "event_id": event.event_id.to_string(),
                     "policy_digest": policy_digest.as_str(),
                 }),

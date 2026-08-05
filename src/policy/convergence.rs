@@ -239,8 +239,7 @@ impl AttemptKind {
 /// The single append-only disposition fact the v1 projection recognizes.
 pub const DISPOSITION_RECORDED_EVENT: &str = "convergence.disposition_recorded";
 
-/// Closed set of authorized dispositions. The five #74 has implemented so
-/// far are here; the rest arrive with their own bounded effects.
+/// Closed set of authorized dispositions — the six #74 defines, all landed.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DispositionKind {
@@ -269,6 +268,17 @@ pub enum DispositionKind {
     /// work went: `follow_up_card_id`. See
     /// `DimensionCount::escalation_waived` and `assess_card`.
     Split,
+    /// Permanently ends an escalated card because the approach itself was
+    /// wrong, and names the exact card that replaces it. Like `Abandon`,
+    /// there is no way back, for the same reason: `CardState::Abandoned`
+    /// has no successors. Unlike `Abandon`, it records where the work
+    /// continued — `replacement_card_id`, together with
+    /// `replacement_cycle_id` so a replacement in another cycle (see
+    /// `RedesignMetadata`) is self-describing rather than silently
+    /// misleading. Unlike `AcceptRisk` and `Split`, it waives nothing and
+    /// never touches `DimensionCount::escalation_waived`: the card is
+    /// terminal, so no budget question remains to answer.
+    Redesign,
 }
 
 /// Why a bounded attempt occurred. This is intentionally descriptive rather
@@ -402,6 +412,45 @@ struct SplitMetadata {
     disposition: DispositionKind,
     dimension: CardDimension,
     follow_up_card_id: String,
+    rationale: String,
+    authorized_by: String,
+    policy_digest: Digest,
+}
+
+/// Metadata a redesign fact must declare, with the same closed-set rigor as
+/// `DispositionMetadata`, `AbandonMetadata`, `AcceptRiskMetadata`, and
+/// `SplitMetadata`.
+///
+/// Closest in shape to `AbandonMetadata`: a redesign, like an abandon,
+/// permanently ends the card and names no `dimension` — a redesign answers
+/// the whole card, not one dimension of it, so there is no per-dimension
+/// question left to distinguish. What a redesign adds instead is the
+/// replacement: `replacement_card_id`, kept as a plain `String` for the
+/// same reason `SplitMetadata::follow_up_card_id` is — this projection
+/// validates facts, not cross-references between cards, so it asks only
+/// that *some* identifier was declared (non-blank, alongside `rationale`
+/// and `authorized_by`); whether that identifier really names an eligible
+/// replacement card is `disposition redesign`'s own job, in
+/// `commands::disposition`, before the fact is ever written. Unlike a
+/// split, a redesign's replacement may live in a different cycle: the
+/// original card is terminal, so no dual-governance question survives (see
+/// `disposition redesign` in `commands::disposition` for the full
+/// reasoning). `replacement_cycle_id` is recorded alongside
+/// `replacement_card_id`, taken from the replacement's own loaded record,
+/// precisely so a cross-cycle binding is self-describing rather than
+/// reading as though it named a card in its own cycle — the cost an
+/// earlier review found in `SplitMetadata::follow_up_card_id`'s own bare,
+/// uncross-referenced id. `policy_digest` here is the digest this fact is
+/// itself recorded under — checked in `project` exactly like any other
+/// fact's — never a digest it retires or a budget it expands; a redesign,
+/// like an abandon, retires nothing and grants nothing back — there is no
+/// budget left on a terminal card to grant.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedesignMetadata {
+    disposition: DispositionKind,
+    replacement_card_id: String,
+    replacement_cycle_id: String,
     rationale: String,
     authorized_by: String,
     policy_digest: Digest,
@@ -786,15 +835,15 @@ pub fn project(
     // always about one card in one exact state, so the card binding below
     // is unconditional rather than selected by a match arm.
     //
-    // Rebaselines, abandons, accept-risk facts, and splits are all excluded
-    // here, for related but distinct reasons. Rebaselines are cycle-only,
-    // not card-bound, and the first pass above already collected,
-    // validated, and accounted for every one of them. Abandons *are*
-    // card-bound, but carry no `dimension` — that is the whole point of
-    // `AbandonMetadata` being a separate shape — and fold into no counter,
-    // so they get their own pass below instead. Accept-risk facts *are*
-    // card-bound and *do* name a `dimension`, unlike an abandon, but they
-    // carry `risk` too, which this loop's `DispositionMetadata`
+    // Rebaselines, abandons, accept-risk facts, splits, and redesigns are
+    // all excluded here, for related but distinct reasons. Rebaselines are
+    // cycle-only, not card-bound, and the first pass above already
+    // collected, validated, and accounted for every one of them. Abandons
+    // *are* card-bound, but carry no `dimension` — that is the whole point
+    // of `AbandonMetadata` being a separate shape — and fold into no
+    // counter, so they get their own pass below instead. Accept-risk facts
+    // *are* card-bound and *do* name a `dimension`, unlike an abandon, but
+    // they carry `risk` too, which this loop's `DispositionMetadata`
     // `deny_unknown_fields` would reject outright — the same reason
     // `AbandonMetadata` is its own shape rather than an optional field
     // bolted onto this one — and they fold into a flag, not a counter, so
@@ -802,16 +851,23 @@ pub fn project(
     // name a `dimension` too, but they carry `follow_up_card_id` instead of
     // `risk`, for the same `deny_unknown_fields` reason, and they fold into
     // the very same flag an accept-risk does, not a counter, so they get
-    // their own pass too. Visiting any of the four here would attempt a
-    // parse its metadata was never going to satisfy, and double-insert its
-    // event identifier into `seen`, misreporting a lone valid fact as a
-    // duplicate.
+    // their own pass too. Redesigns *are* card-bound too, but — like
+    // abandons, and unlike accept-risk facts and splits — carry no
+    // `dimension` at all: a redesign answers the whole card, not one
+    // dimension of it. They carry `replacement_card_id` and
+    // `replacement_cycle_id` instead, for the same `deny_unknown_fields`
+    // reason, and — like an abandon — they fold into no counter and no
+    // flag at all, so they get their own pass too. Visiting any of the
+    // five here would attempt a parse its metadata was never going to
+    // satisfy, and double-insert its event identifier into `seen`,
+    // misreporting a lone valid fact as a duplicate.
     for event in events.iter().filter(|event| {
         event.event_type == DISPOSITION_RECORDED_EVENT
             && !is_rebaseline(event)
             && !is_abandon(event)
             && !is_accept_risk(event)
             && !is_split(event)
+            && !is_redesign(event)
     }) {
         let event_id = event.event_id.as_str().to_owned();
         if !seen.insert(event_id.clone()) {
@@ -919,6 +975,11 @@ pub fn project(
             // validated, and it folds into the very same flag an
             // accept-risk does, never this counter.
             DispositionKind::Split => unreachable!("split facts are filtered out above"),
+            // Unreachable: this loop's filter excludes every redesign fact
+            // too. Its own pass below is the only place one is ever
+            // validated, and — like abandon, and unlike accept-risk and
+            // split — it folds into no counter and no flag at all.
+            DispositionKind::Redesign => unreachable!("redesign facts are filtered out above"),
         }
     }
 
@@ -1203,6 +1264,94 @@ pub fn project(
         }
     }
 
+    // Redesign facts validate with the same fail-closed rigor as an
+    // abandon fact — project/cycle, duplicate identifier, metadata parse,
+    // the same three-way policy-digest rule, and an exact
+    // card_id/card_revision/card_digest/head binding — with one addition:
+    // the non-blank check also covers `replacement_card_id` and
+    // `replacement_cycle_id`, not just `rationale` and `authorized_by`,
+    // because a redesign with no declared replacement is not a decision.
+    // Like an abandon, and unlike an accept-risk or a split, a redesign
+    // folds into no counter and no flag at all: it permanently retires the
+    // card itself (`CardState::Abandoned` has no successors), touches no
+    // `DimensionCount`, and sets no `escalation_waived` — the card is
+    // terminal, so there is nothing left for `assess_card` to read
+    // differently before and after one is recorded. Its event id is still
+    // inserted into `seen`, exactly once, so a genuinely duplicated
+    // redesign fact is still caught even though nothing else about it is
+    // folded.
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == DISPOSITION_RECORDED_EVENT && is_redesign(event))
+    {
+        let event_id = event.event_id.as_str().to_owned();
+        if !seen.insert(event_id.clone()) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "duplicate event identifier".to_owned(),
+            });
+        }
+        if &event.project_id != project_id || event.cycle_id.as_ref() != Some(cycle_id) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact is not bound to this project and cycle".to_owned(),
+            });
+        }
+        let metadata: RedesignMetadata = serde_json::from_value(serde_json::Value::Object(
+            event.metadata.clone().into_iter().collect(),
+        ))
+        .map_err(|error| ProjectionError {
+            event_id: event_id.clone(),
+            reason: format!("malformed metadata: {error}"),
+        })?;
+        // `is_redesign` already selected only redesign-tagged events, so
+        // this can never actually fire; it exists so `disposition` stays a
+        // meaningfully-checked field of this shape rather than dead weight
+        // that `deny_unknown_fields` forces us to declare regardless.
+        debug_assert_eq!(metadata.disposition, DispositionKind::Redesign);
+        if metadata.replacement_card_id.trim().is_empty()
+            || metadata.replacement_cycle_id.trim().is_empty()
+            || metadata.rationale.trim().is_empty()
+            || metadata.authorized_by.trim().is_empty()
+        {
+            return Err(ProjectionError {
+                event_id,
+                reason: "a disposition needs a declared replacement card, replacement cycle, rationale, and an authorizing actor"
+                    .to_owned(),
+            });
+        }
+        // Same three-way rule as every other fact kind: current digest is
+        // fine and a digest an authorized rebaseline explicitly retired is
+        // fine — and since nothing is folded either way, those two cases
+        // are indistinguishable in the result — while anything else
+        // refuses the whole view. See the longer note above the
+        // equivalent check in the attempt loop.
+        let under_retired_digest = metadata.policy_digest != policy_digest;
+        if under_retired_digest && !retired_policy_digests.contains(&metadata.policy_digest) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "fact names a foreign policy digest".to_owned(),
+            });
+        }
+        let (Some(_), Some(_), Some(_), Some(head)) = (
+            event.card_id.as_ref(),
+            event.card_revision,
+            event.card_digest.as_ref(),
+            event.head_sha.as_ref(),
+        ) else {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition lacks exact card revision, digest, or head binding".to_owned(),
+            });
+        };
+        if !is_exact_sha(head) {
+            return Err(ProjectionError {
+                event_id,
+                reason: "disposition head is not an exact commit SHA".to_owned(),
+            });
+        }
+    }
+
     Ok(ProjectConvergence::Configured(result))
 }
 
@@ -1282,6 +1431,26 @@ fn is_split(event: &Event) -> bool {
         .get("disposition")
         .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
         == Some(DispositionKind::Split)
+}
+
+/// Whether a `DISPOSITION_RECORDED_EVENT` fact is a redesign, decided from
+/// its raw `disposition` field rather than by committing to any one full
+/// metadata shape first — mirrors `is_rebaseline`, `is_abandon`,
+/// `is_accept_risk`, and `is_split` exactly, and for the same reason:
+/// `RedesignMetadata` disagrees with `DispositionMetadata` on almost every
+/// other field (it carries `replacement_card_id` and
+/// `replacement_cycle_id`, which the other's `deny_unknown_fields` would
+/// reject), and a wrong guess would turn into a spurious refusal rather
+/// than a graceful fallback. A fact that is not recognizably a redesign —
+/// including one with a missing or malformed `disposition` field — answers
+/// `false` here and is left for the ordinary `DispositionMetadata` parse to
+/// accept or, correctly, refuse.
+fn is_redesign(event: &Event) -> bool {
+    event
+        .metadata
+        .get("disposition")
+        .and_then(|value| serde_json::from_value::<DispositionKind>(value.clone()).ok())
+        == Some(DispositionKind::Redesign)
 }
 
 /// Which bounded card dimension a budget covers.
@@ -1868,6 +2037,55 @@ mod tests {
             occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
             previous_state: None,
             next_state: None,
+            head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
+            metadata,
+        }
+    }
+
+    /// Builds a valid `redesign` disposition fact for `F-001`, naming the
+    /// given replacement card and cycle. Card-bound like every sibling
+    /// fixture above, and carrying a state transition like `abandon_event`
+    /// and unlike `accept_risk_event`/`split_event`: a redesign, like an
+    /// abandon, ends the card outright. Tests that need an invalid or
+    /// differently bound redesign mutate the returned event, exactly as
+    /// `disposition_event` is mutated elsewhere in this module.
+    fn redesign_event(id: u64, replacement_card_id: &str, replacement_cycle_id: &str) -> Event {
+        let policy = policy();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "disposition".to_owned(),
+            serde_json::to_value(DispositionKind::Redesign).unwrap(),
+        );
+        metadata.insert(
+            "replacement_card_id".to_owned(),
+            serde_json::json!(replacement_card_id),
+        );
+        metadata.insert(
+            "replacement_cycle_id".to_owned(),
+            serde_json::json!(replacement_cycle_id),
+        );
+        metadata.insert(
+            "rationale".to_owned(),
+            serde_json::json!(format!("redesign:{id}")),
+        );
+        metadata.insert("authorized_by".to_owned(), serde_json::json!("luna"));
+        metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(policy.digest().unwrap().as_str()),
+        );
+        Event {
+            schema: crate::control::event_store::EVENT_SCHEMA.to_owned(),
+            event_id: format!("E-{id:06}").parse::<EventId>().unwrap(),
+            project_id: "example".parse().unwrap(),
+            cycle_id: Some("C-001".parse().unwrap()),
+            card_id: Some("F-001".parse().unwrap()),
+            card_revision: Some(1),
+            card_digest: Some(Digest::of_bytes(b"card")),
+            event_type: DISPOSITION_RECORDED_EVENT.to_owned(),
+            actor_id: "luna".to_owned(),
+            occurred_at: Timestamp::from_unix_seconds(1).unwrap(),
+            previous_state: Some("active".to_owned()),
+            next_state: Some("abandoned".to_owned()),
             head_sha: Some("0123456789012345678901234567890123456789".to_owned()),
             metadata,
         }
@@ -3951,6 +4169,200 @@ mod tests {
         malformed_head.head_sha = Some("not-a-sha".to_owned());
         let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
             .expect_err("a split with a malformed head must refuse the whole view");
+        assert_eq!(error.reason, "disposition head is not an exact commit SHA");
+    }
+
+    // 74-8: `disposition redesign`'s own projection pass carries the same
+    // six guards as the split pass above, and every one of them gets its
+    // own test too, asserting the exact `error.reason` rather than a bare
+    // `is_err()` — the same lesson 74-6 and 74-7 both restate: a guard
+    // with no dedicated test is a comment, not a behaviour, and a review
+    // mutation can delete one with the rest of the suite staying green.
+    // The six below are, in order: duplicate event id, project/cycle
+    // binding, metadata parse, non-blank
+    // replacement_card_id/replacement_cycle_id/rationale/authorized_by,
+    // the three-way policy-digest rule, and exact card/revision/digest/head
+    // binding including `is_exact_sha`.
+
+    #[test]
+    fn a_duplicate_redesign_identifier_is_refused() {
+        // Guard 1: duplicate event id. 74-7's version is
+        // `a_duplicate_split_identifier_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let first = redesign_event(1, "F-002", "C-001");
+        let mut duplicate = redesign_event(2, "F-002", "C-001");
+        duplicate.event_id = first.event_id.clone();
+
+        let error = project(Some(&policy()), &project_id, &cycle, &[first, duplicate]).expect_err(
+            "two redesign facts sharing one event identifier must refuse the whole view",
+        );
+        assert_eq!(error.reason, "duplicate event identifier");
+    }
+
+    #[test]
+    fn a_redesign_bound_to_another_project_or_cycle_is_refused() {
+        // Guard 2: project/cycle binding. 74-7's version is
+        // `a_split_bound_to_another_project_or_cycle_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign_project = redesign_event(1, "F-002", "C-001");
+        foreign_project.project_id = ProjectId::from_str("other").unwrap();
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_project])
+            .expect_err("a redesign naming a foreign project must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+
+        let mut foreign_cycle = redesign_event(2, "F-002", "C-001");
+        foreign_cycle.cycle_id = Some(CycleId::from_str("C-002").unwrap());
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign_cycle])
+            .expect_err("a redesign naming a foreign cycle must refuse the whole view");
+        assert_eq!(error.reason, "fact is not bound to this project and cycle");
+    }
+
+    #[test]
+    fn a_redesign_with_malformed_metadata_is_refused() {
+        // Guard 3: metadata parse — the guard 74-5's abandon pass shipped
+        // with no dedicated test at all, not even the bare-`is_err()` kind.
+        // A fact whose `disposition` field really does say `redesign`, so
+        // `is_redesign` routes it into this pass, but whose metadata
+        // cannot fill `RedesignMetadata` — missing its own required
+        // `replacement_card_id` field — must refuse with the parse error,
+        // not panic or silently default it to blank.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut missing_replacement = redesign_event(1, "F-002", "C-001");
+        missing_replacement.metadata.remove("replacement_card_id");
+        let error = project(Some(&policy()), &project_id, &cycle, &[missing_replacement])
+            .expect_err(
+                "a redesign fact missing its own required `replacement_card_id` field must \
+                 refuse the whole view",
+            );
+        assert_eq!(
+            error.reason,
+            "malformed metadata: missing field `replacement_card_id`"
+        );
+    }
+
+    #[test]
+    fn a_redesign_without_a_replacement_card_a_replacement_cycle_a_rationale_or_an_authorizing_actor_is_refused()
+     {
+        // Guard 4: non-blank
+        // replacement_card_id/replacement_cycle_id/rationale/authorized_by.
+        // 74-7's version, covering the analogous three fields, is
+        // `a_split_without_a_follow_up_card_id_a_rationale_or_an_authorizing_actor_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut blank_replacement_card = redesign_event(1, "F-002", "C-001");
+        blank_replacement_card
+            .metadata
+            .insert("replacement_card_id".to_owned(), serde_json::json!("   "));
+        let error = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[blank_replacement_card],
+        )
+        .expect_err("a redesign with no declared replacement card is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_replacement_cycle = redesign_event(2, "F-002", "C-001");
+        blank_replacement_cycle
+            .metadata
+            .insert("replacement_cycle_id".to_owned(), serde_json::json!("   "));
+        let error = project(
+            Some(&policy()),
+            &project_id,
+            &cycle,
+            &[blank_replacement_cycle],
+        )
+        .expect_err("a redesign with no declared replacement cycle is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_rationale = redesign_event(3, "F-002", "C-001");
+        blank_rationale
+            .metadata
+            .insert("rationale".to_owned(), serde_json::json!("   "));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_rationale])
+            .expect_err("a redesign with no declared reason is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+
+        let mut blank_actor = redesign_event(4, "F-002", "C-001");
+        blank_actor
+            .metadata
+            .insert("authorized_by".to_owned(), serde_json::json!(""));
+        let error = project(Some(&policy()), &project_id, &cycle, &[blank_actor])
+            .expect_err("a redesign with no declared authorizing actor is not a decision");
+        assert_eq!(
+            error.reason,
+            "a disposition needs a declared replacement card, replacement cycle, rationale, and \
+             an authorizing actor"
+        );
+    }
+
+    #[test]
+    fn a_redesign_bound_to_a_foreign_policy_digest_refuses_the_whole_view() {
+        // Guard 5: the three-way policy-digest rule. 74-7's version is
+        // `a_split_bound_to_a_foreign_policy_digest_refuses_the_whole_view`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut foreign = redesign_event(1, "F-002", "C-001");
+        foreign.metadata.insert(
+            "policy_digest".to_owned(),
+            serde_json::json!(Digest::of_bytes(b"foreign").as_str()),
+        );
+        let error = project(Some(&policy()), &project_id, &cycle, &[foreign]).expect_err(
+            "a redesign naming a digest nobody ever decided about must refuse the whole view",
+        );
+        assert_eq!(error.reason, "fact names a foreign policy digest");
+    }
+
+    #[test]
+    fn a_redesign_without_an_exact_card_and_head_binding_is_refused() {
+        // Guard 6: exact card/revision/digest/head binding including
+        // `is_exact_sha`. 74-7's version is
+        // `a_split_without_an_exact_card_and_head_binding_is_refused`.
+        let project_id = ProjectId::from_str("example").unwrap();
+        let cycle = CycleId::from_str("C-001").unwrap();
+
+        let mut no_head = redesign_event(1, "F-002", "C-001");
+        no_head.head_sha = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_head])
+            .expect_err("a redesign with no head binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut no_revision = redesign_event(2, "F-002", "C-001");
+        no_revision.card_revision = None;
+        let error = project(Some(&policy()), &project_id, &cycle, &[no_revision])
+            .expect_err("a redesign with no card revision binding must refuse the whole view");
+        assert_eq!(
+            error.reason,
+            "disposition lacks exact card revision, digest, or head binding"
+        );
+
+        let mut malformed_head = redesign_event(3, "F-002", "C-001");
+        malformed_head.head_sha = Some("not-a-sha".to_owned());
+        let error = project(Some(&policy()), &project_id, &cycle, &[malformed_head])
+            .expect_err("a redesign with a malformed head must refuse the whole view");
         assert_eq!(error.reason, "disposition head is not an exact commit SHA");
     }
 }

@@ -7224,3 +7224,849 @@ mod disposition_split {
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
     }
 }
+
+// 74-8: `disposition redesign`, run by an actor authorized under
+// `final_authorization_policy.authorizer_actor_ids`, permanently ends an
+// escalated card because the approach itself was wrong, and names the
+// exact card that replaces it — the sixth and last of #74's dispositions.
+// Closest to `abandon`: both terminate the original card through the very
+// same `CardState::Abandoned` transition. What `redesign` adds is the
+// replacement binding, and — deliberately, unlike `split`'s follow-up —
+// that binding may name a card in a different cycle, recorded
+// self-describingly via `replacement_cycle_id` alongside
+// `replacement_card_id`. Unlike `split` and `accept-risk`, it waives
+// nothing and never touches `escalation_waived`: the card is terminal, so
+// there is no budget question left to answer, and there is no
+// `--dimension` either.
+//
+// Wrapped in its own module for the same reason every sibling disposition
+// module is: `the_dry_run_makes_every_check_and_writes_nothing` is already
+// the name used above, five times, for the same property on five other
+// commands, and none of the existing tests may be touched or renamed
+// beyond what this card's own contract requires. A module gives this
+// card's instance of that recurring name a distinct path
+// (`disposition_redesign::the_dry_run_makes_every_check_and_writes_nothing`)
+// without colliding.
+mod disposition_redesign {
+    use super::*;
+
+    /// Identical in shape to every sibling module's own copy of this
+    /// helper: `support::Workspace` is outside this card's file scope, so
+    /// each disposition module keeps its fixture-building local rather
+    /// than reaching into a sibling module's private helpers.
+    fn initialized_with_authorizers(authorizers: &[&str]) -> Workspace {
+        let workspace = Workspace::new();
+        let mut args: Vec<String> = vec![
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ];
+        for authorizer in authorizers {
+            args.push("--final-authorizer-actor-id".into());
+            args.push((*authorizer).to_owned());
+        }
+        let output = Workspace::run(&args);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Like [`opened_with_policy`], but with a final-authorization policy
+    /// installed too, so `disposition redesign`'s authorization check (#7)
+    /// has a configured set to resolve. Order matters exactly as it does in
+    /// `opened_with_policy`: both policies must be in place before the
+    /// cycle is created, which pins the project configuration's digest.
+    fn opened_with_disposition_policies(
+        card_limit: u32,
+        integration_limit: u32,
+        authorizers: &[&str],
+    ) -> Workspace {
+        let workspace = initialized_with_authorizers(authorizers);
+        workspace.configure_convergence_policy(card_limit, integration_limit);
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace
+    }
+
+    /// Runs `disposition redesign` in JSON mode, returning the raw output.
+    /// Mirrors every other per-group `_raw` helper in this file; kept local
+    /// because `support::Workspace` is outside this card's file scope.
+    fn disposition_redesign_raw(workspace: &Workspace, args: &[&str]) -> std::process::Output {
+        let mut full = vec![
+            "disposition".to_owned(),
+            "redesign".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+        ];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Workspace::run(&full)
+    }
+
+    /// Every recorded `convergence.disposition_recorded` fact. Every fact
+    /// this module's fixtures ever record is a redesign (none configures a
+    /// renewal, rebaseline, abandon, acceptance, or split too), so this is
+    /// never filtered further by `metadata.disposition`.
+    fn disposition_recorded_events(workspace: &Workspace) -> Vec<serde_json::Value> {
+        workspace
+            .events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "convergence.disposition_recorded")
+            .collect()
+    }
+
+    /// Creates and activates a card in an arbitrary cycle, not necessarily
+    /// `C-001`. Needed only by
+    /// `a_replacement_in_another_cycle_is_recorded_with_its_own_cycle`:
+    /// `support::Workspace::activate_card`, and every other
+    /// `activate_card_*` helper it offers, hard-codes `cycle_id: C-001`,
+    /// which that test's replacement card cannot use since the whole point
+    /// is putting it in a different cycle. Mirrors
+    /// `activate_card_with_gates`'s body directly, for the same reason
+    /// `initialized_with_authorizers` mirrors `Workspace::initialized`'s:
+    /// `support::Workspace` is outside this card's file scope.
+    fn activate_card_in_cycle(
+        workspace: &Workspace,
+        card_id: &str,
+        cycle_id: &str,
+        include: &[&str],
+    ) {
+        let list = include
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base =
+            workspace.cycle_json(&["status", "--cycle-id", cycle_id])["data"]["baseline_sha"]
+                .as_str()
+                .expect("cycle has a frozen baseline")
+                .to_owned();
+        let body = format!(
+            "card_id: {card_id}\ncycle_id: {cycle_id}\ntitle: Implement {card_id}\ngoal: Deliver {card_id}\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n",
+        );
+        let path = workspace.root.join(format!("{card_id}.yaml"));
+        fs::write(&path, body).unwrap();
+        workspace.card(&["create", "--draft", &path.display().to_string()]);
+        workspace.card(&["activate", "--card-id", card_id]);
+    }
+
+    #[test]
+    fn an_authorized_redesign_ends_a_card_and_names_its_replacement() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
+        let replacement_status_before = workspace.card_json(&["status", "--card-id", "F-002"]);
+        let base = workspace.authority_head();
+        let pre_redesign_head = workspace.control_head();
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "authorized redesign for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "an authorized redesign of an escalated card must succeed: {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        // 79-2's lesson, restated by the contract for this card: an event
+        // written but not committed is invisible by content alone, because
+        // the very next transaction would stage the whole control tree and
+        // sweep it in regardless. The only way to catch "wrote but did not
+        // commit" is to check, right here, that this command's own commit
+        // is what moved the head and left the tree clean — before anything
+        // else touches the control repository.
+        assert_ne!(
+            workspace.control_head(),
+            pre_redesign_head,
+            "disposition redesign must commit its own write; the control head must move"
+        );
+        assert!(
+            support::capture(&workspace.control, &["status", "--porcelain"]).is_empty(),
+            "the control tree must be porcelain-clean immediately after a successful redesign"
+        );
+
+        // The original card is terminated; the replacement is named, not
+        // mutated.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned",
+            "a redesign must move the original card to abandoned"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            replacement_status_before["data"]["state"],
+            "a redesign must not move the replacement card's lifecycle state"
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one disposition fact must be recorded: {dispositions:?}"
+        );
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["event_type"], "convergence.disposition_recorded",
+            "{fact}"
+        );
+        assert_eq!(fact["actor_id"], "owner", "{fact}");
+        assert_eq!(fact["cycle_id"], "C-001", "{fact}");
+        assert_eq!(fact["card_id"], "F-001", "{fact}");
+        assert_eq!(
+            fact["card_revision"], card_status["data"]["revision"],
+            "{fact}"
+        );
+        assert_eq!(fact["card_digest"], card_status["data"]["digest"], "{fact}");
+        assert_eq!(
+            fact["head_sha"], base,
+            "head must bind to the current revision's own base_sha, the one exact SHA a card is \
+         guaranteed to carry in any state: {fact}"
+        );
+        assert_eq!(fact["previous_state"], "changes_requested", "{fact}");
+        assert_eq!(fact["next_state"], "abandoned", "{fact}");
+        assert_eq!(fact["metadata"]["disposition"], "redesign", "{fact}");
+        assert_eq!(fact["metadata"]["replacement_card_id"], "F-002", "{fact}");
+        assert_eq!(fact["metadata"]["replacement_cycle_id"], "C-001", "{fact}");
+        assert_eq!(
+            fact["metadata"]["rationale"], "authorized redesign for testing",
+            "{fact}"
+        );
+        assert_eq!(fact["metadata"]["authorized_by"], "owner", "{fact}");
+        assert_real_policy_digest(fact);
+        assert!(
+            !fact["metadata"]
+                .as_object()
+                .expect("metadata is an object")
+                .contains_key("dimension"),
+            "a redesign fact must name no dimension: {fact}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_in_another_cycle_is_recorded_with_its_own_cycle() {
+        // §5.2: unlike `split`, a redesign's replacement may live in a
+        // different cycle — the original card is terminal, so no
+        // dual-governance question survives. The fact must still record
+        // which cycle the replacement is actually in, not silently assume
+        // it shares the original's — 74-7b's review found exactly that gap
+        // in `split`'s own bare `follow_up_card_id`.
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-002",
+            "--objective",
+            "Second slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+        activate_card_in_cycle(&workspace, "F-002", "C-002", &["docs/f002/**"]);
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the replacement lives in a different cycle",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "a replacement card in another cycle must be permitted, unlike split's follow-up: \
+         {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        let dispositions = disposition_recorded_events(&workspace);
+        assert_eq!(dispositions.len(), 1, "{dispositions:?}");
+        let fact = &dispositions[0];
+        assert_eq!(
+            fact["cycle_id"], "C-001",
+            "the fact itself is still bound to the original card's own cycle: {fact}"
+        );
+        assert_eq!(fact["metadata"]["replacement_card_id"], "F-002", "{fact}");
+        assert_eq!(
+            fact["metadata"]["replacement_cycle_id"], "C-002",
+            "the replacement's own cycle must be recorded, not the original's: {fact}"
+        );
+    }
+
+    #[test]
+    // This is the load-bearing test: the mutation in the contract's own
+    // §8 deletes the redesign exclusion from the card-bound
+    // `DispositionMetadata` loop's filter, which makes the redesign fact
+    // recorded below attempt a `dimension`-shaped parse it was never going
+    // to satisfy — refusing not just F-001's own projection but the whole
+    // cycle's, which is exactly what `approve_card` below would trip over
+    // for F-003, a card the redesign never touched.
+    fn an_unrelated_card_in_the_same_cycle_still_works_after_a_redesign() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let redesign = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "ending the escalated card for testing",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            redesign.status.success(),
+            "the redesign that sets up this scenario must itself succeed: {}{}",
+            String::from_utf8_lossy(&redesign.stdout),
+            String::from_utf8_lossy(&redesign.stderr)
+        );
+
+        // A third card in the same cycle, unrelated to both the original
+        // and the replacement, scoped away from both so all three can
+        // coexist without an ownership-overlap refusal, must be completely
+        // unaffected by F-001's redesign. `card status` alone would only
+        // prove the read-only projection path still works; `approve_card`
+        // drives F-003 through `handoff create`, `review begin`, and
+        // `review record` — three separate `require_convergence_budget`
+        // call sites — so this proves the budget-gated write path stays
+        // open too.
+        workspace.activate_card("F-003", &["docs/f003/**"]);
+        let status = workspace.card_raw(&["status", "--card-id", "F-003"]);
+        assert!(
+            status.status.success(),
+            "card status for an unrelated card must not be broken by another card's redesign: \
+         {}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        workspace.approve_card("F-003", "docs/f003/a.md");
+
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-003"])["data"]["state"],
+            "approved",
+            "an unrelated card in the same cycle must still deliver and be reviewed after \
+         another card's redesign"
+        );
+    }
+
+    #[test]
+    fn a_second_redesign_of_the_same_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.activate_card("F-003", &["docs/f003/**"]);
+
+        let first = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "first redesign",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "the first redesign must succeed: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        // The card's recorded facts do not disappear when it is
+        // redesigned. `card status` publishes exactly `assess_card`'s own
+        // assessment (see `card.rs`'s `card_convergence` doc comment) — so
+        // this is a direct, observed answer to whether `assess_card` still
+        // reports the card `Escalated` post-redesign, not an inference
+        // from the refusal below.
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["convergence"]["status"],
+            "escalated",
+            "a redesigned card's recorded facts do not disappear; it must still assess as \
+         escalated"
+        );
+
+        let before_second_head = workspace.control_head();
+        let second = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-003",
+                "--rationale",
+                "second redesign, immediately",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !second.status.success(),
+            "a second redesign of an already-abandoned card must be refused"
+        );
+        assert_eq!(error_code(&second), "CH-POLICY-INVALID-TRANSITION");
+        // It is check 3 (the lifecycle transition), not check 2 (the
+        // escalation check), that refuses the repeat — the assertion above
+        // already established the card still reads `Escalated`, so if
+        // check 2 had fired instead the message would say the card is not
+        // escalated, not name a transition.
+        assert!(
+            error_message(&second).contains("cannot move from `abandoned` to `abandoned`"),
+            "{}",
+            error_message(&second)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_second_head,
+            "the control repository head must not move on refusal"
+        );
+        assert_eq!(
+            disposition_recorded_events(&workspace).len(),
+            1,
+            "only the first redesign's fact may exist"
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_not_escalated_cannot_be_redesigned() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-001", &["src/**"]);
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "nothing has escalated yet",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card that has never been escalated must not be redesignable"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("card abandon"),
+            "the refusal must name the route that does apply: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "ready",
+            "the refused redesign must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn a_missing_replacement_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the replacement card was never created",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a replacement card that was never activated must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+        assert!(
+            error_message(&output).contains("F-002"),
+            "the refusal must name the missing replacement card: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_card_cannot_replace_itself() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-001",
+                "--rationale",
+                "a card cannot be its own replacement",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a card named as its own replacement must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("own replacement"),
+            "{}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_replacement_card_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.card(&[
+            "abandon",
+            "--card-id",
+            "F-002",
+            "--reason",
+            "superseded before it was picked up",
+        ]);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "abandoned",
+            "the fixture must really have reached a terminal state through a governed command"
+        );
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "a terminal replacement should not be allowed",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a terminal replacement card must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+        assert!(
+            error_message(&output).contains("abandoned"),
+            "the refusal must name the replacement card's terminal state: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn an_unauthorized_actor_cannot_redesign() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "an actor outside the configured set",
+                "--actor",
+                "intruder",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "an actor outside final_authorization_policy.authorizer_actor_ids must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "the refused redesign must not have moved the card"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_authorization_policy_refuses() {
+        // `opened_with_policy` (outside this module) installs a
+        // convergence policy but no `final_authorization_policy` at all —
+        // the scenario `opened_with_disposition_policies` above always
+        // avoids by construction. Escalating a card only requires the
+        // convergence policy; authorizing the redesign requires the other
+        // one, which simply does not exist here.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "no authorization policy exists at all",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a redesign must be refused when no final-authorization policy is configured"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn a_blank_rationale_refuses() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        let before_head = workspace.control_head();
+        let output = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "   ",
+                "--actor",
+                "owner",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a blank rationale must be refused before anything is written"
+        );
+        assert_eq!(error_code(&output), "CH-USAGE-INVALID-ARGUMENTS");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "the control repository head must not move on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+    }
+
+    #[test]
+    fn the_dry_run_makes_every_check_and_writes_nothing() {
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        // For the success the real command would make.
+        let before_head = workspace.control_head();
+        let success_preview = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "would redesign if this were real",
+                "--actor",
+                "owner",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            success_preview.status.success(),
+            "the dry run must report success when the real command would succeed: {}{}",
+            String::from_utf8_lossy(&success_preview.stdout),
+            String::from_utf8_lossy(&success_preview.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&success_preview.stdout).unwrap();
+        assert_eq!(
+            envelope["data"]["dry_run"],
+            serde_json::json!(true),
+            "{envelope}"
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head"
+        );
+        assert!(
+            disposition_recorded_events(&workspace).is_empty(),
+            "a dry run must never write a fact"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "changes_requested",
+            "a dry run must never move the card out of its previous state"
+        );
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-002"])["data"]["state"],
+            "ready",
+            "a dry run must never move the replacement card's state either"
+        );
+
+        // For at least one refusal — the same unauthorized-actor refusal
+        // exercised for the real command above.
+        let refusal_preview = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "would redesign if this were real",
+                "--actor",
+                "intruder",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            !refusal_preview.status.success(),
+            "the dry run must refuse the same way the real command would"
+        );
+        assert_eq!(error_code(&refusal_preview), "CH-POLICY-NOT-ACCEPTED");
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a dry run must never move the control head, including on refusal"
+        );
+        assert!(disposition_recorded_events(&workspace).is_empty());
+
+        // Neither dry run consumed anything: the real redesign, run
+        // afterward, still succeeds exactly once.
+        let real = disposition_redesign_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--replacement-card-id",
+                "F-002",
+                "--rationale",
+                "the real redesign",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            real.status.success(),
+            "the real command must still succeed after both dry runs: {}{}",
+            String::from_utf8_lossy(&real.stdout),
+            String::from_utf8_lossy(&real.stderr)
+        );
+        assert_eq!(disposition_recorded_events(&workspace).len(), 1);
+        assert_eq!(
+            workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
+            "abandoned"
+        );
+    }
+}
