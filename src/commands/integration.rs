@@ -2691,6 +2691,38 @@ fn landing_trailers(
     record: &IntegrationRecord,
     digest: &crate::domain::digest::Digest,
 ) -> Result<Vec<(String, String)>, HarnessError> {
+    // Read here, before `run_land` reaches its own `control.commit` later in
+    // the same transaction — so this is the control head the landing was
+    // actually built from, not the one landing this integration will
+    // eventually produce. Confirmed by reading the flow rather than assuming
+    // it from the name: nothing between `with_transaction` opening the
+    // control repository and this call ever mutates control (`write_atomic`,
+    // `EventStore::append`, and every `Journal` write only touch the working
+    // tree; `ControlRepository::commit` is the sole place control's HEAD
+    // moves, and `run_land` does not call it until after the landing message,
+    // which embeds this trailer, is composed).
+    //
+    // `None` means control has no commits at all. That cannot happen here:
+    // reaching a `Prepared`, merged integration record requires a chain of
+    // earlier successful control commits (at minimum `project init`'s own —
+    // `write_project` pairs writing `project/project.json` with an
+    // unconditional `control.commit`, and that first write can never be the
+    // "nothing to commit" no-op case), and `Journal::require_settled`, which
+    // every mutating command checks first, refuses all further work while any
+    // of those commands failed to reach a clean terminal state. So the
+    // refusal below is insurance against that invariant breaking, not a case
+    // this card expects to exercise — an anchor that cannot be established
+    // must still refuse rather than emit a placeholder.
+    let Some(control_head) = control.head()? else {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "control repository has no commits yet; integration {} cannot be anchored to an unborn control history",
+                record.integration_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        });
+    };
+
     let mut trailers = vec![
         (
             landing::TRAILER_INTEGRATION.to_owned(),
@@ -2704,6 +2736,7 @@ fn landing_trailers(
             landing::TRAILER_CYCLE.to_owned(),
             record.cycle_id.to_string(),
         ),
+        (landing::TRAILER_CONTROL.to_owned(), control_head),
     ];
     for member in &record.members {
         trailers.push((

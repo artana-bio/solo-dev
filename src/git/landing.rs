@@ -32,6 +32,20 @@ pub const TRAILER_CYCLE: &str = "Change-Harness-Cycle";
 pub const TRAILER_CARD: &str = "Change-Harness-Card";
 /// Trailer key naming one gate receipt the landing rests on.
 pub const TRAILER_RECEIPT: &str = "Change-Harness-Receipt";
+/// Trailer key naming the control repository head the landing was built from.
+///
+/// The control repository's history is the integrity chain, but it is
+/// self-referential — nothing outside it records where it stood. This
+/// trailer puts that head into the landing commit, which lives in a
+/// different repository with different write permissions.
+///
+/// The value is the control head read *before* this land's own control
+/// commit: `landing_trailers` observes it while composing the message, and
+/// `integration land` only commits to control afterwards, later in the same
+/// transaction. So the anchored head is always an ancestor of (never equal
+/// to) the control head as of any inspection after land completes — the
+/// relationship #88's verification depends on.
+pub const TRAILER_CONTROL: &str = "Change-Harness-Control";
 
 /// The ref that holds one integration's landing commit.
 #[must_use]
