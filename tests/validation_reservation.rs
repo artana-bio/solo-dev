@@ -4,9 +4,11 @@ mod support;
 
 use std::{
     fs,
+    path::Path,
     process::{Command, Output},
     sync::{Arc, Barrier},
     thread,
+    time::{Duration, Instant},
 };
 
 use support::{Workspace, git};
@@ -60,6 +62,43 @@ fn reserve_process(control: &std::path::Path, actor: &str, fail_at: Option<&str>
     command.output().unwrap()
 }
 
+/// Only the bounded, administrative project-lock refusal is a tolerable
+/// outcome for the losing side of the reservation race. A policy or
+/// validation failure must stay visible to the test immediately.
+fn is_project_lock_refusal(stdout: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()
+        .and_then(|envelope| envelope["error"]["code"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("CH-POLICY-LOCK-HELD")
+}
+
+fn describe(output: &Output) -> String {
+    format!(
+        "{}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Re-runs one contender's reserve after its administrative lock refusal,
+/// retrying only that refusal within a bound. Any other outcome — success,
+/// a different error, or exhaustion — returns immediately.
+fn reserve_after_lock_refusal(control: &Path, actor: &str) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = reserve_process(control, actor, None);
+        if output.status.success()
+            || !is_project_lock_refusal(&output.stdout)
+            || Instant::now() >= deadline
+        {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn identical_concurrent_requests_produce_one_durable_winner_and_one_waiter() {
     let workspace = allocated();
@@ -77,10 +116,41 @@ fn identical_concurrent_requests_produce_one_durable_winner_and_one_waiter() {
     barrier.wait();
     let first = first.join().unwrap();
     let second = second.join().unwrap();
-    assert!(first.status.success());
-    assert!(second.status.success());
-    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    // The project lock is fail-fast: under load a contender can exhaust the
+    // binary's bounded internal retry and exit with the administrative
+    // CH-POLICY-LOCK-HELD refusal instead of a decision. That contender is
+    // the waiter. Every other failure is a real one.
+    for (actor, output) in [("first", &first), ("second", &second)] {
+        assert!(
+            output.status.success() || is_project_lock_refusal(&output.stdout),
+            "reserve ({actor}) failed beyond the administrative lock refusal: {}",
+            describe(output)
+        );
+    }
+    assert!(
+        first.status.success() || second.status.success(),
+        "the lock admits one contender, so at most one refusal\nfirst: {}\nsecond: {}",
+        describe(&first),
+        describe(&second)
+    );
+    let observe = |actor: &'static str, output: Output| -> serde_json::Value {
+        let output = if output.status.success() {
+            output
+        } else {
+            // Classified above as the lock refusal: the race is settled, so
+            // the refused contender must now observe the durable winner.
+            let observed = reserve_after_lock_refusal(&workspace.control, actor);
+            assert!(
+                observed.status.success(),
+                "the refused contender ({actor}) must observe the winner: {}",
+                describe(&observed)
+            );
+            observed
+        };
+        serde_json::from_slice(&output.stdout).expect("the JSON envelope")
+    };
+    let first = observe("first", first);
+    let second = observe("second", second);
     let (winner, waiter) = if first["data"]["disposition"]["kind"] == "reserved" {
         (first, second)
     } else {
@@ -268,4 +338,15 @@ fn a_changed_project_policy_is_refused_before_it_can_reuse_a_reservation() {
         1,
         "a policy mismatch must refuse before it can create or consume another reservation"
     );
+}
+
+#[test]
+fn only_the_project_lock_refusal_is_a_tolerable_concurrent_outcome() {
+    assert!(is_project_lock_refusal(
+        br#"{"error":{"code":"CH-POLICY-LOCK-HELD"}}"#
+    ));
+    assert!(!is_project_lock_refusal(
+        br#"{"error":{"code":"CH-POLICY-INVALID-TRANSITION"}}"#
+    ));
+    assert!(!is_project_lock_refusal(b"not a command envelope"));
 }
