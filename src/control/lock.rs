@@ -1110,25 +1110,34 @@ mod tests {
     #[test]
     fn the_wait_grows_and_is_capped() {
         let timestamps = std::cell::RefCell::new(Vec::new());
-        let first_wait = Duration::from_millis(20);
-        let max_wait = Duration::from_millis(160);
+        let first_wait = Duration::from_millis(10);
+        let max_wait = Duration::from_millis(70);
         let result: Result<(), HarnessError> = retry_while_lock_held_within(
             || {
                 timestamps.borrow_mut().push(Instant::now());
                 Err(lock_held_error())
             },
-            Duration::from_millis(400),
+            Duration::from_millis(600),
             first_wait,
             max_wait,
         );
         assert!(result.is_err());
         let stamps = timestamps.borrow();
-        assert!(
-            stamps.len() >= 4,
-            "need several attempts to observe both growth and the cap, got {}",
-            stamps.len()
-        );
         let deltas: Vec<Duration> = stamps.windows(2).map(|pair| pair[1] - pair[0]).collect();
+
+        // Where the doubling formula first reaches the cap, computed from
+        // the parameters alone so it does not depend on what was observed.
+        let mut probe = first_wait;
+        let mut cap_index = 0usize;
+        while probe < max_wait {
+            probe *= 2;
+            cap_index += 1;
+        }
+        assert!(
+            deltas.len() >= cap_index + 3,
+            "need several attempts at the cap to test that it holds, got {} total (cap reached at attempt {cap_index})",
+            deltas.len()
+        );
 
         // `thread::sleep` guarantees *at least* the requested duration and
         // nothing about the upper bound, so two independently-jittered
@@ -1145,20 +1154,20 @@ mod tests {
                 *delta + Duration::from_millis(3) >= expected,
                 "wait shorter than requested: expected at least {expected:?}, saw {delta:?}"
             );
-            assert!(
-                *delta <= expected + Duration::from_millis(300),
-                "wait far exceeded its expected value: expected ~{expected:?}, saw {delta:?}"
-            );
             expected = std::cmp::min(expected * 2, max_wait);
         }
 
-        // The cap is actually reached, rather than the wait growing forever
-        // or plateauing short of it.
-        assert!(
-            deltas
-                .iter()
-                .any(|delta| *delta + Duration::from_millis(3) >= max_wait),
-            "wait must reach the cap of {max_wait:?} at least once: {deltas:?}"
-        );
+        // The floor above would be satisfied just as well by a wait that
+        // keeps doubling forever — growth alone does not prove capping — so
+        // the ceiling is checked separately, and only from the attempt
+        // where the formula says the cap should already have been reached
+        // (mutation M5: dropping the cap so the wait keeps doubling past
+        // `max_wait`).
+        for (attempt, delta) in deltas.iter().enumerate().skip(cap_index) {
+            assert!(
+                *delta <= max_wait + Duration::from_millis(60),
+                "wait after the cap must not exceed {max_wait:?}: saw {delta:?} at attempt {attempt}"
+            );
+        }
     }
 }
