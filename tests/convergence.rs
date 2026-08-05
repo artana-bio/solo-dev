@@ -8859,3 +8859,592 @@ mod cycle_convergence_enforcement {
         assert_refused_for_convergence(&workspace, &output, &before_head);
     }
 }
+
+// #85: nine call sites map an unusable convergence projection to
+// `ErrorCode::InternalControlCorrupt` instead of letting a malformed,
+// duplicate, foreign, or unbound convergence fact read as an empty, unspent
+// budget. `project`'s own doc comment says why a partial view cannot be
+// tolerated: it "would make an attacker-controlled malformed fact look like
+// unused budget." Before this card nothing exercised any of the nine —
+// `grep -rn "INTERNAL-CONTROL-CORRUPT" tests/` matched three files unrelated
+// to this subsystem, and this file, which owns it, had no occurrence at all
+// — so a plausible "be lenient about legacy projects" edit that swallowed
+// the refusal and returned `LegacyUnassessed` would have left every
+// existing test green while quietly failing *open* on exactly the input the
+// design exists to fail closed on.
+//
+// The nine sites, and which test below pins each:
+//
+//   - `card.rs`'s `card_convergence`, the `card status` read path, called
+//     only by `run_status` — `a_corrupt_fact_refuses_card_status`.
+//   - `card.rs`'s `require_convergence_budget`, card enforcement, called
+//     from `handoff create`, `review begin`, `review record`, `card
+//     revise`, and `work start`/`work resume` (grepped, not assumed — see
+//     the test's own comment for the exact call sites) —
+//     `a_corrupt_fact_refuses_a_card_advancing_command`.
+//   - `cycle.rs`'s `cycle_convergence`, `card_convergence`'s read-path
+//     twin, called only by `run_status` —
+//     `a_corrupt_fact_refuses_cycle_status`.
+//   - `integration.rs`'s `require_cycle_convergence_budget`, cycle
+//     enforcement, called from every governed path in `integration.rs` and
+//     `acceptance.rs` that advances an integration toward promotion —
+//     `a_corrupt_fact_refuses_an_integration_advancing_command`.
+//   - `disposition.rs`'s five card-scoped preflights — `require_renewable`,
+//     `require_abandonable`, `require_risk_acceptable`,
+//     `require_splittable`, and `require_redesignable` — each reads this
+//     cycle's events, calls `project`, and maps its refusal to
+//     `InternalControlCorrupt` in byte-for-byte the same shape
+//     (disposition.rs:420-433, 1048-1061, 1293-1306, 1596-1609,
+//     1942-1955), before any of the five reaches its own dimension,
+//     authorization, or lifecycle checks. Originally pinned by one
+//     representative test standing in for all five; a follow-up repair on
+//     this card found that economy was a defect, not a saving — removing
+//     only `require_renewable`'s refusal left the full suite green — so
+//     each of the five is now pinned by its own test:
+//     `a_corrupt_fact_refuses_a_disposition` (`abandon`),
+//     `a_corrupt_fact_refuses_a_disposition_renew` (`renew`),
+//     `a_corrupt_fact_refuses_a_disposition_accept_risk` (`accept-risk`),
+//     `a_corrupt_fact_refuses_a_disposition_split` (`split`), and
+//     `a_corrupt_fact_refuses_a_disposition_redesign` (`redesign`). The
+//     five blocks are byte-identical text — confirmed the hard way, since
+//     an `Edit` aimed at one of them by its surrounding text matches all
+//     five — and byte-identical copies drift independently: a fail-closed
+//     rule only some call sites enforce is not fail-closed.
+//
+// Every test asserts the exact `CH-INTERNAL-CONTROL-CORRUPT` code, never
+// merely a non-zero exit — a command refused for an unrelated precondition
+// would satisfy a looser assertion and prove nothing — and that the
+// refusal names the precise branch of `project` this corruption triggers
+// ("fact names a foreign policy digest"), not some other malformed-fact
+// reason. The two read-path tests additionally assert the response never
+// reports `legacy_unassessed`, the exact wrong answer a "be lenient" edit
+// would produce, and every test asserts the control repository head did
+// not move: a refusal must not write.
+mod fail_closed_on_corrupt_projection {
+    use super::*;
+    use change_harness::domain::digest::Digest;
+
+    /// Rewrites the one recorded convergence fact's `policy_digest` to a
+    /// digest that was never configured and never retired, then commits
+    /// the edit the way `Workspace::configure_convergence_policy` commits a
+    /// control-repository edit (see its own comment): unlike
+    /// `tamper_card_state` and `tamper_cycle_status`, which leave the tree
+    /// dirty on purpose, a committed edit is what makes the next command
+    /// read this corruption as real recorded history rather than an
+    /// in-flight, uncommitted change.
+    ///
+    /// This is deliberately not the bypass #81 removed. #81 was about
+    /// *configuration*: a value an operator should have been able to set
+    /// through a real command and could not, so the harness was changed to
+    /// accept it. This is *corruption*: no governed command has ever
+    /// emitted, or could be made to emit, a convergence fact naming a
+    /// digest nobody configured and nobody retired — `project`'s own fold
+    /// refuses exactly that shape, with "fact names a foreign policy
+    /// digest", before any command gets a chance to act on it. The only way
+    /// to construct the input this card's tests exist to check is
+    /// therefore to write it directly into the control repository, exactly
+    /// as `support::Workspace::tamper_card_state` and `tamper_cycle_status`
+    /// already do to simulate a transition or edit no command makes. It is
+    /// not a shortcut around a command that should have accepted this
+    /// value — no command ever will, or should; refusing it is the entire
+    /// property this card exists to keep true.
+    ///
+    /// Panics unless exactly one convergence fact is recorded, so a
+    /// fixture that silently produced zero, or more than one, cannot
+    /// corrupt the wrong thing — or something in addition to what the
+    /// calling test believes it corrupted — and so cannot quietly weaken
+    /// every assertion built on top of it.
+    fn corrupt_the_recorded_convergence_facts_policy_digest(workspace: &Workspace) {
+        let events_dir = workspace.control.join("events");
+        let mut corrupted = 0;
+        for entry in fs::read_dir(&events_dir).unwrap() {
+            let entry_path = entry.unwrap().path();
+            if entry_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&entry_path).unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let is_convergence_fact = value["event_type"] == "convergence.attempt_recorded"
+                || value["event_type"] == "convergence.disposition_recorded";
+            if is_convergence_fact {
+                value["metadata"]["policy_digest"] = serde_json::json!(
+                    Digest::of_bytes(b"a policy digest no rebaseline ever installed or retired")
+                        .as_str()
+                );
+                fs::write(
+                    &entry_path,
+                    format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+                )
+                .unwrap();
+                corrupted += 1;
+            }
+        }
+        assert_eq!(
+            corrupted, 1,
+            "the fixture must have produced exactly one convergence fact to corrupt"
+        );
+        support::git(&workspace.control, &["add", "-A"]);
+        support::git(
+            &workspace.control,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "test: corrupt one convergence fact's policy_digest",
+            ],
+        );
+    }
+
+    /// Asserts the refusal every test in this module exists to pin: the
+    /// exact `CH-INTERNAL-CONTROL-CORRUPT` code — never merely a non-zero
+    /// exit, which an unrelated precondition failure would also satisfy —
+    /// that the message names the exact `project` branch this fixture's
+    /// corruption triggers, and that nothing was written.
+    fn assert_refused_for_corruption(
+        workspace: &Workspace,
+        output: &std::process::Output,
+        before_head: &str,
+    ) {
+        assert!(
+            !output.status.success(),
+            "a corrupt convergence fact must refuse, not read as an unspent budget: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(output), "CH-INTERNAL-CONTROL-CORRUPT");
+        assert!(
+            error_message(output).contains("fact names a foreign policy digest"),
+            "the refusal must be the specific `project` branch this fixture's corruption \
+             triggers, not some other malformed-fact reason: {}",
+            error_message(output)
+        );
+        assert_eq!(
+            workspace.control_head(),
+            before_head,
+            "a refusal must not write"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_card_status() {
+        // The read path: `card.rs`'s `card_convergence`, called only by
+        // `run_status`. A permissive policy (limit 3) rules out escalation
+        // as an alternative explanation for the refusal below — one
+        // recorded, then corrupted, fact is nowhere near exhausting it.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = workspace.card_raw(&["status", "--card-id", "F-001"]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+
+        // The exact wrong answer this card exists to prevent: a lenient
+        // edit that swallowed the projection error would report the
+        // card's budget as unassessed instead of refusing to answer at
+        // all.
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("legacy_unassessed"),
+            "a corrupt fact must never be read as an unassessed, and so unspent, budget: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_cycle_status() {
+        // `cycle.rs`'s `cycle_convergence`, `card_convergence`'s cycle-
+        // level twin, called only by `run_status`. The corrupted fact
+        // happens to be card-bound, which is deliberate: `project` refuses
+        // the whole cycle's projection on any one malformed fact
+        // regardless of whether that fact names a card, so this proves the
+        // cycle read path shares the same fail-closed projection the card
+        // read path does, not a separate check that only distrusts
+        // cycle-bound facts.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = workspace.cycle_raw(&["status", "--cycle-id", "C-001"]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("legacy_unassessed"),
+            "a corrupt fact must never be read as an unassessed, and so unspent, budget: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_card_advancing_command() {
+        // `require_convergence_budget` (card.rs) is called from
+        // `handoff create` and `review begin`/`review record` (review.rs:
+        // 391, 410, 630, 789), `work start` and `work resume` (work.rs:
+        // 406, 750, 826), and `card revise` (card.rs: 949, 1038) — grepped
+        // directly across `src/`, not assumed. `handoff create` is used
+        // here: it is the exact site `a_corrupt_convergence_fact_fails_
+        // closed_instead_of_reading_as_unspent_budget` above already
+        // exercises for the narrower property that the refusal is merely
+        // "not escalated"; this pins the stronger one #85 requires — the
+        // exact code — using a corruption built by mutating
+        // `policy_digest` rather than blanking `evidence_ref`.
+        let workspace = opened_with_policy(3, 3);
+        open_review_round(&workspace, "F-001");
+        let path = write_verdict(&workspace, "F-001", RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+        workspace.review(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer",
+        ]);
+        redeliver_candidate(&workspace, "F-001");
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]),
+            "",
+        );
+        let output = workspace.handoff_raw(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_an_integration_advancing_command() {
+        // `require_cycle_convergence_budget` (integration.rs) is called
+        // from every governed path in `integration.rs` and `acceptance.rs`
+        // that advances an integration toward promotion (its own doc
+        // comment names them; `cycle_convergence_enforcement` above
+        // already drives six of them under escalation). `integration
+        // prepare` is used here, against F-002 — a second card, wholly
+        // unrelated to F-001, approved *before* the corruption below so
+        // its own approval path (which also reads this cycle's
+        // convergence projection) does not itself trip the corruption.
+        // F-002 has no conflict and nothing else standing in its way, so
+        // it is a clean probe of exactly one thing: whether the corrupted
+        // cycle-wide projection alone is what refuses it.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.approve_card("F-002", "docs/f002/a.md");
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = workspace.integration_raw(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--card-id",
+            "F-002",
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_disposition() {
+        // The first of the five card-scoped disposition preflights —
+        // `require_renewable`, `require_abandonable`,
+        // `require_risk_acceptable`, `require_splittable`, and
+        // `require_redesignable` — each pinned by its own test rather than
+        // by one representative standing in for all five (see this
+        // module's own top comment for why: a follow-up repair on this
+        // card measured that the economy was a defect, since the five
+        // blocks are byte-identical text that can drift independently). Every one
+        // reads this cycle's events, calls `project`, and maps its
+        // refusal to `InternalControlCorrupt` in byte-for-byte the same
+        // shape (disposition.rs:420-433, 1048-1061, 1293-1306, 1596-1609,
+        // 1942-1955), before it reaches its own dimension, authorization,
+        // or lifecycle checks — none of which this fixture even sets up
+        // (no final-authorization policy is configured, and F-001 is not
+        // escalated): the corrupt projection refuses before any of that
+        // would matter, which is itself part of what every test in this
+        // group proves. This one exercises `disposition abandon`; its
+        // four siblings immediately below exercise `renew`, `accept-risk`,
+        // `split`, and `redesign` against the identical fixture.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = Workspace::run(&[
+            "disposition".to_owned(),
+            "abandon".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--card-id".to_owned(),
+            "F-001".to_owned(),
+            "--rationale".to_owned(),
+            "attempting to abandon under a corrupted projection".to_owned(),
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_disposition_renew() {
+        // `require_renewable`'s own copy of the shared block
+        // (disposition.rs:420-433) — see `a_corrupt_fact_refuses_a_disposition`'s
+        // comment for why this is pinned on its own rather than assumed
+        // identical to that test's `abandon` coverage. Identical fixture:
+        // no final-authorization policy configured, F-001 not escalated —
+        // the corrupt projection must refuse before either check, or
+        // `require_renewable`'s own dimension check, would matter.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = Workspace::run(&[
+            "disposition".to_owned(),
+            "renew".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--card-id".to_owned(),
+            "F-001".to_owned(),
+            "--dimension".to_owned(),
+            "gate-failures".to_owned(),
+            "--rationale".to_owned(),
+            "attempting to renew under a corrupted projection".to_owned(),
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_disposition_accept_risk() {
+        // `require_risk_acceptable`'s own copy of the shared block
+        // (disposition.rs:1293-1306) — see `a_corrupt_fact_refuses_a_disposition`'s
+        // comment for why this is pinned on its own. Identical fixture:
+        // no final-authorization policy configured, F-001 not escalated —
+        // the corrupt projection must refuse before either check, or the
+        // "already accepted" / dimension-exhausted checks that read the
+        // same projection, would matter.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = Workspace::run(&[
+            "disposition".to_owned(),
+            "accept-risk".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--card-id".to_owned(),
+            "F-001".to_owned(),
+            "--dimension".to_owned(),
+            "gate-failures".to_owned(),
+            "--risk".to_owned(),
+            "acting on a corrupted projection".to_owned(),
+            "--rationale".to_owned(),
+            "attempting to accept risk under a corrupted projection".to_owned(),
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_disposition_split() {
+        // `require_splittable`'s own copy of the shared block
+        // (disposition.rs:1596-1609) — see `a_corrupt_fact_refuses_a_disposition`'s
+        // comment for why this is pinned on its own. Identical fixture:
+        // no final-authorization policy configured, F-001 not escalated.
+        //
+        // `--follow-up-card-id` names F-999, a card that is never created
+        // in this fixture, on purpose: `require_splittable`'s check order
+        // (disposition.rs:1563-1753) reads this cycle's projection —
+        // where the corruption lives — before it ever loads the follow-up
+        // card (check 6, after the shared block). A nonexistent follow-up
+        // card is therefore a stronger proof than a real one: if the
+        // corrupt-projection check did not fire first, this would fail
+        // with `CH-PRECONDITION-NOT-FOUND` (a missing card), not silently
+        // pass for the wrong reason — exactly the "different check fired"
+        // failure mode this test exists to rule out.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = Workspace::run(&[
+            "disposition".to_owned(),
+            "split".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--card-id".to_owned(),
+            "F-001".to_owned(),
+            "--dimension".to_owned(),
+            "gate-failures".to_owned(),
+            "--follow-up-card-id".to_owned(),
+            "F-999".to_owned(),
+            "--rationale".to_owned(),
+            "attempting to split under a corrupted projection".to_owned(),
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+
+    #[test]
+    fn a_corrupt_fact_refuses_a_disposition_redesign() {
+        // `require_redesignable`'s own copy of the shared block
+        // (disposition.rs:1942-1955) — see `a_corrupt_fact_refuses_a_disposition`'s
+        // comment for why this is pinned on its own. Identical fixture:
+        // no final-authorization policy configured, F-001 not escalated.
+        //
+        // `--replacement-card-id` names F-999, a card that is never
+        // created in this fixture, for the same reason `split`'s test
+        // above leaves its follow-up card uncreated: `require_redesignable`'s
+        // check order (disposition.rs:1906-2048) reads this cycle's
+        // projection before it ever loads the replacement card (check 4,
+        // after the shared block), so a nonexistent replacement is a
+        // stronger proof than a real one — see that test's own comment.
+        let workspace = opened_with_policy(3, 3);
+        let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
+        let declaration = declaration_with_gate_failures(
+            &workspace,
+            "F-001",
+            &head,
+            "gate_failures:\n  - gate_id: gate.unit\n    reason_category: regression\n",
+        );
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            "F-001",
+            "--declaration",
+            &declaration,
+        ]);
+
+        corrupt_the_recorded_convergence_facts_policy_digest(&workspace);
+
+        let before_head = workspace.control_head();
+        let output = Workspace::run(&[
+            "disposition".to_owned(),
+            "redesign".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--control".to_owned(),
+            workspace.control.display().to_string(),
+            "--card-id".to_owned(),
+            "F-001".to_owned(),
+            "--replacement-card-id".to_owned(),
+            "F-999".to_owned(),
+            "--rationale".to_owned(),
+            "attempting to redesign under a corrupted projection".to_owned(),
+        ]);
+        assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+}
