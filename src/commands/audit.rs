@@ -164,14 +164,19 @@ pub(crate) fn cross_check_cycle(
 }
 
 /// Everything a control-anchor audit finds.
-struct AnchorEvidence {
+pub(crate) struct AnchorEvidence {
     /// How many landing commits reachable from the protected branch carried
     /// at least one control anchor.
     landing_commits_examined: usize,
     /// How many anchored control heads were checked across them.
     anchors_checked: usize,
     /// Claims the objects did not bear out, in discovery order.
-    discrepancies: Vec<Discrepancy>,
+    ///
+    /// Crate-visible for the same reason `CycleEvidence::discrepancies` is:
+    /// `#89` calls this same check at the promotion boundary and reuses
+    /// these findings verbatim in its refusal, rather than risking a second
+    /// copy of the discrepancy text drifting from this one.
+    pub(crate) discrepancies: Vec<Discrepancy>,
 }
 
 /// Cross-checks every control head a landing commit has anchored against the
@@ -180,12 +185,17 @@ struct AnchorEvidence {
 /// #87 anchors the trailer on every landing commit, `run_anchors` decides
 /// what finding one means; this only reports.
 ///
+/// Crate-visible because `#89` calls this exact check at the promotion
+/// boundary in `integration.rs`, the same reason `cross_check_cycle` is
+/// crate-visible for `cycle replay`: two callers must never be able to
+/// disagree about what counts as a discrepancy here.
+///
 /// # Errors
 ///
 /// Returns an error when the authority or control repository cannot be read.
 /// An anchor that fails to hold up — orphaned by a rewrite, or altogether
 /// missing — is a [`Discrepancy`], never an error.
-fn check_control_anchors(
+pub(crate) fn check_control_anchors(
     control: &ControlRepository,
     config: &crate::config::ProjectConfig,
 ) -> Result<AnchorEvidence, HarnessError> {
