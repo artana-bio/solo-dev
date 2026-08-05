@@ -62,6 +62,9 @@ pub enum ProjectCommand {
     Recover(RecoverArgs),
     /// Install a convergence policy on an already-initialized project.
     SetConvergencePolicy(SetConvergencePolicyArgs),
+    /// Install a final-authorization policy on an already-initialized
+    /// project, making its declared `exception_triggers` reachable.
+    SetFinalAuthorizationPolicy(SetFinalAuthorizationPolicyArgs),
 }
 
 impl ProjectCommand {
@@ -78,6 +81,7 @@ impl ProjectCommand {
             Self::Status(..) => "project.status",
             Self::Recover(..) => "project.recover",
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
+            Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
         }
     }
 }
@@ -173,6 +177,24 @@ pub struct SetConvergencePolicyArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `project set-final-authorization-policy`.
+#[derive(Debug, Args)]
+pub struct SetFinalAuthorizationPolicyArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    /// Path to a JSON final-authorization policy to install, in the shape
+    /// `FinalAuthorizationPolicy` deserializes.
+    #[arg(long)]
+    pub policy: PathBuf,
+    /// Who is installing the policy.
+    #[arg(long, default_value = "operator")]
+    pub actor: String,
+    /// Validate and report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Executes a `project` subcommand.
 ///
 /// # Errors
@@ -188,6 +210,9 @@ pub fn execute(
         ProjectCommand::Status(args) => run_status(args),
         ProjectCommand::Recover(args) => run_recover(args, clock),
         ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
+        ProjectCommand::SetFinalAuthorizationPolicy(args) => {
+            run_set_final_authorization_policy(args, clock)
+        }
     }
 }
 
@@ -212,6 +237,34 @@ fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessE
     let policy: ConvergencePolicy =
         serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
             reason: format!("convergence policy is malformed: {source}"),
+            code: ErrorCode::ConfigMalformed,
+        })?;
+    policy.validate().map_err(FieldError::into_error)?;
+    Ok(policy)
+}
+
+/// Reads, parses, and validates a final-authorization policy named by
+/// `--policy`.
+///
+/// Mirrors [`read_convergence_policy`] exactly, for the same reason 79-1's
+/// reader is reused by `set-convergence-policy`: an unreadable or
+/// unparseable document is `ConfigMalformed`, and a document that parses but
+/// fails its own checks carries whatever code
+/// [`FinalAuthorizationPolicy::validate`] already assigns — this function
+/// invents no new rejection of its own.
+fn read_final_authorization_policy(
+    path: &PathBuf,
+) -> Result<FinalAuthorizationPolicy, HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read final authorization policy {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let policy: FinalAuthorizationPolicy =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("final authorization policy is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
         })?;
     policy.validate().map_err(FieldError::into_error)?;
@@ -886,6 +939,18 @@ fn existing_policy_digest(config: &ProjectConfig) -> Result<Option<Digest>, Harn
         .transpose()
 }
 
+/// The digest a project's currently configured final-authorization policy is
+/// frozen at, or `None` for a project that has never declared one.
+fn existing_final_authorization_policy_digest(
+    config: &ProjectConfig,
+) -> Result<Option<Digest>, HarnessError> {
+    config
+        .final_authorization_policy
+        .as_ref()
+        .map(FinalAuthorizationPolicy::digest)
+        .transpose()
+}
+
 /// Whether a cycle carrying this status could still be compared against
 /// `project_revision` at `src/commands/gate.rs:791`
 /// (`gate::validation_progress`).
@@ -990,11 +1055,23 @@ fn all_cycles(control: &ControlRepository) -> Result<Vec<CycleRecord>, HarnessEr
 /// refusal, moved to the moment the policy change is proposed, while the
 /// operator can still decide, instead of discovered later by accident.
 ///
+/// Shared by `set-convergence-policy` and `set-final-authorization-policy`.
+/// `Digest::of_canonical(&config)` covers the whole project document, so
+/// either field moves the same `project_revision` a frozen cycle pins;
+/// `blocks_convergence_policy_change` decides purely from cycle status, with
+/// nothing in it specific to which field of the project changed, so one walk
+/// serves both callers. `policy_name` only chooses the trailing clause's
+/// wording, so each caller's refusal names the policy its own operator is
+/// actually installing rather than the other command's.
+///
 /// # Errors
 ///
 /// Returns [`ErrorCode::PolicyInvalidCycle`] naming every offending cycle and
 /// its status when one exists.
-fn refuse_blocking_cycles(control: &ControlRepository) -> Result<(), HarnessError> {
+fn refuse_blocking_cycles(
+    control: &ControlRepository,
+    policy_name: &str,
+) -> Result<(), HarnessError> {
     let offenders: Vec<CycleRecord> = all_cycles(control)?
         .into_iter()
         .filter(|cycle| blocks_convergence_policy_change(cycle.status))
@@ -1009,7 +1086,7 @@ fn refuse_blocking_cycles(control: &ControlRepository) -> Result<(), HarnessErro
         .join(", ");
     Err(HarnessError::Control {
         reason: format!(
-            "{} cycle(s) could still be compared against `project_revision` and would start failing that comparison once this policy changes the project's digest: {named}. Close or abandon them, or start a new cycle instead, before changing the convergence policy.",
+            "{} cycle(s) could still be compared against `project_revision` and would start failing that comparison once this policy changes the project's digest: {named}. Close or abandon them, or start a new cycle instead, before changing the {policy_name}.",
             offenders.len()
         ),
         code: ErrorCode::PolicyInvalidCycle,
@@ -1085,6 +1162,35 @@ fn already_installed_outcome(
     .with_project(config.project_id.clone())
 }
 
+/// Reports installing a final-authorization policy that is already in force,
+/// unchanged.
+///
+/// Mirrors [`already_installed_outcome`] for the same reason: reinstalling a
+/// byte-identical policy cannot move the project's digest, so it cannot break
+/// a cycle's frozen `project_revision` either, and idempotent success needs
+/// neither `refuse_blocking_cycles` nor the project lock.
+fn already_installed_final_authorization_outcome(
+    config: &ProjectConfig,
+    digest: &Digest,
+    dry_run: bool,
+) -> CommandOutcome {
+    CommandOutcome::new(
+        "project.set-final-authorization-policy",
+        format!(
+            "Project {} already has final authorization policy digest {digest} installed; nothing to do{}",
+            config.project_id,
+            if dry_run { " (dry run)" } else { "" }
+        ),
+        serde_json::json!({
+            "project_id": config.project_id.to_string(),
+            "policy_digest": digest.as_str(),
+            "changed": false,
+            "dry_run": dry_run,
+        }),
+    )
+    .with_project(config.project_id.clone())
+}
+
 /// Validates every check the real write makes, without taking the project
 /// lock or opening a transaction: reporting rather than performing, the same
 /// split `acceptance::preview_record` uses over `acceptance::run_record`'s
@@ -1101,13 +1207,57 @@ fn preview_set_convergence_policy(
         return Ok(already_installed_outcome(&config, new_digest, true));
     }
 
-    refuse_blocking_cycles(&control)?;
+    refuse_blocking_cycles(&control, "convergence policy")?;
     refuse_orphaning_facts(&control, existing_digest.as_ref(), new_digest)?;
 
     Ok(CommandOutcome::new(
         "project.set-convergence-policy",
         format!(
             "Dry run: project {} would install convergence policy digest {new_digest}\nwould write: project/project.json\nwould commit control state\nnothing was changed",
+            config.project_id
+        ),
+        serde_json::json!({
+            "dry_run": true,
+            "project_id": config.project_id.to_string(),
+            "policy_digest": new_digest.as_str(),
+            "previous_policy_digest": existing_digest.as_ref().map(Digest::to_string),
+            "planned_mutations": [
+                "write project/project.json".to_owned(),
+                "commit control state".to_owned(),
+            ],
+        }),
+    )
+    .with_project(config.project_id.clone()))
+}
+
+/// Validates every check the real write makes, without taking the project
+/// lock or opening a transaction. Mirrors
+/// [`preview_set_convergence_policy`]; the one structural difference is what
+/// it does *not* call: unlike `ConvergencePolicy`, whose digest every
+/// convergence fact pins, no recorded fact pins `FinalAuthorizationPolicy`'s
+/// digest the same fail-forever way, so there is no `refuse_orphaning_facts`
+/// equivalent to run here — see [`run_set_final_authorization_policy`] for
+/// the full reasoning.
+fn preview_set_final_authorization_policy(
+    args: &SetFinalAuthorizationPolicyArgs,
+    new_digest: &Digest,
+) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let existing_digest = existing_final_authorization_policy_digest(&config)?;
+
+    if existing_digest.as_ref() == Some(new_digest) {
+        return Ok(already_installed_final_authorization_outcome(
+            &config, new_digest, true,
+        ));
+    }
+
+    refuse_blocking_cycles(&control, "final authorization policy")?;
+
+    Ok(CommandOutcome::new(
+        "project.set-final-authorization-policy",
+        format!(
+            "Dry run: project {} would install final authorization policy digest {new_digest}\nwould write: project/project.json\nwould commit control state\nnothing was changed",
             config.project_id
         ),
         serde_json::json!({
@@ -1168,7 +1318,7 @@ fn run_set_convergence_policy(
             if existing_digest.as_ref() == Some(&new_digest) {
                 return Ok(already_installed_outcome(&config, &new_digest, false));
             }
-            refuse_blocking_cycles(control)?;
+            refuse_blocking_cycles(control, "convergence policy")?;
             refuse_orphaning_facts(control, existing_digest.as_ref(), &new_digest)?;
 
             config.convergence_policy = Some(new_policy);
@@ -1193,6 +1343,172 @@ fn run_set_convergence_policy(
                 "project.set-convergence-policy",
                 format!(
                     "Installed convergence policy digest {new_digest} on project {}",
+                    config.project_id
+                ),
+                serde_json::json!({
+                    "project_id": config.project_id.to_string(),
+                    "policy_digest": new_digest.as_str(),
+                    "previous_policy_digest": existing_digest.as_ref().map(Digest::to_string),
+                    "changed": true,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+/// Installs a final-authorization policy on a project that already exists.
+///
+/// Mirrors [`run_set_convergence_policy`] step for step: read and validate
+/// the policy, short-circuit to an idempotent success on a byte-identical
+/// reinstall, refuse a cycle whose frozen `project_revision` would start
+/// failing `gate.rs:792`'s comparison the moment this policy moves the
+/// project's digest, then write, record one event, and commit.
+///
+/// Before this command existed, nothing could put a value into
+/// `FinalAuthorizationPolicy.exception_triggers` except `project init`
+/// (which always writes it empty) or a test hand-editing `project.json`
+/// directly, bypassing every governed command — so the entire `integration
+/// exception raise`/`resolve` subsystem was unreachable in any project built
+/// through the normal commands. This is that field's other half, the way
+/// `set-convergence-policy` is 79-1's other half for `ConvergencePolicy`: it
+/// changes or first installs a policy on a project that may already have
+/// cards, cycles, and accepted final integrations.
+///
+/// Three decisions this command deliberately does *not* make the way a
+/// neighboring command does, recorded here so nobody "fixes" one of them by
+/// accident:
+///
+/// - **No `authorizer_actor_ids` gate.** Matching `set-convergence-policy`,
+///   `--actor` only names who to credit in the emitted event; it authorizes
+///   nothing. D-013 already treats a declared actor as a claim rather than a
+///   proof, so a gate here would add no real trust. And gating the edit of a
+///   policy on that same policy's own `authorizer_actor_ids` is a bootstrap
+///   trap: a project whose declared authorizers are wrong could never be
+///   corrected, because the only command that could fix them would refuse to
+///   run until they were already right.
+/// - **No re-pinning.** [`refuse_blocking_cycles`] refuses a blocking cycle
+///   outright rather than re-pinning its `project_revision`, the way
+///   `disposition rebaseline` re-pins every non-terminal cycle when it
+///   changes the convergence policy. Re-pinning changes the rules governing
+///   an already-open cycle, which is why that path is an *authorized
+///   disposition* requiring an authorizer — and this command has none (see
+///   above), so it must not perform the equivalent mutation under a
+///   different name. The reachable path stays: set the policy before
+///   creating a cycle, or between cycles.
+/// - **No `refuse_orphaning_facts` equivalent.** Verified, not assumed: a
+///   `ConvergencePolicy`'s digest is written into every convergence fact as
+///   `policy_digest`, and `policy::convergence::project` refuses its
+///   *entire*, project-wide view forever the instant one fact's digest no
+///   longer matches the configured policy — which is exactly what
+///   `refuse_orphaning_facts` exists to prevent before it can happen.
+///   `FinalAuthorizationPolicy`'s digest is also embedded in recorded facts,
+///   but narrower and already self-healing where `ConvergencePolicy`'s is
+///   not: `integration.exception_raised`/`exception_resolved` events each
+///   pin the policy digest in force when they were written
+///   (`exception_bindings`, checked back by `exceptions_for` in
+///   `commands::integration`), and a v2 `AcceptanceRecord` pins
+///   `final_authorization_policy_digest` at acceptance time, re-checked by
+///   `validate_final_authorization_for_promotion` in `commands::acceptance`
+///   before every promotion — by that function's own doc comment,
+///   deliberately: "a changed project policy … must invalidate an older v2
+///   authorization rather than relying on the old record's existence." Each
+///   of those checks its own narrow digest against the *current* policy on
+///   every read, scoped to one integration or one acceptance, not folded
+///   across the whole project. A mismatch fails closed there
+///   (`CH-POLICY-NOT-ACCEPTED`, "no longer matches the current project
+///   policy" / "no longer binds final integration") and is recoverable by
+///   re-authorizing under the new policy — an intentional, working
+///   invalidate-and-redo path, not an unrecoverable, project-wide
+///   corruption with no rebaseline mechanism. So this command leaves that
+///   already-fail-closed re-check to do its job rather than duplicating it
+///   as a second refusal at install time. `refuse_blocking_cycles` still
+///   applies here for the same reason it applies to `set-convergence-policy`:
+///   `Digest::of_canonical(&config)` covers the whole project document, so
+///   this policy moves the same `project_revision` a frozen cycle pins,
+///   regardless of which field changed.
+///
+/// Reusing `refuse_blocking_cycles` here (noted above) is in fact why no
+/// orphaning check is needed at all, not merely why an orphan would be
+/// recoverable if one occurred: it means one cannot occur.
+/// `blocks_convergence_policy_change` refuses every cycle status except
+/// `Draft`, `Closed`, and `Abandoned`. A final integration cannot even be
+/// prepared until its cycle is sealed (`integration.rs:1002`,
+/// `final_cycle_binding`), so no exception binding or v2 acceptance record
+/// for one is ever written under a `Draft` cycle; and a sealed cycle's only
+/// stored successor is `Abandoned` (`CycleStatus::successors`), which is
+/// terminal (`CycleStatus::is_terminal`) and never promotes again, so a
+/// digest pinned on its acceptance record is never re-checked again either.
+/// So `refuse_blocking_cycles` already refuses this install in every cycle
+/// status under which a live, re-checkable digest binding can exist — there
+/// is nothing left to orphan.
+///
+/// That makes `blocks_convergence_policy_change`'s exact refusal list
+/// load-bearing for this command too, not only for `set-convergence-policy`:
+/// narrowing it to exempt any non-terminal status would silently reopen the
+/// orphan this reasoning rules out. `Sealed` above all — it is literally
+/// `FinalAuthorizationPolicy::authorization_unit`'s own value,
+/// `"sealed_cycle"`, so it is exactly the status under which a live v2
+/// acceptance record pins this digest.
+///
+/// # Errors
+///
+/// Returns a configuration error when the policy file cannot be read or
+/// fails its own validation, or a policy error naming the blocking cycles, as
+/// established by [`refuse_blocking_cycles`].
+fn run_set_final_authorization_policy(
+    args: &SetFinalAuthorizationPolicyArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let new_policy = read_final_authorization_policy(&args.policy)?;
+    let new_digest = new_policy.digest()?;
+
+    if args.dry_run {
+        return preview_set_final_authorization_policy(args, &new_digest);
+    }
+
+    with_transaction(
+        &args.control,
+        "project.set-final-authorization-policy",
+        clock,
+        move |control, events, expected, steps| {
+            steps.at("control-write")?;
+            // Re-read and re-check inside the lock rather than trust the
+            // preview's reads: two operations racing to install the same
+            // policy must both still see one consistent, idempotent outcome.
+            let mut config = control.project()?;
+            let existing_digest = existing_final_authorization_policy_digest(&config)?;
+            if existing_digest.as_ref() == Some(&new_digest) {
+                return Ok(already_installed_final_authorization_outcome(
+                    &config,
+                    &new_digest,
+                    false,
+                ));
+            }
+            refuse_blocking_cycles(control, "final authorization policy")?;
+
+            config.final_authorization_policy = Some(new_policy);
+            control.write_atomic(PROJECT_FILE, &format!("{}\n", config.to_json()?))?;
+
+            events.append(
+                &config.project_id,
+                EventDraft::new("project.final_authorization_policy_installed", &args.actor)
+                    .meta("policy_digest", serde_json::json!(new_digest.as_str()))
+                    .meta(
+                        "previous_policy_digest",
+                        serde_json::json!(existing_digest.as_ref().map(Digest::to_string)),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("project: set final authorization policy {new_digest}"),
+            )?;
+
+            Ok(CommandOutcome::new(
+                "project.set-final-authorization-policy",
+                format!(
+                    "Installed final authorization policy digest {new_digest} on project {}",
                     config.project_id
                 ),
                 serde_json::json!({
