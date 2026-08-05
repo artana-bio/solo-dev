@@ -30,6 +30,98 @@ Use `--output json` when another program reads a result. Success returns a
 `harness.command-result/v1` envelope; failures return
 `harness.command-error/v1` with `error.code`, `error.recovery`, and details.
 
+## What the Harness guarantees
+
+The checks below run against the control and authority repositories the CLI
+is pointed at, never against anything outside them. What follows states
+exactly what an integrator can rely on, in three tiers: what the Harness
+prevents outright, what it detects — and, in one case, now blocks — and what
+is left over. Deciding what to trust the Harness for means knowing all three.
+
+### Prevented
+
+The Harness refuses these outright, before anything is written.
+
+A card's convergence budget gates `work start`, `review begin`,
+`review record`, `handoff create`, and `card revise`: once the card's
+declared risk has a dimension at its configured limit, each of these
+refuses, and so does its `--dry-run` preview. `work resume` is the one
+deliberate exception — taking a returned card back up is how the next
+attempt gets produced in the first place, so resume only re-checks the
+budget when resuming is equivalent to starting fresh; the attempt itself is
+still caught the moment it is delivered or reviewed.
+
+A cycle's convergence budget gates every step from integration preparation
+through promotion the same way: `integration prepare`, `integration merge`,
+`integration land`, `integration verify`, `integration review`,
+`acceptance record` (final authorization), and `integration promote` — all
+refuse once integration failures exhaust the cycle's budget.
+
+A convergence projection that cannot be trusted — a malformed, duplicate,
+foreign, or unbound convergence fact — refuses the whole projection rather
+than reading as an unspent budget. Every enforcement command above, and
+`card status` and `cycle status` themselves, report the corruption (exit 10,
+internal error) instead of letting a card or cycle advance, or display, as
+though nothing had been recorded against it.
+
+### Detected, and blocking where it counts
+
+Every landing commit anchors the control repository's exact head, at that
+moment, in a `Change-Harness-Control` trailer. `audit anchors` walks the
+protected branch and reports every anchored head the control repository no
+longer contains, or that is no longer an ancestor of its current head:
+
+```bash
+change-harness audit anchors
+```
+
+Nothing requires an operator to run that. What runs unconditionally:
+`integration promote` performs the identical check itself, before its own
+convergence budget check and before anything else, and refuses if any anchor
+fails — deliberately, with no override:
+
+```bash
+change-harness integration promote --integration-id INT-001 --actor-id promoter
+```
+
+So this tier is not merely detected. The rewrite itself is still not
+prevented — nothing stops an edit to the control repository's own history —
+but promoting onto it is: a rewrite blocks exactly the promotion it would
+otherwise have gone on to authorize. The refusal names both the anchored
+commit and the landing commit that claimed it; its only remedy is restoring
+the control repository from a `backup create` archive that contains the
+anchored commit.
+
+### Residual
+
+Two things the Harness cannot stop, named rather than left for a reader to
+infer:
+
+- An actor who can write to both the control and authority repositories can
+  rewrite either's history and keep the other consistent with it. The anchor
+  check is a cross-check between exactly those two repositories; it has
+  nothing outside them to compare against, so a rewrite that keeps both
+  sides in agreement is invisible to it.
+- An actor who rewrites the protected branch directly on the authority
+  repository — a force-push, or a hand-edited ref, run outside this CLI —
+  bypasses the Harness entirely. Promotion's compare-and-swap catches a
+  stale plan racing a concurrent change; it is not a standing lock on the
+  branch, and it has no way to see, let alone refuse, a Git command that
+  never goes through it.
+
+Both assume write access the Harness treats as non-adversarial. That is
+D-013: a shared operating-system account is not treated as a security
+boundary. `AGENTS.md` states this for people building the Harness; this is
+the same position for people using it. Every `--actor`, `--actor-id`,
+`--reviewer-actor-id`, and `--acceptance-owner` value is a string the caller
+typed, not a proven identity — the CLI's own `--actor` help text says as
+much. The Harness refuses self-review, self-integration review,
+self-acceptance, and self-promotion when the same declared actor would bless
+its own work — that catches the same actor typing the same name twice, not
+one willing to type a different one. It is a deliberate architectural
+position, not unfinished work: claiming otherwise would promise an identity
+or repository-integrity guarantee no Git object can back.
+
 ## Ground rules
 
 1. Declare every source, test, and documentation file in the card's
