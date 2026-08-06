@@ -955,6 +955,27 @@ pub enum HarnessError {
         code: ErrorCode,
     },
 
+    /// A control-state operation failed for a reason with a stable code,
+    /// where this exact site already knows a better fix than the code's
+    /// shared table entry.
+    ///
+    /// A sibling of [`Self::Control`] rather than a new field on it:
+    /// `Control` has hundreds of construction sites that supply no
+    /// override, and adding a field there would force every one of them to
+    /// spell out a `None` for no behavior change. This variant exists so a
+    /// refusal that already knows its own fix can say so without disturbing
+    /// any of them. See #106.
+    #[error("control state: {reason}")]
+    ControlWithRecovery {
+        /// What went wrong.
+        reason: String,
+        /// The stable code for this class of failure.
+        code: ErrorCode,
+        /// This site's own recovery guidance, used in place of the code's
+        /// default table entry.
+        recovery: &'static str,
+    },
+
     /// A control-state file could not be read or written.
     #[error("cannot access control state at {path}: {source}")]
     ControlIo {
@@ -1014,7 +1035,9 @@ impl HarnessError {
             Self::InvalidDigest { .. } => ErrorCode::UsageInvalidDigest,
             Self::InvalidTimestamp { .. } => ErrorCode::UsageInvalidTimestamp,
             Self::ConflictingOptions(_) => ErrorCode::UsageConflictingOptions,
-            Self::Config { code, .. } | Self::Control { code, .. } => *code,
+            Self::Config { code, .. }
+            | Self::Control { code, .. }
+            | Self::ControlWithRecovery { code, .. } => *code,
             Self::ControlIo { source, .. } => classify_io(source),
             Self::WorkspaceNotFound(_) => ErrorCode::PreconditionWorkspaceMissing,
             Self::WorkspaceAccess { .. } => ErrorCode::PreconditionWorkspaceAccess,
@@ -1042,7 +1065,9 @@ impl HarnessError {
             Self::Config { field, reason, .. } => {
                 serde_json::json!({ "field": field, "reason": reason })
             }
-            Self::Control { reason, .. } => serde_json::json!({ "reason": reason }),
+            Self::Control { reason, .. } | Self::ControlWithRecovery { reason, .. } => {
+                serde_json::json!({ "reason": reason })
+            }
             Self::ControlIo { path, .. } => serde_json::json!({ "path": path }),
             Self::WorkspaceNotFound(path) | Self::WorkspaceAccess { path, .. } => {
                 serde_json::json!({ "path": path })
@@ -1050,6 +1075,20 @@ impl HarnessError {
             Self::GitUnavailable(_) | Self::GitCommand(_) | Self::ReportEncoding(_) => {
                 serde_json::json!({})
             }
+        }
+    }
+
+    /// Operator guidance for recovering from this failure.
+    ///
+    /// Every variant except [`Self::ControlWithRecovery`] has no better
+    /// guidance than its [`ErrorCode`]'s shared table entry, reached through
+    /// [`Self::code`]. [`Self::ControlWithRecovery`] carries a fix specific
+    /// to its one construction site and returns that instead. See #106.
+    #[must_use]
+    pub fn recovery(&self) -> &'static str {
+        match self {
+            Self::ControlWithRecovery { recovery, .. } => recovery,
+            _ => self.code().recovery(),
         }
     }
 }

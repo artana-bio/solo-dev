@@ -44,28 +44,30 @@ pub const ERROR_SCHEMA: &str = "harness.command-error/v1";
 /// well past 300 characters) is still one line.
 ///
 /// Every field is routed through `redact_github_tokens`, the same path the
-/// message already used, including `code`. `code` and `recovery` are both
-/// derived from fixed, compile-time-constant `ErrorCode` data today, so
-/// redacting them is a no-op in practice — but wiring it now means a future
-/// change cannot silently reopen the leak this path exists to close. The
-/// concrete risk that motivates this: `ErrorCode::recovery` returns
-/// `&'static str` (its signature is frozen by this card, see #106), so no
+/// message already used, including `code`. `code` is derived from
+/// `ErrorCode` data; `recovery` is [`HarnessError::recovery`] (#106), which
+/// returns either that same `ErrorCode` table text or one site's own
+/// override — either way compile-time-constant text today, so redacting it
+/// is a no-op in practice — but wiring it now means a future change cannot
+/// silently reopen the leak this path exists to close. The concrete risk
+/// that motivates this: both `ErrorCode::recovery` and
+/// `HarnessError::recovery` return `&'static str` (frozen by #106), so no
 /// recovery string can interpolate a runtime value yet. If a later card
-/// changes that signature to build recovery text from live context — a path,
-/// an identifier, anything that could carry a credential shape — and that
+/// changes that to build recovery text from live context — a path, an
+/// identifier, anything that could carry a credential shape — and that
 /// change routes the result through this function, it is already redacted.
-/// It would *not* be protected on the `--output json` path: today,
-/// [`CommandErrorEnvelope::new`] copies `error.code().recovery()` straight
-/// into the envelope's `recovery` field without redaction, on the reasoning
-/// that a `&'static str` can never carry a secret. That reasoning breaks the
-/// moment `recovery()` stops being static, and this function's redaction
-/// would not save it — the JSON envelope is a separate call site.
+/// It would *not* be protected on the `--output json` path:
+/// [`CommandErrorEnvelope::new`] copies `error.recovery()` straight into the
+/// envelope's `recovery` field without redaction, on the reasoning that a
+/// `&'static str` can never carry a secret. That reasoning breaks the moment
+/// `recovery()` stops being static, and this function's redaction would not
+/// save it — the JSON envelope is a separate call site.
 #[must_use]
 pub fn render_text_error(error: &HarnessError) -> String {
     let code = error.code();
     let message = redact_github_tokens(&error.to_string());
     let rendered_code = redact_github_tokens(&code.as_string());
-    let recovery = redact_github_tokens(code.recovery());
+    let recovery = redact_github_tokens(error.recovery());
     format!("{message}\ncode: {rendered_code}\nrecovery: {recovery}")
 }
 
@@ -138,7 +140,7 @@ impl CommandErrorEnvelope {
                 code: error.code().as_string(),
                 message: redact_github_tokens(&error.to_string()),
                 details,
-                recovery: error.code().recovery().to_owned(),
+                recovery: error.recovery().to_owned(),
             },
         }
     }
