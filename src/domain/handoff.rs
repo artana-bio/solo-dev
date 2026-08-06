@@ -104,7 +104,7 @@ impl ActorDeclaration {
     pub fn validate(&self) -> Result<(), HarnessError> {
         let reject = |field: &str| HarnessError::Control {
             reason: format!(
-                "handoff declaration is missing `{field}`; a reviewer cannot distinguish an empty field from an unconsidered one"
+                "handoff declaration's `{field}` is empty; a reviewer cannot distinguish an empty field from an unconsidered one"
             ),
             code: ErrorCode::PolicyIncompleteHandoff,
         };
@@ -546,17 +546,134 @@ mod tests {
 
     #[test]
     fn a_declaration_missing_required_narrative_is_refused() {
-        for mutate in [
-            (|d: &mut ActorDeclaration| d.behavior_delivered = "  ".to_owned())
-                as fn(&mut ActorDeclaration),
-            |d: &mut ActorDeclaration| d.rollback_notes = String::new(),
-            |d: &mut ActorDeclaration| d.implementation_decisions.clear(),
+        const GUARDED_FIELDS: [&str; 3] = [
+            "behavior_delivered",
+            "rollback_notes",
+            "implementation_decisions",
+        ];
+
+        for (field, mutate) in [
+            (
+                "behavior_delivered",
+                (|d: &mut ActorDeclaration| d.behavior_delivered = "  ".to_owned())
+                    as fn(&mut ActorDeclaration),
+            ),
+            (
+                "rollback_notes",
+                (|d: &mut ActorDeclaration| d.rollback_notes = String::new())
+                    as fn(&mut ActorDeclaration),
+            ),
+            (
+                "implementation_decisions",
+                (|d: &mut ActorDeclaration| d.implementation_decisions.clear())
+                    as fn(&mut ActorDeclaration),
+            ),
         ] {
             let mut invalid = declaration();
             mutate(&mut invalid);
             let error = invalid.validate().expect_err("must refuse");
             assert_eq!(error.code(), ErrorCode::PolicyIncompleteHandoff);
+
+            // The `field` interpolation is the entire reason `reject` takes a
+            // parameter. A refusal that names the wrong field -- or names
+            // every field, technically covering itself while telling the
+            // operator nothing -- sends them editing content that was never
+            // the problem. Mutation: hardcoding one field name into the
+            // closure, or swapping two field arguments at the call sites,
+            // must fail this.
+            let message = error.to_string();
+            let marker = format!("`{field}`");
+            assert!(
+                message.contains(&marker),
+                "the refusal for `{field}` must name itself: {message}"
+            );
+            for other in GUARDED_FIELDS.iter().filter(|&&other| other != field) {
+                let other_marker = format!("`{other}`");
+                assert!(
+                    !message.contains(&other_marker),
+                    "the refusal for `{field}` must not also name `{other}`: {message}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_present_but_empty_field_is_not_reported_as_missing() {
+        // Contract 117. An operator who wrote `implementation_decisions: []`
+        // was told the field was missing. It was not: it was present and
+        // empty, and they went looking for a syntax error that did not
+        // exist. Mutation: restoring the old wording (`missing
+        // `{field}``) must make this fail.
+        let mut invalid = declaration();
+        invalid.implementation_decisions = vec![];
+        let error = invalid
+            .validate()
+            .expect_err("an empty list must still be refused");
+        assert!(
+            !error.to_string().contains("missing"),
+            "a present-but-empty field must not be described as missing: {error}"
+        );
+    }
+
+    #[test]
+    fn the_rationale_clause_survives() {
+        // The clause that teaches *why* an empty field is refused --
+        // "a reviewer cannot distinguish an empty field from an
+        // unconsidered one" -- must survive independently of whatever the
+        // first clause says. Mutation: dropping this clause while keeping a
+        // corrected first clause must fail this test without failing
+        // `a_present_but_empty_field_is_not_reported_as_missing` above --
+        // otherwise the two assertions are just reading the same substring.
+        let mut invalid = declaration();
+        invalid.implementation_decisions = vec![];
+        let error = invalid
+            .validate()
+            .expect_err("an empty list must still be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("a reviewer cannot distinguish an empty field from an unconsidered one"),
+            "the rationale clause must survive: {error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_key_fails_deserialization_and_never_reaches_validate() {
+        // Contract 117 §6's finding, pinned: `implementation_decisions` (like
+        // `behavior_delivered` and `rollback_notes`) carries no
+        // `#[serde(default)]`, so `serde` treats the key as required. A
+        // document that omits it fails to deserialize into `ActorDeclaration`
+        // at all -- it never becomes a value `validate` can inspect, and the
+        // error produced is `serde`'s own "missing field", not this type's.
+        // Only a document that supplies the key, however emptily, ever
+        // produces an `ActorDeclaration` for `validate` to reject. That is
+        // why the fixed message says "empty" outright rather than hedging
+        // with "missing or empty": at the point this message is produced,
+        // "missing" cannot be what happened. This mirrors the real pipeline
+        // in `commands::handoff::read_declaration`, which parses with
+        // `serde_yaml_ng` before `validate` ever runs.
+        let omits_the_key = format!(
+            "delivered_sha: {}\nbehavior_delivered: converts temperatures\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert the commit\n",
+            "a".repeat(40)
+        );
+        let deserialize_error = serde_yaml_ng::from_str::<ActorDeclaration>(&omits_the_key)
+            .expect_err("omitting the key must fail to deserialize rather than arrive at validate() as empty");
+        assert!(
+            deserialize_error.to_string().contains("missing field"),
+            "the absent-key error is serde's own, not validate()'s: {deserialize_error}"
+        );
+
+        let states_it_empty = format!(
+            "delivered_sha: {}\nbehavior_delivered: converts temperatures\nimplementation_decisions: []\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert the commit\n",
+            "a".repeat(40)
+        );
+        let parsed: ActorDeclaration = serde_yaml_ng::from_str(&states_it_empty)
+            .expect("an explicit empty list is a well-formed document");
+        assert!(parsed.implementation_decisions.is_empty());
+        assert_eq!(
+            parsed.validate().expect_err("must refuse").code(),
+            ErrorCode::PolicyIncompleteHandoff
+        );
     }
 
     #[test]
