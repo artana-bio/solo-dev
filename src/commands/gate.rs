@@ -32,7 +32,9 @@ use crate::{
         clock::Clock,
         cycle::CycleRecord,
         digest::Digest,
-        gate::{GATE_DIR, GateDefinition, NetworkPolicy},
+        gate::{
+            GATE_DIR, GATE_SCHEMA, GateDefinition, GateEnvironment, NetworkPolicy, RetryPolicy,
+        },
         ids::{CardId, CycleId, IntegrationId, ReceiptId, ValidationReservationId},
         lease::LeaseRecord,
         validation_reservation::{
@@ -92,6 +94,11 @@ pub enum GateCommand {
     Preflight(PreflightArgs),
     /// Report a card's gate evidence and whether it still applies.
     Status(StatusArgs),
+    /// Print a complete, valid gate definition example.
+    ///
+    /// Built by constructing a real `GateDefinition` and serializing it, so
+    /// this can never disagree with what `gate register` accepts — see #108.
+    Example(ExampleArgs),
 }
 
 impl GateCommand {
@@ -115,6 +122,7 @@ impl GateCommand {
             Self::Schedule(..) => "gate.schedule",
             Self::Preflight(..) => "gate.preflight",
             Self::Status(..) => "gate.status",
+            Self::Example(..) => "gate.example",
         }
     }
 }
@@ -291,6 +299,16 @@ pub struct ShowArgs {
     pub gate_id: String,
 }
 
+/// Arguments accepted by `gate example`.
+///
+/// Deliberately empty, and deliberately not [`CommonArgs`]: like
+/// [`RegisterArgs`], which flattens `CommonArgs` and makes `--control`
+/// mandatory, this must be reachable before an operator has a control
+/// repository to point it at — #108 constraint 1, established for
+/// `review example` (`ReviewCommand::Example`) and identical here.
+#[derive(Debug, Args)]
+pub struct ExampleArgs {}
+
 /// Executes a `gate` subcommand.
 ///
 /// # Errors
@@ -310,6 +328,7 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
         GateCommand::Schedule(args) => run_schedule(args, clock),
         GateCommand::Preflight(args) => run_preflight(args),
         GateCommand::Status(args) => run_status(args),
+        GateCommand::Example(..) => run_example(),
     }
 }
 
@@ -483,6 +502,101 @@ pub fn parse_definition(raw: &str) -> Result<GateDefinition, HarnessError> {
         reason: format!("gate definition is malformed: {source}"),
         code: ErrorCode::ConfigMalformed,
     })
+}
+
+/// A complete, valid gate definition, for `gate example` to emit.
+///
+/// Unlike [`crate::commands::review::Verdict`], `GateDefinition` has no
+/// `Option` and no `#[serde(default)]` field (`src/domain/gate.rs:118-139`)
+/// — every field is required, so there is nothing optional to demonstrate by
+/// omission and no `optional_fields`-style advisory to compute. Populating
+/// every field here anyway (rather than reusing zero values wherever one
+/// would validate) follows the same reasoning `example_verdict` in
+/// `src/commands/review.rs` documents: a realistic value teaches the
+/// field's shape, an empty one mostly doesn't.
+///
+/// `argv: ["true"]`: #108 requires this choice to be established and
+/// justified. A gate definition names a command that actually runs, so an
+/// absurd placeholder (a nonexistent binary, or one like `false` that exits
+/// non-zero) would teach badly — see `the_emitted_gate_example_argv_actually_runs`,
+/// which runs this exact argv the way [`crate::runner::run_attempt`] does and
+/// requires it to succeed. A real project command (`cargo test`, `npm test`,
+/// ...) would risk reading as this harness recommending that command,
+/// independent of the project it is guarding. `true` is a real, already
+/// installed executable on every POSIX system this harness targets — it
+/// actually runs — while naming no language or test framework at all. It is
+/// also the same placeholder `tests/support::Workspace::register_gate_revision`
+/// already uses as every fixture gate's argv, for the same reason.
+///
+/// `environment.allow`/`environment.set` and `network_policy` are the other
+/// fields #108's cold-start operator specifically struggled to reconstruct,
+/// so both sub-fields of `environment` are populated rather than left at
+/// their empty-but-valid default, and `network_policy` is set to `Denied` —
+/// the policy `true` actually needs, keeping the example internally
+/// consistent. `retry_policy` uses [`RetryPolicy::default`] rather than
+/// restating its value, so this stays in step with the single-attempt
+/// default `RetryPolicy::default`'s own doc explains (Section 14.2: "a
+/// silent retry converts a flaky result into apparent evidence"). `artifacts`
+/// is left empty: `true` produces no files to retain, and an empty list is
+/// what this crate's own canonical well-formed gate fixture
+/// (`domain::gate::tests::gate`) uses for the same reason.
+fn example_definition() -> GateDefinition {
+    GateDefinition {
+        schema: GATE_SCHEMA.to_owned(),
+        gate_id: "gate.example".to_owned(),
+        revision: 1,
+        argv: vec!["true".to_owned()],
+        working_directory: ".".to_owned(),
+        timeout_seconds: 60,
+        environment: GateEnvironment {
+            allow: vec!["PATH".to_owned()],
+            set: BTreeMap::from([("CI".to_owned(), "true".to_owned())]),
+        },
+        network_policy: NetworkPolicy::Denied,
+        retry_policy: RetryPolicy::default(),
+        artifacts: vec![],
+    }
+}
+
+/// Emits a complete, valid gate-definition example.
+///
+/// #108 constraint 1: reachable without a control repository —
+/// [`ExampleArgs`] carries nothing to open one with, unlike [`RegisterArgs`],
+/// which flattens [`CommonArgs`] and makes `--control` mandatory. #108
+/// constraint 2: listed under `gate --help` because it is an ordinary
+/// [`GateCommand`] variant like any other.
+///
+/// The document is YAML: [`parse_definition`] reads with `serde_yaml_ng`,
+/// the same parser `review example`'s document is read back with, and every
+/// fixture in this crate that writes a gate definition file spells it
+/// `.yaml` (see `tests/support::Workspace::register_gate_revision`). YAML is
+/// also the strictly more general of the two accepted shapes, since
+/// `serde_yaml_ng` accepts JSON as the YAML it syntactically is. This
+/// mirrors `review example` exactly; see `run_example` in
+/// `src/commands/review.rs` for the full argument.
+///
+/// Built by constructing a [`GateDefinition`] and serializing it, never by
+/// writing the document out by hand, so this and [`parse_definition`] can
+/// never disagree about the shape: they are the same `serde` implementation.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example() -> Result<CommandOutcome, HarnessError> {
+    let definition = example_definition();
+    let example =
+        serde_yaml_ng::to_string(&definition).map_err(|source| HarnessError::Control {
+            reason: format!("failed to render the example gate definition: {source}"),
+            code: ErrorCode::InternalEncoding,
+        })?;
+    Ok(CommandOutcome::new(
+        "gate.example",
+        example.clone(),
+        serde_json::json!({
+            "format": "yaml",
+            "example": example,
+        }),
+    ))
 }
 
 /// Reads one registered gate.
