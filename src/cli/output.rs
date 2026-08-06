@@ -18,9 +18,55 @@ pub const RESULT_SCHEMA: &str = "harness.command-result/v1";
 pub const ERROR_SCHEMA: &str = "harness.command-error/v1";
 
 /// Renders one parsed-command error for text mode.
+///
+/// SKILL.md ground rule 4 tells every operator and agent to read a refusal's
+/// code and recovery before retrying, but until this function grew the two
+/// extra lines below, only `--output json` ever showed them. The layout:
+///
+/// ```text
+/// error: <message>
+/// code: <CH-...>
+/// recovery: <recovery text>
+/// ```
+///
+/// The first line is exactly what `error.to_string()` produced before this
+/// function grew the two lines under it — unchanged on purpose, since it is
+/// what scripts and operators already read. `code:` and `recovery:` follow
+/// the same flush-left `label: value` register the crate's other multi-field
+/// text bodies use (see `DoctorReport::to_text`, `card.validate`'s outcome
+/// text), rather than an indented sub-detail: the recovery line is the next
+/// action, not a footnote, so it gets the same visual weight as the message
+/// above it. Recovery text is never wrapped: nothing else in this crate wraps
+/// text output, wrapping would need a terminal-width source this crate does
+/// not have, and — more importantly — an operator or script that greps
+/// stderr for the exact recovery string `--output json` also returns must
+/// find it unbroken. A long recovery string (`convergence_recovery` runs
+/// well past 300 characters) is still one line.
+///
+/// Every field is routed through `redact_github_tokens`, the same path the
+/// message already used, including `code`. `code` and `recovery` are both
+/// derived from fixed, compile-time-constant `ErrorCode` data today, so
+/// redacting them is a no-op in practice — but wiring it now means a future
+/// change cannot silently reopen the leak this path exists to close. The
+/// concrete risk that motivates this: `ErrorCode::recovery` returns
+/// `&'static str` (its signature is frozen by this card, see #106), so no
+/// recovery string can interpolate a runtime value yet. If a later card
+/// changes that signature to build recovery text from live context — a path,
+/// an identifier, anything that could carry a credential shape — and that
+/// change routes the result through this function, it is already redacted.
+/// It would *not* be protected on the `--output json` path: today,
+/// [`CommandErrorEnvelope::new`] copies `error.code().recovery()` straight
+/// into the envelope's `recovery` field without redaction, on the reasoning
+/// that a `&'static str` can never carry a secret. That reasoning breaks the
+/// moment `recovery()` stops being static, and this function's redaction
+/// would not save it — the JSON envelope is a separate call site.
 #[must_use]
 pub fn render_text_error(error: &HarnessError) -> String {
-    redact_github_tokens(&error.to_string())
+    let code = error.code();
+    let message = redact_github_tokens(&error.to_string());
+    let rendered_code = redact_github_tokens(&code.as_string());
+    let recovery = redact_github_tokens(code.recovery());
+    format!("{message}\ncode: {rendered_code}\nrecovery: {recovery}")
 }
 
 /// How a command renders its result.
