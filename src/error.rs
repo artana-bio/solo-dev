@@ -664,8 +664,26 @@ impl ErrorCode {
     /// dispatched to directly from `recovery`, ahead of `policy_recovery`'s
     /// per-category match, so its longer remedy text does not push that
     /// function over its line budget the way it did before this split.
+    ///
+    /// Names every flag `disposition renew` requires, not just the
+    /// command. Naming only the command left an operator one lookup short
+    /// of a working invocation — they still had to go find out it needs
+    /// `--card-id`, `--dimension`, and `--rationale` — the same "go read
+    /// something else first" shape the original defect had, just smaller.
+    ///
+    /// The three flags are named as bare, individually backticked mentions
+    /// rather than folded into one fully worked invocation with example
+    /// values. `--dimension` takes a closed `clap` value enum, so writing
+    /// a placeholder in its place, e.g. `` `--dimension <dimension>` ``,
+    /// fails `tests/recovery_text.rs`: that test appends `--help` to every
+    /// checked span, but `clap` rejects an invalid enum value while
+    /// parsing the span itself, before parsing ever reaches the appended
+    /// `--help`. A bare flag mention is exactly the shape that test's own
+    /// `names_a_command` rule already excludes from the check — the same
+    /// shape it documents for `` `--invariant-holds` `` — which is what
+    /// makes it safe here.
     const fn convergence_recovery() -> &'static str {
-        "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. Run `disposition renew` to grant the exhausted dimension its configured limit again, or record a different disposition if renewal is not the right response."
+        "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. Run `disposition renew` with `--card-id`, `--dimension`, and `--rationale` to grant the exhausted dimension its configured limit again, or record a different disposition if renewal is not the right response."
     }
 
     const fn policy_recovery(self) -> &'static str {
