@@ -665,7 +665,7 @@ impl ErrorCode {
     /// per-category match, so its longer remedy text does not push that
     /// function over its line budget the way it did before this split.
     const fn convergence_recovery() -> &'static str {
-        "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. The command that records one is not part of this release; see issue #74."
+        "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. Run `disposition renew` to grant the exhausted dimension its configured limit again, or record a different disposition if renewal is not the right response."
     }
 
     const fn policy_recovery(self) -> &'static str {
