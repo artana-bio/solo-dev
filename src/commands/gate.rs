@@ -1000,8 +1000,10 @@ fn preview_run(
     require_next_gate(&progress, &args.gate_id)?;
     let reservation = args
         .reservation_id
-        .is_some()
-        .then(|| live_reservation_for_run(&control, args, card_id, clock))
+        .as_deref()
+        .map(|reservation_id| {
+            live_reservation_for_run(&control, reservation_id, args, card_id, clock)
+        })
         .transpose()?;
     Ok(CommandOutcome::new(
         "gate.run",
@@ -1333,20 +1335,29 @@ fn reservation_is_expired(reservation: &ValidationReservationRecord, clock: &dyn
     reservation.expires_at <= clock.now()
 }
 
+/// The exact live validation reservation authorizing a `gate run`.
+///
+/// `reservation_id` is a required, already-extracted `&str` rather than
+/// derived internally from `args.reservation_id: Option<String>` on purpose:
+/// every caller already knows, at the type level, whether a reservation id
+/// was supplied (`preview_run` and `run_gate_locked` only call this inside an
+/// `Option::map`; `acquire_governed_gate_execution` is reached only through
+/// `run_governed_gate`, which `run_gate` calls after its own
+/// `--reservation-id` guard). A second, differently-coded "missing
+/// --reservation-id" refusal living inside this function was unreachable
+/// through every one of those paths and would silently diverge from
+/// `run_gate`'s own guard (`ErrorCode::PolicyInvalidTransition`) if a future
+/// caller ever forgot to check first. Requiring the `&str` here instead makes
+/// that omission a compile error rather than a second, wrongly-coded runtime
+/// refusal — see #119.
 fn live_reservation_for_run(
     control: &ControlRepository,
+    reservation_id: &str,
     args: &RunArgs,
     card_id: &CardId,
     clock: &dyn Clock,
 ) -> Result<ValidationReservationRecord, HarnessError> {
-    let reservation_id: ValidationReservationId = args
-        .reservation_id
-        .as_deref()
-        .ok_or_else(|| HarnessError::Control {
-            reason: "gate run requires --reservation-id".to_owned(),
-            code: ErrorCode::UsageInvalidArguments,
-        })?
-        .parse()?;
+    let reservation_id: ValidationReservationId = reservation_id.parse()?;
     let reservation = reservations_for(control)?
         .into_iter()
         .find(|record| record.reservation_id == reservation_id)
@@ -2588,7 +2599,33 @@ fn acquire_governed_gate_execution(
             let evaluated_sha = inspect::resolve_commit(&scope, "HEAD")?;
             let progress = validation_progress(control, card_id, Some(&evaluated_sha))?;
             require_next_gate(&progress, &args.gate_id)?;
-            let reservation = live_reservation_for_run(control, args, card_id, clock)?;
+            // `run_gate` (this closure's only caller, transitively through
+            // `run_governed_gate`) already refuses a missing
+            // `--reservation-id` with the identical message and code below
+            // before `run_governed_gate` is ever invoked, so this is not
+            // reachable through any current call path. It is written as a
+            // refusal rather than an `.expect()` panic on principle: #84
+            // established that a control-plane tool must never panic in
+            // place of a refusal (no structured error envelope, no exit
+            // code a caller can act on, no recovery guidance), so if a
+            // future caller ever violates the invariant `run_gate` protects
+            // today, the command still fails gracefully. The message and
+            // code are kept byte-identical to `run_gate`'s own guard
+            // (frozen, untouched here) on purpose: a second,
+            // differently-coded refusal for the same condition is exactly
+            // the defect #119 exists to remove, so this must never drift
+            // from that guard's wording.
+            let reservation_id = args.reservation_id.as_deref().ok_or_else(|| {
+                HarnessError::Control {
+                    reason: format!(
+                        "gate run for card {card_id} requires one live validation reservation; run `gate reserve --card-id {card_id} --gate-id {gate_id}` first",
+                        gate_id = args.gate_id
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                }
+            })?;
+            let reservation =
+                live_reservation_for_run(control, reservation_id, args, card_id, clock)?;
             if execution_permit_for(control, &reservation)?.is_some() {
                 return Err(HarnessError::ControlWithRecovery {
                     reason: format!(
@@ -3026,8 +3063,10 @@ fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             require_next_gate(&progress, &args.gate_id)?;
             let reservation = args
                 .reservation_id
-                .is_some()
-                .then(|| live_reservation_for_run(control, args, &card_id, clock))
+                .as_deref()
+                .map(|reservation_id| {
+                    live_reservation_for_run(control, reservation_id, args, &card_id, clock)
+                })
                 .transpose()?;
             let worktree_clean = inspect::worktree_state(&scope)?.clean;
             let existing = receipts_for(control, &card_id)?;
