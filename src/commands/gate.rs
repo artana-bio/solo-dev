@@ -1703,6 +1703,20 @@ fn run_settle(args: &SettleArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     )
 }
 
+/// Recovery guidance for [`run_abandon`]'s "still live" refusal.
+///
+/// The one site #111 migrates onto [`HarnessError::ControlWithRecovery`].
+/// This is the case the cold-start operator in #111's motivating report
+/// actually hit: they held the reservation, but it had not yet expired, and
+/// the previous combined refusal's "expired live reservation" phrasing read
+/// as a description of the reservation being granted rather than the
+/// precondition being refused. `gate settle` (`run_settle`, this file)
+/// checks no expiry at all, so it is the one command that works right now
+/// regardless of how long is left on the clock — unlike the wrong-actor and
+/// already-settled cases, whose only correct answer is "you cannot do this
+/// here," this one has a genuine next step worth naming.
+const ABANDON_LIVE_RESERVATION_RECOVERY: &str = "`gate abandon` only ends a reservation that has already expired, and this one has not. Run `gate settle` with `--reservation-id` (the id named above) and `--outcome abandoned` to end it now.";
+
 fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let reservation_id: ValidationReservationId = args.reservation_id.parse()?;
     with_transaction(
@@ -1718,15 +1732,50 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                     reason: format!("validation reservation {reservation_id} does not exist"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
-            if reservation.holder_actor_id != args.common.actor
-                || settlement_for(control, &reservation)?.is_some()
-                || !reservation_is_expired(&reservation, clock)
-            {
+            // Checked in this order, deliberately (#111 §6): actor, then
+            // settlement, then expiry.
+            //
+            // A wrong actor is refused before either of the other two
+            // conditions is even evaluated, so a caller who is not this
+            // reservation's holder learns nothing about whether someone
+            // else's reservation happens to be settled or expired. D-013
+            // does not make a shared OS account a security boundary here —
+            // such a caller could always retry with `--actor` set to the
+            // name this very refusal would reveal — but that is a reason
+            // the disclosure would cost nothing to a real adversary, not a
+            // reason to volunteer state about a resource the caller does
+            // not hold.
+            //
+            // Once the actor is confirmed to be the reservation's own
+            // holder, settlement is checked before expiry because it is the
+            // more definitive fact: a settled reservation is over no matter
+            // what its expiry clock reads, and a reservation can be settled
+            // before it expires (`run_settle`, this file, has no expiry
+            // check at all). Reporting "not yet expired" to the holder of
+            // an already-settled reservation would wrongly imply that
+            // waiting is the fix, when the real answer is that there is
+            // nothing left to abandon.
+            if reservation.holder_actor_id != args.common.actor {
                 return Err(HarnessError::Control {
                     reason: format!(
-                        "only the original holder may abandon an expired live reservation {reservation_id}"
+                        "only the original holder may abandon validation reservation {reservation_id}"
                     ),
                     code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            if settlement_for(control, &reservation)?.is_some() {
+                return Err(HarnessError::Control {
+                    reason: format!("validation reservation {reservation_id} is already settled"),
+                    code: ErrorCode::PolicyInvalidTransition,
+                });
+            }
+            if !reservation_is_expired(&reservation, clock) {
+                return Err(HarnessError::ControlWithRecovery {
+                    reason: format!(
+                        "validation reservation {reservation_id} is still live and has not expired"
+                    ),
+                    code: ErrorCode::PolicyInvalidTransition,
+                    recovery: ABANDON_LIVE_RESERVATION_RECOVERY,
                 });
             }
             let settlement = ValidationReservationSettlementRecord {
