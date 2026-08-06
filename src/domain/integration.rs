@@ -112,14 +112,69 @@ impl IntegrationStatus {
         if self.successors().contains(&next) {
             return Ok(());
         }
-        Err(HarnessError::Control {
+        Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "integration cannot move from {} to {}",
                 self.name(),
                 next.name()
             ),
             code: ErrorCode::PolicyInvalidTransition,
+            recovery: self.transition_recovery(),
         })
+    }
+
+    /// Recovery guidance for a refused transition: the states this one may
+    /// still reach, not a command.
+    ///
+    /// #112: this guards *every* integration transition (Section 11.3), not
+    /// one command's precondition, so it cannot hardcode any one command's
+    /// name — `integration verify` would be wrong advice attached to, say, a
+    /// refused `accepted -> archived` move, which has nothing to do with
+    /// verification. `domain/integration.rs` also has no CLI vocabulary to
+    /// begin with: this module describes states, and the commands that
+    /// produce them live in `src/commands/integration.rs` and
+    /// `src/commands/acceptance.rs`. Naming the permitted successor
+    /// *states* is the answer this function can compute correctly for
+    /// every caller, and it keeps that boundary intact rather than
+    /// smuggling a command name into a domain type through the one field
+    /// that happens to accept a string. Sites that already know their own
+    /// single correct command — `acceptance::require_reviewed` and
+    /// `check_promotion` in `commands/integration.rs` — say so directly
+    /// instead; they are commands already, so naming one is not a layering
+    /// violation for them the way it would be here.
+    ///
+    /// Returns `&'static str`, not a formatted `String`, because
+    /// [`HarnessError::ControlWithRecovery`]'s `recovery` field requires
+    /// it. There are only nine states, so one literal per state (matching
+    /// [`Self::successors`] one arm at a time) costs nothing that function
+    /// does not already pay, and `transition_recovery_names_every_successor_state`
+    /// below fails if the two drift apart.
+    const fn transition_recovery(self) -> &'static str {
+        match self {
+            Self::Draft => {
+                "From `draft`, the permitted next states are `prepared`, `blocked`, or `abandoned`."
+            }
+            Self::Prepared => {
+                "From `prepared`, the permitted next states are `verified`, `blocked`, or `abandoned`."
+            }
+            Self::Verified => {
+                "From `verified`, the permitted next states are `reviewed`, `blocked`, or `abandoned`."
+            }
+            Self::Reviewed => {
+                "From `reviewed`, the permitted next states are `accepted`, `blocked`, or `abandoned`."
+            }
+            Self::Accepted => {
+                "From `accepted`, the permitted next states are `promoted` or `abandoned`."
+            }
+            Self::Promoted => "From `promoted`, the only permitted next state is `archived`.",
+            Self::Blocked => {
+                "From `blocked`, the permitted next states are `prepared` or `abandoned`."
+            }
+            Self::Archived => "`archived` is a terminal state; no further transition is possible.",
+            Self::Abandoned => {
+                "`abandoned` is a terminal state; no further transition is possible."
+            }
+        }
     }
 }
 
@@ -448,6 +503,123 @@ mod tests {
         // Promotion cannot be undone by abandoning it.
         assert!(Promoted.check_transition(Abandoned).is_err());
         assert!(Archived.check_transition(Prepared).is_err());
+    }
+
+    /// #112, §8: `transition_recovery` is hand-written per state rather than
+    /// formatted from `successors()` (it has to be — `recovery` is
+    /// `&'static str`), so nothing forces the two to agree after an edit to
+    /// either. This is the test that would fail if they drifted: a
+    /// `successors()` edit that adds or removes a reachable state without a
+    /// matching edit to `transition_recovery` fails here on the state whose
+    /// text fell out of sync, rather than shipping a recovery message that
+    /// silently stops matching what the transition table actually allows.
+    #[test]
+    fn transition_recovery_names_every_successor_state() {
+        use IntegrationStatus::{
+            Abandoned, Accepted, Archived, Blocked, Draft, Prepared, Promoted, Reviewed, Verified,
+        };
+        for status in [
+            Draft, Prepared, Verified, Reviewed, Accepted, Promoted, Blocked, Archived, Abandoned,
+        ] {
+            let recovery = status.transition_recovery();
+            for successor in status.successors() {
+                assert!(
+                    recovery.contains(successor.name()),
+                    "{status:?}'s transition_recovery ({recovery:?}) does not name successor `{}`",
+                    successor.name()
+                );
+            }
+        }
+    }
+
+    /// The reverse of the test above: every *other* state named in a
+    /// `transition_recovery` string is a real successor of `status`.
+    /// `transition_recovery_names_every_successor_state` only checks that
+    /// nothing is missing; a table that also names states that are not
+    /// reachable is just as misleading — an operator refused `prepared ->
+    /// reviewed` who reads "the permitted next states are `verified`,
+    /// `reviewed`, ..." tries `reviewed` again and gets the identical
+    /// refusal a second time. Two prior cards in this wave (#107's `Close`,
+    /// #121's `Landed`) each shipped recovery text naming an action the
+    /// operator could not actually take; this is the same class of mistake
+    /// on this card's own new surface, closed at the same time as the
+    /// table itself rather than after the fact.
+    ///
+    /// Matching rule: plain substring containment,
+    /// `recovery.contains(other.name())` — the same rule the forward test
+    /// above already uses, kept identical rather than inventing a second
+    /// one for the other direction. Two things make it defensible here
+    /// rather than merely convenient:
+    ///
+    /// - **Self-reference is excluded on purpose.** Every `transition_recovery`
+    ///   string opens by naming its own state ("From `draft`, ..." /
+    ///   "`archived` is a terminal state...") to say what the sentence is
+    ///   about, not to claim the state can reach itself — `successors()`
+    ///   never contains `self`, so counting that mention as a claim would
+    ///   make every non-terminal state fail against itself, and would
+    ///   false-positive the two terminal states (`archived`, `abandoned`),
+    ///   whose text *only* contains their own name and no successor at
+    ///   all. Skipping `other == status` in the loop below is what keeps
+    ///   "names nothing else" from reading as a violation.
+    /// - **What this rule would miss:** a state name occurring as a
+    ///   substring of a longer, unrelated word — e.g. prose using
+    ///   "unprepared" would trip a naive check for `prepared`, and
+    ///   `abandoned` itself contains `abandon` as a substring, so a rule
+    ///   that matched stems rather than full names (the way this card's
+    ///   own CLI test deliberately does, elsewhere, for `verif`) would
+    ///   read `abandon` out of `abandoned` and misfire. None of the nine
+    ///   state names are substrings of one another, and today's nine
+    ///   `transition_recovery` strings are short, controlled prose with no
+    ///   such accidental larger word, so this gap is real but not
+    ///   currently live. Recorded here rather than silently relied on.
+    #[test]
+    fn transition_recovery_names_no_state_that_is_not_a_successor() {
+        use IntegrationStatus::{
+            Abandoned, Accepted, Archived, Blocked, Draft, Prepared, Promoted, Reviewed, Verified,
+        };
+        let all = [
+            Draft, Prepared, Verified, Reviewed, Accepted, Promoted, Blocked, Archived, Abandoned,
+        ];
+        for status in all {
+            let recovery = status.transition_recovery();
+            let successors = status.successors();
+            for other in all {
+                if other == status {
+                    continue; // naming itself is not a reachability claim
+                }
+                if recovery.contains(other.name()) {
+                    assert!(
+                        successors.contains(&other),
+                        "{status:?}'s transition_recovery ({recovery:?}) names `{}`, which is not a real successor of {status:?} (successors: {successors:?})",
+                        other.name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// #112, test 2: the no-false-positive check for site 1. `check_transition`
+    /// guards every integration transition, so a refusal that has nothing to
+    /// do with verification — here, an abandoned (terminal) integration
+    /// refusing to move anywhere at all — must not claim `verified` is
+    /// reachable or relevant. Without this, a site 1 fix that unconditionally
+    /// named `verified` (or `integration verify`) for every invalid
+    /// transition would pass a test that only checked the `prepared ->
+    /// reviewed` case.
+    #[test]
+    fn a_generic_invalid_transition_does_not_claim_verification_is_needed() {
+        let error = IntegrationStatus::Abandoned
+            .check_transition(IntegrationStatus::Reviewed)
+            .expect_err("abandoned is terminal; no transition is valid");
+        let recovery = error.recovery();
+        assert!(
+            !recovery.to_lowercase().contains("verif"),
+            "an abandoned integration's refusal must not mention verification: {recovery:?}"
+        );
+        assert!(
+            recovery.contains("terminal"),
+            "expected terminal-state guidance, got: {recovery:?}"
+        );
     }
 
     #[test]
