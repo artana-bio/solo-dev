@@ -705,7 +705,7 @@ impl ErrorCode {
                 "Correct the cycle record so its membership and baseline are coherent."
             }
             Self::PolicyInvalidCard => {
-                "Correct the card so it satisfies the activation rules in Section 10.3."
+                "Correct the card as this error states; use `card revise` if the card is already activated."
             }
             Self::PolicyCycleBaselineMismatch => CYCLE_BASELINE_MISMATCH_RECOVERY,
             Self::PolicyOwnershipOverlap => {
@@ -1085,6 +1085,105 @@ mod tests {
                 "{code:?} guidance should be a sentence"
             );
         }
+    }
+
+    #[test]
+    fn the_card_recovery_names_no_specification_section() {
+        // `PolicyInvalidCard` used to send operators to "the activation rules
+        // in Section 10.3" — a specification `SKILL.md` never states and no
+        // adopting operator holds. This pins the defect closed: whatever the
+        // recovery says, it must not point at a section number again.
+        assert!(
+            !ErrorCode::PolicyInvalidCard.recovery().contains("Section"),
+            "PolicyInvalidCard recovery names a specification section the operator \
+             cannot read; got: {}",
+            ErrorCode::PolicyInvalidCard.recovery()
+        );
+    }
+
+    #[test]
+    fn the_card_recovery_is_actionable() {
+        // `PolicyInvalidCard` covers construction sites in `domain/card.rs`,
+        // `commands/card.rs`, and `policy/progressive_validation.rs` whose
+        // reasons are heterogeneous by design: draft-shape defects (a
+        // missing title, an incomplete proof map), immutable-card
+        // collisions (creating or activating a card that already exists),
+        // risk-driven proof and gate-stage requirements, and revision
+        // identity checks. No single sentence can restate all of those
+        // without becoming a paragraph, so this recovery does not try —
+        // instead it points the operator at the per-site `reason` text
+        // (already specific; that was never the defect) and separately
+        // names `card revise`, the command that resolves the largest
+        // single subclass: every refusal caused by a card that already
+        // exists or is already activated.
+        //
+        // Asserting the command is actually named, rather than only that
+        // the string is non-empty, is what lets this test fail: a
+        // regression to generic filler such as "Correct the card." reads
+        // as guidance but resolves nothing, and would still pass a
+        // non-empty check.
+        let recovery = ErrorCode::PolicyInvalidCard.recovery();
+        assert!(
+            recovery.contains("`card revise`"),
+            "PolicyInvalidCard recovery should name `card revise`, the command that \
+             resolves the largest subclass of refusals (a card that already exists or \
+             is already activated); got: {recovery}"
+        );
+    }
+
+    #[test]
+    fn the_card_recovery_conditions_card_revise_on_activation() {
+        // The test above only checks that `card revise` is named
+        // *somewhere*; it passes just as well for an unconditional "use
+        // `card revise`" as for the real text. Unconditional is wrong:
+        // it is the exact defect §6 argues this recovery avoids for a
+        // draft nothing has activated yet, and for the one internal
+        // collision guard reachable with no activated state to revise
+        // (both send the operator toward `card revise`, which would
+        // either do nothing useful or bounce them into `card activate`'s
+        // own "not activated" refusal). This test pins that the
+        // conditional is present *and attached to the clause that names
+        // the command*, not merely present somewhere in the sentence.
+        //
+        // Method: split on `;`, the punctuation this sentence (and its
+        // neighbour `PolicyLandingMismatch`'s recovery) already uses to
+        // separate its two clauses. Find the clause naming `card revise`,
+        // and require that *same* clause to also carry the words "if"
+        // and "activated". Dropping the conditional entirely fails this,
+        // because that clause then has neither word. Keeping a
+        // conditional but attaching it to the *other* clause — "Correct
+        // the card ... if the card is already activated; use `card
+        // revise`." — fails the same way: the clause naming `card
+        // revise` still has neither word, because the condition landed
+        // on "correct the card" instead.
+        //
+        // What this does not catch, named rather than implied: a
+        // rewording that keeps "if" and "activated" in the clause naming
+        // `card revise` but inverts what they mean (a double negative, an
+        // "unless", a condition that no longer actually means "this
+        // named card is activated"); one that restructures the sentence
+        // without `;` as its clause separator; or one that stops
+        // backtick-quoting `card revise` (that one fails loudly instead —
+        // `find` returns `None` and the lookup panics — rather than
+        // silently passing, which is the safe direction for an
+        // unanticipated rewording, but is still a failure for a reason
+        // other than the one this test is named for). Each of those
+        // needs a human rereading the sentence, not a substring check.
+        let recovery = ErrorCode::PolicyInvalidCard.recovery();
+        let clause_naming_card_revise = recovery
+            .split(';')
+            .find(|clause| clause.contains("`card revise`"))
+            .unwrap_or_else(|| {
+                panic!("no clause in PolicyInvalidCard recovery names `card revise`: {recovery:?}")
+            });
+        assert!(
+            clause_naming_card_revise.contains("if")
+                && clause_naming_card_revise.contains("activated"),
+            "the clause naming `card revise` must itself condition it on activation state \
+             rather than presenting it as the unconditional remedy, and the condition must \
+             not have landed in a different clause; clause naming `card revise`: \
+             {clause_naming_card_revise:?} (full recovery: {recovery:?})"
+        );
     }
 
     #[test]
