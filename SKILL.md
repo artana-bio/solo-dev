@@ -317,10 +317,10 @@ Then submit a declaration bound to the exact commit:
 ```yaml
 delivered_sha: <git rev-parse HEAD in the allocated worktree>
 behavior_delivered: What the candidate actually does.
-implementation_decisions: []
-assumptions: []
-known_limitations: []
-residual_risks: []
+implementation_decisions: ["A choice you made and why."]
+assumptions: ["Something inferred rather than specified."]
+known_limitations: ["Something deliberately not done."]
+residual_risks: ["Something that could still be wrong."]
 rollback_notes: revert the landing commit on the protected branch
 ```
 
