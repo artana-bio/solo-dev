@@ -3,6 +3,21 @@
 //! Builds a complete project — candidate repository, control repository, and
 //! bare authority — so tests exercise the real command surface rather than
 //! internal functions.
+//!
+//! # Plumbing versus a governed step
+//!
+//! A fixture may supply plumbing the operator does not type (`--control`,
+//! `--output json`). It may not perform a governed step the operator must
+//! perform themselves, unless some test also drives that path unaided.
+//!
+//! `Workspace::gate`'s `run` branch is the one exception, and the reason
+//! this rule is written down: it silently runs `gate reserve` on the
+//! caller's behalf whenever a `run` call omits `--reservation-id`, so no
+//! test written against `gate` alone can reach the refusal an operator gets
+//! for that same omission. `tests/gate_runner.rs`'s
+//! `gate_run_without_a_reservation_names_the_command_that_makes_one` drives
+//! that unhelped path instead, through `gate_raw`; a guard next to it fails
+//! if that test is ever deleted or repointed at `gate`.
 
 #![allow(dead_code)]
 
@@ -134,6 +149,11 @@ impl Workspace {
     }
 
     /// Runs a `gate` subcommand, asserting success.
+    ///
+    /// `run` is the one case that silently performs an extra governed step
+    /// first (see this module's "Plumbing versus a governed step" doc): it
+    /// reserves on the caller's behalf when `--reservation-id` is missing.
+    /// Use `gate_raw` to drive the exact invocation an operator types.
     pub fn gate(&self, args: &[&str]) -> Output {
         let output = if args.first() == Some(&"run") && !args.contains(&"--reservation-id") {
             let value_after = |flag: &str| {

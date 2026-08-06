@@ -564,6 +564,114 @@ fn gate_run_with_a_reservation_is_unaffected() {
     );
 }
 
+/// #115: pins the #105 acceptance above against being deleted, quietly
+/// repointed at the helping `gate` fixture, or left naming `gate_raw` while
+/// no longer driving an unreserved `run` — see `tests/support/mod.rs`'s
+/// "Plumbing versus a governed step" module doc for the rule this guards.
+///
+/// Reads this file's own source rather than re-running the scenario. Two
+/// separate properties are pinned:
+///
+/// - *Which fixture method is named* — `gate_raw` (unhelped) versus `gate`
+///   (silently reserves first). A behavioral check has nothing to observe
+///   here: point the test at `gate` instead of `gate_raw` and it stops
+///   reaching the refusal at all, it does not reach a *different* one, so
+///   nothing downstream would notice.
+/// - *What that call actually drives* — `run` as the first argument, with
+///   no `--reservation-id` among the rest. Checking only the fixture name
+///   is not enough: a body that keeps calling `gate_raw` but drives an
+///   unrelated command (`gate_raw(&["list"])`), or a `run` that already
+///   carries `--reservation-id`, would still satisfy "calls `gate_raw`, not
+///   `gate`" while no longer exercising the un-helped path #2 asks for —
+///   `gate_raw` only means "not silently reserved," not "reserved this
+///   card, this gate, unreserved, right now."
+///
+/// What this does not pin: everything after the call. The exit code, error
+/// code, and message assertions the test above makes could still be
+/// weakened or deleted without this guard noticing — it checks the shape of
+/// the invocation, not what the test does with the result.
+#[test]
+fn gate_run_without_a_reservation_test_still_drives_the_unhelped_fixture() {
+    let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/gate_runner.rs"))
+        .expect("gate_runner.rs should be readable at the repository root");
+
+    // Built with `format!` rather than written out as one literal: this test
+    // reads its own file, and a literal `"fn gate_run_..._makes_one()"` would
+    // be a second, accidental occurrence of the very string it searches for
+    // — right here — so deleting or renaming the real declaration below
+    // would still leave a "match" for `source.find` to report, just the
+    // wrong one, and this guard would silently stop guarding anything.
+    let target_fn = "gate_run_without_a_reservation_names_the_command_that_makes_one";
+    let marker = format!("fn {target_fn}()");
+    let start = source.find(&marker).unwrap_or_else(|| {
+        panic!(
+            "{target_fn} must still exist: it is the only test that drives `gate run` \
+             without the fixture's auto-reserve help (see tests/support/mod.rs's \
+             \"Plumbing versus a governed step\" module doc)"
+        )
+    });
+
+    let body_start = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .expect("a fn declaration is followed by a body");
+    // Every top-level item in this rustfmt'd file closes at column zero, so
+    // the first `}` alone on its own line after `body_start` is this
+    // function's own closing brace — not a nested block (those are always
+    // indented) and not the next item (a blank line, then a doc comment or
+    // attribute, comes after it). That keeps the extracted text to exactly
+    // this function, never leaking into the next one's doc comment.
+    let body_end = source[body_start..]
+        .find("\n}\n")
+        .map(|offset| body_start + offset + "\n}".len())
+        .expect("a fn body closes with a brace alone on its own line");
+    let body = &source[body_start..body_end];
+
+    assert!(
+        body.contains(".gate_raw(&["),
+        "{target_fn} must call `gate_raw`, the fixture that does not auto-reserve, or it \
+         can never reach the refusal it exists to prove:\n{body}"
+    );
+    assert!(
+        !body.contains(".gate(&["),
+        "{target_fn} must not call the helping `gate` fixture — it silently reserves on \
+         `run`'s behalf, so the refusal this test exists to prove would never fire:\n{body}"
+    );
+
+    // The two assertions above only confirm which fixture *method* is
+    // named. A body that still calls `gate_raw` but drives an unrelated
+    // command, or a `run` that already carries `--reservation-id`, would
+    // pass both while no longer exercising the un-helped path #2 asks for.
+    // Isolate the exact argument list `gate_raw` is called with — not just
+    // its presence — the same way `Workspace::gate` itself decides whether
+    // a `run` needs help: `args.first() == Some(&"run")` and no
+    // `--reservation-id` among the rest (tests/support/mod.rs).
+    let call_marker = ".gate_raw(&[";
+    let call_start = body
+        .find(call_marker)
+        .map(|offset| offset + call_marker.len())
+        .expect("already confirmed present by the assertion above");
+    let call_end = body[call_start..]
+        .find(']')
+        .map(|offset| call_start + offset)
+        .expect("gate_raw's argument list closes with `]`, and this call has no nested `[`");
+    let call_args = &body[call_start..call_end];
+
+    let first_arg = call_args.split(',').next().unwrap_or_default().trim();
+    assert_eq!(
+        first_arg, "\"run\"",
+        "{target_fn} must call `gate_raw` with `run` as its first argument, not {first_arg} \
+         — calling `gate_raw` alone only proves the call was not silently reserved, not that \
+         it drove the invocation an operator gets refused for:\n{body}"
+    );
+    assert!(
+        !call_args.contains("\"--reservation-id\""),
+        "{target_fn} must not pass --reservation-id to `gate_raw` — a `run` that already \
+         carries one is the reserved, helped path, not the omission an operator hits and \
+         this test exists to prove:\n{body}"
+    );
+}
+
 #[test]
 fn a_dry_run_produces_no_receipt() {
     let workspace = allocated();
