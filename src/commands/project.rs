@@ -15,8 +15,9 @@ use crate::{
         gate::stranded_execution_permits, integration::ResumeOutcome, transaction::with_transaction,
     },
     config::{
-        ConvergencePolicy, DEFAULT_AUTHORITY_REMOTE, FieldError, FinalAuthorizationPolicy,
-        HostPolicy, PROJECT_SCHEMA, ProjectConfig, ValidationPolicy,
+        CONVERGENCE_POLICY_V1, CardConvergenceLimits, ConvergencePolicy, CycleConvergenceLimits,
+        DEFAULT_AUTHORITY_REMOTE, FieldError, FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA,
+        ProjectConfig, RiskConvergenceLimits, ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -67,6 +68,12 @@ pub enum ProjectCommand {
     /// Install a final-authorization policy on an already-initialized
     /// project, making its declared `exception_triggers` reachable.
     SetFinalAuthorizationPolicy(SetFinalAuthorizationPolicyArgs),
+    /// Print a complete, valid convergence-policy example.
+    ///
+    /// Built by constructing a real `ConvergencePolicy` and serializing it,
+    /// so this can never disagree with what `project set-convergence-policy`
+    /// accepts — see #108.
+    Example(ExampleArgs),
 }
 
 impl ProjectCommand {
@@ -84,6 +91,7 @@ impl ProjectCommand {
             Self::Recover(..) => "project.recover",
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
             Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
+            Self::Example(..) => "project.example",
         }
     }
 }
@@ -197,6 +205,14 @@ pub struct SetFinalAuthorizationPolicyArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `project example`.
+///
+/// Deliberately empty, and deliberately not [`SetConvergencePolicyArgs`]:
+/// #108 constraint 1 requires this to be reachable before an operator has a
+/// control repository or a project to point it at, so it names neither.
+#[derive(Debug, Args)]
+pub struct ExampleArgs {}
+
 /// Executes a `project` subcommand.
 ///
 /// # Errors
@@ -215,6 +231,7 @@ pub fn execute(
         ProjectCommand::SetFinalAuthorizationPolicy(args) => {
             run_set_final_authorization_policy(args, clock)
         }
+        ProjectCommand::Example(..) => run_example(),
     }
 }
 
@@ -271,6 +288,114 @@ fn read_final_authorization_policy(
         })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
+}
+
+/// A complete, valid convergence policy, for `project example` to emit.
+///
+/// #108's warning about a convincing-looking budget applies to this example
+/// with extra force: unlike `review example`'s illustrative finding, these
+/// numbers name exactly how many failed attempts a project tolerates before
+/// a card or cycle must stop and receive an authorized human disposition
+/// (`SKILL.md`, "Convergence budgets and escalation"). Two failure modes had
+/// to be avoided at once: an absurdly large limit, which teaches that a
+/// budget does not really bind anything, and a single plausible-looking
+/// number repeated at every risk tier and every dimension, which invites an
+/// operator to adopt it verbatim as *the* recommended policy instead of
+/// setting one deliberately for their own project.
+///
+/// The values chosen instead demonstrate the one relationship the schema
+/// itself has no field to express, but that every real policy should carry:
+/// the budget on each of the four card dimensions narrows as declared risk
+/// climbs, so a `critical` card is walked back to an authorized decision
+/// after fewer unresolved attempts than a `low` one gets. Every dimension at
+/// every tier is also given its own distinct number, rather than one value
+/// standing in for all four the way the test fixtures in this crate do
+/// (`Workspace::configure_convergence_policy`), because a fixture only needs
+/// "a policy is configured" while an example has to show a reader which
+/// number is which. `run_example`'s warning says the "not a recommendation"
+/// half out loud, because the JSON document itself — `deny_unknown_fields`,
+/// like every other #108 schema — has no field left to carry a comment in.
+fn example_convergence_policy() -> ConvergencePolicy {
+    ConvergencePolicy {
+        version: CONVERGENCE_POLICY_V1.to_owned(),
+        card_limits: RiskConvergenceLimits {
+            low: CardConvergenceLimits {
+                review_returns: 5,
+                repair_attempts: 5,
+                gate_failures: 5,
+                material_scope_revisions: 3,
+            },
+            medium: CardConvergenceLimits {
+                review_returns: 4,
+                repair_attempts: 4,
+                gate_failures: 4,
+                material_scope_revisions: 2,
+            },
+            high: CardConvergenceLimits {
+                review_returns: 3,
+                repair_attempts: 3,
+                gate_failures: 3,
+                material_scope_revisions: 2,
+            },
+            critical: CardConvergenceLimits {
+                review_returns: 2,
+                repair_attempts: 2,
+                gate_failures: 2,
+                material_scope_revisions: 1,
+            },
+        },
+        cycle_limits: CycleConvergenceLimits {
+            integration_failures: 3,
+        },
+    }
+}
+
+/// Emits a complete, valid convergence-policy example.
+///
+/// #108 constraint 1: reachable without a control repository, a project, or
+/// a card — [`ExampleArgs`] carries nothing to open one with. #108
+/// constraint 2: listed under `project --help` because it is an ordinary
+/// [`ProjectCommand`] variant like any other.
+///
+/// The document is JSON, not YAML. This is the one point where this command
+/// cannot follow `review example`'s pattern: [`read_convergence_policy`],
+/// above, parses only with `serde_json::from_str`, unlike `read_verdict`'s
+/// `serde_yaml_ng::from_str`. Emitting YAML here would produce a document
+/// its own reader rejects, defeating the entire point of #108 — see
+/// [`read_convergence_policy`]'s doc comment.
+///
+/// Built by constructing a [`ConvergencePolicy`] and serializing it, never by
+/// writing the document out by hand, so this and [`read_convergence_policy`]
+/// can never disagree about the shape: they are the same `serde`
+/// implementation. Unlike [`crate::commands::review::run_example`], there is
+/// no optional-field advisory to compute: `ConvergencePolicy`, and every
+/// type nested inside it, has no `Option` and no `#[serde(default)]` field,
+/// so every field emitted here is required by the schema, not merely shown
+/// for shape.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example() -> Result<CommandOutcome, HarnessError> {
+    let policy = example_convergence_policy();
+    let example =
+        serde_json::to_string_pretty(&policy).map_err(|source| HarnessError::Control {
+            reason: format!("failed to render the example convergence policy: {source}"),
+            code: ErrorCode::InternalEncoding,
+        })?;
+    Ok(CommandOutcome::new(
+        "project.example",
+        example.clone(),
+        serde_json::json!({
+            "format": "json",
+            "example": example,
+        }),
+    )
+    .with_warning(
+        "the limits above are illustrative, not a recommendation: they show a budget that \
+         narrows as risk rises, but a real policy's exact numbers must be set deliberately for \
+         this project's own risk tolerance and card volume, never copied verbatim",
+    ))
 }
 
 /// Builds the configuration an `init` invocation describes.
