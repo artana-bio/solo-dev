@@ -26,8 +26,8 @@ use crate::{
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
         review::{
-            Decision, Finding, GateAdequacy, REVIEW_DIR, REVIEW_SCHEMA, ReviewRecord,
-            check_independence,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, REVIEW_DIR,
+            REVIEW_SCHEMA, ReviewRecord, check_independence,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -44,6 +44,11 @@ pub enum ReviewCommand {
     Record(RecordArgs),
     /// Show a card's review history and whether the latest still applies.
     Inspect(CardArgs),
+    /// Print a complete, valid verdict document.
+    ///
+    /// Built by constructing a real verdict and serializing it, so this can
+    /// never disagree with what `review record` accepts — see #108.
+    Example(ExampleArgs),
 }
 
 impl ReviewCommand {
@@ -58,6 +63,7 @@ impl ReviewCommand {
             Self::Begin(..) => "review.begin",
             Self::Record(..) => "review.record",
             Self::Inspect(..) => "review.inspect",
+            Self::Example(..) => "review.example",
         }
     }
 }
@@ -111,6 +117,14 @@ pub struct CardArgs {
     #[arg(long)]
     pub card_id: String,
 }
+
+/// Arguments accepted by `review example`.
+///
+/// Deliberately empty, and deliberately not [`CommonArgs`]: #108 constraint 1
+/// requires this to be reachable before an operator has a control repository,
+/// a project, or a card to point it at, so it names neither.
+#[derive(Debug, Args)]
+pub struct ExampleArgs {}
 
 /// The reviewer-authored half of a review.
 ///
@@ -174,6 +188,7 @@ pub fn execute(command: &ReviewCommand, clock: &dyn Clock) -> Result<CommandOutc
         ReviewCommand::Begin(args) => run_begin(args, clock),
         ReviewCommand::Record(args) => run_record(args, clock),
         ReviewCommand::Inspect(args) => run_inspect(args),
+        ReviewCommand::Example(..) => run_example(),
     }
 }
 
@@ -492,6 +507,116 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
         reason: format!("verdict is malformed: {source}"),
         code: ErrorCode::ConfigMalformed,
     })
+}
+
+/// A complete, valid review verdict, for `review example` to emit.
+///
+/// Every field is populated, including the ones [`Verdict::reason_category`],
+/// [`Verdict::findings`], [`Verdict::residual_risks`], and
+/// [`Verdict::human_reviewer`] make optional — an example that omits a field
+/// teaches a reader nothing about its shape, which is the exact gap #108
+/// exists to close: a finding's prose field being `detail` and not `summary`
+/// is invisible in an example that carries no finding at all. The one field
+/// left at its empty value is `reason_category`: it answers "why is this
+/// being returned", and this example is an approval, which returns nothing to
+/// answer for. See [`Verdict::reason_category`] for when it becomes required.
+fn example_verdict() -> Verdict {
+    Verdict {
+        reviewer_actor_id: "reviewer-example".to_owned(),
+        decision: Decision::Approved,
+        reason_category: None,
+        findings: vec![Finding {
+            severity: FindingSeverity::Medium,
+            location: "src/example.rs:42".to_owned(),
+            detail: "off-by-one at the upper boundary".to_owned(),
+            disposition: Disposition::Resolved,
+        }],
+        gate_adequacy: GateAdequacy {
+            gates_observe_acceptance: true,
+            unobserved_behaviors: vec![],
+            basis: "ran the registered gates and probed each acceptance behavior directly"
+                .to_owned(),
+        },
+        residual_risks: vec!["none identified".to_owned()],
+        human_reviewer: true,
+    }
+}
+
+/// Which of `verdict`'s top-level fields `read_verdict` accepts as absent.
+///
+/// Established by asking the real deserializer, field by field, rather than
+/// read off a list maintained by hand: for each field this removes it from
+/// the serialized document and asks whether `Verdict` still parses without
+/// it. A hand-maintained claim about the schema is exactly what #108 exists
+/// to stop from silently drifting from what the parser actually accepts, and
+/// that argument applies to this advisory exactly as it does to the example
+/// document itself.
+///
+/// # Errors
+///
+/// Returns an error when `verdict` cannot be serialized to inspect.
+fn optional_fields(verdict: &Verdict) -> Result<Vec<String>, HarnessError> {
+    let value = serde_json::to_value(verdict)?;
+    let object = value.as_object().ok_or_else(|| HarnessError::Control {
+        reason: "the example verdict did not serialize to a document with fields".to_owned(),
+        code: ErrorCode::InternalEncoding,
+    })?;
+    let mut optional: Vec<String> = object
+        .keys()
+        .filter(|key| {
+            let mut reduced = object.clone();
+            reduced.remove(key.as_str());
+            serde_json::from_value::<Verdict>(serde_json::Value::Object(reduced)).is_ok()
+        })
+        .cloned()
+        .collect();
+    optional.sort();
+    Ok(optional)
+}
+
+/// Emits a complete, valid review-verdict example.
+///
+/// #108 constraint 1: reachable without a control repository, a project, or a
+/// card — [`ExampleArgs`] carries nothing to open one with. #108 constraint
+/// 2: listed under `review --help` because it is an ordinary [`ReviewCommand`]
+/// variant like any other.
+///
+/// The document is YAML: every fixture and every `SKILL.md` example that
+/// names a verdict file spells it `verdict.yaml`, and `read_verdict` parses
+/// with `serde_yaml_ng`, which accepts JSON as the YAML it syntactically is —
+/// so YAML is both what this codebase already writes by convention and the
+/// strictly more general of the two accepted shapes.
+///
+/// Built by constructing a [`Verdict`] and serializing it, never by writing
+/// the document out by hand, so this and [`read_verdict`] can never disagree
+/// about the shape: they are the same `serde` implementation.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example() -> Result<CommandOutcome, HarnessError> {
+    let verdict = example_verdict();
+    let example = serde_yaml_ng::to_string(&verdict).map_err(|source| HarnessError::Control {
+        reason: format!("failed to render the example verdict: {source}"),
+        code: ErrorCode::InternalEncoding,
+    })?;
+    let optional = optional_fields(&verdict)?;
+    Ok(CommandOutcome::new(
+        "review.example",
+        example.clone(),
+        serde_json::json!({
+            "format": "yaml",
+            "example": example,
+            "optional_fields": optional,
+        }),
+    )
+    .with_warning(format!(
+        "every field above is shown so its shape is visible, including these, which default \
+         when the key is absent: {}. `reason_category` additionally becomes required — not \
+         merely accepted — when `decision` is `changes_requested` under a project with a \
+         configured convergence policy that requires one (`require_review_return_reason`)",
+        optional.join(", ")
+    )))
 }
 
 /// Whether a decision returns work to the feature actor.
