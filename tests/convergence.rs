@@ -3859,6 +3859,121 @@ mod disposition_renew {
         );
     }
 
+    /// Every long option a remedy string spells, in the order it spells
+    /// them, whether or not the text wraps it in backticks.
+    ///
+    /// Scanned out of the text rather than compared against a hard-coded
+    /// copy of the invocation, so the cross-check below measures the
+    /// remedy against the command's real `--help` surface rather than a
+    /// second hand-written claim that would rot in lockstep with the first
+    /// and prove nothing.
+    fn flags_named_by(remedy: &str) -> Vec<String> {
+        remedy
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+            .filter(|word| word.starts_with("--"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_escalation_refusal_names_the_command_that_resolves_it() {
+        // The remedy handed to an operator when a card escalates has to
+        // name the command that resolves it, and every flag that command
+        // requires, in a shape `disposition renew` really accepts. For two
+        // releases this text named an issue number instead of a command at
+        // all — true when written, silently false from the moment
+        // `disposition renew` shipped, because nothing tied the text to
+        // the command surface. The fix that followed replaced the issue
+        // number with the bare command name: an improvement, but not the
+        // full promise — an operator who read it still had to go find out
+        // which flags to type.
+        //
+        // The `!remedy.contains('#')` assertion below is this test's
+        // single most important line: it is the one that would have
+        // caught the original defect directly, because a remedy that
+        // hands back an issue reference always contains a `#`, and one
+        // that hands back a real command never needs to. Keep it even if
+        // the rest of this test changes shape.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let output = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+        assert!(
+            !output.status.success(),
+            "an escalated card must refuse a new review round: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-CONVERGENCE-ESCALATED");
+
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("an error envelope");
+        let remedy = envelope["error"]["recovery"]
+            .as_str()
+            .expect("a coded refusal carries operator guidance")
+            .to_owned();
+
+        // Checked ahead of the command-name check on purpose: this is the
+        // property the original defect violated, so it is what this test
+        // must report first if a future edit ever resurrects an
+        // issue-number remedy in place of a command.
+        assert!(
+            !remedy.contains('#'),
+            "the remedy must hand the operator a command, not an issue to go read: {remedy}"
+        );
+        assert!(
+            remedy.contains("disposition renew"),
+            "the remedy must name the command that records a disposition: {remedy}"
+        );
+
+        // The three required flags must all be named, in the order an
+        // operator types them. Filtered to just the required set so an
+        // extra, unrelated flag mention elsewhere in the text (as
+        // Mutation 3 plants) does not trip this assertion — catching that
+        // is the cross-check below's job, and it needs a mutation that
+        // leaves this assertion green to prove it is not redundant with
+        // it.
+        let named = flags_named_by(&remedy);
+        let required = vec!["--card-id", "--dimension", "--rationale"];
+        let named_required: Vec<&str> = named
+            .iter()
+            .map(String::as_str)
+            .filter(|flag| required.contains(flag))
+            .collect();
+        assert_eq!(
+            named_required, required,
+            "the remedy must spell every flag an operator has to type, in the order they type \
+             them: named {named:?} in {remedy}"
+        );
+
+        // Cross-checked against the command's real `--help` surface,
+        // walking every flag the text actually names rather than the
+        // filtered, already-known-good `named_required` above — so a
+        // fabricated flag fails here even though it would satisfy every
+        // earlier assertion. `tests/recovery_text.rs` would not catch it
+        // either: that test only runs a backtick span through `--help`
+        // when the span's first token is not itself a flag, so a bare
+        // `--force` mention — exactly the shape this remedy uses for its
+        // real flags — is invisible to it by design.
+        let help = Workspace::run(&[
+            "disposition".to_owned(),
+            "renew".to_owned(),
+            "--help".to_owned(),
+        ]);
+        assert!(
+            help.status.success(),
+            "the remedy names `disposition renew`, so that command must exist: {}",
+            String::from_utf8_lossy(&help.stderr)
+        );
+        let help = String::from_utf8_lossy(&help.stdout).into_owned();
+        for flag in &named {
+            assert!(
+                help.contains(flag.as_str()),
+                "the remedy spells `{flag}`, which `disposition renew` does not accept: {help}"
+            );
+        }
+    }
+
     #[test]
     fn an_unauthorized_actor_cannot_renew() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
