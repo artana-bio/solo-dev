@@ -1,9 +1,34 @@
 //! End-to-end CLI behavior.
 
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 
 fn harness_command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_change-harness"))
+}
+
+/// Runs `git` against `repo`, panicking with its stderr on failure.
+///
+/// `tests/support/mod.rs` has an identical helper, but pulling in that module
+/// here — via `mod support;` — would drag in its full three-repository
+/// `Workspace` fixture, which this file has deliberately never needed for
+/// anything else it tests. The one test below that needs Git needs exactly
+/// two bare `git init`s, so it gets this narrow copy instead.
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run(args: &[&str]) -> Output {
@@ -257,6 +282,226 @@ fn json_mode_renders_failures_as_the_error_envelope() {
     assert!(envelope["error"]["details"]["path"].is_string());
 }
 
+// --- card 114: text mode prints the code and the recovery --------------
+//
+// All three tests below drive the same deterministic refusal as
+// `doctor_rejects_a_missing_workspace` and `json_mode_renders_failures_as_the_error_envelope`
+// above: `doctor --workspace <a path that does not exist>`. No control
+// repository or other fixture is needed to trigger it, and it was already
+// established in this file as the refusal these `--output json` assertions
+// use, so reusing it keeps the three tests below narrowly about the layout
+// card 114 adds rather than about standing up a new failure.
+
+#[test]
+fn a_text_mode_refusal_prints_its_error_code() {
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+    let output = harness_command()
+        .arg("doctor")
+        .arg("--workspace")
+        .arg(&missing)
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    // The specific code this refusal carries, not a bare `contains("CH-")`:
+    // that weaker check would already pass on the pre-card rendering the
+    // moment any other line happened to mention a code-shaped string, and
+    // proves nothing about whether this refusal's own code is present.
+    assert!(
+        stderr.contains("CH-PRECONDITION-WORKSPACE-MISSING"),
+        "text mode must print the stable error code: {stderr}"
+    );
+}
+
+#[test]
+fn a_text_mode_refusal_prints_its_recovery() {
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+    let output = harness_command()
+        .arg("doctor")
+        .arg("--workspace")
+        .arg(&missing)
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("Create the path or pass an existing one."),
+        "text mode must print the recovery text: {stderr}"
+    );
+}
+
+#[test]
+fn the_json_envelope_is_unchanged() {
+    // The regression guard for card 114: this card touches only text-mode
+    // rendering, so `--output json` for this exact refusal must still
+    // produce exactly today's fields and values. Beyond the specific values
+    // (also covered non-exhaustively by `json_mode_renders_failures_as_the_error_envelope`
+    // above), this asserts the exact key count at every level — root, error
+    // body, and details — so a field added anywhere in the envelope changes
+    // one of those counts even if its value is never individually checked.
+    let missing = tempfile::tempdir()
+        .expect("temporary directory should be created")
+        .path()
+        .join("missing");
+    let output = harness_command()
+        .args(["doctor", "--output", "json", "--workspace"])
+        .arg(&missing)
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stderr.is_empty());
+    let envelope = stdout_json(&output);
+
+    assert_eq!(envelope["schema"], "harness.command-error/v1");
+    assert_eq!(envelope["command"], "doctor");
+    assert_eq!(envelope["status"], "error");
+    assert_eq!(
+        envelope["error"]["code"],
+        "CH-PRECONDITION-WORKSPACE-MISSING"
+    );
+    assert_eq!(
+        envelope["error"]["message"],
+        format!("workspace does not exist: {}", missing.display())
+    );
+    assert_eq!(
+        envelope["error"]["recovery"],
+        "Create the path or pass an existing one."
+    );
+    assert_eq!(
+        envelope["error"]["details"]["path"],
+        missing.display().to_string()
+    );
+
+    assert_eq!(
+        envelope.as_object().unwrap().len(),
+        4,
+        "envelope root must carry exactly schema, command, status, error: {envelope}"
+    );
+    assert_eq!(
+        envelope["error"].as_object().unwrap().len(),
+        4,
+        "error body must carry exactly code, message, details, recovery: {envelope}"
+    );
+    assert_eq!(
+        envelope["error"]["details"].as_object().unwrap().len(),
+        1,
+        "details must carry exactly path: {envelope}"
+    );
+}
+
+#[test]
+fn a_long_recovery_string_survives_text_mode_rendering_unbroken() {
+    // The two text-mode tests above only exercise short recovery strings —
+    // "Create the path or pass an existing one." (40 characters) and
+    // "Supply an identifier matching its documented prefix and shape." (62
+    // characters) — so neither would notice a rendering defect that only
+    // truncates past roughly 80 characters. The recovery that actually
+    // matters for that class of defect is
+    // `ErrorCode::PolicyConvergenceEscalated`'s `convergence_recovery`: 332
+    // characters, and the one an independent cold-start reviewer resolved a
+    // refusal from unaided. Reaching it needs a card with a spent
+    // convergence budget — a configured convergence policy, an active
+    // cycle, an activated card with a real worktree, a delivered candidate,
+    // and a review round recording a declared return, the fixture
+    // `tests/convergence.rs::escalate_via_review_returns` builds against
+    // `tests/support::Workspace`. This file has never needed that module or
+    // a real project at all; every refusal it triggers elsewhere fails
+    // before one would exist. Standing up a full project, cycle, card, and
+    // review round here to test one rendering property would be
+    // disproportionate, so this test does not do it, and the 332-character
+    // case stays untested by this file.
+    //
+    // What it uses instead is the longest recovery string reachable at the
+    // same fixture cost this file's other tests already pay:
+    // `ErrorCode::ConfigAuthorityIncompatible`'s recovery, 99 characters.
+    // `project init` refuses before creating anything once the authority
+    // path turns out to have a working tree, so the only setup is two `git
+    // init`s and no project, cycle, card, or `Workspace`. 99 characters is
+    // comfortably past the ~80-character truncation this test exists to
+    // catch, even though it is far short of 332.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repository = root.join("repository");
+    let authority = root.join("authority.git");
+    let control = root.join("control");
+    let worktrees = root.join("worktrees");
+
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init", "-q", "-b", "main"]);
+    git(&repository, &["config", "user.email", "f@local.invalid"]);
+    git(&repository, &["config", "user.name", "Fixture"]);
+    fs::write(repository.join("README.md"), "hello\n").unwrap();
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "-q", "-m", "initial"]);
+
+    // A working tree, not the bare repository `project init` requires, is
+    // what triggers `ConfigAuthorityIncompatible`.
+    fs::create_dir_all(&authority).unwrap();
+    git(&authority, &["init", "-q", "-b", "main"]);
+
+    let output = harness_command()
+        .arg("project")
+        .arg("init")
+        .arg("--project-id")
+        .arg("example")
+        .arg("--repository")
+        .arg(&repository)
+        .arg("--control")
+        .arg(&control)
+        .arg("--authority")
+        .arg(&authority)
+        .arg("--worktree-root")
+        .arg(&worktrees)
+        .output()
+        .expect("the CLI should start");
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "configuration category is exit 3"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    let code = change_harness::error::ErrorCode::ConfigAuthorityIncompatible;
+    let recovery = code.recovery();
+    assert_eq!(
+        recovery.len(),
+        99,
+        "this test's premise is that the string stays well past the ~80-character \
+         truncation it exists to catch; if this fails, `ErrorCode::ConfigAuthorityIncompatible`'s \
+         recovery text changed and the premise needs rechecking"
+    );
+
+    // The direct proof against truncation: `.contains` on the *complete*
+    // string (not a prefix) cannot pass if any character — including the
+    // last one — was dropped by rendering.
+    assert!(
+        stderr.contains(recovery),
+        "the full recovery string must appear unbroken, not truncated: {stderr}"
+    );
+
+    // The stronger regression guard: the entire line-by-line rendering,
+    // exact, the same rigor `text_cycle_id_error_redacts_github_token_exactly`
+    // above applies to its own (much shorter) recovery string.
+    assert_eq!(
+        stderr,
+        format!(
+            "error: control state: authority {} has a working tree; promotion into a checked-out branch would desynchronize its index and files\ncode: {}\nrecovery: {recovery}\n",
+            authority.display(),
+            code.as_string(),
+        )
+    );
+}
+
 #[test]
 fn invalid_cycle_id_json_redacts_github_token_from_message_and_details() {
     const TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
@@ -333,9 +578,15 @@ fn text_cycle_id_error_redacts_github_token_exactly() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Card 114 added the `code:` and `recovery:` lines below the message
+    // line this test used to check alone; the exact match now covers all
+    // three so a redaction gap in either new line would still fail this
+    // test the same way a gap in the message line always did.
     assert_eq!(
         stderr,
-        "error: invalid identifier `[redacted:github-token]`: expected prefix `C-`\n"
+        "error: invalid identifier `[redacted:github-token]`: expected prefix `C-`\n\
+        code: CH-USAGE-INVALID-ID\n\
+        recovery: Supply an identifier matching its documented prefix and shape.\n"
     );
     let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
     assert!(!combined.contains(TOKEN));
