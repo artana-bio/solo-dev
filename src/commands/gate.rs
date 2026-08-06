@@ -2229,6 +2229,49 @@ fn execution_permit_for(
     Ok(Some(permit))
 }
 
+/// Reservations whose execution permit was committed but never settled: the
+/// recovery-visible fact that a governed `gate run` was interrupted after
+/// acquiring its execution capability and before it could finish. Only
+/// `acquire_governed_gate_execution` ever writes one of these permits
+/// (`gate mutate` runs its whole campaign inside one transaction and never
+/// acquires one), so this never fires for an interrupted `gate mutate`. See
+/// #110.
+///
+/// This is the one place that scans every reservation to ask which are
+/// stranded. Every other caller of [`execution_permit_for`] and
+/// [`settlement_for`] in this file already holds one known reservation and
+/// asks about it specifically; composing the two checks here, behind a
+/// single `pub(crate)` query, is what lets `project status` and `project
+/// recover` (`src/commands/project.rs`) name a stranded reservation without
+/// reaching past this file's three private helpers (`reservations_for`,
+/// `settlement_for`, `execution_permit_for`) to reimplement "permit present,
+/// settlement absent" a second time. Those three stay exactly as private as
+/// they were; only this composed fact is exported.
+///
+/// No timestamps, no heuristics: a reservation is stranded solely because
+/// its permit exists with no settlement on disk, exactly [`execution_permit_for`]
+/// and [`settlement_for`]'s own definitions, so this never fires for a
+/// reservation that is merely expired but was properly settled or never run.
+///
+/// # Errors
+///
+/// Returns an error when a reservation, permit, or settlement record on disk
+/// is malformed or fails its identity check.
+pub(crate) fn stranded_execution_permits(
+    control: &ControlRepository,
+) -> Result<Vec<ValidationExecutionPermitRecord>, HarnessError> {
+    let mut stranded = Vec::new();
+    for reservation in reservations_for(control)? {
+        let Some(permit) = execution_permit_for(control, &reservation)? else {
+            continue;
+        };
+        if settlement_for(control, &reservation)?.is_none() {
+            stranded.push(permit);
+        }
+    }
+    Ok(stranded)
+}
+
 fn cpu_heavy_lanes(control: &ControlRepository) -> Result<Vec<CpuHeavyLaneRecord>, HarnessError> {
     let directory = control.path(CPU_HEAVY_LANE_DIR);
     if !directory.exists() {
@@ -2457,6 +2500,21 @@ fn run_schedule(args: &ScheduleArgs, clock: &dyn Clock) -> Result<CommandOutcome
     ))
 }
 
+/// Recovery guidance for [`acquire_governed_gate_execution`]'s "already
+/// acquired" refusal.
+///
+/// The one site #110 migrates onto [`HarnessError::ControlWithRecovery`].
+/// `PolicyInvalidTransition`'s shared table entry — "Move through the
+/// documented states in order, or abandon the subject." — names no command
+/// at all, and there is exactly one correct next step no matter what prior
+/// state produced the stuck permit: settle the reservation explicitly. An
+/// operator who reached this refusal is always the reservation's own
+/// holder (an earlier check in the same function refuses any other actor
+/// first), so the fix is never "wait" or "reserve again" — reserving again
+/// hands back the same reservation, per #110's motivating report, whose
+/// operator escaped only by searching `--help` for `gate settle`.
+const RESERVATION_ALREADY_ACQUIRED_RECOVERY: &str = "An execution permit for this reservation was acquired but never settled, so the run that held it may have been interrupted before it could finish. Run `gate settle` with `--reservation-id` (the id named above) and `--outcome abandoned` to release it, once you have confirmed no run is still using it.";
+
 #[allow(clippy::too_many_lines)]
 fn acquire_governed_gate_execution(
     args: &RunArgs,
@@ -2483,12 +2541,13 @@ fn acquire_governed_gate_execution(
             require_next_gate(&progress, &args.gate_id)?;
             let reservation = live_reservation_for_run(control, args, card_id, clock)?;
             if execution_permit_for(control, &reservation)?.is_some() {
-                return Err(HarnessError::Control {
+                return Err(HarnessError::ControlWithRecovery {
                     reason: format!(
                         "validation reservation {} is already acquired",
                         reservation.reservation_id
                     ),
                     code: ErrorCode::PolicyInvalidTransition,
+                    recovery: RESERVATION_ALREADY_ACQUIRED_RECOVERY,
                 });
             }
             let existing = receipts_for(control, card_id)?;

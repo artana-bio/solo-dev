@@ -11,7 +11,9 @@ use clap::{Args, Subcommand};
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
-    commands::{integration::ResumeOutcome, transaction::with_transaction},
+    commands::{
+        gate::stranded_execution_permits, integration::ResumeOutcome, transaction::with_transaction,
+    },
     config::{
         ConvergencePolicy, DEFAULT_AUTHORITY_REMOTE, FieldError, FinalAuthorizationPolicy,
         HostPolicy, PROJECT_SCHEMA, ProjectConfig, ValidationPolicy,
@@ -675,9 +677,14 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let journal = Journal::new(&control);
     let unresolved = journal.unresolved()?;
     let head = control.head()?;
+    // A committed execution permit with no settlement: `gate run` was
+    // interrupted after acquiring the reservation and before it could
+    // finish. Nothing here is torn (see `unresolved_operations` above), so
+    // this is the only surface that names it. See #110.
+    let stranded = stranded_execution_permits(&control)?;
 
     let mut text = format!(
-        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}",
+        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}\nstranded validation reservations: {}",
         config.project_id,
         control.root().display(),
         head.as_deref().unwrap_or("unborn"),
@@ -690,7 +697,8 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             }
             LockDiagnosis::Ambiguous { reason, .. } => format!("AMBIGUOUS: {reason}"),
         },
-        unresolved.len()
+        unresolved.len(),
+        stranded.len()
     );
     let disagreement = locator_disagreement(&control);
     let authority = authority_health(&config);
@@ -724,6 +732,14 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         );
     }
 
+    for permit in &stranded {
+        let _ = write!(
+            text,
+            "\n  {} acquired by {} at {} with no settlement recorded",
+            permit.reservation_id, permit.holder_actor_id, permit.acquired_at
+        );
+    }
+
     let mut outcome = CommandOutcome::new(
         "project.status",
         text,
@@ -745,6 +761,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             },
             "authority": authority,
             "unresolved_operations": unresolved,
+            "stranded_reservations": stranded,
             "locator_disagreement": disagreement,
         }),
     );
@@ -801,6 +818,12 @@ fn run_resume(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, H
     )
 }
 
+// #110 grew this past the pedantic line threshold by reporting a stranded
+// reservation alongside the pre-existing journaled-operation report; see
+// the identical allow on `acquire_governed_gate_execution` and
+// `settle_governed_gate_execution` in `src/commands/gate.rs` for the same
+// reasoning applied at the same wave's other long, linear functions.
+#[allow(clippy::too_many_lines)]
 fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
@@ -871,7 +894,14 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         return run_resume(args, clock);
     }
 
-    if unresolved.is_empty() {
+    // A committed execution permit with no settlement: `gate run` was
+    // interrupted after acquiring the reservation and before it could
+    // finish. `--resume` above never sees this — it settles only journaled
+    // promotions — so it is fetched here, on the reporting path both kinds
+    // of interruption share. See #110.
+    let stranded = stranded_execution_permits(&control)?;
+
+    if unresolved.is_empty() && stranded.is_empty() {
         return Ok(CommandOutcome::new(
             "project.recover",
             format!(
@@ -881,6 +911,7 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             serde_json::json!({
                 "project_id": config.project_id.to_string(),
                 "unresolved_operations": [],
+                "stranded_reservations": [],
                 "recovery_required": false,
             }),
         )
@@ -889,33 +920,61 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 
     // This package reports rather than repairs. Automatic resumption across
     // every mutation boundary is WP-500; inventing it here would mean guessing
-    // at boundaries that do not exist yet.
+    // at boundaries that do not exist yet. A stranded reservation is refused
+    // the same way: clearing it would mean asserting the process that
+    // acquired it is dead, and nothing recorded on disk tells the Harness
+    // that (a `SIGKILL`, a power cut, and a closed laptop all leave the
+    // identical state). The operator is the only one who can confirm that,
+    // so this reports the fact and leaves settling it to `gate settle`.
     let mut text = format!(
-        "Project {} has {} interrupted operation(s)",
-        config.project_id,
-        unresolved.len()
+        "Project {} has interrupted state to recover",
+        config.project_id
     );
-    for record in &unresolved {
-        let _ = write!(
-            text,
-            "\n\n{} {} ({:?})\n  started: {}\n  completed steps: {}\n  failure: {}",
-            record.operation_id,
-            record.command,
-            record.state,
-            record.started_at,
-            if record.steps.is_empty() {
-                "none".to_owned()
-            } else {
-                record.steps.join(", ")
-            },
-            record.failure.as_deref().unwrap_or("none recorded")
+    if !unresolved.is_empty() {
+        let _ = write!(text, "\n\n{} interrupted operation(s):", unresolved.len());
+        for record in &unresolved {
+            let _ = write!(
+                text,
+                "\n\n{} {} ({:?})\n  started: {}\n  completed steps: {}\n  failure: {}",
+                record.operation_id,
+                record.command,
+                record.state,
+                record.started_at,
+                if record.steps.is_empty() {
+                    "none".to_owned()
+                } else {
+                    record.steps.join(", ")
+                },
+                record.failure.as_deref().unwrap_or("none recorded")
+            );
+        }
+        text.push_str(
+            "\n\nEach entry names the last boundary it reached. Run `project recover --resume` \
+             to finish a promotion whose authority update succeeded; anything else must be \
+             inspected and resolved by hand.",
         );
     }
-    text.push_str(
-        "\n\nEach entry names the last boundary it reached. Run `project recover --resume` \
-         to finish a promotion whose authority update succeeded; anything else must be \
-         inspected and resolved by hand.",
-    );
+    if !stranded.is_empty() {
+        let _ = write!(
+            text,
+            "\n\n{} validation reservation(s) have an acquired execution permit with no \
+             recorded settlement:",
+            stranded.len()
+        );
+        for permit in &stranded {
+            let _ = write!(
+                text,
+                "\n\n{} acquired by {} at {}\n  no settlement is recorded, and the Harness \
+                 cannot tell whether the process that acquired it is still running. Confirm \
+                 that yourself, then run `gate settle --reservation-id {} --outcome abandoned` \
+                 to release it.",
+                permit.reservation_id,
+                permit.holder_actor_id,
+                permit.acquired_at,
+                permit.reservation_id
+            );
+        }
+    }
 
     Ok(CommandOutcome::new(
         "project.recover",
@@ -923,6 +982,7 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         serde_json::json!({
             "project_id": config.project_id.to_string(),
             "unresolved_operations": unresolved,
+            "stranded_reservations": stranded,
             "recovery_required": true,
         }),
     )
