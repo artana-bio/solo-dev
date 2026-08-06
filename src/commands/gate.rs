@@ -3092,6 +3092,18 @@ fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     )
 }
 
+/// Recovery guidance for [`require_next_gate`]'s final-integration refusal.
+///
+/// The one site #106 migrates onto [`HarnessError::ControlWithRecovery`].
+/// Chosen over this file's 28 other `PolicyInvalidTransition` construction
+/// sites because it fires from a single fixed condition — the requested gate
+/// belongs to [`crate::config::ValidationStage::FinalIntegration`] — with
+/// exactly one correct exit no matter what else is true of the card, unlike
+/// the reservation-lifecycle and generic "card is `X`" sites nearby, whose
+/// correct next command depends on which of several possible prior states
+/// the caller actually holds.
+const FINAL_INTEGRATION_GATE_RECOVERY: &str = "Run `integration prepare` with `--cycle-id` and `--actor-id` once the card is ready; final-integration checks run automatically during combined verification, not through `gate run`.";
+
 /// Refuses attempts to skip the frozen order. Final-integration checks are
 /// deliberately not runnable against one card: they are owned by combined
 /// verification after a landing SHA exists.
@@ -3119,11 +3131,12 @@ pub fn require_next_gate(
         return Ok(());
     };
     if requested_stage == crate::config::ValidationStage::FinalIntegration {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "gate `{requested_gate}` belongs to final integration; prepare the approved candidate and let combined integration verification run it on the landing SHA"
             ),
             code: ErrorCode::PolicyInvalidTransition,
+            recovery: FINAL_INTEGRATION_GATE_RECOVERY,
         });
     }
     if progress.next_permitted_gate.as_deref() != Some(requested_gate) {

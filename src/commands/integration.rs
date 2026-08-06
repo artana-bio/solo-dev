@@ -2508,14 +2508,18 @@ fn run_merge(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
     }
 }
 
-/// The bare text of a [`HarnessError`], without [`HarnessError::Control`]'s
-/// own `"control state: "` prefix.
+/// The bare text of a [`HarnessError`], without the `"control state: "`
+/// prefix both [`HarnessError::Control`] and
+/// [`HarnessError::ControlWithRecovery`] add through the same
+/// `#[error(...)]` Display (see #106).
 ///
 /// Exists only so `finalize_conflict` can join two error reasons into one
 /// sentence without nesting that prefix in its own middle.
 fn plain_reason(error: &HarnessError) -> String {
     match error {
-        HarnessError::Control { reason, .. } => reason.clone(),
+        HarnessError::Control { reason, .. } | HarnessError::ControlWithRecovery { reason, .. } => {
+            reason.clone()
+        }
         other => other.to_string(),
     }
 }
@@ -4522,4 +4526,40 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             .with_project(config.project_id.clone()))
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #106 follow-up: `ControlWithRecovery` shares `Control`'s
+    /// `#[error("control state: {reason}")]` Display, so `plain_reason` must
+    /// strip the same prefix from both or `finalize_conflict` nests
+    /// `"control state: "` mid-sentence the first time a
+    /// `ConflictMergeFailed` site migrates to the new variant. Both errors
+    /// carry the identical reason text on purpose: the only thing that can
+    /// make `plain_reason`'s two outputs differ is the prefix, not the
+    /// input.
+    ///
+    /// Reachable only as a unit test: nothing in this codebase constructs a
+    /// `ConflictMergeFailed` `ControlWithRecovery` today (`plain_reason` is
+    /// private, and #106 deliberately migrated no second site), so there is
+    /// no real refusal to drive through `finalize_conflict` from outside
+    /// this module.
+    #[test]
+    fn plain_reason_strips_the_control_state_prefix_from_both_control_variants() {
+        let shared_reason = "shared reason text";
+        let control = HarnessError::Control {
+            reason: shared_reason.to_owned(),
+            code: ErrorCode::ConflictMergeFailed,
+        };
+        let with_recovery = HarnessError::ControlWithRecovery {
+            reason: shared_reason.to_owned(),
+            code: ErrorCode::ConflictMergeFailed,
+            recovery: "some recovery text.",
+        };
+
+        assert_eq!(plain_reason(&control), shared_reason);
+        assert_eq!(plain_reason(&with_recovery), shared_reason);
+    }
 }
