@@ -287,8 +287,27 @@ fn next_permitted_action_wire_name(action: NextPermittedAction) -> String {
 /// `review record` — and the previews that must never promise a write the
 /// real command would refuse — all call this before writing anything, so a
 /// raw retry or a fresh review cannot dodge the escalation through the
-/// ordinary CLI surface. Other cards in the same cycle are unaffected: this
-/// only ever assesses the one `record` names.
+/// ordinary CLI surface.
+///
+/// #72-3 closed the three routes left around that loop, bringing the callers
+/// to six. `work start` calls this from `preflight_start`, the one place
+/// `preview_start` and `run_start`'s transaction share, so a new assignment
+/// is refused in a single spot rather than two. `card revise` calls it from
+/// `preview_revise` and `run_revise`: a revision returns the card to `ready`,
+/// and 71-R1 already made the counters span revisions, so revising neither
+/// resets the budget nor may itself proceed on a spent one. `work resume`
+/// calls it from `run_resume`'s dry run and from `resume_to_active`'s
+/// transaction, but only when the source state is `Ready` — the one state
+/// `resumes_to_active` admits that is functionally a fresh `work start`
+/// rather than picking already-owned work back up. Resuming from
+/// `changes_requested`, `blocked`, or `review_pending` is left open on
+/// purpose, or a card could never accumulate the attempts this budget exists
+/// to count; so are `work checkpoint` and `work block`, which park or
+/// annotate a card without advancing it, and `card status`, which reports
+/// the same assessment as data instead of a refusal.
+///
+/// Other cards in the same cycle are unaffected: this only ever assesses the
+/// one `record` names.
 ///
 /// `config.convergence_policy` is read exactly once, into `policy`, and that
 /// same value feeds both [`project`] and [`assess_card`] below. `assess_card`
