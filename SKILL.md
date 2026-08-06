@@ -292,8 +292,13 @@ all candidate changes. A dirty or untracked worktree blocks handoff by design.
 
 ### 5. Prove the narrow feature claim first
 
+`gate run` requires a live reservation. Reserve the exact gate before running
+it: a reservation authorizes one expensive validation attempt, not standing
+permission to run the gate repeatedly.
+
 ```bash
-change-harness gate run --card-id F-001 --gate-id gate.fmt --actor implementer-a
+change-harness gate reserve --card-id F-001 --gate-id gate.fmt --actor implementer-a
+change-harness gate run --card-id F-001 --gate-id gate.fmt --reservation-id VR-000001 --actor implementer-a
 ```
 
 Each receipt binds to the exact commit and records cleanliness. For a material

@@ -47,6 +47,7 @@ use std::process::Command;
 const COVERED_SECTIONS: &[&str] = &[
     "## Convergence budgets and escalation",
     "## What the Harness guarantees",
+    "## Lifecycle",
 ];
 
 /// Reads `SKILL.md` from the repository root.
