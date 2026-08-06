@@ -2875,7 +2875,10 @@ fn run_gate(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harness
     require_next_gate(&progress, &args.gate_id)?;
     if args.reservation_id.is_none() {
         return Err(HarnessError::Control {
-            reason: format!("gate run for card {card_id} requires one live validation reservation"),
+            reason: format!(
+                "gate run for card {card_id} requires one live validation reservation; run `gate reserve --card-id {card_id} --gate-id {gate_id}` first",
+                gate_id = args.gate_id
+            ),
             code: ErrorCode::PolicyInvalidTransition,
         });
     }

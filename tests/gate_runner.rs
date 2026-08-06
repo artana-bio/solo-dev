@@ -477,6 +477,40 @@ fn running_a_gate_without_an_allocation_is_a_precondition_failure() {
     assert_eq!(output.status.code(), Some(4));
 }
 
+/// #105 acceptance: the refusal names the command that produces the missing
+/// reservation. `gate`, unlike `gate_raw`, silently reserves on behalf of any
+/// `run` fixture that omits `--reservation-id` (see tests/support/mod.rs), so
+/// a test written against `gate` could never reach this refusal — only
+/// `gate_raw` passes the arguments through untouched.
+#[test]
+fn gate_run_without_a_reservation_names_the_command_that_makes_one() {
+    let workspace = allocated();
+    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    assert_eq!(output.status.code(), Some(5), "policy category is exit 5");
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("gate reserve"),
+        "the refusal must name the command that produces a reservation: {message}"
+    );
+}
+
+/// The no-false-positive counterpart: a properly reserved run must still
+/// succeed. Without this, a change that refused every `gate run` (for
+/// example, deleting the `reservation_id.is_none()` guard) would also pass
+/// the test above.
+#[test]
+fn gate_run_with_a_reservation_is_unaffected() {
+    let workspace = allocated();
+    let output = reserved_run_raw(&workspace, "F-001", "gate.unit");
+    assert!(
+        output.status.success(),
+        "a properly reserved run must still succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn a_dry_run_produces_no_receipt() {
     let workspace = allocated();
