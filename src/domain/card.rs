@@ -1152,7 +1152,23 @@ rollback_strategy: revert
 
     #[test]
     fn revision_zero_is_rejected() {
-        assert!(CardRecord::activate(&draft(), 0, "alvaro", stamp()).is_err());
+        // #119: every production call site passes a literal `1` or
+        // `self.revision + 1` where `self.revision >= 1` (enforced by this
+        // same guard on every prior activation), so this guard is not
+        // reachable through `card activate` or `card revise`. It is kept
+        // because it is the sole enforcement of "revisions begin at 1" for
+        // `CardRecord::activate`, a `pub` constructor callable by any future
+        // caller within the crate; removing it would leave the invariant
+        // unchecked everywhere rather than covered by a surviving refusal
+        // elsewhere, unlike `gate.rs`'s `live_reservation_for_run` guard.
+        // Asserting the exact code and message (not just `.is_err()`) is
+        // what makes this test fail if either is later broken.
+        let error = CardRecord::activate(&draft(), 0, "alvaro", stamp()).expect_err("must reject");
+        assert_eq!(error.code(), ErrorCode::PolicyInvalidCard);
+        assert_eq!(
+            error.to_string(),
+            "control state: card revisions begin at 1"
+        );
     }
 
     #[test]
