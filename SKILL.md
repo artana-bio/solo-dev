@@ -338,7 +338,16 @@ change-harness review begin --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
 ```
 
-The reviewer should try to break the claim, including the declared mutation.
+The reviewer must run at least one mutation the implementer did **not**
+declare. Re-running the declared mutation only re-checks a report you already
+have; a mutation the implementer never tried is the only kind that can find
+what their evidence could not.
+
+The valuable outcome is a mutation that **survives**. A green suite while the
+behaviour can be silently inverted means the guard is real but undefended —
+that is a finding to report, not a badly chosen mutation. Say what survived
+and what it proves.
+
 An approval cannot include an open finding. A candidate or card revision makes
 approval stale; re-handoff and fresh review are required.
 
