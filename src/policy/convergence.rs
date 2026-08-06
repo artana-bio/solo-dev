@@ -1548,8 +1548,11 @@ pub enum CardConvergence {
 ///
 /// A single-variant enum on purpose: the next action is a closed value
 /// programs compare against, not a prose sentence whose wording can drift
-/// between call sites. #74 adds the command that satisfies it; until then
-/// this names what is required, not what already exists.
+/// between call sites. The `disposition` commands satisfy it: every variant
+/// of [`DispositionKind`] answers an escalation, and which of them applies
+/// is the authorized actor's judgment, not something this value narrows.
+/// It stays single-variant for that reason — it says a disposition is
+/// required, never which one.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum NextPermittedAction {

@@ -1098,11 +1098,20 @@ fn refuse_blocking_cycles(
 ///
 /// `policy::convergence::project` refuses its entire view — not just the
 /// mismatched fact — the moment one recorded `convergence.attempt_recorded`
-/// event names a digest other than the currently configured policy's, and it
-/// stays refused forever: nothing in this codebase can rebind an old fact to
-/// a new policy. That rebaseline is issue #74; until it ships, installing a
-/// policy that would orphan existing facts is refused here instead of
-/// leaving the projection permanently unusable.
+/// event names a digest other than the currently configured policy's, and
+/// no rebinding ever makes that fact current again: nothing in this codebase
+/// rewrites a recorded fact onto a new policy.
+///
+/// `disposition rebaseline` resolves that from the other side rather than by
+/// rebinding. It retires the old digest, and the projection reads a fact
+/// under a retired digest as a true record of what happened that no longer
+/// measures today's budget — validated in full, but never counted. A digest
+/// no rebaseline retired still refuses the whole view, so that narrowing is
+/// only ever as wide as an authorized decision made it.
+///
+/// This command is not that decision: it installs a policy and nothing else.
+/// So a policy that would orphan existing facts is still refused here, and
+/// the refusal names the command that can make the change instead.
 ///
 /// # Errors
 ///
@@ -1121,13 +1130,40 @@ fn refuse_orphaning_facts(
     if !has_facts {
         return Ok(());
     }
-    let currently = existing_digest.map_or_else(
-        || "no configured policy".to_owned(),
-        |digest| format!("policy digest {digest}"),
+    // The remedy is only `disposition rebaseline` when there is a digest to
+    // retire. With none configured, that command refuses at its own check 2
+    // ("no policy digest to retire"), so naming it here would send the
+    // operator to a second refusal — the exact defect this message carried
+    // for two releases when it named an issue instead of a command.
+    //
+    // No CLI path reaches that branch: every writer of an
+    // `ATTEMPT_RECORDED_EVENT` is gated on `config.convergence_policy` being
+    // `Some` (`review.rs`, both sites in `handoff.rs`, `card.rs`, and
+    // `integration.rs`), and nothing removes a policy once installed, so a
+    // fact cannot outlive the policy that admitted it. It is kept, and left
+    // untested, as a diagnostic for a hand-edited project document — which
+    // is why its text sends the operator to the control repository rather
+    // than to a command that would only refuse again.
+    let (currently, remedy) = existing_digest.map_or_else(
+        || {
+            (
+                "no configured policy".to_owned(),
+                "No digest is configured to retire, so no rebaseline applies either: these facts name a policy this project no longer accounts for, and the control repository has to be inspected before any policy is installed."
+                    .to_owned(),
+            )
+        },
+        |digest| {
+            (
+                format!("policy digest {digest}"),
+                format!(
+                    "This command installs a policy and nothing else. Run `disposition rebaseline` with `--policy` and `--rationale` to retire {digest} and install this one as a single authorized decision, re-pinning every non-terminal cycle; the facts already recorded stay in the record as history that no longer counts toward a budget."
+                ),
+            )
+        },
     );
     Err(HarnessError::Control {
         reason: format!(
-            "convergence facts are already recorded against {currently}; installing digest {new_digest} would name a foreign digest for every one of them, and the convergence projection refuses its entire view rather than read a fact it cannot bind — permanently, since nothing here can rebaseline an old fact onto a new policy. That rebaseline is issue #74; until it ships, this refuses instead of orphaning the recorded facts."
+            "convergence facts are already recorded against {currently}; installing digest {new_digest} would name a foreign digest for every one of them, and the convergence projection refuses its entire view rather than read a fact it cannot bind. {remedy}"
         ),
         code: ErrorCode::ConfigControlIncompatible,
     })

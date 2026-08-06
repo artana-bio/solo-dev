@@ -2169,6 +2169,29 @@ fn error_message(output: &std::process::Output) -> String {
         .to_owned()
 }
 
+/// Every long option a remedy string spells, in the order it spells them,
+/// whether or not the text wraps it in backticks.
+///
+/// Scanned out of the text rather than compared against a hard-coded copy of
+/// the invocation, so a cross-check measures the remedy against the command's
+/// real `--help` surface rather than a second hand-written claim that would
+/// rot in lockstep with the first and prove nothing.
+///
+/// At file scope rather than inside `disposition_renew` because two refusals
+/// now make the same promise and are pinned the same way: the escalation
+/// remedy (`the_escalation_refusal_names_the_command_that_resolves_it`) and
+/// the orphaned-facts refusal
+/// (`set_convergence_policy_refuses_to_change_a_policy_once_facts_exist`).
+/// Both texts carried an issue number where a command belonged.
+fn flags_named_by(remedy: &str) -> Vec<String> {
+    remedy
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .filter(|word| word.starts_with("--"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Exhausts a card's `review_returns` budget with one declared return, under
 /// a limit-1 policy — the shortest real path to `Escalated`. Leaves the card
 /// `changes_requested`, still holding its work lease. Returns the review's
@@ -3363,18 +3386,222 @@ fn set_convergence_policy_refuses_to_change_a_policy_once_facts_exist() {
         "{output:?}"
     );
     let message = error_message(&output);
+
+    // This refusal used to end "That rebaseline is issue #74; until it
+    // ships, this refuses instead of orphaning the recorded facts." — true
+    // when written, silently false from the moment `disposition rebaseline`
+    // shipped, and pinned in place by an assertion that required the `#74`
+    // this now forbids. A test can hold a defect still as easily as it can
+    // catch one; the assertion below is the same shape
+    // `the_escalation_refusal_names_the_command_that_resolves_it` settled
+    // on for the identical defect in `ErrorCode::convergence_recovery`,
+    // and it is checked first for the same reason: an operator-facing
+    // refusal that hands back an issue reference always contains a `#`,
+    // and one that hands back a real command never needs to.
     assert!(
-        message.contains("#74"),
-        "the refusal must name #74 as where the rebaseline comes from: {message}"
+        !message.contains('#'),
+        "the refusal must hand the operator a command, not an issue to go read: {message}"
+    );
+    assert!(
+        message.contains("disposition rebaseline"),
+        "the refusal must name the command that can make this change: {message}"
     );
     assert!(
         message.contains("entire view"),
         "the refusal must say why: the projection rejects the whole view, not just the mismatched fact: {message}"
     );
+
+    // Cross-checked against the real `--help` surface, walking every flag
+    // the message names, so a fabricated flag fails here even though it
+    // would satisfy every assertion above. `tests/recovery_text.rs` cannot
+    // reach this text at all: it scans `src/error.rs` recovery strings, and
+    // this is a `HarnessError::Control` reason built in `src/commands/`.
+    let help = Workspace::run(&[
+        "disposition".to_owned(),
+        "rebaseline".to_owned(),
+        "--help".to_owned(),
+    ]);
+    assert!(
+        help.status.success(),
+        "the refusal names `disposition rebaseline`, so that command must exist: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let help = String::from_utf8_lossy(&help.stdout).into_owned();
+    let named = flags_named_by(&message);
+    assert!(
+        named.iter().any(|flag| flag == "--policy")
+            && named.iter().any(|flag| flag == "--rationale"),
+        "the refusal must spell the flags an operator has to type: named {named:?} in {message}"
+    );
+    for flag in &named {
+        assert!(
+            help.contains(flag.as_str()),
+            "the refusal spells `{flag}`, which `disposition rebaseline` does not accept: {help}"
+        );
+    }
     assert_eq!(
         stored_project_document(&workspace)["convergence_policy"]["cycle_limits"]["integration_failures"],
         serde_json::json!(3),
         "the original policy must remain installed, unchanged"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "a refused change must not move the control repository's head"
+    );
+}
+
+#[test]
+fn set_convergence_policy_refuses_when_facts_exist_but_no_policy_is_configured() {
+    // `refuse_orphaning_facts` computes its remedy from `existing_digest:
+    // Option<&Digest>`, and the two branches say different things on
+    // purpose: `disposition rebaseline` retires a *configured* digest, so
+    // with none configured it would refuse at its own check 2 ("no policy
+    // digest to retire") — naming it here would hand the operator a second
+    // dead end, the exact defect this file's sibling test above exists to
+    // keep out of the *other* branch. That distinction is a comment in
+    // `src/commands/project.rs`, not yet a behavior any test pins — the one
+    // above only ever drives `existing_digest` to `Some`. This test drives
+    // it to `None` instead, with a fact still on record.
+    //
+    // No CLI path produces that shape: every writer of an
+    // `ATTEMPT_RECORDED_EVENT` is gated on `config.convergence_policy` being
+    // `Some`, and nothing removes a policy once installed, so a fact cannot
+    // outlive the policy that admitted it — exactly what the function's own
+    // doc comment says. It is built here the same way
+    // `Workspace::tamper_card_state` and `tamper_cycle_status` build the
+    // other shapes no shipped command can reach: direct file surgery on the
+    // control repository, standing in for the hand-edited project document
+    // that comment names as this branch's only reachable caller.
+    let workspace = opened_with_policy(3, 3);
+    open_review_round(&workspace, "F-001");
+    let path = write_verdict(&workspace, "F-001", RETURN_WITH_ACCEPTANCE_DEFECT_REASON);
+    let recorded = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer",
+    ]);
+    assert!(
+        recorded.status.success(),
+        "the fixture return must be recorded: {}",
+        String::from_utf8_lossy(&recorded.stdout)
+    );
+    assert_eq!(
+        attempt_recorded_events(&workspace).len(),
+        1,
+        "the fixture must leave exactly one recorded fact"
+    );
+
+    // Same isolation the sibling test above performs, for the same reason:
+    // an active C-001 would trip `refuse_blocking_cycles` first, and this
+    // test would never reach the orphaned-facts check it exists to pin.
+    workspace.cycle(&[
+        "abandon",
+        "--cycle-id",
+        "C-001",
+        "--reason",
+        "isolate the facts check from the cycle check",
+    ]);
+
+    // The hand edit: strips `convergence_policy` back out of the project
+    // document. The fact recorded above stays untouched in the event
+    // store — nothing here touches `control/events/` — so the project now
+    // has a recorded fact and no policy at all to have recorded it against.
+    // Left uncommitted on purpose, matching `tamper_card_state` and
+    // `tamper_cycle_status`: this simulates an edit made outside the
+    // harness, not a step the harness itself performed. `ControlRepository::
+    // project()` reads this file with a plain `fs::read_to_string`, so the
+    // command under test sees it whether or not it is committed —
+    // `a_cycle_in_a_terminal_state_does_not_block_the_install` already
+    // relies on exactly that when it runs a real `set-convergence-policy`
+    // straight after `tamper_cycle_status` leaves the tree dirty.
+    let project_path = workspace.control.join("project/project.json");
+    let mut document = stored_project_document(&workspace);
+    document
+        .as_object_mut()
+        .expect("project.json is a JSON object")
+        .remove("convergence_policy");
+    fs::write(
+        &project_path,
+        format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+    )
+    .unwrap();
+    assert!(
+        !stored_project_document(&workspace)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "the hand edit must actually remove the configured policy before the command runs"
+    );
+    let before = workspace.control_head();
+
+    let policy = convergence_policy_document(3, 5);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "installing a policy over facts recorded with none configured must still refuse: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        error_code(&output),
+        "CH-CONFIG-CONTROL-INCOMPATIBLE",
+        "{output:?}"
+    );
+    let message = error_message(&output);
+
+    // The property this test exists for. With no policy configured,
+    // `disposition rebaseline` has no digest to retire and would refuse at
+    // its own second check, so naming it would trade this refusal for
+    // another one instead of resolving anything — the same defect the
+    // sibling test above pins out of the digest-configured branch, now
+    // pinned out of this one too. A mutation that collapses both branches
+    // to the digest branch's remedy leaves that sibling test green — it
+    // never drives `existing_digest` to `None` — and is caught here.
+    assert!(
+        !message.contains("disposition rebaseline"),
+        "with no policy configured there is no digest to retire, so the refusal must not send the operator to a command that would only refuse again: {message}"
+    );
+
+    // Two phrases lifted from the real remedy, chosen only after counting
+    // how often each candidate appears across the *whole* message, mutated
+    // and not. `"no configured policy"` was the first candidate tried and
+    // the one rejected: it is `{currently}`'s value, part of the prefix
+    // both branches share, so it reads exactly once in this message both
+    // before and after the mutation above and cannot tell the two apart.
+    // These two live only inside the branch-specific remedy sentence
+    // (verified the same way: zero occurrences elsewhere in this message,
+    // zero in the digest-configured branch's message, and zero once the
+    // mutation replaces the sentence they come from), so either one
+    // disappearing is the mutation, not noise.
+    assert!(
+        message.contains("no rebaseline applies either"),
+        "the refusal must say why naming the command would not help: {message}"
+    );
+    assert!(
+        message.contains("the control repository has to be inspected"),
+        "the refusal must send the operator to inspect the control repository instead of to a command that would only refuse again: {message}"
+    );
+    assert!(
+        message.contains("entire view"),
+        "the refusal must still say why: the projection rejects the whole view, not just the mismatched fact: {message}"
+    );
+
+    assert!(
+        !stored_project_document(&workspace)
+            .as_object()
+            .expect("project.json is a JSON object")
+            .contains_key("convergence_policy"),
+        "a refused install must leave the hand-edited project document alone"
     );
     assert_eq!(
         workspace.control_head(),
@@ -3857,23 +4084,6 @@ mod disposition_renew {
             String::from_utf8_lossy(&after.stdout),
             String::from_utf8_lossy(&after.stderr)
         );
-    }
-
-    /// Every long option a remedy string spells, in the order it spells
-    /// them, whether or not the text wraps it in backticks.
-    ///
-    /// Scanned out of the text rather than compared against a hard-coded
-    /// copy of the invocation, so the cross-check below measures the
-    /// remedy against the command's real `--help` surface rather than a
-    /// second hand-written claim that would rot in lockstep with the first
-    /// and prove nothing.
-    fn flags_named_by(remedy: &str) -> Vec<String> {
-        remedy
-            .split_whitespace()
-            .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-            .filter(|word| word.starts_with("--"))
-            .map(str::to_owned)
-            .collect()
     }
 
     #[test]
