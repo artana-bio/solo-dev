@@ -283,6 +283,142 @@ fn a_result_that_cannot_be_printed_does_not_turn_a_committed_activation_into_a_p
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn a_json_error_that_cannot_be_printed_reports_its_category_instead_of_panicking() {
+    // `card status --card-id F-001` on a workspace where F-001 was never
+    // created fails before touching any state: `stored_draft` finds no
+    // draft file on disk and returns `CH-PRECONDITION-NOT-FOUND` (exit 4),
+    // without the command having opened anything for writing. The JSON
+    // error envelope is written to stdout; a caller that closed stdout must
+    // still see PRECONDITION, not a panic that reads as a harness crash.
+    let workspace = opened();
+    let before = workspace.control_head();
+
+    // A pipe with no reader is required to create a stable EPIPE. Closing
+    // descriptor 1 instead can cause a later file open to reuse it.
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "card",
+            "status",
+            "--output",
+            "json",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--card-id",
+            "F-001",
+        ])
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the CLI should start");
+    let output = child.wait_with_output().expect("the CLI should finish");
+
+    // The assertion the test exists for: a bare `println!` (or a "fix" that
+    // still panics on the nested render-failure arm) exits 101 here instead,
+    // because the write panics before `main` ever reaches
+    // `ExitCode::from(error.category())`.
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "an unwritable JSON error envelope must still report PRECONDITION (4), not panic (101): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // And the half that makes the assertion above mean something: a
+    // reporting path that mutated control state on its way to failing —
+    // for instance, one that tried to persist a fallback record before
+    // giving up on stdout — would move this SHA, and would be a worse
+    // defect than the crash it was trying to avoid.
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "a report that could not be printed must not touch control state either"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_text_error_that_cannot_be_printed_reports_its_category_instead_of_panicking() {
+    // Same failure, text mode: `render_text_error` writes the "error: ..."
+    // line to stderr instead of the envelope going to stdout (text is the
+    // default format, so `--output` is omitted here), so it is stderr that
+    // is broken in this test and stdout that is captured for inspection.
+    let workspace = opened();
+    let before = workspace.control_head();
+
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "card",
+            "status",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--card-id",
+            "F-001",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(writer))
+        .spawn()
+        .expect("the CLI should start");
+    let output = child.wait_with_output().expect("the CLI should finish");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "an unwritable text error line must still report PRECONDITION (4), not panic (101); stdout carried: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "a report that could not be printed must not touch control state either"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_malformed_invocation_that_cannot_be_printed_reports_usage_instead_of_panicking() {
+    // `parse_or_report` in `src/main.rs` renders the JSON envelope for a clap
+    // parse failure through the same locked-handle-with-discarded-result
+    // pattern as the write above, but nothing had exercised *this* site under
+    // a broken pipe. Unlike the other broken-pipe tests in this file, there is
+    // no workspace or control state to check: `Cli::try_parse` fails before
+    // any of that is ever resolved, so the exit code is the whole assertion.
+    //
+    // `project status --output json`, with no `--control` flag and
+    // `CHANGE_HARNESS_CONTROL` scrubbed from the environment, is the same
+    // malformed invocation `an_argument_error_still_honours_the_json_contract`
+    // in `tests/cli.rs` drives under a normal, readable pipe: clap's own
+    // "required argument `--control` was not provided", asked for in JSON.
+    //
+    // The assertion this test exists for: a bare `println!` in place of the
+    // locked write here exits 101 instead, because the write panics before
+    // `parse_or_report` ever returns `Err(ExitCode::from(ExitCategory::Usage))`.
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args(["project", "status", "--output", "json"])
+        .env_remove("CHANGE_HARNESS_CONTROL")
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the CLI should start");
+    let output = child.wait_with_output().expect("the CLI should finish");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unwritable JSON envelope for a parse failure must still report USAGE (2), not panic (101): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Drives a card to a recorded review carrying the given open finding
 /// locations, leaving it ready for the next round.
 fn review_round(

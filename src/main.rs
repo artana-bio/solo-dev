@@ -57,9 +57,23 @@ fn parse_or_report() -> Result<Cli, ExitCode> {
         reason: error.render().to_string().trim().to_owned(),
         code: ErrorCode::UsageInvalidArguments,
     };
+    // Nothing has executed yet — parsing itself is what failed — so `Usage`
+    // below is the whole truth about this invocation. `println!`/`eprintln!`
+    // panic on a broken pipe (exit 101), which would misreport a malformed
+    // invocation as a harness crash to a caller that stopped reading.
+    // Written through a locked handle with the write result discarded,
+    // following the pattern #16 established for output after a command
+    // succeeds (commit 661bc60): the exit code decided below must not
+    // depend on whether anyone was still reading.
     match CommandErrorEnvelope::new(attempted.join("."), &failure).render() {
-        Ok(rendered) => println!("{rendered}"),
-        Err(nested) => eprintln!("error: {nested}"),
+        Ok(rendered) => {
+            let mut stdout = io::stdout().lock();
+            let _ = writeln!(stdout, "{rendered}");
+        }
+        Err(nested) => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "error: {nested}");
+        }
     }
     Err(ExitCode::from(ExitCategory::Usage))
 }
@@ -121,14 +135,33 @@ fn main() -> ExitCode {
             ExitCode::from(ExitCategory::Success)
         }
         Err(error) => {
+            // Every path that reaches here returns before committing any
+            // mutation, so `error.category()` below is the whole truth about
+            // what happened. `println!`/`eprintln!` panic on a broken pipe
+            // (exit 101), which would misreport that stable category as a
+            // harness crash to a caller that stopped reading — the same
+            // failure #16 fixed for a successful result (commit 661bc60),
+            // applied here to the error envelope and the text-mode line.
+            // Written through a locked handle with the write result
+            // discarded, so an unread pipe can never change the exit code
+            // chosen below.
             match format {
                 // The error envelope is a machine-readable result, not a
                 // diagnostic, so it goes to stdout where a JSON consumer reads.
                 OutputFormat::Json => match CommandErrorEnvelope::new(command, &error).render() {
-                    Ok(rendered) => println!("{rendered}"),
-                    Err(nested) => eprintln!("error: {nested}"),
+                    Ok(rendered) => {
+                        let mut stdout = io::stdout().lock();
+                        let _ = writeln!(stdout, "{rendered}");
+                    }
+                    Err(nested) => {
+                        let mut stderr = io::stderr().lock();
+                        let _ = writeln!(stderr, "error: {nested}");
+                    }
                 },
-                OutputFormat::Text => eprintln!("error: {}", render_text_error(&error)),
+                OutputFormat::Text => {
+                    let mut stderr = io::stderr().lock();
+                    let _ = writeln!(stderr, "error: {}", render_text_error(&error));
+                }
             }
             ExitCode::from(error.category())
         }
