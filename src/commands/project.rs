@@ -1086,7 +1086,7 @@ fn refuse_blocking_cycles(
         .join(", ");
     Err(HarnessError::Control {
         reason: format!(
-            "{} cycle(s) could still be compared against `project_revision` and would start failing that comparison once this policy changes the project's digest: {named}. Close or abandon them, or start a new cycle instead, before changing the {policy_name}.",
+            "{} cycle(s) could still be compared against `project_revision` and would start failing that comparison once this policy changes the project's digest: {named}. Abandon them before changing the {policy_name}.",
             offenders.len()
         ),
         code: ErrorCode::PolicyInvalidCycle,

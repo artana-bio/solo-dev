@@ -3860,6 +3860,210 @@ fn a_draft_cycle_does_not_block_while_every_unreachable_status_does() {
     );
 }
 
+// #107: the refusal above used to end "Close or abandon them, or start a
+// new cycle instead, before changing the {policy}." An operator blocked by
+// exactly one sealed cycle followed the "start a new cycle" clause, started
+// a second cycle, and the very next attempt named two offenders instead of
+// one. `refuse_blocking_cycles` walks every cycle in the control repository
+// with no notion of "current cycle" (see its own doc comment above
+// `all_cycles`), so a freshly created cycle can only ever sit alongside an
+// existing offender: it starts `draft`, which does not block, but the
+// moment it is activated — the only way to make it useful — it becomes a
+// second one.
+//
+// #107 review round two found a second, narrower defect in the clause that
+// was left behind: "Close" names `CycleStatus::Closed`, and no command in
+// this codebase can ever produce it (see `remedy_argv`'s doc comment
+// below). Naming it is the same category of defect as "start a new cycle"
+// — advice nobody can carry out — just milder, since the operator has
+// "abandon" to fall back on rather than being driven backwards. The three
+// tests below are #107's evidence: the first pins the false "start a new
+// cycle" clause gone, the second pins the unreachable "close" gone, the
+// third pins that what remains ("abandon") is true.
+#[test]
+fn the_policy_change_refusal_does_not_advise_starting_a_new_cycle() {
+    let workspace = opened();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "a single blocking cycle must still refuse: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE", "{output:?}");
+    let message = error_message(&output);
+    assert!(
+        message.contains("C-001") && message.contains("active"),
+        "sanity: the refusal must still name the one offending cycle: {message}"
+    );
+    assert!(
+        !message.contains("start a new cycle"),
+        "the refusal must not advise an action that can only ever add a second offender \
+         alongside the first, never remove it: {message}"
+    );
+}
+
+// `following_the_refusal_reaches_a_state_where_the_policy_installs` below
+// proves that *some* remedy the refusal names actually works — it cannot,
+// on its own, prove that *every* named remedy does, because
+// `perform_first_named_remedy` stops at the first one it recognizes and
+// can execute. A message reading "Close or abandon them" still passes that
+// test today (it finds "abandon" and stops looking), even though "close"
+// cannot be carried out. This test is what actually pins "close" gone; see
+// #107's report for why the two are deliberately separate tests rather
+// than one broadened assertion.
+#[test]
+fn the_policy_change_refusal_does_not_advise_closing_a_cycle() {
+    let workspace = opened();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let output = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+
+    assert!(
+        !output.status.success(),
+        "a single blocking cycle must still refuse: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let message = error_message(&output);
+    assert!(
+        !message.to_lowercase().contains("close"),
+        "the refusal must not name an action no command in this codebase can perform \
+         (`CycleStatus::Closed` has no producer — see `remedy_argv`'s doc comment below): \
+         {message}"
+    );
+}
+
+/// Remedies this test can actually carry out against a blocking cycle,
+/// mapped to the `cycle` subcommand argv that performs them.
+///
+/// Deliberately excludes `close`: no command in this codebase can ever
+/// produce `CycleStatus::Closed` — `src/commands/cycle.rs`'s `store` has
+/// exactly five call sites (create/activate/seal/declare-group/abandon) and
+/// none of them writes `closed`, the same fact
+/// `a_cycle_in_a_terminal_state_does_not_block_the_install` above already
+/// establishes and leans on `tamper_cycle_status` to simulate. The refusal
+/// no longer offers `close` as of #107 review round two
+/// (`the_policy_change_refusal_does_not_advise_closing_a_cycle` above pins
+/// that); `close` stays out of this map on purpose anyway, so that if a
+/// future edit reintroduces the word, `perform_first_named_remedy` still
+/// cannot act on it and `following_the_refusal_reaches_a_state_where_the_policy_installs`
+/// keeps testing only remedies this harness can really perform.
+fn remedy_argv<'a>(verb: &str, cycle_id: &'a str) -> Option<Vec<&'a str>> {
+    match verb {
+        "abandon" => Some(vec![
+            "abandon",
+            "--cycle-id",
+            cycle_id,
+            "--reason",
+            "following the refusal's own remedy",
+        ]),
+        "seal" => Some(vec!["seal", "--cycle-id", cycle_id]),
+        _ => None,
+    }
+}
+
+/// Finds the remedy verb `message` names first (earliest byte position,
+/// case-insensitively) among the verbs [`remedy_argv`] knows how to
+/// execute, and runs it against `cycle_id` — so *what* this performs comes
+/// from parsing `message`, not from an assumption hard-coded into the test
+/// that calls it.
+///
+/// #107 §9 mutation 2 (advise a different, non-clearing action, such as
+/// sealing) changes what this function does without changing a line of it:
+/// it recognizes `seal` too, and sealing an already-`active` cycle succeeds
+/// without leaving the blocking set (`Sealed` blocks exactly like `Active`
+/// does), so the caller's later re-attempt is refused again and the
+/// mutation is caught one level up, at the "policy installs" assertion —
+/// not here.
+fn perform_first_named_remedy(workspace: &Workspace, message: &str, cycle_id: &str) {
+    let lowercase = message.to_lowercase();
+    let chosen = ["abandon", "seal"]
+        .into_iter()
+        .filter_map(|verb| lowercase.find(verb).map(|position| (position, verb)))
+        .min_by_key(|&(position, _)| position);
+
+    let Some((_, verb)) = chosen else {
+        panic!(
+            "the refusal names no remedy this test knows how to execute (checked for \
+             \"abandon\" and \"seal\"): {message}"
+        );
+    };
+    let argv = remedy_argv(verb, cycle_id)
+        .expect("every verb this function can choose has a matching remedy_argv arm");
+
+    let output = workspace.cycle_raw(&argv);
+    assert!(
+        output.status.success(),
+        "performing the refusal's own remedy (`{verb}`) must itself succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn following_the_refusal_reaches_a_state_where_the_policy_installs() {
+    // The test that matters (#107 §8.2): it does not replay a fixed script
+    // ("call `cycle abandon`") — it reads the refusal's own text and
+    // performs whichever remedy the text names first, among the remedies
+    // `perform_first_named_remedy` can actually execute. It proves *a*
+    // named remedy works, not that *every* named remedy does — that is
+    // `the_policy_change_refusal_does_not_advise_closing_a_cycle` above's
+    // job, not this test's; see that test and `perform_first_named_remedy`'s
+    // doc comment for why `close` is excluded from what this can execute.
+    let workspace = opened();
+    let policy = convergence_policy_document(3, 3);
+    let policy_path = write_json(&workspace, "policy.json", &policy);
+
+    let refused = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+    assert!(
+        !refused.status.success(),
+        "the fixture must start out refused, or the rest of this test proves nothing: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(
+        error_code(&refused),
+        "CH-POLICY-INVALID-CYCLE",
+        "{refused:?}"
+    );
+    let message = error_message(&refused);
+
+    perform_first_named_remedy(&workspace, &message, "C-001");
+
+    let retried = Workspace::run(&set_convergence_policy_args(
+        &workspace,
+        &policy_path,
+        false,
+    ));
+    assert!(
+        retried.status.success(),
+        "following exactly what the refusal now says must reach a state where the policy \
+         installs: {}{}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr),
+    );
+    assert_eq!(
+        stored_project_document(&workspace)["convergence_policy"],
+        policy,
+        "the policy named in the original, refused attempt must be the one now installed"
+    );
+}
+
 // 74-2: `disposition renew`, run by an actor authorized under
 // `final_authorization_policy.authorizer_actor_ids`, against a card
 // currently escalated in the dimension it names, appends one bound
