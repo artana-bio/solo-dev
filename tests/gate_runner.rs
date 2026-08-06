@@ -36,6 +36,24 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+/// Extracts every backtick-delimited span from `text`, in source order.
+/// Mirrors the extraction rule `tests/recovery_text.rs` uses to check
+/// command references named in `src/error.rs`'s recovery text against the
+/// real CLI, applied here to a refusal's `reason` text instead.
+fn backtick_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            break;
+        };
+        spans.push(&after_open[..close]);
+        rest = &after_open[close + 1..];
+    }
+    spans
+}
+
 /// Executes one known gate through the only production-capable path: an exact
 /// holder reservation followed by the governed disposable-source run.
 fn reserved_run_raw(workspace: &Workspace, card_id: &str, gate_id: &str) -> std::process::Output {
@@ -475,6 +493,75 @@ fn running_a_gate_without_an_allocation_is_a_precondition_failure() {
 
     let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
     assert_eq!(output.status.code(), Some(4));
+}
+
+/// #105 acceptance: the refusal names the command that produces the missing
+/// reservation. `gate`, unlike `gate_raw`, silently reserves on behalf of any
+/// `run` fixture that omits `--reservation-id` (see tests/support/mod.rs), so
+/// a test written against `gate` could never reach this refusal — only
+/// `gate_raw` passes the arguments through untouched.
+///
+/// `message.contains("gate reserve")` alone would pass for any string
+/// containing those two words, including one that names a flag `gate
+/// reserve` does not have — it proves the command is *present*, not that it
+/// *works*. The extraction-and-run below, the same mechanism
+/// `tests/recovery_text.rs` uses for command references in `src/error.rs`,
+/// proves the printed invocation is real: `clap` validates the subcommand
+/// path and every flag before `--help` short-circuits, so a corrupted
+/// subcommand or a corrupted flag both fail argument parsing, without
+/// needing a control repository or any fixture state.
+#[test]
+fn gate_run_without_a_reservation_names_the_command_that_makes_one() {
+    let workspace = allocated();
+    let output = workspace.gate_raw(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    assert_eq!(output.status.code(), Some(5), "policy category is exit 5");
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("gate reserve"),
+        "the refusal must name the command that produces a reservation: {message}"
+    );
+
+    // Extract the exact printed invocation rather than hardcoding the
+    // expected string — asserting the message equals a literal typed here
+    // would only prove two copies of the same text match.
+    let spans = backtick_spans(message);
+    assert_eq!(
+        spans.len(),
+        1,
+        "expected exactly one backticked command reference in the refusal: {message}"
+    );
+    let invocation = spans[0];
+    let args: Vec<&str> = invocation.split_whitespace().collect();
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args(&args)
+        .arg("--help")
+        .output()
+        .expect("the CLI binary should start");
+    assert!(
+        help.status.success(),
+        "the refusal names `{invocation}`, which is not a real command shape (exit {:?}):\n\
+         stdout: {}\nstderr: {}",
+        help.status.code(),
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr),
+    );
+}
+
+/// The no-false-positive counterpart: a properly reserved run must still
+/// succeed. Without this, a change that refused every `gate run` (for
+/// example, deleting the `reservation_id.is_none()` guard) would also pass
+/// the test above.
+#[test]
+fn gate_run_with_a_reservation_is_unaffected() {
+    let workspace = allocated();
+    let output = reserved_run_raw(&workspace, "F-001", "gate.unit");
+    assert!(
+        output.status.success(),
+        "a properly reserved run must still succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
