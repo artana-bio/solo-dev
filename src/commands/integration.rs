@@ -1335,6 +1335,21 @@ fn report_integration(
     if let Some(landing) = &record.landing_sha {
         let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nlanding commit: {landing}"));
     }
+    // #112: `land` builds a real artifact but is not a transition (see
+    // `IntegrationStatus`'s own doc comment), so a landed integration still
+    // reports `prepared` above — indistinguishable from one that was never
+    // merged unless this line says which. Gated on `record.landing_sha`
+    // rather than resolving `refs/harness/landing/<id>` in git: that field's
+    // own doc comment is why it exists on the record at all instead of
+    // being re-derived from the ref ("a ref can be deleted, and the record
+    // is what promotion reloads"), and `run_decision_packet` already uses
+    // this exact field and condition to reach this exact same next action.
+    let next_permitted_action = (record.status == IntegrationStatus::Prepared
+        && record.landing_sha.is_some())
+    .then_some("integration.verify");
+    if let Some(next_action) = next_permitted_action {
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nnext action: {next_action}"));
+    }
 
     CommandOutcome::new(
         command,
@@ -1354,6 +1369,7 @@ fn report_integration(
             "integration_head": record.integration_head,
             "integration_tree": record.integration_tree,
             "landing_sha": record.landing_sha,
+            "next_permitted_action": next_permitted_action,
             "members": record.members,
         }),
     )
@@ -3803,6 +3819,39 @@ fn require_control_anchors_intact(
     })
 }
 
+/// Builds the refusal for "the integration is not yet in the status a
+/// status-gated command requires," adding #112's own recovery when the
+/// reason is exactly the landed-but-unverified case: a built landing
+/// commit that nothing has verified yet, the one status the refusing
+/// command reaches with an unambiguous next command regardless of which
+/// later status it was actually checking for. Every other status (draft,
+/// verified-but-not-reviewed, already accepted, ...) has a different or
+/// non-obvious next step, so those keep the plain code default rather than
+/// guessing.
+///
+/// Shared by `check_promotion` below and `acceptance::require_reviewed`,
+/// which hit this identical case from a different required status —
+/// factored out once duplicating it a second time made `check_promotion`
+/// exceed clippy's line limit.
+pub(crate) fn status_gate_refusal(
+    reason: String,
+    record: &IntegrationRecord,
+    unverified_recovery: &'static str,
+) -> HarnessError {
+    if record.status == IntegrationStatus::Prepared && record.landing_sha.is_some() {
+        HarnessError::ControlWithRecovery {
+            reason,
+            code: ErrorCode::PolicyInvalidTransition,
+            recovery: unverified_recovery,
+        }
+    } else {
+        HarnessError::Control {
+            reason,
+            code: ErrorCode::PolicyInvalidTransition,
+        }
+    }
+}
+
 /// Verifies everything Section 13.6 requires before the authority is touched.
 ///
 /// Shared between `preview_promote` and `run_promote`, so both check the
@@ -3826,14 +3875,16 @@ fn check_promotion(
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(control, config, &record.cycle_id)?;
     if record.status != IntegrationStatus::Accepted {
-        return Err(HarnessError::Control {
-            reason: format!(
-                "integration {} is `{}`; only an accepted integration may be promoted",
-                record.integration_id,
-                record.status.name()
-            ),
-            code: ErrorCode::PolicyInvalidTransition,
-        });
+        let reason = format!(
+            "integration {} is `{}`; only an accepted integration may be promoted",
+            record.integration_id,
+            record.status.name()
+        );
+        return Err(status_gate_refusal(
+            reason,
+            record,
+            "Run `integration verify` before promotion can be authorized.",
+        ));
     }
     let Some(landing_sha) = record.landing_sha.clone() else {
         return Err(HarnessError::Control {

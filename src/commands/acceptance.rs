@@ -15,7 +15,7 @@ use crate::{
         card::{load_card, store_card_state},
         integration::{
             load_cycle, load_integration, load_verification, member_implementers,
-            require_cycle_convergence_budget, require_no_pending_exception,
+            require_cycle_convergence_budget, require_no_pending_exception, status_gate_refusal,
         },
         transaction::with_transaction,
     },
@@ -576,18 +576,29 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 }
 
 /// Refuses an acceptance for an integration that has not been reviewed.
+///
+/// #112: the refusal carries its own recovery — see `status_gate_refusal`
+/// in `commands/integration.rs` — exactly when the reason is a built
+/// landing commit nothing has verified yet, the one non-`Reviewed` status
+/// with an unambiguous next command. `acceptance record` on an
+/// already-accepted integration reaches this same refusal from a later
+/// status, where `integration verify` would be wrong advice since
+/// verification already happened; that and every other non-`Reviewed`
+/// status keep the plain code default rather than guessing.
 fn require_reviewed(record: &IntegrationRecord) -> Result<(), HarnessError> {
     if record.status == IntegrationStatus::Reviewed {
         return Ok(());
     }
-    Err(HarnessError::Control {
-        reason: format!(
-            "integration {} is `{}`; acceptance follows an integration review",
-            record.integration_id,
-            record.status.name()
-        ),
-        code: ErrorCode::PolicyInvalidTransition,
-    })
+    let reason = format!(
+        "integration {} is `{}`; acceptance follows an integration review",
+        record.integration_id,
+        record.status.name()
+    );
+    Err(status_gate_refusal(
+        reason,
+        record,
+        "Run `integration verify` before recording acceptance.",
+    ))
 }
 
 /// Turns an acceptance into the command's outcome.
