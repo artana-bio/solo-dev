@@ -22,6 +22,35 @@ pub const LEASE_DIR: &str = "leases";
 /// Schema identifier for the worktree locator file.
 pub const WORKTREE_LINK_SCHEMA: &str = "harness.worktree-link/v1";
 
+/// How long a held lease may show no recorded sign of life before `project
+/// status` and `project recover` (`src/commands/project.rs`) report it as
+/// silent. See #80.
+///
+/// Fixed, not policy-configurable. Every knob this crate lets an operator
+/// tune lives in `ProjectConfig` and its policy types under `src/config/`,
+/// which #80's frozen file scope does not include, so there is nowhere to
+/// hang a per-project override without widening that scope — and a fixed
+/// constant beside the struct it governs is the simpler choice on its own
+/// merits, needing no plumbing through `project init`/`set-*-policy` for a
+/// first cut at a problem nothing currently detects at all.
+///
+/// Thirty minutes is argued from the incident that motivated this card
+/// (#80 §1): an actor that hung for 35 minutes went unnoticed for the rest
+/// of a session. Set below that so the same failure would already have
+/// been visible, while staying well above the gap between an ordinary
+/// checkpoint and the next — this repository's own `cargo test`/`cargo
+/// clippy` runs complete in low single-digit minutes.
+///
+/// What this misses: an actor who checkpoints every 29 minutes while doing
+/// nothing in between is indistinguishable from one working normally. This
+/// measures *recorded* activity, not truthful activity — see D-013 on why
+/// a declared actor identity is never proven, which is the same limit
+/// applied to declared progress. It also never flags a lease under thirty
+/// minutes old that has not yet checkpointed: `granted_at` itself counts
+/// as the first sign of life, so a card is only ever reported after a full
+/// threshold of silence, never merely for being new.
+pub const SILENT_LEASE_THRESHOLD_SECONDS: i64 = 30 * 60;
+
 /// Whether a lease is still held.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +114,38 @@ impl LeaseRecord {
     #[must_use]
     pub const fn is_held(&self) -> bool {
         matches!(self.status, LeaseStatus::Held)
+    }
+
+    /// The most recent instant this lease showed a recorded sign of life:
+    /// the newest progress note, or `granted_at` when none has been
+    /// recorded yet.
+    ///
+    /// Folds across every timestamp on the record rather than trusting
+    /// `progress`'s last element to already be the newest, so a note
+    /// appended out of order can never make this go backwards.
+    #[must_use]
+    pub fn last_activity_at(&self) -> Timestamp {
+        self.progress
+            .iter()
+            .map(|note| note.recorded_at)
+            .fold(self.granted_at, Timestamp::max)
+    }
+
+    /// True when this is a held lease with no recorded sign of life for at
+    /// least [`SILENT_LEASE_THRESHOLD_SECONDS`], as of `now`.
+    ///
+    /// A released lease is never silent, regardless of age: nobody is
+    /// waiting on a released allocation, so there is nothing here for an
+    /// operator to check on. This says nothing about *why* a held one is
+    /// quiet — a slow, legitimate task and an actor who is not coming back
+    /// look identical from here, on purpose. See `work reclaim`
+    /// (`src/commands/work.rs`) for the operator judgment this
+    /// deliberately does not make.
+    #[must_use]
+    pub fn is_silent(&self, now: Timestamp) -> bool {
+        self.is_held()
+            && now.unix_seconds() - self.last_activity_at().unix_seconds()
+                >= SILENT_LEASE_THRESHOLD_SECONDS
     }
 }
 
@@ -271,5 +332,104 @@ mod tests {
         let mut value = serde_json::to_value(lease()).unwrap();
         value["surprise"] = serde_json::json!(1);
         assert!(serde_json::from_value::<LeaseRecord>(value).is_err());
+    }
+
+    /// #80: a lease with no checkpoints is not silent until a full
+    /// threshold has elapsed since `granted_at` itself, and is silent from
+    /// the instant it has.
+    #[test]
+    fn a_lease_with_no_checkpoints_turns_silent_exactly_at_the_threshold() {
+        let record = lease(); // granted_at = stamp(), progress = []
+        let base = stamp().unix_seconds();
+
+        let one_second_short =
+            FixedClock::at_unix_seconds(base + SILENT_LEASE_THRESHOLD_SECONDS - 1)
+                .unwrap()
+                .now();
+        assert!(
+            !record.is_silent(one_second_short),
+            "must not be silent one second before the threshold"
+        );
+
+        let exactly_at_threshold =
+            FixedClock::at_unix_seconds(base + SILENT_LEASE_THRESHOLD_SECONDS)
+                .unwrap()
+                .now();
+        assert!(
+            record.is_silent(exactly_at_threshold),
+            "must be silent the instant the threshold is reached"
+        );
+    }
+
+    /// #80 §10 mutation 3's proof: a checkpoint after `granted_at` is what
+    /// `last_activity_at` must track, not `granted_at` alone. A lease
+    /// granted long enough ago to be silent on `granted_at` alone must read
+    /// as active again once a recent checkpoint lands.
+    #[test]
+    fn a_recent_progress_note_counts_as_a_sign_of_life() {
+        let mut record = lease();
+        let base = stamp().unix_seconds();
+        let checkpoint_at = FixedClock::at_unix_seconds(base + SILENT_LEASE_THRESHOLD_SECONDS - 5)
+            .unwrap()
+            .now();
+        record.progress.push(ProgressNote {
+            recorded_at: checkpoint_at,
+            note: "still going".to_owned(),
+            head_sha: None,
+        });
+
+        // Elapsed since `granted_at` alone already exceeds the threshold;
+        // elapsed since the checkpoint does not.
+        let query_at = FixedClock::at_unix_seconds(base + SILENT_LEASE_THRESHOLD_SECONDS + 5)
+            .unwrap()
+            .now();
+        assert_eq!(record.last_activity_at(), checkpoint_at);
+        assert!(
+            !record.is_silent(query_at),
+            "a checkpoint 10s ago must count as a sign of life even though granted_at is old"
+        );
+    }
+
+    #[test]
+    fn last_activity_at_is_the_maximum_recorded_timestamp_even_written_out_of_order() {
+        let mut record = lease();
+        let base = stamp().unix_seconds();
+        let earlier = FixedClock::at_unix_seconds(base + 100).unwrap().now();
+        let later = FixedClock::at_unix_seconds(base + 500).unwrap().now();
+        // Pushed out of chronological order: the newer note first.
+        record.progress.push(ProgressNote {
+            recorded_at: later,
+            note: "second".to_owned(),
+            head_sha: None,
+        });
+        record.progress.push(ProgressNote {
+            recorded_at: earlier,
+            note: "first, appended after, timestamped before".to_owned(),
+            head_sha: None,
+        });
+        assert_eq!(record.last_activity_at(), later);
+    }
+
+    /// A released lease is never silent, no matter how old: nobody is
+    /// waiting on a released allocation.
+    ///
+    /// The offset is a fixed 100 years, deliberately not derived from
+    /// `SILENT_LEASE_THRESHOLD_SECONDS`: this test's claim ("released is
+    /// never silent") does not depend on that constant's value at all, and
+    /// deriving from it made this test's own fixture construction overflow
+    /// under §10 mutation 1 (an enormous mutated threshold), which would
+    /// have obscured that mutation's real effect behind an unrelated
+    /// `time`-crate range panic instead of a clean assertion result.
+    #[test]
+    fn a_released_lease_is_never_silent_regardless_of_age() {
+        let mut record = lease();
+        record.status = LeaseStatus::Released;
+        record.released_at = Some(stamp());
+        let base = stamp().unix_seconds();
+        let hundred_years_seconds = 100 * 365 * 24 * 3600;
+        let far_future = FixedClock::at_unix_seconds(base + hundred_years_seconds)
+            .unwrap()
+            .now();
+        assert!(!record.is_silent(far_future));
     }
 }

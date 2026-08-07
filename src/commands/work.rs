@@ -19,7 +19,7 @@ use crate::{
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         card::{CardRecord, CardState},
-        clock::Clock,
+        clock::{Clock, Timestamp},
         ids::{CardId, LeaseId},
         lease::{
             LEASE_DIR, LEASE_SCHEMA, LeaseRecord, LeaseStatus, ProgressNote, WORKTREE_LINK_SCHEMA,
@@ -192,11 +192,12 @@ fn next_lease_id(control: &ControlRepository) -> Result<LeaseId, HarnessError> {
     format!("L-{:06}", highest + 1).parse()
 }
 
-/// Every lease for one card, oldest first.
-fn leases_for(
-    control: &ControlRepository,
-    card_id: &CardId,
-) -> Result<Vec<LeaseRecord>, HarnessError> {
+/// Every lease record in the control repository, oldest id first.
+///
+/// Factored out of `leases_for` so the per-card filter and
+/// [`silent_leases`]'s project-wide scan share one reader instead of two
+/// definitions of "how leases are listed and parsed."
+fn all_leases(control: &ControlRepository) -> Result<Vec<LeaseRecord>, HarnessError> {
     let directory = control.path(LEASE_DIR);
     if !directory.exists() {
         return Ok(Vec::new());
@@ -223,11 +224,43 @@ fn leases_for(
                 reason: format!("lease {name} is malformed: {source}"),
                 code: ErrorCode::InternalControlCorrupt,
             })?;
-        if lease.card_id == *card_id {
-            leases.push(lease);
-        }
+        leases.push(lease);
     }
     Ok(leases)
+}
+
+/// Every lease for one card, oldest first.
+fn leases_for(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<Vec<LeaseRecord>, HarnessError> {
+    Ok(all_leases(control)?
+        .into_iter()
+        .filter(|lease| lease.card_id == *card_id)
+        .collect())
+}
+
+/// Held leases with no recorded sign of life for at least
+/// [`crate::domain::lease::SILENT_LEASE_THRESHOLD_SECONDS`], as of `now`.
+///
+/// Mirrors `stranded_execution_permits` (`src/commands/gate.rs`): the one
+/// place that scans every lease to ask which are quiet too long, so
+/// `project status` and `project recover` (`src/commands/project.rs`) share
+/// one definition of "silent" instead of each reimplementing "held, and
+/// idle past the threshold" on its own. See #80.
+///
+/// # Errors
+///
+/// Returns an error when the lease store cannot be read or a record is
+/// malformed.
+pub(crate) fn silent_leases(
+    control: &ControlRepository,
+    now: Timestamp,
+) -> Result<Vec<LeaseRecord>, HarnessError> {
+    Ok(all_leases(control)?
+        .into_iter()
+        .filter(|lease| lease.is_silent(now))
+        .collect())
 }
 
 /// The lease currently held for a card, if any.

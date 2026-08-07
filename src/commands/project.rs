@@ -12,7 +12,8 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        gate::stranded_execution_permits, integration::ResumeOutcome, transaction::with_transaction,
+        gate::stranded_execution_permits, integration::ResumeOutcome,
+        transaction::with_transaction, work::silent_leases,
     },
     config::{
         CONVERGENCE_POLICY_V1, CardConvergenceLimits, ConvergencePolicy, CycleConvergenceLimits,
@@ -31,14 +32,14 @@ use crate::{
         acceptance::ACCEPTANCE_DIR,
         archive::ARCHIVE_DIR,
         card::CARD_DIR,
-        clock::Clock,
+        clock::{Clock, Timestamp},
         cycle::{CYCLE_DIR, CycleRecord, CycleStatus},
         digest::Digest,
         gate::GATE_DIR,
         handoff::HANDOFF_DIR,
         ids::ProjectId,
         integration::{INTEGRATION_DIR, VERIFICATION_DIR},
-        lease::LEASE_DIR,
+        lease::{LEASE_DIR, LeaseRecord},
         review::REVIEW_DIR,
     },
     error::{ErrorCode, HarnessError},
@@ -244,7 +245,7 @@ pub fn execute(
     match command {
         ProjectCommand::Init(args) => run_init(args, clock),
         ProjectCommand::Validate(args) => run_validate(args),
-        ProjectCommand::Status(args) => run_status(args),
+        ProjectCommand::Status(args) => run_status(args, clock),
         ProjectCommand::Recover(args) => run_recover(args, clock),
         ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
         ProjectCommand::SetFinalAuthorizationPolicy(args) => {
@@ -992,7 +993,76 @@ fn locator_disagreement(control: &ControlRepository) -> Option<String> {
     }
 }
 
-fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
+/// One silent lease as `project status`/`project recover` report it: the
+/// stored fields plus the two an operator or a script needs and cannot
+/// safely recompute from the record alone — `last_activity_at` depends on
+/// comparing every progress note, and `elapsed_seconds` depends on `now`,
+/// the instant this report was produced.
+fn silent_lease_json(lease: &LeaseRecord, now: Timestamp) -> serde_json::Value {
+    let last_activity_at = lease.last_activity_at();
+    serde_json::json!({
+        "lease_id": lease.lease_id,
+        "card_id": lease.card_id,
+        "actor_id": lease.actor_id,
+        "branch": lease.branch,
+        "worktree_path": lease.worktree_path,
+        "granted_at": lease.granted_at,
+        "last_activity_at": last_activity_at,
+        "elapsed_seconds": now.unix_seconds() - last_activity_at.unix_seconds(),
+    })
+}
+
+/// [`silent_lease_json`], applied to every entry a caller already filtered.
+fn silent_leases_json(silent: &[LeaseRecord], now: Timestamp) -> Vec<serde_json::Value> {
+    silent
+        .iter()
+        .map(|lease| silent_lease_json(lease, now))
+        .collect()
+}
+
+/// Appends the operator-facing writeup for every silently-stuck lease to
+/// `project recover`'s report.
+///
+/// Matches the verbosity of the stranded-reservation writeup beside it in
+/// `run_recover`, but deliberately never phrases `work reclaim` as a step
+/// to run in sequence: reclaiming a lease from an actor who is merely slow
+/// is destructive, and nothing recorded here tells the Harness which one
+/// this is. It states the fact and names the option; the operator decides.
+/// See #80 §6.3.
+fn write_silent_lease_report(text: &mut String, silent: &[LeaseRecord], now: Timestamp) {
+    if silent.is_empty() {
+        return;
+    }
+    let _ = write!(
+        text,
+        "\n\n{} lease(s) held with no recorded sign of life for at least {} seconds:",
+        silent.len(),
+        crate::domain::lease::SILENT_LEASE_THRESHOLD_SECONDS
+    );
+    for lease in silent {
+        let last_activity_at = lease.last_activity_at();
+        let _ = write!(
+            text,
+            "\n\n{} for card {}, held by {}\n  branch: {}\n  worktree: {}\n  granted: {}\n  last recorded sign of life: {last_activity_at} ({}s ago)\n  this alone does not mean {} is gone; the Harness cannot tell a slow actor from one who is not coming back. If you have independently confirmed the work will not continue, `work reclaim --card-id {} --actor-id <new-actor> --reason <reason>` is how the card changes hands — nothing here decides that for you.",
+            lease.lease_id,
+            lease.card_id,
+            lease.actor_id,
+            lease.branch,
+            lease.worktree_path.display(),
+            lease.granted_at,
+            now.unix_seconds() - last_activity_at.unix_seconds(),
+            lease.actor_id,
+            lease.card_id,
+        );
+    }
+}
+
+// #80 grew this past the pedantic line threshold by reporting silent
+// leases alongside the pre-existing stranded-reservation report; see the
+// identical allow on `run_recover`, just below, added by #110 for the same
+// reasoning at the same kind of long, linear report function.
+#[allow(clippy::too_many_lines)]
+fn run_status(args: &StatusArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let journal = Journal::new(&control);
@@ -1003,9 +1073,17 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     // finish. Nothing here is torn (see `unresolved_operations` above), so
     // this is the only surface that names it. See #110.
     let stranded = stranded_execution_permits(&control)?;
+    // A held lease with no recorded sign of life for at least
+    // `SILENT_LEASE_THRESHOLD_SECONDS`: the fact #80 exists to surface.
+    // `now` is captured once and reused for every silent-lease computation
+    // below, so the count in the summary line and the entries enumerated
+    // later can never disagree with each other over which instant "now"
+    // was.
+    let now = clock.now();
+    let silent = silent_leases(&control, now)?;
 
     let mut text = format!(
-        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}\nstranded validation reservations: {}",
+        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}\nstranded validation reservations: {}\nsilent leases: {}",
         config.project_id,
         control.root().display(),
         head.as_deref().unwrap_or("unborn"),
@@ -1019,7 +1097,8 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             LockDiagnosis::Ambiguous { reason, .. } => format!("AMBIGUOUS: {reason}"),
         },
         unresolved.len(),
-        stranded.len()
+        stranded.len(),
+        silent.len()
     );
     let disagreement = locator_disagreement(&control);
     let authority = authority_health(&config);
@@ -1061,6 +1140,18 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         );
     }
 
+    for lease in &silent {
+        let _ = write!(
+            text,
+            "\n  {} held by {} for card {}, no recorded sign of life since {} ({}s)",
+            lease.lease_id,
+            lease.actor_id,
+            lease.card_id,
+            lease.last_activity_at(),
+            now.unix_seconds() - lease.last_activity_at().unix_seconds()
+        );
+    }
+
     let mut outcome = CommandOutcome::new(
         "project.status",
         text,
@@ -1083,6 +1174,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "authority": authority,
             "unresolved_operations": unresolved,
             "stranded_reservations": stranded,
+            "silent_leases": silent_leases_json(&silent, now),
             "locator_disagreement": disagreement,
         }),
     );
@@ -1221,8 +1313,20 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     // promotions — so it is fetched here, on the reporting path both kinds
     // of interruption share. See #110.
     let stranded = stranded_execution_permits(&control)?;
+    // A held lease with no recorded sign of life for at least
+    // `SILENT_LEASE_THRESHOLD_SECONDS`. Reported here too, and not only from
+    // `project status`, because this is exactly where an operator lands
+    // after any other kind of interruption, and a silently-stuck lease is
+    // the kind #80 exists to surface. It is kept out of `recovery_required`
+    // below on purpose: nothing about a silent lease is torn the way an
+    // unresolved journal entry or a stranded permit is, and folding a
+    // heuristic judgment call into a boolean this codebase already tests as
+    // a hard "something is broken" fact would make that fact less
+    // trustworthy, not more. See #80 §6.2.
+    let now = clock.now();
+    let silent = silent_leases(&control, now)?;
 
-    if unresolved.is_empty() && stranded.is_empty() {
+    if unresolved.is_empty() && stranded.is_empty() && silent.is_empty() {
         return Ok(CommandOutcome::new(
             "project.recover",
             format!(
@@ -1233,6 +1337,32 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                 "project_id": config.project_id.to_string(),
                 "unresolved_operations": [],
                 "stranded_reservations": [],
+                "silent_leases": [],
+                "recovery_required": false,
+            }),
+        )
+        .with_project(config.project_id.clone()));
+    }
+
+    if unresolved.is_empty() && stranded.is_empty() {
+        // Only silent leases: nothing here is torn, so this is not the
+        // interrupted-state report below — see the comment on `silent`
+        // above for why `recovery_required` stays `false`. The fact still
+        // belongs on this command's output, because this is where an
+        // operator looks after any interruption, silent leases included.
+        let mut text = format!(
+            "Project {} has no interrupted operations to recover",
+            config.project_id
+        );
+        write_silent_lease_report(&mut text, &silent, now);
+        return Ok(CommandOutcome::new(
+            "project.recover",
+            text,
+            serde_json::json!({
+                "project_id": config.project_id.to_string(),
+                "unresolved_operations": [],
+                "stranded_reservations": [],
+                "silent_leases": silent_leases_json(&silent, now),
                 "recovery_required": false,
             }),
         )
@@ -1296,6 +1426,7 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             );
         }
     }
+    write_silent_lease_report(&mut text, &silent, now);
 
     Ok(CommandOutcome::new(
         "project.recover",
@@ -1304,6 +1435,7 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             "project_id": config.project_id.to_string(),
             "unresolved_operations": unresolved,
             "stranded_reservations": stranded,
+            "silent_leases": silent_leases_json(&silent, now),
             "recovery_required": true,
         }),
     )
