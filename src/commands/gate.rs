@@ -332,11 +332,17 @@ pub fn execute(command: &GateCommand, clock: &dyn Clock) -> Result<CommandOutcom
     }
 }
 
+/// #142: the read failure a gate definition path can hit — a distinct call
+/// site from parsing, so it needs no introspection to tell apart from a
+/// schema failure (#142 §10's "pure gain" half).
+const GATE_DEFINITION_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the gate definition file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
 /// Reads and parses a gate definition from disk.
 fn read_definition(path: &PathBuf) -> Result<GateDefinition, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("cannot read gate definition {}: {source}", path.display()),
         code: ErrorCode::ConfigMalformed,
+        recovery: GATE_DEFINITION_READ_RECOVERY,
     })?;
     parse_definition(&raw)
 }
@@ -385,24 +391,54 @@ struct MutationWitness {
     restoration_digest: Digest,
 }
 
+/// #142: no `gate` subcommand emits a mutation campaign example, so this and
+/// its siblings below point at the concrete detail #142 §11's second
+/// paragraph asks for — the field or requirement the message above already
+/// names — rather than inventing a command that does not exist.
+const MUTATION_CAMPAIGN_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the mutation campaign file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// See [`MUTATION_CAMPAIGN_READ_RECOVERY`]. Split from its `_SYNTAX_RECOVERY`
+/// sibling by `serde_json::Error::is_data()`, the same stable, public
+/// introspection `project.rs`'s convergence- and final-authorization-policy
+/// readers use.
+const MUTATION_CAMPAIGN_SCHEMA_RECOVERY: &str = "This mutation campaign is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated example for a mutation campaign document; re-check the field the message names.";
+
+/// The syntax-failure sibling of [`MUTATION_CAMPAIGN_SCHEMA_RECOVERY`].
+const MUTATION_CAMPAIGN_SYNTAX_RECOVERY: &str = "This mutation campaign is not valid JSON; the message above names the exact line and column to fix.";
+
+/// Recovery for the two hand-written post-parse checks below: unlike the
+/// three sites above, these never touch `serde` at all — the document
+/// already deserialized successfully — so every reachable failure here is
+/// unambiguously a content problem, never a syntax one.
+const MUTATION_CAMPAIGN_CONTENT_RECOVERY: &str = "This is a content problem, not a syntax problem: the document parsed, but the requirement named above was not met.";
+
 fn read_declared_campaign(path: &Path) -> Result<(DeclaredMutationCampaign, Digest), HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("cannot read mutation campaign {}: {source}", path.display()),
         code: ErrorCode::ConfigMalformed,
+        recovery: MUTATION_CAMPAIGN_READ_RECOVERY,
     })?;
-    let campaign: DeclaredMutationCampaign =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let campaign: DeclaredMutationCampaign = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            MUTATION_CAMPAIGN_SCHEMA_RECOVERY
+        } else {
+            MUTATION_CAMPAIGN_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!(
                 "mutation campaign {} is malformed: {source}",
                 path.display()
             ),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     if campaign.schema != DECLARED_MUTATION_CAMPAIGN_SCHEMA || campaign.mutations.is_empty() {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: "mutation campaign must use the supported schema and contain mutations"
                 .to_owned(),
             code: ErrorCode::ConfigMalformed,
+            recovery: MUTATION_CAMPAIGN_CONTENT_RECOVERY,
         });
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -414,10 +450,11 @@ fn read_declared_campaign(path: &Path) -> Result<(DeclaredMutationCampaign, Dige
             || mutation.expected_utf8 == mutation.replacement_utf8
             || !ids.insert(mutation.id.clone())
         {
-            return Err(HarnessError::Control {
+            return Err(HarnessError::ControlWithRecovery {
                 reason: "mutation campaign declarations must be unique, relative, and reversible"
                     .to_owned(),
                 code: ErrorCode::ConfigMalformed,
+                recovery: MUTATION_CAMPAIGN_CONTENT_RECOVERY,
             });
         }
     }
@@ -447,21 +484,49 @@ fn campaign_digest_for_reservation(
     }
 }
 
+/// #142: no `gate` subcommand emits a CPU-profile example; see
+/// [`MUTATION_CAMPAIGN_READ_RECOVERY`] for why these name the field the
+/// message already surfaces instead of a command that does not exist.
+const CPU_PROFILE_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the CPU profile file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// See [`MUTATION_CAMPAIGN_SCHEMA_RECOVERY`] for why `is_data()` splits this
+/// from its `_SYNTAX_RECOVERY` sibling rather than a shared, honest-for-both
+/// message.
+const CPU_PROFILE_SCHEMA_RECOVERY: &str = "This CPU profile is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated example for a CPU profile document; re-check the field the message names.";
+
+/// The syntax-failure sibling of [`CPU_PROFILE_SCHEMA_RECOVERY`].
+const CPU_PROFILE_SYNTAX_RECOVERY: &str =
+    "This CPU profile is not valid JSON; the message above names the exact line and column to fix.";
+
+/// Recovery for the hand-written post-parse check below: the document
+/// already deserialized successfully, so this is unambiguously a content
+/// problem, never a syntax one — see [`MUTATION_CAMPAIGN_CONTENT_RECOVERY`].
+const CPU_PROFILE_CONTENT_RECOVERY: &str = "This is a content problem, not a syntax problem: the document parsed, but the requirement named above was not met.";
+
 fn cpu_profile_digest_for_reservation(
     mode: ValidationExecutionMode,
     profile: Option<&Path>,
 ) -> Result<Option<Digest>, HarnessError> {
     match (mode, profile) {
         (ValidationExecutionMode::CpuHeavy, Some(path)) => {
-            let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
-                reason: format!("cannot read CPU profile {}: {source}", path.display()),
-                code: ErrorCode::ConfigMalformed,
-            })?;
-            let profile: CpuHeavyProfile =
-                serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            let raw =
+                fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
+                    reason: format!("cannot read CPU profile {}: {source}", path.display()),
+                    code: ErrorCode::ConfigMalformed,
+                    recovery: CPU_PROFILE_READ_RECOVERY,
+                })?;
+            let profile: CpuHeavyProfile = serde_json::from_str(&raw).map_err(|source| {
+                let recovery = if source.is_data() {
+                    CPU_PROFILE_SCHEMA_RECOVERY
+                } else {
+                    CPU_PROFILE_SYNTAX_RECOVERY
+                };
+                HarnessError::ControlWithRecovery {
                     reason: format!("CPU profile {} is malformed: {source}", path.display()),
                     code: ErrorCode::ConfigMalformed,
-                })?;
+                    recovery,
+                }
+            })?;
             if profile.schema != CPU_HEAVY_PROFILE_SCHEMA
                 || !matches!(
                     profile.risk.as_str(),
@@ -471,11 +536,12 @@ fn cpu_profile_digest_for_reservation(
                 || profile.resource_cost.cpu_cores == 0
                 || profile.resource_cost.memory_mib == 0
             {
-                return Err(HarnessError::Control {
+                return Err(HarnessError::ControlWithRecovery {
                     reason:
                         "CPU profile has unsupported schema or invalid risk, duration, or resources"
                             .to_owned(),
                     code: ErrorCode::ConfigMalformed,
+                    recovery: CPU_PROFILE_CONTENT_RECOVERY,
                 });
             }
             Ok(Some(Digest::of_canonical(&profile)?))
@@ -492,15 +558,31 @@ fn cpu_profile_digest_for_reservation(
     }
 }
 
+/// #142: `serde_yaml_ng::Error` (v0.10.0) has no public equivalent of
+/// `serde_json::Error::classify()` — its `ErrorImpl` enum, which does carry
+/// the distinction, is `pub(crate)` (`serde_yaml_ng` source, `src/error.rs`)
+/// and unreachable from here. String-matching the `Display` text is the only
+/// remaining introspection, and #142 §10 calls out its fragility: a wording
+/// change in a future `serde_yaml_ng` release would break it with no compile
+/// error. This site does not take that trade — one recovery, honest for
+/// both a syntax and a schema failure, naming `gate example` either way,
+/// since #142 §10 explicitly allows a site that cannot tell modes 2 and 3
+/// apart to say so rather than guess. Pinned by
+/// `gate_definition_recovery_is_identical_for_a_syntax_and_a_schema_failure`
+/// in `tests/config_malformed_recovery.rs`, so a later attempt to split this
+/// message by content would need to touch that test too, not silently drift.
+const GATE_DEFINITION_PARSE_RECOVERY: &str = "This gate definition could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. Compare it against `gate example`'s output, a complete, valid gate definition.";
+
 /// Parses a gate definition from YAML or JSON.
 ///
 /// # Errors
 ///
 /// Returns a configuration error when the document is malformed.
 pub fn parse_definition(raw: &str) -> Result<GateDefinition, HarnessError> {
-    serde_yaml_ng::from_str(raw).map_err(|source| HarnessError::Control {
+    serde_yaml_ng::from_str(raw).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("gate definition is malformed: {source}"),
         code: ErrorCode::ConfigMalformed,
+        recovery: GATE_DEFINITION_PARSE_RECOVERY,
     })
 }
 
@@ -2254,13 +2336,24 @@ fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                         source,
                     }
                 })?;
+                // #142: left on the shared `ConfigMalformed` fallback recovery
+                // deliberately. This does not fit #142 §3's taxonomy at
+                // all — it is not a file read and not a parse call, it is a
+                // `u32` overflow guard reached only once `index + 1` exceeds
+                // `u32::MAX`, deep inside mutation execution rather than at
+                // any point this function reads or parses the operator's
+                // document. #142 §8 forbids fixing a product defect this
+                // work surfaces (arguably this reuses `ConfigMalformed` for
+                // something that is not configuration-shaped at all) rather
+                // than reporting it, so it is reported in #142's evidence
+                // instead of recategorized here.
                 let outcome = run_attempt_with_validation_cache(
                     &gate,
                     &execution.source,
                     &log_root,
                     u32::try_from(index + 1).map_err(|_| HarnessError::Control {
                         reason: "mutation campaign has too many entries".to_owned(),
-                        code: ErrorCode::ConfigMalformed,
+                        code: ErrorCode::ConfigMalformed, // #142-fallback-ok: not a file/parse site, see comment above
                     })?,
                     clock,
                     Some(&execution.cache),
@@ -2297,12 +2390,19 @@ fn run_mutate(args: &MutateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     restoration_digest,
                 });
             }
+            // #142: left on the shared fallback recovery, same reasoning as
+            // the `u32::try_from` guard above — `read_declared_campaign`
+            // already refuses an empty campaign at load time
+            // (`campaign.mutations.is_empty()`), so `witnesses` ending up
+            // empty here is defensive, not a document the operator is
+            // expected to fix by rereading its syntax or its schema. Not
+            // #142's to recategorize; reported instead.
             let final_baseline_digest = witnesses
                 .last()
                 .map(|w| w.restoration_digest.clone())
                 .ok_or_else(|| HarnessError::Control {
                     reason: "mutation campaign is empty".to_owned(),
-                    code: ErrorCode::ConfigMalformed,
+                    code: ErrorCode::ConfigMalformed, // #142-fallback-ok: not a file/parse site, see comment above
                 })?;
             let witness_path = format!(
                 "validation-mutation-witnesses/{}.json",
@@ -3733,20 +3833,43 @@ pub(crate) fn load_compatibility_request(
     load_json_request(path)
 }
 
+/// #142: no `gate` or `audit` subcommand emits a compatibility-request
+/// example (this reader also serves `IntegrationCompatibilityRequestV1` via
+/// [`read_integration_compatibility_request`], not only
+/// [`CompatibilityRequest`] via [`load_compatibility_request`] — one more
+/// reason not to name a single example command here).
+const COMPATIBILITY_REQUEST_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the compatibility request file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// See [`MUTATION_CAMPAIGN_SCHEMA_RECOVERY`] for why `is_data()` splits this
+/// from its `_SYNTAX_RECOVERY` sibling.
+const COMPATIBILITY_REQUEST_SCHEMA_RECOVERY: &str = "This compatibility request is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated example for a compatibility request document; re-check the field the message names.";
+
+/// The syntax-failure sibling of [`COMPATIBILITY_REQUEST_SCHEMA_RECOVERY`].
+const COMPATIBILITY_REQUEST_SYNTAX_RECOVERY: &str = "This compatibility request is not valid JSON; the message above names the exact line and column to fix.";
+
 fn load_json_request<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!(
             "cannot read receipt compatibility request {}: {source}",
             path.display()
         ),
         code: ErrorCode::ConfigMalformed,
+        recovery: COMPATIBILITY_REQUEST_READ_RECOVERY,
     })?;
-    serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
-        reason: format!(
-            "receipt compatibility request {} is malformed: {source}",
-            path.display()
-        ),
-        code: ErrorCode::ConfigMalformed,
+    serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            COMPATIBILITY_REQUEST_SCHEMA_RECOVERY
+        } else {
+            COMPATIBILITY_REQUEST_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
+            reason: format!(
+                "receipt compatibility request {} is malformed: {source}",
+                path.display()
+            ),
+            code: ErrorCode::ConfigMalformed,
+            recovery,
+        }
     })
 }
 

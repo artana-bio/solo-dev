@@ -456,6 +456,26 @@ fn generated_source_is_owned(
         .any(|pattern| provably_contains_pattern(pattern, source, case))
 }
 
+/// #142: no `card` subcommand emits a draft example — `SKILL.md`'s "Write a
+/// bounded card" section carries a hand-authored template instead of a
+/// generated one, and #142 §11 asks for a *command* reference, so this does
+/// not point at a document section instead (see
+/// `HANDOFF_DECLARATION_PARSE_RECOVERY` in `src/commands/handoff.rs` for the
+/// same reasoning and the regression it avoids repeating). `serde_yaml_ng`
+/// also offers no syntax/schema split — see `GATE_DEFINITION_PARSE_RECOVERY`
+/// in `src/commands/gate.rs` — so this is one honest-for-both message.
+///
+/// Reached from two contexts: `commands::card::read_draft`'s external,
+/// operator-supplied file (already given its own read-failure recovery one
+/// call site earlier — B1's second reproduction, #142 §1) and
+/// `stored_draft`'s re-read of this project's own already-activated,
+/// control-managed draft, where a failure here means external corruption
+/// rather than an operator's typo. The text below commits to neither story —
+/// "re-check the position or field" reads correctly either way — rather
+/// than picking the likelier case and being wrong for the other, per #142
+/// §10.
+const DRAFT_PARSE_RECOVERY: &str = "This card draft could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. There is no generated example for a card draft document; re-check the position or field the message names.";
+
 impl CardDraft {
     /// Checks each generated declaration, and what its class implies about
     /// this card's write scope.
@@ -569,9 +589,10 @@ impl CardDraft {
     /// Returns a configuration error when the document is malformed or carries
     /// an undefined field.
     pub fn parse(raw: &str) -> Result<Self, HarnessError> {
-        serde_yaml_ng::from_str(raw).map_err(|source| HarnessError::Control {
+        serde_yaml_ng::from_str(raw).map_err(|source| HarnessError::ControlWithRecovery {
             reason: format!("card draft is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
+            recovery: DRAFT_PARSE_RECOVERY,
         })
     }
 

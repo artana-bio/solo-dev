@@ -328,15 +328,33 @@ fn resolve_dependency_bindings(
     Ok(bindings)
 }
 
+/// #142: distinct call site from the parse below, so the read failure needs
+/// no introspection to tell apart from a schema failure.
+const HANDOFF_DECLARATION_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the declaration file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// No `handoff` subcommand emits a declaration example — `SKILL.md`'s
+/// "Verify and hand off" section carries a hand-authored template instead of
+/// a generated one, and #142 §11 is specifically about naming a *command*,
+/// so this does not invent a reference to a document section instead
+/// (`src/error.rs`'s own `the_card_recovery_names_no_specification_section`
+/// test pins exactly this mistake shut for a different code, after it
+/// shipped once as "Section 10.3"). `serde_yaml_ng` also offers no
+/// syntax/schema split — see `GATE_DEFINITION_PARSE_RECOVERY` in
+/// `src/commands/gate.rs` — so this is one honest-for-both message naming
+/// the field or position the message above already gives.
+const HANDOFF_DECLARATION_PARSE_RECOVERY: &str = "This handoff declaration could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. There is no generated example for a handoff declaration document; re-check the position or field the message names.";
+
 /// Reads and parses an actor declaration.
 fn read_declaration(path: &PathBuf) -> Result<ActorDeclaration, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("cannot read declaration {}: {source}", path.display()),
         code: ErrorCode::ConfigMalformed,
+        recovery: HANDOFF_DECLARATION_READ_RECOVERY,
     })?;
-    serde_yaml_ng::from_str(&raw).map_err(|source| HarnessError::Control {
+    serde_yaml_ng::from_str(&raw).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("handoff declaration is malformed: {source}"),
         code: ErrorCode::ConfigMalformed,
+        recovery: HANDOFF_DECLARATION_PARSE_RECOVERY,
     })
 }
 

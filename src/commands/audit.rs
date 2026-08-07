@@ -782,6 +782,28 @@ fn exception_bindings_match(
                 .map(crate::domain::digest::Digest::as_str)
 }
 
+/// #142: no `audit` or `gate` subcommand emits a compatibility-request
+/// example (see `COMPATIBILITY_REQUEST_READ_RECOVERY` in
+/// `src/commands/gate.rs`, which reads the same document kind through a
+/// separate, unshared implementation — `gate::load_json_request` is not
+/// reused here; #142 §8 forbids fixing that duplication as part of this
+/// card, so it is reported rather than merged).
+const COMPATIBILITY_REQUEST_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the compatibility request file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// See `MUTATION_CAMPAIGN_SCHEMA_RECOVERY` in `src/commands/gate.rs` for why
+/// `is_data()` splits this from its `_SYNTAX_RECOVERY` sibling.
+const COMPATIBILITY_REQUEST_SCHEMA_RECOVERY: &str = "This compatibility request is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated example for a compatibility request document; re-check the field the message names.";
+
+/// The syntax-failure sibling of [`COMPATIBILITY_REQUEST_SCHEMA_RECOVERY`].
+const COMPATIBILITY_REQUEST_SYNTAX_RECOVERY: &str = "This compatibility request is not valid JSON; the message above names the exact line and column to fix.";
+
+/// The `serde_json::from_value` conversion below reparses an already-parsed
+/// `serde_json::Value`, so every error it can produce is
+/// `Category::Data` (`serde_json::Error::classify()`) — there is no raw text
+/// left for a syntax error to come from. Unlike the split pair above, this
+/// is unambiguously schema-shaped, always.
+const INTEGRATION_COMPATIBILITY_REQUEST_SCHEMA_RECOVERY: &str = "This integration compatibility request is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated example for an integration compatibility request document; re-check the field the message names.";
+
 /// Projects the same exact decision as `gate status` in the durable cycle
 /// audit.  The request must name a card in this cycle; it is never inferred
 /// from the receipt it evaluates, because that would erase incompatible
@@ -791,29 +813,41 @@ fn audit_compatibility(
     cycle: &CycleRecord,
     path: &PathBuf,
 ) -> Result<serde_json::Value, HarnessError> {
-    let raw = std::fs::read_to_string(path).map_err(|source| HarnessError::Control {
-        reason: format!(
-            "cannot read receipt compatibility request {}: {source}",
-            path.display()
-        ),
-        code: ErrorCode::ConfigMalformed,
-    })?;
-    let envelope: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let raw =
+        std::fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
+            reason: format!(
+                "cannot read receipt compatibility request {}: {source}",
+                path.display()
+            ),
+            code: ErrorCode::ConfigMalformed,
+            recovery: COMPATIBILITY_REQUEST_READ_RECOVERY,
+        })?;
+    let envelope: serde_json::Value = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            COMPATIBILITY_REQUEST_SCHEMA_RECOVERY
+        } else {
+            COMPATIBILITY_REQUEST_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!(
                 "receipt compatibility request {} is malformed: {source}",
                 path.display()
             ),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     if envelope["expected"]["subject"]["kind"] == "integration" {
         let request: IntegrationCompatibilityRequestV1 =
-            serde_json::from_value(envelope).map_err(|source| HarnessError::Control {
-                reason: format!(
-                    "integration compatibility request {} is malformed: {source}",
-                    path.display()
-                ),
-                code: ErrorCode::ConfigMalformed,
+            serde_json::from_value(envelope).map_err(|source| {
+                HarnessError::ControlWithRecovery {
+                    reason: format!(
+                        "integration compatibility request {} is malformed: {source}",
+                        path.display()
+                    ),
+                    code: ErrorCode::ConfigMalformed,
+                    recovery: INTEGRATION_COMPATIBILITY_REQUEST_SCHEMA_RECOVERY,
+                }
             })?;
         if request.context.cycle_id != cycle.cycle_id {
             return Err(HarnessError::Control {

@@ -255,6 +255,28 @@ pub fn execute(
     }
 }
 
+/// #142: this file's read failures and its parse failures used to share one
+/// generic recovery ("Correct the JSON or YAML syntax of the document."),
+/// which was actively wrong for a read failure (there is no document to
+/// have syntax) and for a schema failure such as B1's missing
+/// `authorization_unit` (the syntax was already valid). The constants below
+/// give each of the three failure modes #142 §3 identifies its own text,
+/// naming `project example`/`project example-final-authorization` — #143's
+/// two document-emitting commands — wherever the failure is schema-shaped,
+/// since comparing against a complete, valid document is the thing that
+/// would actually have unstuck the operator.
+const CONVERGENCE_POLICY_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the convergence policy file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// `serde_json::Error::classify()` (see [`Category`](serde_json::error::Category))
+/// tells a syntax failure apart from a data (schema) failure on a public,
+/// stable API — no string-matching involved — so this and its
+/// `_SYNTAX_RECOVERY` sibling are only ever reached from the branch that
+/// actually applies; see the `map_err` closure below.
+const CONVERGENCE_POLICY_SCHEMA_RECOVERY: &str = "This convergence policy is valid JSON but does not match the schema; the message above names the missing or invalid field. Compare it against `project example`'s output, a complete, valid convergence policy.";
+
+/// The syntax-failure sibling of [`CONVERGENCE_POLICY_SCHEMA_RECOVERY`].
+const CONVERGENCE_POLICY_SYNTAX_RECOVERY: &str = "This convergence policy is not valid JSON; the message above names the exact line and column to fix.";
+
 /// Reads, parses, and validates a convergence policy named by `--convergence-policy`.
 ///
 /// Called from [`config_from_args`], which `run_init` invokes before it
@@ -266,21 +288,46 @@ pub fn execute(
 /// will not yield a document; a policy that parses but fails its own checks
 /// carries whatever code `ConvergencePolicy::validate` already assigns.
 fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!(
             "cannot read convergence policy {}: {source}",
             path.display()
         ),
         code: ErrorCode::ConfigMalformed,
+        recovery: CONVERGENCE_POLICY_READ_RECOVERY,
     })?;
-    let policy: ConvergencePolicy =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let policy: ConvergencePolicy = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            CONVERGENCE_POLICY_SCHEMA_RECOVERY
+        } else {
+            CONVERGENCE_POLICY_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!("convergence policy is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
 }
+
+/// #142, same shape as [`CONVERGENCE_POLICY_READ_RECOVERY`] above, for the
+/// document B1 (#142 §1) actually hit: `authorization_unit` missing, with
+/// valid JSON syntax, sent to "Correct the JSON or YAML syntax" — the
+/// recovery that named the one thing that was not wrong.
+const FINAL_AUTHORIZATION_POLICY_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the final-authorization policy file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// See [`CONVERGENCE_POLICY_SCHEMA_RECOVERY`] for why this and its
+/// `_SYNTAX_RECOVERY` sibling can be split by `serde_json::Error::is_data()`
+/// rather than guessing. This is the exact text B1 needed:
+/// `project example-final-authorization` (#143) is the sibling command that
+/// exists specifically because `authorization_unit` appeared in no example,
+/// no `--help` text, and no `SKILL.md` section before it landed.
+const FINAL_AUTHORIZATION_POLICY_SCHEMA_RECOVERY: &str = "This final-authorization policy is valid JSON but does not match the schema; the message above names the missing or invalid field. Compare it against `project example-final-authorization`'s output, a complete, valid final-authorization policy.";
+
+/// The syntax-failure sibling of [`FINAL_AUTHORIZATION_POLICY_SCHEMA_RECOVERY`].
+const FINAL_AUTHORIZATION_POLICY_SYNTAX_RECOVERY: &str = "This final-authorization policy is not valid JSON; the message above names the exact line and column to fix.";
 
 /// Reads, parses, and validates a final-authorization policy named by
 /// `--policy`.
@@ -294,18 +341,26 @@ fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessE
 fn read_final_authorization_policy(
     path: &PathBuf,
 ) -> Result<FinalAuthorizationPolicy, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!(
             "cannot read final authorization policy {}: {source}",
             path.display()
         ),
         code: ErrorCode::ConfigMalformed,
+        recovery: FINAL_AUTHORIZATION_POLICY_READ_RECOVERY,
     })?;
-    let policy: FinalAuthorizationPolicy =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let policy: FinalAuthorizationPolicy = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            FINAL_AUTHORIZATION_POLICY_SCHEMA_RECOVERY
+        } else {
+            FINAL_AUTHORIZATION_POLICY_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!("final authorization policy is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
 }
@@ -799,11 +854,29 @@ fn reinitialize(
     .with_project(config.project_id.clone()))
 }
 
+/// #142: left on `ErrorCode::ConfigMalformed`'s shared fallback recovery
+/// deliberately, not by oversight.
+///
+/// This read failure is a `HarnessError::Config`, not a
+/// `HarnessError::Control` — the one `ConfigMalformed` site in the frozen
+/// file scope built that way. `Config` has no per-site recovery field the
+/// way `Control` gained `ControlWithRecovery` in #106; giving it one would
+/// mean either adding a field to `HarnessError::Config` (touching
+/// `src/error.rs`, which #142 §7 permits only when §9 requires it, and §9
+/// only requires it when every `ConfigMalformed` site has been converted —
+/// this one and `ProjectConfig::from_json`'s own fallback branch
+/// (`src/config/mod.rs:617`) are the two that have not) or swapping this
+/// site's variant to `ControlWithRecovery`, which would change the error's
+/// `Display` prefix — from a `configuration field` preamble naming the
+/// literal field `<file>`, to `control state:` — and drop the `field` key
+/// from its JSON `details()` — a shape change #142 §8 does not clearly
+/// license for a card scoped to recovery text. Reported rather than worked
+/// around; see #142's evidence report for the follow-up this implies.
 fn run_validate(args: &ValidateArgs) -> Result<CommandOutcome, HarnessError> {
     let raw = fs::read_to_string(&args.config).map_err(|source| HarnessError::Config {
         field: "<file>".to_owned(),
         reason: format!("cannot read {}: {source}", args.config.display()),
-        code: ErrorCode::ConfigMalformed,
+        code: ErrorCode::ConfigMalformed, // #142-fallback-ok: HarnessError::Config has no per-site recovery, see comment above
     })?;
 
     let config = ProjectConfig::from_json(&raw)?;
