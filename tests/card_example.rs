@@ -352,6 +352,39 @@ fn the_emitted_card_draft_example_names_every_optional_field() {
 }
 
 #[test]
+fn the_emitted_card_draft_example_warns_that_base_sha_must_be_replaced() {
+    // Review of #180: `base_sha`'s placeholder round-trips through `card
+    // create` unchecked (`the_emitted_card_draft_example_is_accepted_by_card_create`
+    // above) but is refused one stage later, at `card activate`
+    // (`require_cycle_baseline`, `src/commands/card.rs`) — see this file's
+    // module doc for the exact refusal shape. The warning on stderr is the
+    // only thing that tells an operator to replace it before reaching that
+    // later refusal, and nothing checked its content until this test.
+    //
+    // Asserted on stderr specifically, not through `--output json`: stderr
+    // is the channel an operator actually sees running `card example`
+    // directly (`main.rs` writes every warning there, in both output
+    // modes), the same discipline
+    // `the_emitted_card_draft_example_text_mode_stdout_is_accepted_by_card_create`
+    // applies to the document itself. Deliberately not asserted verbatim —
+    // only the load-bearing claim, that `base_sha` is named and replacement
+    // is required — because the exact prose will be reworded over time and
+    // a verbatim test would then be deleted rather than fixed.
+    //
+    // Mutation that must make this fail: reword the warning to drop the
+    // `base_sha` clause (verified by hand against this exact test in the
+    // card's evidence report).
+    let output = Workspace::run(&["card".to_owned(), "example".to_owned()]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("base_sha") && stderr.contains("replaced"),
+        "the warning on stderr must name `base_sha` and say it must be replaced before real \
+         use: {stderr}"
+    );
+}
+
+#[test]
 fn card_example_is_discoverable_from_help() {
     // #108 §6 constraint 2: a surface nobody finds is the problem restated.
     let output = Workspace::run(&["card".to_owned(), "--help".to_owned()]);
