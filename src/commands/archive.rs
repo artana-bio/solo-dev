@@ -14,13 +14,13 @@ use crate::{
         card::{load_card, store_card_state},
         integration::load_integration,
         transaction::with_transaction,
-        work::held_lease,
+        work::{held_lease, release_lease},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         archive::{ARCHIVE_SCHEMA, ArchiveRecord},
         card::CardState,
-        clock::Clock,
+        clock::{Clock, Timestamp},
         digest::CANONICAL_ALGORITHM,
         ids::IntegrationId,
         integration::{IntegrationRecord, IntegrationStatus},
@@ -334,6 +334,7 @@ fn clean_up_card(
     control: &ControlRepository,
     config: &crate::config::ProjectConfig,
     card_id: &crate::domain::ids::CardId,
+    now: Timestamp,
 ) -> Result<Vec<String>, HarnessError> {
     let scope = GitScope::work_tree(&config.repository);
     let branch = format!("card/{card_id}");
@@ -353,7 +354,8 @@ fn clean_up_card(
         });
     }
 
-    if let Some(lease) = held_lease(control, card_id)?
+    let lease = held_lease(control, card_id)?;
+    if let Some(lease) = &lease
         && lease.worktree_path.exists()
     {
         // `work start` locks the worktree so `git worktree prune` cannot
@@ -379,6 +381,21 @@ fn clean_up_card(
     if exists {
         delete_branch(&scope, &branch)?;
         removed.push(branch);
+    }
+
+    // Released last, once every removal above has succeeded. The lease is
+    // where `held_lease` finds the worktree to remove, so releasing it any
+    // earlier would hide the allocation from the code that still has to
+    // clean it up — the same reason release does not belong at landing,
+    // where the branch and worktree are still on disk. A failure above
+    // aborts the transaction with the lease still held, which is the state
+    // that honestly describes what is left behind.
+    //
+    // Outside the `exists()` guard on purpose: a lease whose worktree is
+    // already gone is still a record claiming an allocation that is not
+    // there, which is exactly what this is correcting.
+    if let Some(mut lease) = lease {
+        release_lease(control, &mut lease, now)?;
     }
     Ok(removed)
 }
@@ -536,9 +553,13 @@ fn run_close(args: &CommonArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
             }
 
             steps.outside_control("cleanup-started")?;
+            // One instant for the whole close: every lease it releases was
+            // freed by the same operation, so stamping them apart would
+            // record a sequence that did not happen.
+            let now = clock.now();
             let mut removed = Vec::new();
             for member in &record.members {
-                removed.extend(clean_up_card(control, &config, &member.card_id)?);
+                removed.extend(clean_up_card(control, &config, &member.card_id, now)?);
                 let (card, state) = load_card(control, &member.card_id)?;
                 state.state.check_transition(CardState::Closed)?;
                 store_card_state(control, &card, &state, CardState::Closed)?;

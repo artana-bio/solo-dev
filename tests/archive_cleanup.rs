@@ -72,6 +72,24 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+/// The lease record a card holds, read straight off disk.
+///
+/// Read as a file rather than through `work status`, so these tests assert
+/// what was actually persisted rather than what one reader chose to report.
+fn lease_record(workspace: &Workspace, lease_id: &str) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(workspace.control.join(format!("leases/{lease_id}.json"))).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The id of the lease a card currently holds, or `None` once released.
+fn held_lease_id(workspace: &Workspace, card: &str) -> Option<String> {
+    workspace.work_json(&["status", "--card-id", card])["data"]["held_lease"]["lease_id"]
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 #[test]
 fn archiving_creates_a_ref_for_the_landing_and_every_candidate() {
     let (workspace, id) = promoted(2);
@@ -238,6 +256,103 @@ fn closing_removes_the_worktrees_and_branches() {
             "closed"
         );
     }
+}
+
+#[test]
+fn closing_releases_the_lease_it_cleaned_up() {
+    // `LeaseStatus::Released` existed, serialized, and was exercised in
+    // `lease.rs`'s unit tests while no production path ever constructed it,
+    // so `is_held()` was true for every lease that had ever been granted and
+    // `held_lease` never returned `None` once a card was started. The
+    // allocation a lease names is what `archive close` removes, so this is
+    // where it ends.
+    let (workspace, id) = archived(2);
+
+    let leases: Vec<String> = ["F-001", "F-002"]
+        .iter()
+        .map(|card| held_lease_id(&workspace, card).expect("the fixture must hold a lease"))
+        .collect();
+    for lease_id in &leases {
+        let before = lease_record(&workspace, lease_id);
+        assert_eq!(before["status"], "held");
+        assert_eq!(before["released_at"], serde_json::Value::Null);
+    }
+
+    workspace.archive(&["close", "--integration-id", &id]);
+
+    for (card, lease_id) in ["F-001", "F-002"].iter().zip(&leases) {
+        let after = lease_record(&workspace, lease_id);
+        assert_eq!(
+            after["status"], "released",
+            "closing must release {lease_id}: {after}"
+        );
+        assert!(
+            after["released_at"].is_string(),
+            "a released lease must record when: {after}"
+        );
+        // The record survives its release. A lease is the answer to "who held
+        // this card, and where" long after the allocation is gone, so release
+        // is a state change and never a deletion.
+        assert_eq!(after["card_id"], *card);
+        assert_eq!(
+            held_lease_id(&workspace, card),
+            None,
+            "a released lease must stop reading as held for {card}"
+        );
+    }
+}
+
+#[test]
+fn a_close_dry_run_leaves_the_lease_held() {
+    // `preview_close` mirrors every refusal the real close makes without any
+    // of its writes. Releasing is a write.
+    let (workspace, id) = archived(1);
+    let lease_id = held_lease_id(&workspace, "F-001").unwrap();
+
+    workspace.archive(&["close", "--integration-id", &id, "--dry-run"]);
+
+    let record = lease_record(&workspace, &lease_id);
+    assert_eq!(
+        record["status"], "held",
+        "a dry run must not release the lease: {record}"
+    );
+    assert_eq!(record["released_at"], serde_json::Value::Null);
+    assert_eq!(held_lease_id(&workspace, "F-001").as_deref(), Some(&*lease_id));
+}
+
+#[test]
+fn a_refused_close_leaves_the_lease_held() {
+    // Ordering, stated as a test: the lease is released last, after every
+    // removal has succeeded, because `held_lease` is where cleanup finds the
+    // worktree to remove. A close that refuses leaves the worktree on disk,
+    // so the lease naming it has to still be held — otherwise the allocation
+    // survives with nothing pointing at it, and the next close would walk
+    // straight past it.
+    let (workspace, id) = archived(1);
+    let lease_id = held_lease_id(&workspace, "F-001").unwrap();
+    fs::write(
+        workspace.worktrees.join("F-001").join("in-progress.txt"),
+        "not committed\n",
+    )
+    .unwrap();
+
+    let output = workspace.archive_raw(&["close", "--integration-id", &id]);
+    assert_eq!(error_code(&output), "CH-PRECONDITION-WORKTREE-DIRTY");
+
+    let record = lease_record(&workspace, &lease_id);
+    assert_eq!(
+        record["status"], "held",
+        "a refused close must leave the lease holding its worktree: {record}"
+    );
+    assert!(workspace.worktrees.join("F-001").exists());
+
+    // Not retried here. `cleanup-started` is journaled `outside_control`, so
+    // a failure past it is recorded partial whatever control looks like, and
+    // `project recover --resume` settles only `integration.promote`
+    // (`PROMOTE_COMMAND`, `src/commands/project.rs`) — so the retry would be
+    // a test of journal recovery, which this change does not touch.
+    // `closing_releases_the_lease_it_cleaned_up` is what proves a close that
+    // succeeds does release.
 }
 
 #[test]
