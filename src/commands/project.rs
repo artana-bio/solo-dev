@@ -16,8 +16,9 @@ use crate::{
     },
     config::{
         CONVERGENCE_POLICY_V1, CardConvergenceLimits, ConvergencePolicy, CycleConvergenceLimits,
-        DEFAULT_AUTHORITY_REMOTE, FieldError, FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA,
-        ProjectConfig, RiskConvergenceLimits, ValidationPolicy,
+        DEFAULT_AUTHORITY_REMOTE, ExceptionTrigger, FINAL_AUTHORIZATION_POLICY_V1, FieldError,
+        FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA, ProjectConfig, RiskConvergenceLimits,
+        ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -74,6 +75,15 @@ pub enum ProjectCommand {
     /// so this can never disagree with what `project set-convergence-policy`
     /// accepts — see #108.
     Example(ExampleArgs),
+    /// Print a complete, valid final-authorization-policy example.
+    ///
+    /// A sibling command rather than a selector on `example`, so it appears
+    /// by name in `project --help`'s own command list — see #143 §7 and
+    /// [`run_example_final_authorization`]. Built by constructing a real
+    /// `FinalAuthorizationPolicy` and serializing it, so this can never
+    /// disagree with what `project set-final-authorization-policy` accepts,
+    /// the same guarantee #108 established for `example`.
+    ExampleFinalAuthorization(ExampleFinalAuthorizationArgs),
 }
 
 impl ProjectCommand {
@@ -92,6 +102,7 @@ impl ProjectCommand {
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
             Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
             Self::Example(..) => "project.example",
+            Self::ExampleFinalAuthorization(..) => "project.example-final-authorization",
         }
     }
 }
@@ -213,6 +224,14 @@ pub struct SetFinalAuthorizationPolicyArgs {
 #[derive(Debug, Args)]
 pub struct ExampleArgs {}
 
+/// Arguments accepted by `project example-final-authorization`.
+///
+/// Deliberately empty, matching [`ExampleArgs`] for the same reason: #108
+/// constraint 1 requires this to be reachable before an operator has a
+/// control repository or a project to point it at, so it names neither.
+#[derive(Debug, Args)]
+pub struct ExampleFinalAuthorizationArgs {}
+
 /// Executes a `project` subcommand.
 ///
 /// # Errors
@@ -232,6 +251,7 @@ pub fn execute(
             run_set_final_authorization_policy(args, clock)
         }
         ProjectCommand::Example(..) => run_example(),
+        ProjectCommand::ExampleFinalAuthorization(..) => run_example_final_authorization(),
     }
 }
 
@@ -395,6 +415,109 @@ fn run_example() -> Result<CommandOutcome, HarnessError> {
         "the limits above are illustrative, not a recommendation: they show a budget that \
          narrows as risk rises, but a real policy's exact numbers must be set deliberately for \
          this project's own risk tolerance and card volume, never copied verbatim",
+    ))
+}
+
+/// A complete, valid final-authorization policy, for `project
+/// example-final-authorization` to emit.
+///
+/// #143: a second independent cold-start operator hit the one unnavigable
+/// refusal in 139 commands here — `authorization_unit` rejected with no
+/// example, no `--help` text, and no `SKILL.md` section showing its shape,
+/// resolved only by running `strings` on the binary. `authorization_unit`
+/// has exactly one accepted value, `"sealed_cycle"`
+/// (`FinalAuthorizationPolicy::validate`), reproduced here unedited the same
+/// way [`example_convergence_policy`] reproduces `CONVERGENCE_POLICY_V1`
+/// unedited: a value the schema pins to one exact string is not a place for
+/// creative license.
+///
+/// `authorizer_actor_ids` is where this function cannot follow
+/// [`example_convergence_policy`]'s example: a convergence policy's numbers
+/// are free-standing, so that function could choose values that teach
+/// risk-scaling without being mistaken for a literal recommendation. This
+/// field has no equivalent freedom — its only valid values *are* actor
+/// identifiers, and any name chosen here is necessarily wrong for every
+/// project except one that happens to have declared an actor by that exact
+/// name. Two clearly generic slot names are used, rather than one, so the
+/// shape — a list, not a single fixed name — is visible;
+/// [`run_example_final_authorization`]'s warning says outright that both
+/// must be replaced with actors the target project has actually declared
+/// before the document is installed for real.
+///
+/// `exception_triggers` is populated rather than left at its `#[serde(default)]`
+/// empty list. It is the only field `FinalAuthorizationPolicy` makes
+/// optional, and an empty list serializes to no key at all
+/// (`skip_serializing_if = "Vec::is_empty"`) — teaching a reader nothing
+/// about the five names `ExceptionTrigger` accepts, exactly the kind of gap
+/// #143 exists to close. `review example`'s `example_verdict`
+/// (`src/commands/review.rs`) established the same principle for its own
+/// optional fields: every field is shown, because one left out teaches
+/// nothing about its shape. Two of the five are shown here, not all five, so
+/// the field's shape — an array of `snake_case` strings — is visible without
+/// reading as "enable every trigger" advice, the same over-recommendation
+/// [`example_convergence_policy`]'s own doc comment avoids for its numbers.
+fn example_final_authorization_policy() -> FinalAuthorizationPolicy {
+    FinalAuthorizationPolicy {
+        version: FINAL_AUTHORIZATION_POLICY_V1.to_owned(),
+        authorization_unit: "sealed_cycle".to_owned(),
+        authorizer_actor_ids: vec![
+            "primary-authorizer".to_owned(),
+            "secondary-authorizer".to_owned(),
+        ],
+        exception_triggers: vec![
+            ExceptionTrigger::PolicyChange,
+            ExceptionTrigger::CriticalResidualRisk,
+        ],
+    }
+}
+
+/// Emits a complete, valid final-authorization-policy example.
+///
+/// #108 constraint 1, carried over unchanged: reachable without a control
+/// repository, a project, or a card — [`ExampleFinalAuthorizationArgs`]
+/// carries nothing to open one with, exactly like [`ExampleArgs`]. #108
+/// constraint 2: listed under `project --help` because it is an ordinary
+/// [`ProjectCommand`] variant like any other — and, per #143 §7, named so
+/// that listing itself is where an operator scanning for "how do I see this
+/// document" finds it, rather than needing to already suspect `project
+/// example` takes a selector before running `project example --help` to
+/// discover one.
+///
+/// The document is JSON, not YAML, for the same reason [`run_example`]'s is:
+/// [`read_final_authorization_policy`] parses only with
+/// `serde_json::from_str`.
+///
+/// Built by constructing a [`FinalAuthorizationPolicy`] and serializing it,
+/// never by writing the document out by hand, so this and
+/// [`read_final_authorization_policy`] can never disagree about the shape:
+/// they are the same `serde` implementation.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example_final_authorization() -> Result<CommandOutcome, HarnessError> {
+    let policy = example_final_authorization_policy();
+    let example =
+        serde_json::to_string_pretty(&policy).map_err(|source| HarnessError::Control {
+            reason: format!("failed to render the example final authorization policy: {source}"),
+            code: ErrorCode::InternalEncoding,
+        })?;
+    Ok(CommandOutcome::new(
+        "project.example-final-authorization",
+        example.clone(),
+        serde_json::json!({
+            "format": "json",
+            "example": example,
+        }),
+    )
+    .with_warning(
+        "the two authorizer_actor_ids above are placeholder slot names, not real actors: \
+         `project set-final-authorization-policy` will accept and install this document \
+         exactly as shown, but only an actor id that exactly matches one of these two names \
+         can ever complete a real authorization under it, so installing it unedited \
+         authorizes nobody in any real project. Replace both with actor ids this project has \
+         actually declared before installing it for real; the two exception_triggers shown \
+         illustrate the field's shape and are not a recommendation to enable exactly those two",
     ))
 }
 
