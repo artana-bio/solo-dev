@@ -456,14 +456,16 @@ fn generated_source_is_owned(
         .any(|pattern| provably_contains_pattern(pattern, source, case))
 }
 
-/// #142: no `card` subcommand emits a draft example — `SKILL.md`'s "Write a
-/// bounded card" section carries a hand-authored template instead of a
-/// generated one, and #142 §11 asks for a *command* reference, so this does
-/// not point at a document section instead (see
-/// `HANDOFF_DECLARATION_PARSE_RECOVERY` in `src/commands/handoff.rs` for the
-/// same reasoning and the regression it avoids repeating). `serde_yaml_ng`
-/// also offers no syntax/schema split — see `GATE_DEFINITION_PARSE_RECOVERY`
-/// in `src/commands/gate.rs` — so this is one honest-for-both message.
+/// #180 added `card example` (`src/commands/card.rs`), which prints a
+/// complete, valid card draft by constructing a real `CardDraft` and
+/// serializing it — so this recovery now names that command instead of
+/// #142's original "there is no generated example" wording, which #180 §2
+/// made false the moment the command existed:
+/// `tests/config_malformed_example_claims.rs` fails on this exact constant
+/// the moment `card example` is real, and would keep failing on the old
+/// wording forever after. `serde_yaml_ng` still offers no syntax/schema
+/// split — see `GATE_DEFINITION_PARSE_RECOVERY` in `src/commands/gate.rs` —
+/// so this remains one message, honest for both failure shapes.
 ///
 /// Reached from two contexts: `commands::card::read_draft`'s external,
 /// operator-supplied file (already given its own read-failure recovery one
@@ -474,7 +476,7 @@ fn generated_source_is_owned(
 /// "re-check the position or field" reads correctly either way — rather
 /// than picking the likelier case and being wrong for the other, per #142
 /// §10.
-const DRAFT_PARSE_RECOVERY: &str = "This card draft could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. There is no generated example for a card draft document; re-check the position or field the message names.";
+const DRAFT_PARSE_RECOVERY: &str = "This card draft could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. Compare it against `card example`'s output, a complete, valid card draft.";
 
 impl CardDraft {
     /// Checks each generated declaration, and what its class implies about

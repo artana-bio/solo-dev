@@ -249,6 +249,15 @@ integrate or promote.
 
 A card is a contract. It needs one observable outcome, a narrow scope, named
 gates, acceptance behavior, independent review policy, and rollback plan.
+`card example` prints a complete valid draft to start from — it is
+serialized from the same type `card create` deserializes, so it cannot
+describe a shape the command would refuse. Its values are illustrative, not
+a recommendation to copy verbatim; the warning it prints says exactly which
+ones to replace.
+
+```bash
+change-harness card example
+```
 
 ```yaml
 card_id: F-001
@@ -315,7 +324,14 @@ only after the narrow proof passes, at the schedule the Harness authorizes.
 change-harness work verify --card-id F-001
 ```
 
-Then submit a declaration bound to the exact commit:
+Then submit a declaration bound to the exact commit. `handoff example` prints
+a complete valid declaration to start from, serialized from the same type
+`handoff create` deserializes; its `delivered_sha` is a placeholder that must
+be replaced with this exact commit before the document will be accepted:
+
+```bash
+change-harness handoff example
+```
 
 ```yaml
 delivered_sha: <git rev-parse HEAD in the allocated worktree>

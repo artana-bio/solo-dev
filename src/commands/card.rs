@@ -19,7 +19,11 @@ use crate::{
         repository::ControlRepository,
     },
     domain::{
-        card::{CARD_DIR, CardDraft, CardRecord, CardState},
+        artifact::{ArtifactClass, GeneratedArtifact},
+        card::{
+            Acceptance, CARD_DIR, CardDraft, CardRecord, CardState, NamedGates, PROOF_MAP_SCHEMA,
+            ProofMap, ProofMapEntry, Risk, WriteScope,
+        },
         clock::Clock,
         cycle::{CYCLE_DIR, CycleRecord, CycleStatus},
         digest::Digest,
@@ -81,6 +85,15 @@ pub enum CardCommand {
     Abandon(AbandonArgs),
     /// Report a card's state, revision, and digest.
     Status(StatusArgs),
+    /// Print a complete, valid card draft example.
+    ///
+    /// Built by constructing a real `CardDraft` and serializing it, so this
+    /// can never disagree with what `card create` accepts — see #108. #180
+    /// added this: the one document kind #142 §11 had found with no
+    /// generated example at all, and the exact dead end its own §1 traces —
+    /// `acceptance: invalid type: sequence, expected struct Acceptance`,
+    /// with a recovery that used to say outright that no example existed.
+    Example(ExampleArgs),
 }
 
 impl CardCommand {
@@ -98,6 +111,7 @@ impl CardCommand {
             Self::Revise(..) => "card.revise",
             Self::Abandon(..) => "card.abandon",
             Self::Status(..) => "card.status",
+            Self::Example(..) => "card.example",
         }
     }
 }
@@ -192,6 +206,15 @@ pub struct StatusArgs {
     pub card_id: String,
 }
 
+/// Arguments accepted by `card example`.
+///
+/// Deliberately empty, and deliberately not [`CommonArgs`]: #108 constraint 1
+/// requires this to be reachable before an operator has a control repository,
+/// a project, or a cycle to point it at, so it names neither — the same
+/// reasoning `review::ExampleArgs` and `project::ExampleArgs` already give.
+#[derive(Debug, Args)]
+pub struct ExampleArgs {}
+
 /// Executes a `card` subcommand.
 ///
 /// # Errors
@@ -205,6 +228,7 @@ pub fn execute(command: &CardCommand, clock: &dyn Clock) -> Result<CommandOutcom
         CardCommand::Revise(args) => run_revise(args, clock),
         CardCommand::Abandon(args) => run_abandon(args, clock),
         CardCommand::Status(args) => run_status(args),
+        CardCommand::Example(..) => run_example(),
     }
 }
 
@@ -223,6 +247,215 @@ fn read_draft(path: &PathBuf) -> Result<CardDraft, HarnessError> {
         recovery: CARD_DRAFT_READ_RECOVERY,
     })?;
     CardDraft::parse(&raw)
+}
+
+/// `deadbeef`, the classic hexspeak placeholder, repeated to fill the 40 hex
+/// characters `base_sha` requires (`CardDraft::validate`). A real object id
+/// is the SHA-1 of actual Git object content; producing one that happens to
+/// equal a constructed string is not a thing an operator, or this function,
+/// could do by accident. `deadbeef` is also recognizable on sight as
+/// constructed, unlike an arbitrary-looking hex string that could pass for a
+/// real prefix and tempt an operator into wondering whether it means
+/// something. [`run_example`]'s warning says outright that it must be
+/// replaced with the target cycle's real frozen baseline before `card
+/// create` is run for anything but this example.
+const EXAMPLE_BASE_SHA: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+/// A complete, valid card draft, for `card example` to emit.
+///
+/// #180: `CardDraft` is the first example document with genuinely optional
+/// fields — `non_goals`, `contract_reads`, `contract_changes`, `depends_on`,
+/// `exclusive_resources`, and `generated_artifacts` all carry
+/// `#[serde(default)]`, and `proof_map` carries
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]` besides.
+/// Every one of them is populated here, for the same reason
+/// [`crate::commands::review::example_verdict`] populates
+/// [`crate::commands::review::Verdict`]'s own optional fields: an example
+/// that omits a field teaches a reader nothing about its shape. This matters
+/// more for `proof_map` than for the rest — left at `None`, it would not
+/// merely look empty, `skip_serializing_if` would drop the key from the
+/// document entirely, hiding that the field exists at all. Populating it
+/// also means [`optional_fields`] (below) reports it correctly: a key that
+/// never appears in the serialized document can never be discovered by
+/// removing it and re-parsing.
+///
+/// The one field this must get right above every other is `acceptance`: the
+/// operator whose dead end #180 exists to close had written a sequence
+/// where `Acceptance` — a struct with `behaviors` and `regressions` — was
+/// expected. Constructing a real `Acceptance` here means that shape is
+/// exactly what a reader sees; see [`run_example`]'s doc comment for why
+/// that guarantee is structural rather than a promise this function could
+/// silently stop keeping.
+///
+/// `depends_on` names one illustrative card id, `F-099`, distinct from this
+/// document's own `F-100`, so the field's shape — a list of card ids, not a
+/// single one — is visible without needing a second entry. Nothing about
+/// `card create` checks that a declared dependency exists (`card activate`
+/// is where that would matter, and this document never reaches it in
+/// `card`'s own test), so the id needs only to be well-formed, not real;
+/// [`run_example`]'s warning says to remove it entirely for a card with no
+/// real dependency, which is the common case this example is not.
+///
+/// `generated_artifacts` carries one per-card entry whose `sources` is
+/// contained in `write_scope.include`, so [`CardDraft::validate`]'s
+/// ownership check (`validate_generated_artifacts`, `src/domain/card.rs`)
+/// accepts it — the artifact's own `path` is not checked against scope by
+/// that function, but this example still places it inside the declared
+/// scope, matching what a card would need in order to actually commit it.
+///
+/// `risk` is `Low`, under which `card activate` never requires a
+/// `proof_map` (`ValidationPolicy::requires_proof_map`'s default names only
+/// `medium`, `high`, and `critical`) — the point being made here is that a
+/// proof map is always *accepted*, at any risk, not that this risk demands
+/// one.
+fn example_card_draft() -> CardDraft {
+    CardDraft {
+        card_id: "F-100".parse().unwrap_or_else(|error| {
+            unreachable!("`F-100` is a well-formed card id literal: {error}")
+        }),
+        cycle_id: "C-100".parse().unwrap_or_else(|error| {
+            unreachable!("`C-100` is a well-formed cycle id literal: {error}")
+        }),
+        title: "One-line title".to_owned(),
+        goal: "What will be true when this card lands.".to_owned(),
+        non_goals: vec!["What this card deliberately does not do.".to_owned()],
+        risk: Risk::Low,
+        change_kind: "feature".to_owned(),
+        base_sha: EXAMPLE_BASE_SHA.to_owned(),
+        write_scope: WriteScope {
+            include: vec![
+                "src/example_feature.rs".to_owned(),
+                "src/example_feature_generated.rs".to_owned(),
+                "tests/example_feature.rs".to_owned(),
+            ],
+            exclude: vec![],
+        },
+        contract_reads: vec!["auth.session".to_owned()],
+        contract_changes: vec!["api.v1".to_owned()],
+        depends_on: vec!["F-099".parse().unwrap_or_else(|error| {
+            unreachable!("`F-099` is a well-formed card id literal: {error}")
+        })],
+        exclusive_resources: vec!["shared-database-migration-lock".to_owned()],
+        named_gates: NamedGates {
+            feature: vec!["gate.unit".to_owned()],
+            review: vec![],
+            integration: vec!["gate.all".to_owned()],
+        },
+        acceptance: Acceptance {
+            behaviors: vec!["Observable behavior a test can fail.".to_owned()],
+            regressions: vec!["Behavior that must keep working.".to_owned()],
+        },
+        generated_artifacts: vec![GeneratedArtifact {
+            path: "src/example_feature_generated.rs".to_owned(),
+            class: ArtifactClass::PerCard,
+            generator: Some("gate.codegen".to_owned()),
+            sources: vec!["src/example_feature.rs".to_owned()],
+            identifier: None,
+        }],
+        review_policy: "independent".to_owned(),
+        rollback_strategy: "revert the landing commit on the protected branch".to_owned(),
+        proof_map: Some(ProofMap {
+            schema: PROOF_MAP_SCHEMA.to_owned(),
+            entries: vec![ProofMapEntry {
+                invariant: "The declared behavior stays true.".to_owned(),
+                precondition: "A focused fixture exercises exactly this behavior.".to_owned(),
+                assertion: "The check observes the behavior directly.".to_owned(),
+                mutation: "A discriminating change that must make the assertion fail.".to_owned(),
+            }],
+            claim_boundary: "Only the behavior named above; nothing wider is claimed.".to_owned(),
+        }),
+    }
+}
+
+/// Which of `draft`'s top-level fields `CardDraft::parse` accepts as absent.
+///
+/// Mirrors [`crate::commands::review::optional_fields`] exactly — same
+/// technique, same reasoning — rather than importing it: that function is
+/// private to `review.rs` and #180's frozen file scope does not include it,
+/// but the argument for existing at all is unchanged. Established by asking
+/// the real deserializer, field by field, rather than reading a hand-typed
+/// list off `CardDraft`'s `#[serde(default)]` attributes: a hand-maintained
+/// claim about the schema is exactly what #108 exists to stop from silently
+/// drifting from what the parser actually accepts, and `CardDraft` — unlike
+/// [`crate::commands::review::Verdict`] before it — has six such attributes
+/// to keep in step, not one.
+///
+/// # Errors
+///
+/// Returns an error when `draft` cannot be serialized to inspect.
+fn optional_fields(draft: &CardDraft) -> Result<Vec<String>, HarnessError> {
+    let value = serde_json::to_value(draft)?;
+    let object = value.as_object().ok_or_else(|| HarnessError::Control {
+        reason: "the example card draft did not serialize to a document with fields".to_owned(),
+        code: ErrorCode::InternalEncoding,
+    })?;
+    let mut optional: Vec<String> = object
+        .keys()
+        .filter(|key| {
+            let mut reduced = object.clone();
+            reduced.remove(key.as_str());
+            serde_json::from_value::<CardDraft>(serde_json::Value::Object(reduced)).is_ok()
+        })
+        .cloned()
+        .collect();
+    optional.sort();
+    Ok(optional)
+}
+
+/// Emits a complete, valid card-draft example.
+///
+/// #108 constraint 1: reachable without a control repository, a project, or
+/// a cycle — [`ExampleArgs`] carries nothing to open one with. #108
+/// constraint 2: listed under `card --help` because it is an ordinary
+/// [`CardCommand`] variant like any other.
+///
+/// The document is YAML: `read_draft` and `stored_draft` both parse with
+/// [`CardDraft::parse`], which reads with `serde_yaml_ng` — the same parser
+/// `review example`'s document is read back with, and `serde_yaml_ng`
+/// accepts JSON as the YAML it syntactically is, so YAML is the strictly
+/// more general of the two accepted shapes. This mirrors `review example`
+/// exactly; see `run_example` in `src/commands/review.rs` for the full
+/// argument.
+///
+/// Built by constructing a [`CardDraft`] and serializing it, never by
+/// writing the document out by hand, so this and [`CardDraft::parse`] can
+/// never disagree about the shape: they are the same `serde`
+/// implementation. That equivalence is what makes `acceptance` land as a
+/// struct here rather than the sequence the operator #180 exists for wrote:
+/// Rust's type system does not let this function build a `CardDraft` whose
+/// `acceptance` field is anything but a real `Acceptance`, so there is no
+/// path through this code that could regress the exact shape that mattered.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example() -> Result<CommandOutcome, HarnessError> {
+    let draft = example_card_draft();
+    let example = serde_yaml_ng::to_string(&draft).map_err(|source| HarnessError::Control {
+        reason: format!("failed to render the example card draft: {source}"),
+        code: ErrorCode::InternalEncoding,
+    })?;
+    let optional = optional_fields(&draft)?;
+    Ok(CommandOutcome::new(
+        "card.example",
+        example.clone(),
+        serde_json::json!({
+            "format": "yaml",
+            "example": example,
+            "optional_fields": optional,
+        }),
+    )
+    .with_warning(format!(
+        "every value above is illustrative, not a template to copy verbatim: `card_id`, \
+         `cycle_id`, and the single `depends_on` entry are placeholder identifiers and must be \
+         replaced with this project's real ones (or `depends_on` cleared entirely, for a card \
+         with no real dependency), and `base_sha` is the hexspeak placeholder `deadbeef` \
+         repeated to fill 40 hex characters — not a real commit in any repository — which must \
+         be replaced with the exact 40-character object id the target cycle is frozen at \
+         before `card create` is run for real. Every field above is shown so its shape is \
+         visible, including these, which default when the key is absent: {}",
+        optional.join(", ")
+    )))
 }
 
 /// Relative path of a stored draft.
