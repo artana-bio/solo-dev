@@ -16,7 +16,13 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        acceptance::{acceptance_for, validate_final_authorization_for_promotion},
+        acceptance::{
+            EXCEPTION_TRIGGER_NOT_ENABLED_RECOVERY,
+            FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
+            FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY, FINAL_AUTHORIZATION_STALE_RECOVERY,
+            FINAL_INTEGRATION_SEAL_STALE_RECOVERY, acceptance_for,
+            validate_final_authorization_for_promotion,
+        },
         audit::check_control_anchors,
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
@@ -1629,15 +1635,14 @@ pub(crate) fn exceptions_for(
         return Ok(Vec::new());
     }
     let expected_integration_digest = record.substantive_digest()?.as_str().to_owned();
-    let policy =
-        config
-            .final_authorization_policy
-            .as_ref()
-            .ok_or_else(|| HarnessError::Control {
-                reason: "final authorization policy is not configured for exception validation"
-                    .to_owned(),
-                code: ErrorCode::PolicyNotAccepted,
-            })?;
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::ControlWithRecovery {
+            reason: "final authorization policy is not configured for exception validation"
+                .to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        }
+    })?;
     let expected_policy_digest = policy.digest()?.as_str().to_owned();
     let expected_seal = record
         .sealed_cycle_digest
@@ -1680,12 +1685,13 @@ pub(crate) fn exceptions_for(
                 || sealed_cycle_digest != expected_seal
                 || policy_digest != expected_policy_digest
             {
-                return Err(HarnessError::Control {
+                return Err(HarnessError::ControlWithRecovery {
                     reason: format!(
                         "exception event {} no longer binds final integration {}",
                         event.event_id, record.integration_id
                     ),
                     code: ErrorCode::PolicyNotAccepted,
+                    recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
                 });
             }
             let evidence_refs = event
@@ -1862,14 +1868,13 @@ fn exception_bindings(
             code: ErrorCode::PolicyInvalidTransition,
         });
     }
-    let policy =
-        config
-            .final_authorization_policy
-            .as_ref()
-            .ok_or_else(|| HarnessError::Control {
-                reason: "final authorization policy does not declare exception triggers".to_owned(),
-                code: ErrorCode::PolicyNotAccepted,
-            })?;
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::ControlWithRecovery {
+            reason: "final authorization policy does not declare exception triggers".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        }
+    })?;
     let cycle = load_cycle(control, &record.cycle_id)?;
     let seal = record
         .sealed_cycle_digest
@@ -1883,12 +1888,13 @@ fn exception_bindings(
         })?;
     let actual = Digest::of_canonical(&cycle)?;
     if cycle.status != CycleStatus::Sealed || &actual != seal {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final integration {} no longer binds its sealed cycle",
                 record.integration_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_INTEGRATION_SEAL_STALE_RECOVERY,
         });
     }
     Ok((policy.digest()?, record.substantive_digest()?, seal.clone()))
@@ -1898,22 +1904,22 @@ fn validate_exception_authorizer(
     config: &crate::config::ProjectConfig,
     authorizer: &str,
 ) -> Result<(), HarnessError> {
-    let policy =
-        config
-            .final_authorization_policy
-            .as_ref()
-            .ok_or_else(|| HarnessError::Control {
-                reason: "final authorization policy is not configured".to_owned(),
-                code: ErrorCode::PolicyNotAccepted,
-            })?;
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::ControlWithRecovery {
+            reason: "final authorization policy is not configured".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        }
+    })?;
     if policy.authorizes(authorizer) {
         Ok(())
     } else {
-        Err(HarnessError::Control {
+        Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {authorizer} is not configured to resolve final integration exceptions"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         })
     }
 }
@@ -1953,12 +1959,13 @@ fn run_exception_raise(
             .as_ref()
             .expect("checked above");
         if !policy.enables_exception(trigger) {
-            return Err(HarnessError::Control {
+            return Err(HarnessError::ControlWithRecovery {
                 reason: format!(
                     "exception trigger `{}` is not enabled by final authorization policy",
                     trigger.name()
                 ),
                 code: ErrorCode::PolicyNotAccepted,
+                recovery: EXCEPTION_TRIGGER_NOT_ENABLED_RECOVERY,
             });
         }
         require_no_pending_exception(control, &config, &record)?;
@@ -3857,6 +3864,10 @@ pub(crate) fn status_gate_refusal(
 /// Shared between `preview_promote` and `run_promote`, so both check the
 /// cycle's convergence budget through this one call rather than each risking
 /// its own copy drifting from the other's.
+// #179 pushed this past the default line limit by giving two of its checks
+// their own per-site `recovery:` line — the same reason three other
+// functions in this file already carry this same allow.
+#[allow(clippy::too_many_lines)]
 fn check_promotion(
     control: &ControlRepository,
     config: &crate::config::ProjectConfig,
@@ -3907,9 +3918,10 @@ fn check_promotion(
             code: ErrorCode::PreconditionNotFound,
         })?;
     if let Some(reason) = acceptance.blocks_promotion_of(&landing_sha) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!("promotion is not authorized: {reason}"),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     validate_final_authorization_for_promotion(control, config, record, &acceptance)?;
@@ -3920,12 +3932,13 @@ fn check_promotion(
     // acceptance owner signed off.
     let substantive = record.substantive_digest()?;
     if acceptance.integration_record_digest != substantive {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "acceptance {} authorized integration digest {} but the record now digests to {substantive}; the plan changed after it was accepted",
                 acceptance.acceptance_id, acceptance.integration_record_digest
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     let verification = load_verification(control, &record.integration_id)?;

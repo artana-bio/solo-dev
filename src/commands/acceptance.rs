@@ -35,6 +35,119 @@ use crate::{
     policy::actors,
 };
 
+// ---------------------------------------------------------------------
+// #179: `ErrorCode::PolicyNotAccepted`'s per-site recovery text.
+//
+// Every one of the sites #179 §2 counted shared one fallback string
+// (`src/error.rs`'s `PolicyNotAccepted` table entry) whose advice —
+// "Record an acceptance for this exact landing commit before
+// promoting." — was the thing the reproducing operator had just
+// attempted. #179 §7 asks for the situations to be established before
+// any text is written: not one bespoke string per site, and not one
+// string standing in for all of them (the original defect, just with
+// more call sites).
+//
+// Reading every real construction site in this file, `disposition.rs`,
+// and `integration.rs` (re-measured at 29, not the 36 the card's own §2
+// counted — see the evidence report for where that count went wrong)
+// sorts them into five situations, by what an operator would actually
+// have to do differently, not by which file or which specific command
+// triggered the refusal:
+//
+// 1. **No policy at all** (11 sites): `final_authorization_policy` was
+//    never configured, or was configured once and is gone by the time a
+//    later recheck runs. The fix is the same regardless of which
+//    command tripped over the absence: install one.
+// 2. **This actor is not on the list** (8 sites, including B2): a
+//    policy exists, but the acting actor is not among
+//    `authorizer_actor_ids`. #179 §8's own requirement for B2 — name
+//    `final_authorization_policy.authorizer_actor_ids` and
+//    `project example-final-authorization` — generalizes cleanly to
+//    every site in this group, `disposition.rs`'s six included: the
+//    field an operator needs to check does not change with the
+//    operation being authorized.
+// 3. **This integration's own binding is stale, before any decision is
+//    recorded** (2 sites): the cycle was resealed after
+//    `integration prepare --final` last captured its digest, so the
+//    integration record itself — not any acceptance or exception — no
+//    longer matches the cycle it claims to bind. Recording a decision
+//    is exactly what is being refused here, so "record one" would be
+//    circular; the fix is to re-prepare.
+// 4. **An existing decision no longer covers the current state** (7
+//    sites): an acceptance or exception was validly recorded once, but
+//    the landing commit, the plan, or the policy has since moved, or
+//    the recorded decision was itself a rejection. Unlike group 3,
+//    something *was* already decided — the fix is a fresh decision
+//    against the state as it is now, not a re-preparation.
+// 5. **This specific trigger is not enabled** (1 site): a policy exists
+//    and may authorize this actor for other things, but
+//    `exception_triggers` does not list the one just named. A
+//    different field than group 2's, so it needs its own text naming
+//    it — reusing group 2's text here would send an operator to fix
+//    the wrong list, the original defect with a smaller blast radius.
+//
+// One of the card's own candidate axes does not actually appear: "an
+// acceptance genuinely does not exist yet" describes `check_promotion`'s
+// own missing-acceptance check (`src/commands/integration.rs`) in
+// spirit, but that site's code is `ErrorCode::PreconditionNotFound`, not
+// `PolicyNotAccepted` — out of this card's scope, and the reason the
+// shared fallback's own wording ("Record an acceptance...") never
+// actually matched any `PolicyNotAccepted` site to begin with.
+//
+// Defined here, alongside `validate_final_authorization` and
+// `validate_final_authorization_for_promotion` — the two functions that
+// already own every rule these five situations describe — rather than
+// once per file. `disposition.rs` and `integration.rs` import what they
+// need, the same way `integration.rs` already imports
+// `validate_final_authorization_for_promotion` itself from this module.
+// ---------------------------------------------------------------------
+
+/// Group 1: no `final_authorization_policy` is configured for this
+/// project — never installed, or installed once and gone by the time a
+/// later recheck runs. 11 sites: this file's `validate_final_authorization`
+/// and `validate_final_authorization_for_promotion` (one each), every one
+/// of `disposition.rs`'s six authorization checks, and three in
+/// `integration.rs`'s exception handling (`exceptions_for`,
+/// `exception_bindings`, `validate_exception_authorizer`).
+pub(crate) const FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY: &str = "`final_authorization_policy` is not configured for this project (or was removed since an earlier check relied on it); run `project example-final-authorization` for a complete, valid document, then install one with `project set-final-authorization-policy`.";
+
+/// Group 2: a policy exists, but this actor is not among its
+/// `authorizer_actor_ids`. 8 sites, including B2 (#179 §8) — this file's
+/// own `validate_final_authorization`, every one of `disposition.rs`'s
+/// six authorization checks, and `integration.rs`'s
+/// `validate_exception_authorizer`. Names
+/// `final_authorization_policy.authorizer_actor_ids` and
+/// `project example-final-authorization`: #179 §8's requirement for B2
+/// specifically, generalized to the seven siblings that ask the
+/// identical question about a different actor doing a different thing.
+pub(crate) const FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY: &str = "This actor is not among `final_authorization_policy.authorizer_actor_ids`; run `project example-final-authorization` to see a configured policy's shape, then retry as one of the listed actors or add this one with `project set-final-authorization-policy`.";
+
+/// Group 3: this final integration's own `sealed_cycle_digest` no longer
+/// matches its cycle — the cycle was resealed after
+/// `integration prepare --final` last captured it. 2 sites: this file's
+/// `validate_final_authorization` and `integration.rs`'s
+/// `exception_bindings`, both reached *before* any acceptance or
+/// exception is recorded, which is why the fix is to re-prepare rather
+/// than to retry recording (recording is exactly what is being refused).
+pub(crate) const FINAL_INTEGRATION_SEAL_STALE_RECOVERY: &str = "This final integration's sealed-cycle binding no longer matches the cycle; run `integration prepare --final` again for this cycle, then retry.";
+
+/// Group 4: an acceptance or exception was validly recorded once, but
+/// the landing commit, the plan, or the policy has since moved — or the
+/// recorded decision was itself a rejection. 7 sites: four checks in
+/// this file's `validate_final_authorization_for_promotion`, plus
+/// `integration.rs`'s `exceptions_for` (one check) and `check_promotion`
+/// (two checks). Unlike group 3, a decision already exists; the fix is
+/// a fresh one against the state as it stands now, not a re-preparation.
+pub(crate) const FINAL_AUTHORIZATION_STALE_RECOVERY: &str = "The reason above names what changed. What was recorded no longer covers the current landing commit, plan, or policy — record a fresh decision against the current state with `acceptance record`, or, for an exception, `integration exception raise`.";
+
+/// Group 5: a policy exists and may authorize this actor for other
+/// things, but `exception_triggers` does not list the one just named. 1
+/// site: `integration.rs`'s `run_exception_raise`. Kept apart from
+/// group 2 because the field to check is different — reusing group 2's
+/// text would send an operator to fix `authorizer_actor_ids` for a
+/// problem that lives in `exception_triggers`.
+pub(crate) const EXCEPTION_TRIGGER_NOT_ENABLED_RECOVERY: &str = "This trigger is not among `final_authorization_policy.exception_triggers`; add it with `project set-final-authorization-policy`, or raise a trigger the policy already declares.";
+
 /// Subcommands under `acceptance`.
 #[derive(Debug, Subcommand)]
 pub enum AcceptanceCommand {
@@ -283,16 +396,18 @@ fn validate_final_authorization(
     if !record.final_for_cycle {
         return Ok(None);
     }
-    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| HarnessError::Control {
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| HarnessError::ControlWithRecovery {
         reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a sealed cycle".to_owned(),
         code: ErrorCode::PolicyNotAccepted,
+        recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
     })?;
     if !policy.authorizes(authorizer_actor_id) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {authorizer_actor_id} is not configured to authorize final sealed cycles"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
     let cycle = load_cycle(control, &record.cycle_id)?;
@@ -308,12 +423,13 @@ fn validate_final_authorization(
         })?;
     let actual = crate::domain::digest::Digest::of_canonical(&cycle)?;
     if cycle.status != crate::domain::cycle::CycleStatus::Sealed || &actual != sealed {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final integration {} no longer binds its sealed cycle",
                 record.integration_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_INTEGRATION_SEAL_STALE_RECOVERY,
         });
     }
     Ok(Some((policy.digest()?, sealed.clone())))
@@ -339,21 +455,23 @@ pub(crate) fn validate_final_authorization_for_promotion(
         if config.final_authorization_policy.is_none() {
             return Ok(());
         }
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final integration {} has a v1 acceptance while an explicit final authorization policy requires v2",
                 record.integration_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     if acceptance.schema != ACCEPTANCE_V2_SCHEMA {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final integration {} requires a v2 final authorization",
                 record.integration_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     let Some(authorizer) = acceptance.authorizer_actor_id.as_deref() else {
@@ -374,21 +492,21 @@ pub(crate) fn validate_final_authorization_for_promotion(
             code: ErrorCode::InternalControlCorrupt,
         });
     };
-    let policy =
-        config
-            .final_authorization_policy
-            .as_ref()
-            .ok_or_else(|| HarnessError::Control {
-                reason: "final authorization policy is no longer configured".to_owned(),
-                code: ErrorCode::PolicyNotAccepted,
-            })?;
+    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| {
+        HarnessError::ControlWithRecovery {
+            reason: "final authorization policy is no longer configured".to_owned(),
+            code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        }
+    })?;
     if !policy.authorizes(authorizer) || &policy.digest()? != recorded_policy {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final authorization {} no longer matches the current project policy",
                 acceptance.acceptance_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     let cycle = load_cycle(control, &record.cycle_id)?;
@@ -397,12 +515,13 @@ pub(crate) fn validate_final_authorization_for_promotion(
         || record.sealed_cycle_digest.as_ref() != Some(recorded_seal)
         || &current_seal != recorded_seal
     {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "final authorization {} no longer matches its sealed cycle",
                 acceptance.acceptance_id
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
     Ok(())

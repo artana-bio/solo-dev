@@ -109,6 +109,10 @@ use crate::{
     cli::output::CommandOutcome,
     commands::{
         CONTROL_ENV,
+        acceptance::{
+            FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
+            FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        },
         card::{load_card, store_card_state},
         transaction::with_transaction,
     },
@@ -501,17 +505,19 @@ fn require_renewable(
     // either. Each will need to find its own already-configured surface to
     // reuse, the way this one reuses `final_authorization_policy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence budget renewal".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {actor} is not configured to authorize a convergence budget renewal"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 
@@ -827,17 +833,19 @@ fn require_rebaseline(
     // function's own long note for why this set is reused rather than
     // given its own field on `ConvergencePolicy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence policy rebaseline".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {actor} is not configured to authorize a convergence policy rebaseline"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 
@@ -1107,17 +1115,19 @@ fn require_abandonable(
     // through — see `require_renewable`'s own long note for why this set is
     // reused rather than given its own field on `ConvergencePolicy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence disposition abandon".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {actor} is not configured to authorize a convergence disposition abandon"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 
@@ -1393,17 +1403,19 @@ fn require_risk_acceptable(
     // for why this set is reused rather than given its own field on
     // `ConvergencePolicy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence risk acceptance".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!(
                 "actor {actor} is not configured to authorize a convergence risk acceptance"
             ),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 
@@ -1750,15 +1762,17 @@ fn require_splittable(
     // long note for why this set is reused rather than given its own field
     // on `ConvergencePolicy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence split".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!("actor {actor} is not configured to authorize a convergence split"),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 
@@ -2045,15 +2059,17 @@ fn require_redesignable(
     // own long note for why this set is reused rather than given its own
     // field on `ConvergencePolicy`.
     let authorization = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::Control {
+        HarnessError::ControlWithRecovery {
             reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a convergence redesign".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         }
     })?;
     if !authorization.authorizes(actor) {
-        return Err(HarnessError::Control {
+        return Err(HarnessError::ControlWithRecovery {
             reason: format!("actor {actor} is not configured to authorize a convergence redesign"),
             code: ErrorCode::PolicyNotAccepted,
+            recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
         });
     }
 

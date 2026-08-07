@@ -4709,6 +4709,102 @@ mod disposition_renew {
         );
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
     }
+
+    // #179: `disposition renew`'s two `PolicyNotAccepted` sites (no policy
+    // configured; actor not authorized) share their recovery text,
+    // word-for-word, with `acceptance record`'s own B2 site
+    // (`tests/policy_not_accepted_recovery.rs`) — the situations are the
+    // same regardless of which command, or which file, triggers them. The
+    // two constants live in `src/commands/acceptance.rs` as `pub(crate)`,
+    // so they cannot be imported into this external test crate; each
+    // expected string below is copied verbatim, the same way
+    // `tests/per_site_recovery.rs`'s own `FINAL_INTEGRATION_RECOVERY`
+    // copies its migrated site's text rather than importing it.
+
+    /// `FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const POLICY_NOT_CONFIGURED_RECOVERY: &str = "`final_authorization_policy` is not configured for this project (or was removed since an earlier check relied on it); run `project example-final-authorization` for a complete, valid document, then install one with `project set-final-authorization-policy`.";
+
+    /// `FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim — the exact text
+    /// B2 (#179 §1, §8) requires.
+    const ACTOR_NOT_AUTHORIZED_RECOVERY: &str = "This actor is not among `final_authorization_policy.authorizer_actor_ids`; run `project example-final-authorization` to see a configured policy's shape, then retry as one of the listed actors or add this one with `project set-final-authorization-policy`.";
+
+    #[test]
+    fn renew_with_no_final_authorization_policy_gets_group_1s_recovery() {
+        // `opened_with_policy` installs a convergence policy but never a
+        // final-authorization one (it runs plain `Workspace::initialized`,
+        // which passes no `--final-authorizer-actor-id`) — exactly the
+        // "no policy at all" situation group 1 covers.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "no policy configured",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "a renewal with no final-authorization policy configured must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let recovery = envelope["error"]["recovery"]
+            .as_str()
+            .expect("a recovery string");
+        assert_eq!(
+            recovery, POLICY_NOT_CONFIGURED_RECOVERY,
+            "a disposition.rs site sharing group 1 must carry byte-identical text to \
+             acceptance.rs's own copy of the same constant; got: {recovery:?}"
+        );
+    }
+
+    #[test]
+    fn renew_by_an_unauthorized_actor_gets_group_2s_recovery_identical_to_b2() {
+        // Only `owner` is a configured authorizer; `intern` is not.
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "unauthorized actor",
+                "--actor",
+                "intern",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "a renewal by an actor absent from authorizer_actor_ids must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let recovery = envelope["error"]["recovery"]
+            .as_str()
+            .expect("a recovery string");
+        assert_eq!(
+            recovery, ACTOR_NOT_AUTHORIZED_RECOVERY,
+            "a disposition.rs site sharing group 2 must carry byte-identical text to B2's own \
+             `acceptance record` refusal (tests/policy_not_accepted_recovery.rs); got: \
+             {recovery:?}"
+        );
+    }
 }
 
 // 74-4: `disposition rebaseline`, run by an actor authorized under
@@ -10111,5 +10207,651 @@ mod fail_closed_on_corrupt_projection {
             "attempting to redesign under a corrupted projection".to_owned(),
         ]);
         assert_refused_for_corruption(&workspace, &output, &before_head);
+    }
+}
+
+// #179 review repair: `disposition_renew`'s two tests above pin group 1 and
+// group 2's constants against `disposition.rs` sites, but that is only one
+// of the three files #179 counted real construction sites in.
+// `src/commands/acceptance.rs`'s own doc comment (right above its five
+// `*_RECOVERY` constants) credits `integration.rs` with 9 of the 29 sites,
+// spread across all five groups — and nothing anywhere pinned any of them:
+// a site could be reassigned to the wrong group's constant and every
+// existing test (`tests/policy_not_accepted_recovery.rs`'s content
+// `.contains()` checks, `tests/policy_not_accepted_coverage.rs`'s "has *a*
+// recovery" structural scan, `tests/recovery_override_text.rs`'s
+// command-name scan) would keep passing, because none of them compares a
+// specific site's *actual* text against the *specific* constant its group
+// requires. Confirmed by mutation: reassigning `integration.rs:1911`
+// (`validate_exception_authorizer`'s own "no policy" branch) from group 1's
+// constant to group 4's changed nothing observable in the full suite.
+//
+// This module closes that gap the same way `disposition_renew` closes it
+// for `disposition.rs`: drive the real CLI to each site and compare its
+// `recovery` field against a byte-for-byte local copy of the constant that
+// site's group requires. The constants live in `src/commands/acceptance.rs`
+// as `pub(crate)`, unreachable from this external test crate, so they are
+// copied verbatim here — exactly as `disposition_renew`'s own copies are,
+// for the identical reason its own comment gives.
+//
+// # Coverage: 8 of `integration.rs`'s 9 sites, one test each
+//
+//   1643 `exceptions_for`               group 1 -- acceptance_record_with_a_pending_exception_after_the_policy_is_removed_gets_group_1s_recovery
+//   1694 `exceptions_for`               group 4 -- acceptance_record_after_the_plan_changes_with_a_pending_exception_gets_group_4s_recovery
+//   1875 `exception_bindings`           group 1 -- exception_raise_with_no_policy_at_all_gets_group_1s_recovery
+//   1897 `exception_bindings`           group 3 -- exception_raise_after_the_cycle_reseals_gets_group_3s_recovery
+//   1911 `validate_exception_authorizer` group 1 -- left; see below
+//   1922 `validate_exception_authorizer` group 2 -- exception_resolve_by_an_unauthorized_actor_gets_group_2s_recovery
+//   1968 `run_exception_raise`          group 5 -- exception_raise_with_a_disabled_trigger_gets_group_5s_recovery
+//   3924 `check_promotion` (blocks_promotion_of) group 4 -- promote_after_the_acceptance_is_tampered_to_rejected_gets_group_4s_recovery
+//   3941 `check_promotion` (digest mismatch)     group 4 -- promote_after_the_plan_changes_post_acceptance_gets_group_4s_recovery
+//
+// `validate_exception_authorizer`'s own "no policy" branch (1911) is left
+// deliberately, and for a stronger reason than "no fixture reaches it
+// without inventing one" — the standard this card sets, and the reason
+// `acceptance.rs`'s own two v1/v2 schema-mismatch sites in
+// `validate_final_authorization_for_promotion` go untested for recovery
+// content by every #179 test file. Line 1911 is provably dead code given
+// the current call graph, reachable by no fixture at all, invented or
+// otherwise: `validate_exception_authorizer` has exactly one call site
+// (`run_exception_resolve`'s `validate` closure, `src/commands/
+// integration.rs:2033`), and it always runs immediately after
+// `exception_bindings` (line 2032) on that same call's own `config`
+// binding. `exception_bindings` already refuses — with group 1's own
+// constant, at its own line 1875 — whenever `config.
+// final_authorization_policy` is `None`, so by the time `validate_
+// exception_authorizer` runs at all on that same `config`, the field has
+// already been proven `Some`. Its own `.ok_or_else` at line 1911 has no
+// path left to take. Confirmed empirically, not just by reading: the
+// review's mutation at 1911 (swapping its `recovery:` reference from group
+// 1's constant to group 4's) left `cargo test` unchanged, and it stays
+// unchanged after every test this module adds, because none of them — nor
+// any fixture reachable from the CLI — can execute that line. Reaching it
+// at all would mean calling the private function directly, which this
+// external test crate cannot do (it is not even `pub(crate)`), and doing
+// so would be inventing a second test mechanism in place of the one this
+// module (and `disposition_renew` before it) already uses.
+mod policy_not_accepted_integration_groups {
+    use super::*;
+
+    /// `FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const POLICY_NOT_CONFIGURED_RECOVERY: &str = "`final_authorization_policy` is not configured for this project (or was removed since an earlier check relied on it); run `project example-final-authorization` for a complete, valid document, then install one with `project set-final-authorization-policy`.";
+
+    /// `FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const ACTOR_NOT_AUTHORIZED_RECOVERY: &str = "This actor is not among `final_authorization_policy.authorizer_actor_ids`; run `project example-final-authorization` to see a configured policy's shape, then retry as one of the listed actors or add this one with `project set-final-authorization-policy`.";
+
+    /// `FINAL_INTEGRATION_SEAL_STALE_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const SEAL_STALE_RECOVERY: &str = "This final integration's sealed-cycle binding no longer matches the cycle; run `integration prepare --final` again for this cycle, then retry.";
+
+    /// `FINAL_AUTHORIZATION_STALE_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const STALE_RECOVERY: &str = "The reason above names what changed. What was recorded no longer covers the current landing commit, plan, or policy — record a fresh decision against the current state with `acceptance record`, or, for an exception, `integration exception raise`.";
+
+    /// `EXCEPTION_TRIGGER_NOT_ENABLED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const TRIGGER_NOT_ENABLED_RECOVERY: &str = "This trigger is not among `final_authorization_policy.exception_triggers`; add it with `project set-final-authorization-policy`, or raise a trigger the policy already declares.";
+
+    /// The `recovery` field of a coded JSON error envelope.
+    fn recovery_of(output: &std::process::Output) -> String {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("an error envelope");
+        envelope["error"]["recovery"]
+            .as_str()
+            .expect("a coded refusal carries a recovery string")
+            .to_owned()
+    }
+
+    /// Like `support::Workspace::initialized`, but also installs a
+    /// final-authorization policy through the governed
+    /// `project set-final-authorization-policy` naming `authorizers` and
+    /// enabling `triggers`. `support::Workspace` is outside this card's
+    /// file scope and its `initialized` helper does not accept this, so
+    /// this mirrors `disposition_renew`'s own `initialized_with_
+    /// authorizers` and adds `exception_triggers` — installed the
+    /// governed way `tests/exceptions.rs`'s own comment on this exact
+    /// field requires ("the bypass this section exists to remove").
+    fn initialized_with_final_policy(authorizers: &[&str], triggers: &[&str]) -> Workspace {
+        let workspace = Workspace::initialized();
+        let policy = serde_json::json!({
+            "version": "harness.final-authorization-policy/v1",
+            "authorization_unit": "sealed_cycle",
+            "authorizer_actor_ids": authorizers,
+            "exception_triggers": triggers,
+        });
+        let path = workspace.root.join("final-authorization-policy.json");
+        fs::write(&path, serde_json::to_string_pretty(&policy).unwrap()).unwrap();
+        let output = Workspace::run(&[
+            "project".into(),
+            "set-final-authorization-policy".into(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--policy".into(),
+            path.display().to_string(),
+            "--actor".into(),
+            "operator".into(),
+            "--output".into(),
+            "json".into(),
+        ]);
+        assert!(
+            output.status.success(),
+            "installing the final-authorization policy failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        workspace
+    }
+
+    /// Drives one card through a sealed final cycle to a reviewed final
+    /// integration — the shared precondition `exception_bindings` (and
+    /// everything downstream of it) requires. Mirrors `tests/
+    /// policy_not_accepted_recovery.rs`'s own `reviewed_final` exactly,
+    /// kept as a local copy for the same file-scope reason every sibling
+    /// copy of this fixture in this suite gives.
+    fn reviewed_final(workspace: &Workspace) -> String {
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "integration group fixture",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["src/**"]);
+        workspace.approve_card("F-001", "src/a.rs");
+        workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+        let id = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+            "--final",
+        ])["data"]["integration_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for step in ["merge", "land"] {
+            workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+        }
+        workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+        workspace.integration(&[
+            "review",
+            "--integration-id",
+            &id,
+            "--reviewer-actor-id",
+            "reviewer",
+        ]);
+        id
+    }
+
+    /// Drives one card through an ordinary (non-final) cycle to an
+    /// accepted v1 integration. `check_promotion`'s `blocks_promotion_of`
+    /// and integration-digest checks (group 4, sites 3924 and 3941) apply
+    /// identically whether or not `final_for_cycle` is set — confirmed by
+    /// reading `check_promotion` itself, which gates neither check behind
+    /// it — so neither test that uses this needs a final-authorization
+    /// policy at all.
+    fn accepted_v1(workspace: &Workspace) -> String {
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "integration group fixture",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["src/**"]);
+        workspace.approve_card("F-001", "src/a.rs");
+        let id = workspace.integration_json(&[
+            "prepare",
+            "--cycle-id",
+            "C-001",
+            "--actor-id",
+            "coordinator",
+        ])["data"]["integration_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for step in ["merge", "land"] {
+            workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+        }
+        workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+        workspace.integration(&[
+            "review",
+            "--integration-id",
+            &id,
+            "--reviewer-actor-id",
+            "reviewer",
+        ]);
+        workspace.acceptance(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--authorizer-actor-id",
+            "owner",
+        ]);
+        id
+    }
+
+    /// Raises one exception, asserting success, and returns its event id.
+    fn raise_exception(
+        workspace: &Workspace,
+        integration_id: &str,
+        trigger: &str,
+        actor: &str,
+    ) -> String {
+        let output = workspace.integration_json(&[
+            "exception",
+            "raise",
+            "--integration-id",
+            integration_id,
+            "--actor-id",
+            actor,
+            "--trigger",
+            trigger,
+            "--evidence-ref",
+            "receipt:R-001",
+        ]);
+        output["data"]["exception_event_id"]
+            .as_str()
+            .expect("a raised exception's event id")
+            .to_owned()
+    }
+
+    /// Rewrites cycle `cycle_id`'s own `objective` field directly on disk,
+    /// without going through any governed command or commit — the same
+    /// "edit made outside the governed path" technique `support::
+    /// Workspace::tamper_cycle_status` uses for its sibling field
+    /// (`tests/policy_not_accepted_recovery.rs`'s own `tamper_cycle_
+    /// objective` gives the full rationale), applied here to move the
+    /// cycle's canonical digest without touching `status`.
+    fn tamper_cycle_objective(workspace: &Workspace, cycle_id: &str, objective: &str) {
+        let path = workspace.control.join(format!("cycles/{cycle_id}.json"));
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["objective"] = serde_json::json!(objective);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+        )
+        .unwrap();
+    }
+
+    /// Removes a previously installed `final_authorization_policy` from
+    /// `project/project.json` directly, simulating "configured once and is
+    /// gone by the time a later recheck runs" — the parenthetical
+    /// `FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY` itself names.
+    /// No governed command can do this: `SetFinalAuthorizationPolicyArgs`
+    /// (`src/commands/project.rs`) takes a required `--policy` path with
+    /// no way to clear a policy already set, so this mirrors `tests/
+    /// promotion.rs`'s own `.remove("final_authorization_policy")`
+    /// technique rather than inventing a new one.
+    fn remove_final_authorization_policy(workspace: &Workspace) {
+        let path = workspace.control.join("project/project.json");
+        let mut project: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        project
+            .as_object_mut()
+            .unwrap()
+            .remove("final_authorization_policy");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+        )
+        .unwrap();
+    }
+
+    /// Rewrites integration `integration_id`'s own `prepared_by` field
+    /// directly on disk — a field `IntegrationRecord::substantive_digest`
+    /// covers but no earlier check in either path below reads, so it moves
+    /// the plan's digest in isolation. Mirrors `tests/promotion.rs`'s
+    /// `final_authorization_refuses_promotion_after_the_substantive_plan_
+    /// changes`, which already proves this exact edit reaches `check_
+    /// promotion`'s digest comparison.
+    fn tamper_integration_prepared_by(
+        workspace: &Workspace,
+        integration_id: &str,
+        prepared_by: &str,
+    ) {
+        let path = workspace
+            .control
+            .join(format!("integrations/{integration_id}.json"));
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["prepared_by"] = serde_json::json!(prepared_by);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&record).unwrap()),
+        )
+        .unwrap();
+    }
+
+    /// Rewrites acceptance `acceptance_id`'s own `decision` field directly
+    /// on disk, decoupling it from the integration's own `status` (which
+    /// only a real `acceptance record` call moves, and stays `accepted`
+    /// regardless of this edit). That isolation is the point: a *real*
+    /// rejection leaves `status` at `reviewed` (proven by `tests/
+    /// promotion.rs`'s own `a_rejection_is_recorded_and_blocks_
+    /// promotion`), which would trip `check_promotion`'s earlier status
+    /// gate before ever reaching `blocks_promotion_of`'s decision check —
+    /// exactly the site this test needs to isolate.
+    fn tamper_acceptance_decision(workspace: &Workspace, acceptance_id: &str, decision: &str) {
+        let path = workspace
+            .control
+            .join(format!("acceptances/{acceptance_id}.json"));
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["decision"] = serde_json::json!(decision);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&record).unwrap()),
+        )
+        .unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // Group 1: no policy configured at all.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn exception_raise_with_no_policy_at_all_gets_group_1s_recovery() {
+        let workspace = Workspace::initialized();
+        let id = reviewed_final(&workspace);
+        // Deliberately never installs a final-authorization policy.
+
+        let output = workspace.integration_raw(&[
+            "exception",
+            "raise",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "owner",
+            "--trigger",
+            "policy_change",
+            "--evidence-ref",
+            "receipt:R-001",
+        ]);
+        assert!(
+            !output.status.success(),
+            "raising an exception with no final-authorization policy configured must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output)
+                .contains("final authorization policy does not declare exception triggers"),
+            "not exercising `exception_bindings`'s own policy-missing site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            POLICY_NOT_CONFIGURED_RECOVERY,
+            "integration.rs:1875 (`exception_bindings`) shares group 1 and must carry \
+             byte-identical text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    #[test]
+    fn acceptance_record_with_a_pending_exception_after_the_policy_is_removed_gets_group_1s_recovery()
+     {
+        let workspace = initialized_with_final_policy(&["owner"], &["policy_change"]);
+        let id = reviewed_final(&workspace);
+        raise_exception(&workspace, &id, "policy_change", "owner");
+        remove_final_authorization_policy(&workspace);
+
+        let output = workspace.acceptance_raw(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--authorizer-actor-id",
+            "owner",
+        ]);
+        assert!(
+            !output.status.success(),
+            "recording an acceptance with a pending exception and no policy configured must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output)
+                .contains("final authorization policy is not configured for exception validation"),
+            "not exercising `exceptions_for`'s own policy-missing site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            POLICY_NOT_CONFIGURED_RECOVERY,
+            "integration.rs:1643 (`exceptions_for`) shares group 1 and must carry byte-identical \
+             text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Group 2: a policy exists, but this actor is not among its
+    // `authorizer_actor_ids`.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn exception_resolve_by_an_unauthorized_actor_gets_group_2s_recovery() {
+        let workspace = initialized_with_final_policy(&["owner"], &["policy_change"]);
+        let id = reviewed_final(&workspace);
+        let event_id = raise_exception(&workspace, &id, "policy_change", "owner");
+
+        let output = workspace.integration_raw(&[
+            "exception",
+            "resolve",
+            "--integration-id",
+            &id,
+            "--exception-event-id",
+            &event_id,
+            "--authorizer-actor-id",
+            "intern",
+        ]);
+        assert!(
+            !output.status.success(),
+            "resolving an exception as an actor absent from authorizer_actor_ids must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output)
+                .contains("is not configured to resolve final integration exceptions"),
+            "not exercising `validate_exception_authorizer`'s own actor-check site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            ACTOR_NOT_AUTHORIZED_RECOVERY,
+            "integration.rs:1922 (`validate_exception_authorizer`) shares group 2 and must carry \
+             byte-identical text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Group 3: this final integration's own binding is stale, before any
+    // decision is recorded.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn exception_raise_after_the_cycle_reseals_gets_group_3s_recovery() {
+        let workspace = initialized_with_final_policy(&["owner"], &["policy_change"]);
+        let id = reviewed_final(&workspace);
+        tamper_cycle_objective(&workspace, "C-001", "resealed with different content");
+
+        let output = workspace.integration_raw(&[
+            "exception",
+            "raise",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "owner",
+            "--trigger",
+            "policy_change",
+            "--evidence-ref",
+            "receipt:R-001",
+        ]);
+        assert!(
+            !output.status.success(),
+            "raising an exception against a final integration whose sealed-cycle binding no \
+             longer matches its cycle must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output).contains("no longer binds its sealed cycle"),
+            "not exercising `exception_bindings`'s own seal-staleness site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            SEAL_STALE_RECOVERY,
+            "integration.rs:1897 (`exception_bindings`) shares group 3 and must carry \
+             byte-identical text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Group 4: an existing decision no longer covers the current state.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn acceptance_record_after_the_plan_changes_with_a_pending_exception_gets_group_4s_recovery() {
+        let workspace = initialized_with_final_policy(&["owner"], &["policy_change"]);
+        let id = reviewed_final(&workspace);
+        raise_exception(&workspace, &id, "policy_change", "owner");
+        tamper_integration_prepared_by(&workspace, &id, "tampered-coordinator");
+
+        let output = workspace.acceptance_raw(&[
+            "record",
+            "--integration-id",
+            &id,
+            "--authorizer-actor-id",
+            "owner",
+        ]);
+        assert!(
+            !output.status.success(),
+            "recording an acceptance once the plan has changed under a pending exception must \
+             refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output).contains("no longer binds final integration"),
+            "not exercising `exceptions_for`'s own digest-mismatch site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            STALE_RECOVERY,
+            "integration.rs:1694 (`exceptions_for`) shares group 4 and must carry byte-identical \
+             text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    #[test]
+    fn promote_after_the_acceptance_is_tampered_to_rejected_gets_group_4s_recovery() {
+        let workspace = Workspace::initialized();
+        let id = accepted_v1(&workspace);
+        tamper_acceptance_decision(&workspace, "ACC-000001", "rejected");
+
+        let output = workspace.integration_raw(&[
+            "promote",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "promoter",
+        ]);
+        assert!(
+            !output.status.success(),
+            "promoting an integration whose only recorded acceptance now reads `rejected` must \
+             refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output).contains("promotion is not authorized"),
+            "not exercising `check_promotion`'s own `blocks_promotion_of` site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            STALE_RECOVERY,
+            "integration.rs:3924 (`check_promotion`) shares group 4 and must carry byte-identical \
+             text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    #[test]
+    fn promote_after_the_plan_changes_post_acceptance_gets_group_4s_recovery() {
+        let workspace = Workspace::initialized();
+        let id = accepted_v1(&workspace);
+        tamper_integration_prepared_by(&workspace, &id, "tampered-coordinator");
+
+        let output = workspace.integration_raw(&[
+            "promote",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "promoter",
+        ]);
+        assert!(
+            !output.status.success(),
+            "promoting once the accepted plan has changed must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output).contains("the plan changed after it was accepted"),
+            "not exercising `check_promotion`'s own integration-digest site; got: {}",
+            error_message(&output)
+        );
+        assert_eq!(
+            recovery_of(&output),
+            STALE_RECOVERY,
+            "integration.rs:3941 (`check_promotion`) shares group 4 and must carry byte-identical \
+             text to acceptance.rs's own copy of the same constant"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Group 5: a policy exists, but this specific exception trigger is not
+    // among `exception_triggers`.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn exception_raise_with_a_disabled_trigger_gets_group_5s_recovery() {
+        let workspace = initialized_with_final_policy(&["owner"], &["policy_change"]);
+        let id = reviewed_final(&workspace);
+
+        let output = workspace.integration_raw(&[
+            "exception",
+            "raise",
+            "--integration-id",
+            &id,
+            "--actor-id",
+            "owner",
+            "--trigger",
+            "critical_residual_risk",
+            "--evidence-ref",
+            "receipt:R-001",
+        ]);
+        assert!(
+            !output.status.success(),
+            "raising a trigger the policy does not declare must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+        assert!(
+            error_message(&output).contains("is not enabled by final authorization policy"),
+            "not exercising `run_exception_raise`'s own trigger-not-enabled site; got: {}",
+            error_message(&output)
+        );
+        // `tests/policy_not_accepted_recovery.rs`'s own
+        // `exception_trigger_not_enabled_names_exception_triggers_field`
+        // already checks this site's recovery *content* (`.contains`); this
+        // adds the stronger byte-identical *identity* check the rest of
+        // this module gives every other site, so group 5 is not the one
+        // group left with presence-only coverage.
+        assert_eq!(
+            recovery_of(&output),
+            TRIGGER_NOT_ENABLED_RECOVERY,
+            "integration.rs:1968 (`run_exception_raise`) is group 5's only site and must carry \
+             byte-identical text to acceptance.rs's own copy of the same constant"
+        );
     }
 }
