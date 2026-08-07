@@ -23,10 +23,33 @@
 //! says, the same division of labor `config_malformed_recovery.rs` and
 //! `config_malformed_coverage.rs` already establish for `ConfigMalformed`.
 //! Group 1 and group 2 are also each proven to hold across files, not just
-//! within this one — see `tests/convergence.rs`'s
-//! `mod policy_not_accepted_disposition_groups`, which pins the identical
-//! two constants against a `disposition renew` refusal, a command with
-//! nothing to do with acceptance or promotion.
+//! within this one — see `tests/convergence.rs`'s `mod disposition_renew`
+//! (its last two tests), which pins the identical two constants against a
+//! `disposition renew` refusal, a command with nothing to do with
+//! acceptance or promotion.
+//!
+//! # Group membership: pinned identity versus mere presence
+//!
+//! Everything above and everything `tests/convergence.rs`'s
+//! `mod disposition_renew` adds checks *content* (a site's `recovery`
+//! contains, or does not contain, some expected substring) or, for group 1
+//! and group 2 in `disposition.rs`, *identity* (a site's `recovery` is
+//! byte-identical to a specific group's constant). Until a later review,
+//! nothing did either for `integration.rs`, which owns 9 of the 29 real
+//! sites across all five groups — a site there could be reassigned to the
+//! wrong group's constant and every test in this file, plus
+//! `tests/policy_not_accepted_coverage.rs`'s structural "has *a* recovery"
+//! scan and `tests/recovery_override_text.rs`'s command-name scan, would
+//! keep passing. `tests/convergence.rs`'s `mod
+//! policy_not_accepted_integration_groups` closes that gap the same way
+//! `mod disposition_renew` closes it for `disposition.rs`: byte-identical
+//! identity checks, one per site, for 8 of `integration.rs`'s 9 sites.
+//! The ninth (`validate_exception_authorizer`'s own "no policy" branch,
+//! `src/commands/integration.rs:1911`) is left, and documented there as
+//! left: it is provably dead code given the current call graph (its sole
+//! caller always runs a stricter check first, on the same input, that
+//! already guarantees the branch's own precondition false), not merely a
+//! site nothing yet tests.
 //!
 //! Groups 3 and 4 both hinge on a final integration's own sealed-cycle
 //! binding going stale relative to its cycle — the same underlying event
