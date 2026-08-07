@@ -1,32 +1,79 @@
 # Change Harness
 
-Change Harness is a project-neutral CLI that governs how a change — written by
-a human or a coding agent — gets from a worktree onto a protected branch,
-without ever letting an unreviewed or unverified change slip through.
+Change Harness is a project- and language-neutral CLI that lets one developer
+delegate real work to autonomous coding agents — Codex, Claude Code, or any
+other — and know what actually landed without reading every diff.
 
 ## Why this exists
 
-The moment an agent (or a person moving fast) can push a change, three
-questions become hard to answer with certainty: did the exact code that was
-reviewed reach the protected branch, unchanged? Did the tests that ran belong
-to that same commit, or to something adjacent? And if two changes land
-together, was the *combination* ever actually checked — or only each piece in
-isolation?
+Coordinating agents is the half that gets solved for you. Worktree isolation,
+fan-out, dependency ordering, retries: those ship inside the agent tools
+themselves and improve with every release. Writing another orchestrator means
+racing the vendors on their own ground.
 
-Change Harness exists to make those three questions structurally unavoidable
-rather than a matter of trust. It binds every review, every test receipt, and
-every promotion to an exact Git commit SHA — not a branch name, not "whatever
-is checked out right now." A card cannot be approved and then quietly changed
-before it lands. A gate cannot pass on uncommitted content and be presented as
-evidence about a commit. Two changes cannot land together without the combined
-result being verified as its own thing, separately from either change alone.
-It is a mechanical control, not a judgment call: the harness does not decide
-whether code is *good*, only that the thing being promoted is provably the
+The half that does not get solved by adding more agents is knowing whether what
+they report is true. An agent that says "tests pass" is making a claim. An agent
+supervising other agents is making a claim about claims — the same failure
+modes one level up, and persuadable the way any language model is persuadable.
+That ceiling is what actually bounds delegation: hand over more work and your
+own review capacity becomes the bottleneck you were trying to remove.
+
+Change Harness puts something non-probabilistic in that loop. Three questions
+get hard to answer the moment an agent can move code, and it makes all three
+mechanical rather than a matter of trust:
+
+- did the exact code that was reviewed reach the protected branch, unchanged?
+- did the tests that ran belong to that same commit, or to something adjacent?
+- if two changes land together, was the *combination* ever checked — or only
+  each piece in isolation?
+
+Every review, every test receipt, and every promotion binds to an exact Git
+commit SHA — not a branch name, not whatever is checked out right now. A card
+cannot be approved and then quietly changed before it lands. A gate cannot pass
+on uncommitted content and be presented as evidence about a commit. Two changes
+cannot land together without the combined result being verified as its own
+thing, separately from either change alone. A refusal is an exit code, not an
+opinion: nothing in this loop can be talked into "close enough."
+
+It is a mechanical control, not a judgment call. The harness does not decide
+whether code is *good* — only that the thing being promoted is provably the
 thing that was reviewed.
 
-The repository is intentionally independent from ARTANA. ARTANA will eventually
-consume the CLI through project configuration and named gate definitions; it
-will not own the workflow engine.
+## What it is for
+
+One developer, many agents, any project. The design centre is a solo operator
+running several agents at once on their own machine, and three properties
+follow from it.
+
+**Durable.** The control repository is an ordinary Git repository on disk
+holding cards, receipts, reviews, locks, and lineage. It outlives the session
+that created it, the agent that crashed, and the laptop that rebooted.
+Orchestration state living inside one agent's context does not.
+
+**Cross-tool.** Codex can author a change and Claude Code can review it, bound
+to the exact SHA that was handed off — which neither of them can then move
+without the approval ceasing to apply. No vendor has an incentive to build that
+seam. This project develops itself through it: the defect fixes described below
+were each authored by a different tool than the one that wrote the original
+code (D-076).
+
+**Project-neutral.** Nothing in the engine knows Rust, cargo, or this
+repository. [`tests/project_neutrality.rs`](./tests/project_neutrality.rs)
+drives a complete lifecycle against a Python project whose gates are ordinary
+shell commands — written precisely because every other fixture *is* Rust, so a
+cargo assumption could have been baked in with every suite still passing.
+
+What it is not is a security boundary. Every actor identity is a string the
+caller typed (D-013), so the harness catches the same actor blessing its own
+work, not an operator determined to defeat their own controls. For one
+developer coordinating cooperating agents that is the correct scope rather than
+a shortfall: there is no adversary here, only unreliable narrators. The
+`Residual` section of [`SKILL.md`](./SKILL.md) states exactly where the line
+falls.
+
+ARTANA is the first project this was built to govern, and consumes the CLI
+through project configuration and named gate definitions. It does not own the
+workflow engine, and nothing here depends on it.
 
 ## For coding agents
 
@@ -42,7 +89,10 @@ a second reviewer accepted it.
 It is a portable, tool-neutral guide. Copy `SKILL.md` into any repository this
 harness governs, or provide it to any person or agent using the CLI. It does
 not contain live assignments or authority: those always come from fresh
-Harness status queries.
+Harness status queries. That split is deliberate, and it is what an agent that
+has lost the thread recovers from — `card status` and `cycle status` answer
+what this actor currently owns and what is blocking it, so the next step comes
+from read state rather than from whatever survived in a context window.
 
 Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
 instead, which carries the reading contract and engineering rules for building
@@ -133,7 +183,8 @@ the prototype survives only under `refs/archive/spikes/SPIKE-001`.
 
 ## Product boundary
 
-Change Harness automates mechanical controls:
+Change Harness automates mechanical controls — the things that can be settled
+by inspecting a Git object rather than by forming an opinion:
 
 - exact commit and branch checks;
 - worktree allocation;
@@ -145,8 +196,13 @@ Change Harness automates mechanical controls:
 
 It does not decide whether a requirement is correct, whether an architecture is
 appropriate, whether tests prove the intended behavior, or whether residual risk
-is acceptable. Those judgments stay with people, and the harness's job is to
-make sure the artifacts they judge are the exact ones that will land.
+is acceptable. Those judgments stay with you — the point is that the artifacts
+you judge are the exact ones that will land, and that an agent cannot revise
+them afterwards without the evidence ceasing to apply.
+
+That division is what makes the delegation safe to widen. An agent can be wrong
+about anything in the second list and the first list still holds; the failure
+shows up as a refusal you can read, not as a change that quietly landed.
 
 Local hooks are convenience guardrails, not a security boundary. Strong
 authorization requires a separate identity or operating-system boundary.
