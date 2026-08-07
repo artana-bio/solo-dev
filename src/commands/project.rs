@@ -830,9 +830,17 @@ fn reinitialize(
 ) -> Result<CommandOutcome, HarnessError> {
     let existing = control.project()?;
     if existing != *config {
+        // The closing sentence is the guidance `ConfigControlIncompatible`'s
+        // recovery text used to carry for every site that shares the code.
+        // It moved here because it is only true here: the same code also
+        // reports convergence facts bound to a policy digest an install
+        // would orphan, where pointing at a different control repository is
+        // the wrong thing to do. A message knows which mismatch it is
+        // describing; `ErrorCode::recovery` is a pure function of the code
+        // and never can.
         return Err(HarnessError::Control {
             reason: format!(
-                "control repository at {} is already bound to a different configuration; refusing to rebind",
+                "control repository at {} is already bound to a different configuration; refusing to rebind. Point at the control repository that matches this configuration, or initialize the new project somewhere else.",
                 control.root().display()
             ),
             code: ErrorCode::ConfigControlIncompatible,
