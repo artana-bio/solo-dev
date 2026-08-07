@@ -16,7 +16,8 @@ use std::{collections::BTreeSet, fs};
 use change_harness::{
     commands::review::Verdict,
     domain::review::{
-        Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationEvidence,
+        Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationAuthorship,
+        MutationEvidence, ReviewConduct,
     },
 };
 use support::Workspace;
@@ -113,10 +114,12 @@ fn reference_verdict() -> Verdict {
                 mutation: "reference mutation".to_owned(),
                 failing_test: "reference_failing_test".to_owned(),
                 oracle: "reference oracle".to_owned(),
+                authorship: MutationAuthorship::ReviewerDevised,
             }),
         },
         residual_risks: vec!["reference risk".to_owned()],
         human_reviewer: true,
+        review_conduct: Some(ReviewConduct::SeparateProcess),
     }
 }
 
@@ -342,6 +345,76 @@ fn the_emitted_example_carries_mutation_evidence_on_stdout_and_is_accepted() {
     assert_eq!(
         envelope["data"]["review"]["gate_adequacy"]["mutation_evidence"]["status"], "demonstrated",
         "the recorded review must carry what stdout showed, not a stripped-down version of it"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the review binds to the exact candidate the fixture handed off"
+    );
+}
+
+// #28 §12 mutation 3. Mutation: drop `authorship` from `example_verdict`'s
+// `MutationEvidence::Demonstrated` (in practice, since `authorship` is a
+// required, non-`Option` field and the struct literal would then fail to
+// compile, the equivalent mutation exercised for the evidence report is
+// `#[serde(skip_serializing)]` on the field — it still omits the key from
+// what `review example` emits, and the round trip below fails exactly as a
+// dropped field would: `authorship` is required at deserialize time with no
+// default, so re-parsing an example missing it is refused).
+//
+// This test must fail on the shape assertion below before it ever reaches
+// `review record` — mirroring how the test above pins `mutation_evidence`
+// itself, this pins the field #28 adds inside it.
+#[test]
+fn the_emitted_example_carries_mutation_authorship_on_stdout_and_is_accepted() {
+    let (workspace, reviewed) = handed_off();
+
+    let output = Workspace::run(&["review".to_owned(), "example".to_owned()]);
+    assert!(
+        output.status.success(),
+        "review example must succeed (exit {:?})",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    for needle in [
+        "authorship: reviewer_devised",
+        "review_conduct: separate_process",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "stdout must carry `{needle}`, the new fields #28 adds: {stdout}"
+        );
+    }
+
+    let path = workspace
+        .root
+        .join("captured-stdout-mutation-authorship.yaml");
+    fs::write(&path, &stdout).unwrap();
+
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        // #120, as above: the captured example always declares
+        // `reviewer-example`.
+        "--actor",
+        "reviewer-example",
+    ]);
+    assert_eq!(
+        envelope["status"], "success",
+        "the example carrying authorship and review_conduct must still be accepted by `review \
+         record`: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["gate_adequacy"]["mutation_evidence"]["authorship"],
+        "reviewer_devised",
+        "the recorded review must carry what stdout showed, not a stripped-down version of it"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["review_conduct"], "separate_process",
+        "the recorded review must carry the declared conduct too"
     );
     assert_eq!(
         envelope["data"]["review"]["candidate_sha"], reviewed,

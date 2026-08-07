@@ -26,8 +26,9 @@ use crate::{
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
         review::{
-            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationEvidence,
-            REVIEW_DIR, REVIEW_SCHEMA, ReviewRecord, check_independence,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationAuthorship,
+            MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct, ReviewRecord,
+            check_independence, check_review_conduct,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -183,6 +184,19 @@ pub struct Verdict {
     /// limits as `check_independence`. It catches the omission, not the liar.
     #[serde(default)]
     pub human_reviewer: bool,
+    /// Where this review was actually carried out.
+    ///
+    /// #28: an `independent`-policy card needs a genuinely separate process,
+    /// and D-013 makes this exactly as declared-not-proven as
+    /// `human_reviewer` above — recorded on the review and refusable by
+    /// [`check_review_conduct`], with the same limits `check_independence`
+    /// already carries. `Option` at the schema boundary, so a verdict written
+    /// against the schema `review example` emitted before this field existed
+    /// still parses — but on an `independent`-policy card, leaving it `None`
+    /// is refused exactly as declaring [`ReviewConduct::SameContext`] is; see
+    /// [`check_review_conduct`] for the full rule and its one remaining gap.
+    #[serde(default)]
+    pub review_conduct: Option<ReviewConduct>,
 }
 
 /// Executes a `review` subcommand.
@@ -547,6 +561,14 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 /// fixtures. See [`GateAdequacy::mutation_evidence`] for
 /// [`MutationEvidence::Exempt`], the declared-exemption case this example
 /// does not need.
+///
+/// `review_conduct` and `mutation_evidence`'s new `authorship` field are
+/// both shown at their honest, ordinary values —
+/// [`ReviewConduct::SeparateProcess`] and
+/// [`MutationAuthorship::ReviewerDevised`] — completing the same one
+/// coherent story: a reviewer, in a fresh context, devising their own
+/// mutation against the candidate. See [`MutationAuthorship::ImplementerRestated`]
+/// for the other real state this example does not need to show.
 fn example_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-example".to_owned(),
@@ -567,10 +589,12 @@ fn example_verdict() -> Verdict {
                 mutation: "widened the upper boundary in src/example.rs:42 by one".to_owned(),
                 failing_test: "rejects_the_value_at_the_upper_boundary".to_owned(),
                 oracle: "gate.unit".to_owned(),
+                authorship: MutationAuthorship::ReviewerDevised,
             }),
         },
         residual_risks: vec!["none identified".to_owned()],
         human_reviewer: true,
+        review_conduct: Some(ReviewConduct::SeparateProcess),
     }
 }
 
@@ -754,27 +778,48 @@ fn require_review_return_reason(
 /// was never called here at all. It now asks exactly what `run_record` asks,
 /// with the same `HandoffScope` split by decision.
 ///
-/// Order matters here, not just presence, and this now checks six things in
+/// Order matters here, not just presence, and this now checks seven things in
 /// the same order `run_record` does: whether the verdict declares an
 /// admissible reason for a review return, then whether the card's
 /// convergence budget is spent, then whether a review round ever opened for
-/// this handoff, then staleness, then independence, then mutation evidence.
-/// A verdict that is both a self-review and stale is refused as stale first
-/// — the independence check pre-existed the staleness fix and ran first;
-/// moved it after staleness so a case failing both reasons reports the same
-/// one in both forms, which is the entire point of a preview. Caught by
-/// review round 1 of this exact card, on the fixture where a revoked handoff
-/// is also a self-review. The review-begun check runs ahead of staleness and
-/// independence because it asks the most basic question: whether there is a
-/// review to be stale or self-reviewing about at all. The reason-declaration
-/// check runs ahead of everything else: 71-R2 requires it to refuse before
-/// anything is written, and nothing above it needs a card, a handoff, or a
-/// worktree to answer — it needs only the project's configured policy and
-/// the verdict the caller already supplied. The convergence-budget check
-/// (72-2) runs immediately after: it is the first thing that needs the
-/// loaded card record, so it is the first check able to refuse once that
-/// record exists, ahead of the review-begun, staleness, and independence
-/// checks below, which all need a handoff besides.
+/// this handoff, then staleness, then independence, then review conduct,
+/// then mutation evidence. A verdict that is both a self-review and stale is
+/// refused as stale first — the independence check pre-existed the staleness
+/// fix and ran first; moved it after staleness so a case failing both
+/// reasons reports the same one in both forms, which is the entire point of
+/// a preview. Caught by review round 1 of this exact card, on the fixture
+/// where a revoked handoff is also a self-review. The review-begun check
+/// runs ahead of staleness and independence because it asks the most basic
+/// question: whether there is a review to be stale or self-reviewing about
+/// at all. The reason-declaration check runs ahead of everything else: 71-R2
+/// requires it to refuse before anything is written, and nothing above it
+/// needs a card, a handoff, or a worktree to answer — it needs only the
+/// project's configured policy and the verdict the caller already supplied.
+/// The convergence-budget check (72-2) runs immediately after: it is the
+/// first thing that needs the loaded card record, so it is the first check
+/// able to refuse once that record exists, ahead of the review-begun,
+/// staleness, and independence checks below, which all need a handoff
+/// besides.
+///
+/// `check_review_conduct` runs immediately after `check_independence` and
+/// before the mutation-evidence check: #28 groups it with independence
+/// thematically — a declared same-context conduct refuses under
+/// `ErrorCode::PolicySelfReview`, the same code `check_independence` uses,
+/// because both are a review that admits it was not independent of the work
+/// it reviews; an undeclared conduct refuses separately, under
+/// `ErrorCode::PolicyIncompleteReview`, the same code and register
+/// `GateAdequacy::validate_mutation_evidence` already uses for an absent
+/// `mutation_evidence` — see `check_review_conduct`'s doc for why a missing
+/// declaration and a false one are kept under different codes. It needs only
+/// `record.review_policy` (already loaded, above, for the convergence-budget
+/// check) and `verdict.review_conduct`, so it has no dependency on the
+/// handoff or the mutation-evidence check that would force a different
+/// position. #189/#120: this call is what keeps `--dry-run` from reporting
+/// success for a same-context or undeclared-conduct verdict the real command
+/// would refuse — `check_review_conduct` is a free function precisely so it
+/// can be called here, on `record.review_policy` and `verdict.review_conduct`
+/// directly, before any `ReviewRecord` exists, the same reason
+/// `check_independence` is one.
 ///
 /// The mutation-evidence check runs last, mirroring where
 /// [`GateAdequacy::validate_mutation_evidence`] sits inside
@@ -818,6 +863,7 @@ fn preview_record(
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
+    check_review_conduct(&record.review_policy, verdict.review_conduct)?;
     verdict.gate_adequacy.validate_mutation_evidence()?;
     Ok(CommandOutcome::new(
         "review.record",
@@ -1085,11 +1131,17 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 gate_adequacy: verdict.gate_adequacy.clone(),
                 residual_risks: verdict.residual_risks.clone(),
                 human_reviewer: verdict.human_reviewer,
+                review_conduct: verdict.review_conduct,
                 supersedes: previous.as_ref().map(|review| review.review_id.clone()),
                 reviewed_at: clock.now(),
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
             review.validate()?;
+            // #28: kept separate from `validate()` rather than folded into
+            // it — see `check_review_conduct`'s doc for why — but must still
+            // run in the real transaction exactly as `preview_record` runs it
+            // on the dry-run path, so the two cannot disagree.
+            check_review_conduct(&record.review_policy, review.review_conduct)?;
             review.check_risk_policy(record.risk)?;
             if let Some(superseded) = previous.as_ref() {
                 review.check_supersedes(superseded)?;
