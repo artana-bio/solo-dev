@@ -97,6 +97,21 @@ established:
   behave; contract revision with invalidated approval and a priced budget is
   `card revise` plus the `material-scope-revisions` dimension.
 
+One of those concessions describes an architecture the shipped code has not
+finished catching up to: the sentence "it is what makes their verdicts mean
+something" is true of the design, not yet of the artifact. A review today
+records its verdict but not the mutation it was tested against (#95);
+nothing yet binds a supervising agent's approval to the specific check that
+earned it. That makes the claim aspirational in exactly the place this
+document is otherwise scrupulous about the distinction. The gap is not
+theoretical: in the 2026-08-07 wave, five cards were independently reviewed
+with a mutation different from the implementer's; three of the five —
+#144, #145, #142 — turned up a real, previously unpinned gap and required a
+repair before merge. The other two, #143 and #153, did not: the
+implementer's own tests already caught the reviewer's mutation. A
+supervising agent's verdict is already carrying weight the control
+repository has no field yet to record.
+
 ## The killer question
 
 > Can enough economically useful software changes be described by contracts
@@ -117,6 +132,21 @@ governed project is the harness itself, driven by its author, and
 documentation and defect-fix cards are the easy class. The real experiment is
 the next governed project that is not this one.
 
+That data point has an ending. The control repository's last governed action
+was `integration promote INT-035` on 2026-08-02, after 37 cards and 35
+integration cycles (34 promoted, one — INT-032 — abandoned). `origin/main`
+has taken 215 commits since with no governed integration behind any of them
+(measured 2026-08-07). By the Protocol's own definition below, every one of
+those 215 commits is a bypass, set against 34 promoted integrations — a
+ratio nobody would call reassuring. Being biased and easy-class does not
+make the number smaller: a threshold chosen after the data arrives is not a
+threshold, and the same discipline applies to explanations chosen after the
+data arrives. Why self-hosting stopped is not established. The third
+cold-start run's counter C names candidates, not conclusions: ghost
+`gate reserve` exit-0 loops (#146), card-shape thrash with no `card example`
+generator (#180), and gate-stage rules an operator can learn only by being
+refused.
+
 ### Protocol
 
 For every unit of work in a governed project over a fixed window, record at
@@ -130,6 +160,58 @@ card-writing time and at close:
 3. **Read anyway** — was the diff read line-by-line despite fully evidenced
    promotion. The delegation ceiling is measured by this number falling.
 4. **Escaped defects** — severity-weighted, on unread cards versus read ones.
+
+The killer question above is single-operator: whether one operator stops
+reading diffs. The product goal is a fleet: many agents building cards in
+parallel, unattended, overnight, with the operator reading no code. These
+four measures cannot see concurrency at all — they could hold perfectly and
+the fleet could still be out of reach. Two more measures record what they
+miss:
+
+5. **Serial human minutes per card** — wall-clock a human spends on the
+   steps that do not parallelize: freezing a contract, reviewing with a
+   mutation different from the implementer's, merging. Neither the control
+   repository nor GitHub's PR metadata records this — both preserve only
+   the instant a decision is committed, not the deliberation before it — so
+   this measure needs a timer an operator keeps, not a git log. As an
+   unmeasured estimate, an operator's own sense of the work is something
+   like 30 minutes a card; the argument does not depend on the exact
+   figure, only on it being nonzero — because while it is, agent count is
+   not the constraint: three agents and ten agents finish twenty cards in
+   the same wall clock.
+6. **Concurrent cards sustained** — how many cards' worth of gates a shared
+   test suite absorbs before its own wall-clock time, not contract quality,
+   becomes the limit. Recording it needs several complete suites started
+   together on an otherwise idle machine, each timed to completion. The
+   only attempt made for this amendment was a solo run on a machine already
+   carrying other sessions' real load — it took closer to 18 minutes and,
+   being neither idle nor concurrent, confirms nothing either way. The only
+   figures available — roughly 8 minutes solo, roughly 25–40 minutes with
+   three running at once — are a single unreproduced estimate, not a
+   recorded result. Taken at face value anyway: something like 4–6
+   concurrent cards before the suite dominates, roughly 3x throughput, not
+   10x.
+
+Neither carries a kill threshold. A number fixed today, from either, would
+be reverse-engineered from an estimate nobody has actually measured yet —
+the same failure the rule against post-hoc thresholds exists to block, one
+step earlier: there is not yet even a data point to fix a threshold after.
+Measure 6 is additionally bottlenecked today by test-suite wall-clock time,
+an infrastructure property, not a claim about whether contracts substitute
+for a read diff; thresholding it would grade the thesis on CI speed
+instead. The same caution applies to a later change in it: a rise in
+measure 6 more plausibly means the test suite got faster than that
+delegation got stronger, and should be read as the former until shown
+otherwise.
+
+Measure 3 assumes someone was there to do the reading. Unattended,
+`read anyway = 0%` stops being able to distinguish triumph from negligence —
+it reads the same whether the operator trusted the evidence enough to skip
+the diff, or was asleep and skipped it by default. Measure 4 carries the
+weight in that regime instead: an escaped defect can be found and attributed
+after the fact, on nobody's schedule, in a way a diff that nobody was ever
+going to read cannot. This is a limit of the measurement, not a new
+threshold.
 
 ### Kill thresholds, fixed in advance
 
