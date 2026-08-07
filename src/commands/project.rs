@@ -1140,10 +1140,13 @@ fn refuse_orphaning_facts(
     // `ATTEMPT_RECORDED_EVENT` is gated on `config.convergence_policy` being
     // `Some` (`review.rs`, both sites in `handoff.rs`, `card.rs`, and
     // `integration.rs`), and nothing removes a policy once installed, so a
-    // fact cannot outlive the policy that admitted it. It is kept, and left
-    // untested, as a diagnostic for a hand-edited project document — which
-    // is why its text sends the operator to the control repository rather
-    // than to a command that would only refuse again.
+    // fact cannot outlive the policy that admitted it. It is kept as a
+    // diagnostic for a hand-edited project document — which is why its text
+    // sends the operator to the control repository rather than to a command
+    // that would only refuse again — and it is pinned by
+    // `set_convergence_policy_refuses_when_facts_exist_but_no_policy_is_configured`,
+    // which reaches it by performing that hand edit directly, the way
+    // `tamper_card_state` reaches the other shapes no shipped command builds.
     let (currently, remedy) = existing_digest.map_or_else(
         || {
             (
