@@ -488,14 +488,16 @@ pub struct ReviewRecord {
     /// [`ReviewRecord::digest`] for a record nothing about actually changed —
     /// see `mutation_evidence`'s doc for the full argument, identical here.
     ///
-    /// Unlike `mutation_evidence`, absence is not refused by
-    /// [`ReviewRecord::validate`] for every review — only [`check_review_conduct`]
-    /// reads it, and only for a card whose `review_policy` is exactly
-    /// `"independent"`, and even then only a *declared*
-    /// [`ReviewConduct::SameContext`] is refused. A review that never
-    /// declares its conduct at all is accepted exactly as it was before this
-    /// field existed; see `check_review_conduct`'s doc for why that gap is
-    /// left open rather than closed.
+    /// Not read by [`ReviewRecord::validate`] itself — only
+    /// [`check_review_conduct`] reads it, called beside `validate` rather
+    /// than from inside it — and, exactly as [`GateAdequacy::mutation_evidence`]
+    /// is, refused when absent: on a card whose `review_policy` is exactly
+    /// `"independent"`, `None` is refused precisely as
+    /// [`ReviewConduct::SameContext`] is. Only a card whose `review_policy`
+    /// is not exactly `"independent"` accepts an absent declaration; see
+    /// `check_review_conduct`'s doc for the full argument, including why
+    /// requiring the declaration here does not orphan the roughly 72 reviews
+    /// already on disk — the same reason `mutation_evidence` itself does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_conduct: Option<ReviewConduct>,
     /// The review this one supersedes, when it is a re-review.
@@ -856,8 +858,9 @@ pub fn check_independence(reviewer: &str, feature_actor: &str) -> Result<(), Har
     Ok(())
 }
 
-/// Refuses a review that declares same-context conduct for a card whose
-/// review policy demands genuine separation.
+/// Refuses a review of an `independent`-policy card that does not declare a
+/// genuinely separate conduct — either because it says nothing, or because it
+/// says `same_context`.
 ///
 /// #28 §1: "a genuinely separate process is required for an
 /// `independent`-policy card." §4 of the same card established that
@@ -884,60 +887,91 @@ pub fn check_independence(reviewer: &str, feature_actor: &str) -> Result<(), Har
 /// holds there, so a preview cannot report success for a verdict the real
 /// command would refuse.
 ///
-/// # What this refuses, precisely, and what it does not
+/// # `None` is refused here, and it is not `mutation_evidence`'s gap repeated
 ///
-/// The obvious rule, and only the obvious rule: `review_policy` compared
-/// byte-for-byte against `"independent"`, and `conduct` compared against
-/// exactly [`ReviewConduct::SameContext`]. Two things that misses, both
-/// deliberately:
+/// The first version of this function read `conduct != Some(SameContext)` as
+/// the whole rule and left `None` accepted on every `review_policy`,
+/// reasoning that refusing it would orphan the roughly 72 reviews already on
+/// disk. That reasoning does not survive contact with
+/// [`GateAdequacy::validate_mutation_evidence`], which sits a few hundred
+/// lines above this function and already answers the identical question for
+/// an identical shape: those 72 records carry no `mutation_evidence` at all,
+/// `validate_mutation_evidence` refuses `None` unconditionally, and nothing
+/// broke, because **stored records are read, never re-validated** —
+/// `ReviewRecord::validate` (and this function, called beside it) runs
+/// exactly once, at the moment a new review is recorded, never again when an
+/// old one is read back by `review inspect` or `integration::member_implementers`.
+/// A required field orphans old records only if something asks them to
+/// satisfy it after the fact; nothing here does.
 ///
-/// - A `review_policy` of `"Independent"`, `"independent-ish"`, or any other
-///   string that is not the exact literal `"independent"` is not refused,
-///   whatever conduct is declared. §8 of #28 forbids widening
-///   `CardDraft.review_policy`'s type or validation — it stays a free-form
-///   `String` — so there is no enum this function could match against
-///   instead, and no normalization this function invents is authorized by
-///   the card that owns the field. A card author who misspells the policy
-///   they meant gets silence, not a refusal, from this check.
-/// - A review that never declares `conduct` at all — `None`, exactly what an
-///   old review deserializes to, and exactly what a new one deserializes to
-///   if the reviewer never writes the key — is not refused either, on any
-///   `review_policy`. This is not an oversight: before this card, nothing
-///   asked the question at all, and a review that still does not answer it
-///   is in the same state it was always in, not a new one this card
-///   introduced. Refusing `None` on an `independent` card would refuse every
-///   one of the roughly 72 reviews already on disk were any of them
-///   re-validated, and would refuse a verdict written against the schema
-///   `review example` emitted before this field existed. Only a review that
-///   *asserts* `same_context` is refused; one that says nothing is not read
-///   as though it asserted anything.
+/// The narrower reading was this function's own error, not a misreading of
+/// #28: §5 says a separate process "is required" for an `independent` card,
+/// and omission does not satisfy a requirement — it is silence about one.
+/// Leaving `None` unrefused made the check's only casualty the reviewer
+/// honest enough to write `same_context`; one who wrote nothing passed
+/// unremarked, which is the shape of a rule that punishes candor.
 ///
-/// Both gaps are real and both are named here rather than closed silently.
-/// D-013 already commits this tool to declared-not-proven facts; a check
-/// that only catches the spelling and the candor of whoever fills in the
-/// form is consistent with that, not a departure from it.
+/// So, following [`GateAdequacy::validate_mutation_evidence`]'s established
+/// shape and register — required, with the refusal naming exactly what the
+/// reviewer must supply — `None` is now refused on an `independent` card
+/// exactly as [`ReviewConduct::SameContext`] is, under
+/// [`ErrorCode::PolicyIncompleteReview`] rather than
+/// [`ErrorCode::PolicySelfReview`]: a missing declaration and a false one are
+/// different failures, and this codebase already keeps them under different
+/// codes everywhere else `ReviewRecord::validate` checks both in the same
+/// pass (an empty `basis` versus a self-review, for instance). D-013 still
+/// holds without qualification: requiring the declaration is not proving the
+/// process, and the message below says so.
+///
+/// # What this still refuses only the obvious form of
+///
+/// A `review_policy` of `"Independent"`, `"INDEPENDENT"`, `"independent-ish"`,
+/// or any other string that is not the exact literal `"independent"` is not
+/// refused, whatever conduct is declared or omitted. §8 of #28 forbids
+/// widening `CardDraft.review_policy`'s type or validation — it stays a
+/// free-form `String` — so there is no enum this function could match
+/// against instead, and no normalization this function invents is authorized
+/// by the card that owns the field. A card author who misspells the policy
+/// they meant gets silence, not a refusal, from this check. Named here
+/// rather than closed silently, for the same reason the `None` gap used to
+/// be: D-013 already commits this tool to declared-not-proven facts, and a
+/// check that only catches the exact spelling of whoever filled in the
+/// policy field is consistent with that, not a departure from it.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::PolicySelfReview`] when `review_policy` is exactly
-/// `"independent"` and `conduct` is declared [`ReviewConduct::SameContext`].
-/// The closest existing code, reused rather than added — #28 §8 forbids a
-/// new `ErrorCode` variant, and this is the same underlying concern
-/// `check_independence` already reports under it: a review that admits it
-/// was not independent of the work it reviews. The identity check and this
-/// one differ in which declared fact fails, not in what kind of failure it
-/// is.
+/// On a card whose `review_policy` is exactly `"independent"`:
+///
+/// - Returns [`ErrorCode::PolicyIncompleteReview`] when `conduct` is `None` —
+///   the same code, and the same "required, with a declared reason or value,
+///   not optional and silent" register, [`GateAdequacy::validate_mutation_evidence`]
+///   already uses for an absent `mutation_evidence`.
+/// - Returns [`ErrorCode::PolicySelfReview`] when `conduct` is declared
+///   [`ReviewConduct::SameContext`] — the closest existing code, reused
+///   rather than added per #28 §8, for the same underlying concern
+///   `check_independence` already reports under it: a review that admits it
+///   was not independent of the work it reviews.
+///
+/// Any other `review_policy` accepts every `conduct`, declared or not — see
+/// the false-positive direction this must not create, tested directly.
 pub fn check_review_conduct(
     review_policy: &str,
     conduct: Option<ReviewConduct>,
 ) -> Result<(), HarnessError> {
-    if review_policy != "independent" || conduct != Some(ReviewConduct::SameContext) {
+    if review_policy != "independent" {
         return Ok(());
     }
-    Err(HarnessError::Control {
-        reason: "review_policy `independent` requires a genuinely separate review process, and this review declares `same_context` conduct; independence is procedural, so the harness can only refuse the declared case".to_owned(),
-        code: ErrorCode::PolicySelfReview,
-    })
+    match conduct {
+        None => Err(HarnessError::Control {
+            reason: "a review of an `independent`-policy card must declare whether it was conducted in a separate process — set `review_conduct: separate_process` or `review_conduct: same_context` on the record; independence is procedural, so the harness can require the declaration but cannot confirm it".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        }),
+        Some(ReviewConduct::SameContext) => Err(HarnessError::Control {
+            reason: "review_policy `independent` requires a genuinely separate review process, and this review declares `same_context` conduct; independence is procedural, so the harness can only refuse the declared case".to_owned(),
+            code: ErrorCode::PolicySelfReview,
+        }),
+        Some(ReviewConduct::SeparateProcess) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1866,14 +1900,35 @@ mod tests {
             .expect("the honest declaration this check exists to require must be accepted");
     }
 
-    /// §10.3: named as a deliberate gap, not an oversight. A review that
-    /// never declares its conduct is in the same state every review was in
-    /// before this card existed, and refusing it now would refuse the
-    /// roughly 72 reviews already on disk were any of them re-validated.
+    // Repair, post-review. The first version of this function accepted a
+    // review that said nothing about its conduct on an `independent` card --
+    // reasoning that refusing `None` would orphan the roughly 72 reviews
+    // already on disk, which does not hold: `GateAdequacy::validate_mutation_evidence`
+    // already refuses an absent `mutation_evidence` unconditionally, on an
+    // identical `Option` shape, because stored records are read, never
+    // re-validated. The practical effect of the old rule was that the only
+    // reviewer it ever refused was one honest enough to write
+    // `same_context`; one who wrote nothing passed unremarked. §28 §1 says a
+    // separate process "is required", and omission does not satisfy a
+    // requirement.
+    //
+    // Mutation: restore `conduct != Some(ReviewConduct::SameContext)` as the
+    // whole rule (or otherwise make the `None` arm return `Ok(())`). This
+    // test must fail -- an undeclared conduct would then be accepted again.
     #[test]
-    fn an_independent_policy_card_accepts_undeclared_conduct() {
-        check_review_conduct("independent", None)
-            .expect("an undeclared conduct is not read as an assertion of same-context conduct");
+    fn an_independent_policy_card_refuses_undeclared_conduct() {
+        let error = check_review_conduct("independent", None).expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+        assert!(
+            error.to_string().contains("separate process")
+                && error.to_string().contains("separate_process"),
+            "the refusal must name what the reviewer must declare, in `mutation_evidence`'s \
+             established register: {error}"
+        );
+        assert!(
+            error.to_string().contains("cannot confirm"),
+            "the message must not overclaim what requiring the declaration proves: {error}"
+        );
     }
 
     // #28 §12 mutation 2, the false-positive direction. Mutation: make the
@@ -1892,6 +1947,20 @@ mod tests {
                     )
                 },
             );
+        }
+    }
+
+    /// The repair above is scoped to `independent`-policy cards exactly as
+    /// the same-context refusal always was: a non-`independent` card accepts
+    /// an undeclared conduct too, not only a declared `same_context` one.
+    /// Both halves of the false-positive direction, pinned separately so a
+    /// mutation widening either one independently is caught.
+    #[test]
+    fn a_non_independent_policy_card_accepts_undeclared_conduct() {
+        for policy in ["solo", "pair", ""] {
+            check_review_conduct(policy, None).unwrap_or_else(|error| {
+                panic!("policy `{policy}` must not require the declaration at all: {error}")
+            });
         }
     }
 

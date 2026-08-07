@@ -232,6 +232,87 @@ fn review_record_previews_a_same_context_conduct_refusal() {
     );
 }
 
+// Repair, post-review: `check_review_conduct` refuses an absent declaration
+// on an `independent`-policy card exactly as it refuses a declared
+// `same_context` one, and the same #189/#120 defect applies to both arms of
+// that one function -- there is no separate call site to forget, but the
+// coverage still needs its own pinned fixture, since this exercises a
+// different `ErrorCode` than the test above.
+//
+// Mutation: remove the `check_review_conduct` call from `preview_record`
+// (the same edit mutation 5 above names). This test must fail: the dry run
+// would report success for a verdict that declares no conduct at all on an
+// `independent` card, which the real command refuses.
+#[test]
+fn review_record_previews_an_undeclared_conduct_refusal() {
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // No `review_conduct` key at all -- otherwise a clean, distinct-reviewer
+    // approval, exactly as the fixture above except for the field this test
+    // exercises.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
+    )
+    .unwrap();
+    let path = verdict.display().to_string();
+
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_parity(
+        "review record",
+        &real,
+        &workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-POLICY-INCOMPLETE-REVIEW",
+        "the fixture must exercise the undeclared-conduct refusal, not something else"
+    );
+}
+
 #[test]
 fn review_record_previews_a_staleness_refusal() {
     // `preview_record` called `check_independence` but never

@@ -172,7 +172,7 @@ fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, de
     fs::write(
         &verdict,
         format!(
-            "reviewer_actor_id: reviewer-session\ndecision: {decision}\nfindings:\n  - severity: high\n    location: src/{card_id}/a.rs\n    detail: the candidate has a defect\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n"
+            "reviewer_actor_id: reviewer-session\ndecision: {decision}\nfindings:\n  - severity: high\n    location: src/{card_id}/a.rs\n    detail: the candidate has a defect\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n"
         ),
     )
     .unwrap();

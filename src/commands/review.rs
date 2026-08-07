@@ -190,10 +190,11 @@ pub struct Verdict {
     /// and D-013 makes this exactly as declared-not-proven as
     /// `human_reviewer` above — recorded on the review and refusable by
     /// [`check_review_conduct`], with the same limits `check_independence`
-    /// already carries. `Option`, and defaulted rather than required, because
-    /// a verdict written against the schema `review example` emitted before
-    /// this field existed must keep parsing; see [`ReviewConduct`] for what
-    /// leaving it undeclared does and does not mean.
+    /// already carries. `Option` at the schema boundary, so a verdict written
+    /// against the schema `review example` emitted before this field existed
+    /// still parses — but on an `independent`-policy card, leaving it `None`
+    /// is refused exactly as declaring [`ReviewConduct::SameContext`] is; see
+    /// [`check_review_conduct`] for the full rule and its one remaining gap.
     #[serde(default)]
     pub review_conduct: Option<ReviewConduct>,
 }
@@ -802,15 +803,21 @@ fn require_review_return_reason(
 ///
 /// `check_review_conduct` runs immediately after `check_independence` and
 /// before the mutation-evidence check: #28 groups it with independence
-/// thematically — both refuse a review that admits it was not independent of
-/// the work it reviews, under the same `ErrorCode::PolicySelfReview` — and it
-/// needs only `record.review_policy` (already loaded, above, for the
-/// convergence-budget check) and `verdict.review_conduct`, so it has no
-/// dependency on the handoff or the mutation-evidence check that would force
-/// a different position. #189/#120: this call is what keeps `--dry-run` from
-/// reporting success for a same-context verdict the real command would
-/// refuse — `check_review_conduct` is a free function precisely so it can be
-/// called here, on `record.review_policy` and `verdict.review_conduct`
+/// thematically — a declared same-context conduct refuses under
+/// `ErrorCode::PolicySelfReview`, the same code `check_independence` uses,
+/// because both are a review that admits it was not independent of the work
+/// it reviews; an undeclared conduct refuses separately, under
+/// `ErrorCode::PolicyIncompleteReview`, the same code and register
+/// `GateAdequacy::validate_mutation_evidence` already uses for an absent
+/// `mutation_evidence` — see `check_review_conduct`'s doc for why a missing
+/// declaration and a false one are kept under different codes. It needs only
+/// `record.review_policy` (already loaded, above, for the convergence-budget
+/// check) and `verdict.review_conduct`, so it has no dependency on the
+/// handoff or the mutation-evidence check that would force a different
+/// position. #189/#120: this call is what keeps `--dry-run` from reporting
+/// success for a same-context or undeclared-conduct verdict the real command
+/// would refuse — `check_review_conduct` is a free function precisely so it
+/// can be called here, on `record.review_policy` and `verdict.review_conduct`
 /// directly, before any `ReviewRecord` exists, the same reason
 /// `check_independence` is one.
 ///
