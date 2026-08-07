@@ -58,7 +58,7 @@ fn verdict(workspace: &Workspace, body: &str) -> String {
 /// A clean approval by a distinct reviewer.
 fn approval(reviewer: &str) -> String {
     format!(
-        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n"
+        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n"
     )
 }
 
@@ -139,7 +139,7 @@ fn self_review_is_refused_through_a_spelling_variant() {
 #[test]
 fn approving_over_an_open_finding_is_refused() {
     let (workspace, _) = handed_off();
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
     let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
@@ -152,7 +152,7 @@ fn approving_over_a_dispositioned_finding_is_permitted() {
     // SPIKE-001 F-4: the reviewer must be able to approve while recording that
     // a real problem cannot be fixed within this card's write scope.
     let (workspace, _) = handed_off();
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: high\n    location: tests/\n    detail: no coverage of behavior 4\n    disposition: out_of_scope\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [raises on invalid input]\n  basis: mutation-tested the suite; it passes with the guard removed\nresidual_risks: [behavior 4 stays ungated]\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: high\n    location: tests/\n    detail: no coverage of behavior 4\n    disposition: out_of_scope\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [raises on invalid input]\n  basis: mutation-tested the suite; it passes with the guard removed\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: [behavior 4 stays ungated]\n";
     let path = verdict(&workspace, body);
 
     let output = workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
@@ -175,7 +175,7 @@ fn approving_over_a_dispositioned_finding_is_permitted() {
 #[test]
 fn changes_requested_returns_the_card_to_work() {
     let (workspace, _) = handed_off();
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
     let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
@@ -189,7 +189,7 @@ fn changes_requested_returns_the_card_to_work() {
 #[test]
 fn requesting_changes_without_a_finding_is_refused() {
     let (workspace, _) = handed_off();
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
     let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
@@ -211,6 +211,59 @@ fn a_review_must_state_how_gate_adequacy_was_established() {
     let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+}
+
+// #95 gap 1, §10 test 3, exercised through the real CLI rather than only
+// `ReviewRecord::validate` directly. `approval()` above already carries a
+// `mutation_evidence` block; this strips exactly that block back out, so the
+// verdict is otherwise identical to one the CLI already accepts.
+//
+// Mutation (§11.2): remove the §8.3 enforcement from `ReviewRecord::validate`.
+// This test must fail — the stripped verdict would then be accepted.
+#[test]
+fn a_verdict_with_no_mutation_evidence_is_refused_by_the_cli() {
+    let (workspace, _) = handed_off();
+    let stripped = approval("reviewer-session-a").replace(
+        "  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\n",
+        "",
+    );
+    assert!(
+        !stripped.contains("mutation_evidence"),
+        "the fixture must actually omit the key, not merely blank a sub-field: {stripped}"
+    );
+    let path = verdict(&workspace, &stripped);
+
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+}
+
+// §10 test 3's other half: a review claiming an exemption is not silently
+// dropped or reduced to the bare fact that gates were adequate — the
+// exemption itself, and the reviewer's stated reason, are part of the
+// recorded, retrievable review.
+#[test]
+fn a_declared_exemption_is_recorded_and_visible() {
+    let (workspace, _) = handed_off();
+    let path = verdict(&workspace, &approval("reviewer-session-a"));
+
+    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    assert_eq!(envelope["status"], "success");
+    let evidence = &envelope["data"]["review"]["gate_adequacy"]["mutation_evidence"];
+    assert_eq!(evidence["status"], "exempt");
+    assert_eq!(
+        evidence["reason"], "fixture verdict for unrelated review behavior; no mutation performed",
+        "the exemption's own reason must be visible in the recorded review, not merely a boolean"
+    );
+
+    // And still visible on a later read, not only in the write's own reply.
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let recorded = &inspected["data"]["reviews"][0]["gate_adequacy"]["mutation_evidence"];
+    assert_eq!(recorded["status"], "exempt");
+    assert_eq!(
+        recorded["reason"],
+        "fixture verdict for unrelated review behavior; no mutation performed"
+    );
 }
 
 #[test]
@@ -276,7 +329,7 @@ fn findings_remain_visible_after_a_later_approval() {
     let (workspace, _) = handed_off();
 
     // First round: changes requested with a finding.
-    let rejection = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let rejection = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -318,7 +371,7 @@ fn findings_remain_visible_after_a_later_approval() {
     // approval carrying `findings: []`, which the harness accepted — so it was
     // asserting that a critical open finding can be approved away, under a name
     // claiming the opposite. See `an_approval_may_not_drop_a_prior_open_finding`.
-    let resolution = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let resolution = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -360,7 +413,7 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
     // consulted it again. Supersession without this check is only filing.
     let (workspace, _) = handed_off();
 
-    let rejection = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let rejection = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -415,7 +468,7 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
         "the refusal must name the finding it is protecting: {message}"
     );
 
-    let dispositioned = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let dispositioned = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -471,7 +524,7 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
     // there. Recording `RV-000039` on `F-027` hit exactly this and was refused.
     let (workspace, _) = handed_off();
 
-    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the comparison loses to a case variant\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the comparison loses to a case variant\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -483,7 +536,7 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
     next_round(&workspace, "narrowed");
 
     // The verdict that used to be unrecordable.
-    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the demonstrated character is closed; the class survives at another\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the demonstrated character is closed; the class survives at another\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -501,7 +554,7 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
 
     // And it settles nothing: the next round cannot approve over it.
     next_round(&workspace, "still-not-fixed");
-    let premature = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class survives\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let premature = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class survives\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let refused = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -530,7 +583,7 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
 
     // The fixture has to be able to succeed, or the refusal proves nothing:
     // the same approval with the finding actually settled goes through.
-    let settled = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class is closed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let settled = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: the class is closed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -555,7 +608,7 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
     // thing this rule exists to prevent.
     let (workspace, _) = handed_off();
 
-    let two = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass\n    disposition: open\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: destructive operation is not bounded\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let two = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass\n    disposition: open\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: destructive operation is not bounded\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -566,7 +619,7 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
 
     next_round(&workspace, "fixed-one");
 
-    let half = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed only the authorization bypass\nresidual_risks: []\n";
+    let half = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed only the authorization bypass\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let refused = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -589,7 +642,7 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
 
     // The fixture has to be able to succeed: one entry per finding goes
     // through, and the record then says what became of each.
-    let both = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: the destructive operation is now bounded\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let both = "reviewer_actor_id: reviewer-session-b\ndecision: approved\nfindings:\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: authorization bypass fixed\n    disposition: resolved\n  - severity: critical\n    location: \"src/a.rs:10\"\n    detail: the destructive operation is now bounded\n    disposition: resolved\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -610,7 +663,7 @@ fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
     // first-time observation filed as though three rounds had already seen it.
     let (workspace, _) = handed_off();
 
-    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let opened = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -621,7 +674,7 @@ fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
 
     next_round(&workspace, "elsewhere");
 
-    let invented = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: fixed\n    disposition: resolved\n  - severity: high\n    location: src/never-seen.rs\n    detail: pretending this has been here for rounds\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let invented = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: fixed\n    disposition: resolved\n  - severity: high\n    location: src/never-seen.rs\n    detail: pretending this has been here for rounds\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let refused = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -643,7 +696,7 @@ fn the_first_review_of_a_card_cannot_carry_a_finding_forward() {
     // it. Refused where the record is built instead.
     let (workspace, _) = handed_off();
 
-    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: claiming this survived a round that never happened\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let carried = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: claiming this survived a round that never happened\n    disposition: still_open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let refused = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -667,7 +720,7 @@ fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
     // over a prior review that no longer shows anything open.
     let (workspace, _) = handed_off();
 
-    let first = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let first = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -701,7 +754,7 @@ fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
     workspace.review(&["begin", "--card-id", "F-001"]);
 
     // A second round about a different problem entirely, silent on the first.
-    let second = "reviewer_actor_id: reviewer-session-b\ndecision: changes_requested\nfindings:\n  - severity: medium\n    location: src/b.rs\n    detail: naming\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let second = "reviewer_actor_id: reviewer-session-b\ndecision: changes_requested\nfindings:\n  - severity: medium\n    location: src/b.rs\n    detail: naming\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let output = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -772,7 +825,7 @@ fn a_reviewer_can_record_that_a_card_is_blocked() {
     // was discarded rather than filed.
     let (workspace, _) = handed_off();
 
-    let blocked = "reviewer_actor_id: reviewer-session-a\ndecision: blocked\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: needs a decision outside my remit\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [the failure path]\n  basis: read the gate definitions\nresidual_risks: []\n";
+    let blocked = "reviewer_actor_id: reviewer-session-a\ndecision: blocked\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: needs a decision outside my remit\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [the failure path]\n  basis: read the gate definitions\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     workspace.review(&[
         "record",
         "--card-id",
@@ -897,7 +950,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     // Declaring it is the way through. Like every other identity in this
     // harness it is a claim, not a proof — D-013 — so this must be recorded on
     // the review rather than checked.
-    let human = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\nhuman_reviewer: true\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let human = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\nhuman_reviewer: true\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let envelope = workspace.review_json(&[
         "record",
         "--card-id",

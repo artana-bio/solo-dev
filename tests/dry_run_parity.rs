@@ -127,7 +127,7 @@ fn review_record_previews_a_self_review_refusal() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();
@@ -188,7 +188,7 @@ fn review_record_previews_a_staleness_refusal() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();
@@ -254,7 +254,7 @@ fn review_record_previews_a_stale_self_review_as_stale() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();

@@ -191,6 +191,17 @@ pub struct Finding {
 /// not evidence for the acceptance behavior it appeared to support. Recording
 /// this makes the strongest thing reviewers actually did a required output
 /// rather than an act of conscience.
+///
+/// #95 gap 1 finishes that thought. `basis` records *that* a reviewer reached
+/// a conclusion and *why*, in prose nothing can check or count — a real
+/// recorded one reads "Mutation-tested both behaviors. Removing `Ready` from
+/// `resumes_to_active` fails `a_card_revised_...`; skipping the locator check
+/// ... fails `resuming_a_revised_card_...`. Neither passes without its
+/// mechanism." That is already mutation-shaped reasoning, trapped where
+/// nothing can verify it happened.
+/// [`mutation_evidence`](Self::mutation_evidence) is that same act, given a
+/// shape a later card can cross-check mechanically instead of parsing prose
+/// for it.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GateAdequacy {
@@ -200,6 +211,82 @@ pub struct GateAdequacy {
     pub unobserved_behaviors: Vec<String>,
     /// How the reviewer established this.
     pub basis: String,
+    /// Structured evidence that this claim was earned by mutation, or a
+    /// declared reason none applies.
+    ///
+    /// `Option`, not because an absent claim is acceptable — see
+    /// [`ReviewRecord::validate`], which refuses `None` exactly as it
+    /// refuses an empty `basis` — but because 72 review facts already
+    /// recorded in the control repository, every one carrying `gate_adequacy`
+    /// with exactly the three fields above, predate this field and both this
+    /// struct and [`ReviewRecord`] derive `deny_unknown_fields`. A bare
+    /// required field would fail to deserialize every one of them; `#[serde(default)]`
+    /// is what lets a record written before this field existed still
+    /// project. `skip_serializing_if` is the other half of that: without it,
+    /// reading one of those 72 records back and re-serializing it — which
+    /// [`ReviewRecord::digest`] does, and which `integration::member_implementers`
+    /// relies on producing the same bytes it always has, to catch a review
+    /// altered after the fact — would silently move its digest by writing out
+    /// a key the stored record never had. `ActorDeclaration::gate_failures`
+    /// (`src/domain/handoff.rs`) established exactly this pattern, for
+    /// exactly this reason, first.
+    ///
+    /// So this field being `Option` at the schema boundary is a compatibility
+    /// shim for facts recorded before it existed, not a statement that the
+    /// question is optional. [`ReviewRecord::validate`] is where the question
+    /// is actually asked, and it runs only on a review newly being recorded
+    /// — never on one of the 72 being read back — so the two constraints
+    /// (old records must still deserialize; new records must not skip this)
+    /// do not conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_evidence: Option<MutationEvidence>,
+}
+
+/// Evidence that a [`GateAdequacy::gates_observe_acceptance`] claim was
+/// earned by mutating the candidate and watching a gate catch it — or a
+/// declared reason no mutation applies to this review.
+///
+/// #95 names the shape directly: what was changed, which test failed, and at
+/// which oracle — enough that a later card could cross-check it mechanically,
+/// which free-text `basis` cannot be. Each field of [`Self::Demonstrated`] is
+/// one of those three:
+///
+/// - `mutation`: what was changed. Not a diff — a reviewer's description of
+///   the change, the same register `basis` already writes in.
+/// - `failing_test`: which test failed against it. A name, so a later card
+///   could look it up.
+/// - `oracle`: at which gate or command the failure was observed. Distinct
+///   from `failing_test` because the two answer different questions a
+///   cross-check would need separately — which assertion caught it, and which
+///   run surfaced that assertion.
+///
+/// [`Self::Exempt`] exists because #95 names the trap on the other side too:
+/// "a required field that cannot honestly be filled invites a fabricated
+/// one." A documentation-only card has no code to mutate, and demanding
+/// `Demonstrated` from it would manufacture exactly that fabrication. Unlike
+/// [`GateAdequacy::mutation_evidence`] being absent, though, an exemption is
+/// itself a declared, reviewed claim — see [`ReviewRecord::validate`], which
+/// refuses either variant filled with nothing but its own required shape and
+/// no content, the same way `ActorDeclaration::validate` refuses a
+/// present-but-empty `implementation_decisions` (#117): "a reviewer cannot
+/// distinguish an empty field from an unconsidered one."
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "status")]
+pub enum MutationEvidence {
+    /// The reviewer mutated the candidate and a gate caught it.
+    Demonstrated {
+        /// What was changed to test whether a gate would catch it.
+        mutation: String,
+        /// The test that failed against the mutated code.
+        failing_test: String,
+        /// The gate or command whose run reported the failure.
+        oracle: String,
+    },
+    /// No mutation applies to this review, and why.
+    Exempt {
+        /// Why this review has no mutation to demonstrate.
+        reason: String,
+    },
 }
 
 /// One recorded review of one exact candidate.
@@ -412,6 +499,48 @@ impl ReviewRecord {
             });
         }
 
+        // #95 gap 1, §8.3. `None` is the shape a record written before this
+        // field existed deserializes to — see `GateAdequacy::mutation_evidence`
+        // — but every review recorded from here on is new, and a new review
+        // that leaves the question unanswered is refused exactly as one with
+        // an empty `basis` is above: required, with a declared exemption, not
+        // optional and silent. An operator can still say "none applies", but
+        // only by writing `Exempt` and a reason — never by omission.
+        match &self.gate_adequacy.mutation_evidence {
+            None => {
+                return Err(HarnessError::Control {
+                    reason: "a review must record the mutation its gate-adequacy claim was earned by — what was changed, which test failed, and at which oracle — or declare, on the record, why none applies".to_owned(),
+                    code: ErrorCode::PolicyIncompleteReview,
+                });
+            }
+            Some(MutationEvidence::Demonstrated {
+                mutation,
+                failing_test,
+                oracle,
+            }) => {
+                if mutation.trim().is_empty()
+                    || failing_test.trim().is_empty()
+                    || oracle.trim().is_empty()
+                {
+                    // #117's shape, one field short of that card rather than
+                    // this one: a value is present but empty, which is not
+                    // the same fact as absent and must not be read as it.
+                    return Err(HarnessError::Control {
+                        reason: "mutation evidence is present but empty; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
+                }
+            }
+            Some(MutationEvidence::Exempt { reason }) => {
+                if reason.trim().is_empty() {
+                    return Err(HarnessError::Control {
+                        reason: "mutation evidence declares an exemption but gives no reason; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -613,6 +742,11 @@ mod tests {
             gates_observe_acceptance: true,
             unobserved_behaviors: vec![],
             basis: "ran the suite and probed each acceptance behavior directly".to_owned(),
+            mutation_evidence: Some(MutationEvidence::Demonstrated {
+                mutation: "removed the absolute-zero guard in fahrenheit_to_celsius".to_owned(),
+                failing_test: "rejects_below_absolute_zero".to_owned(),
+                oracle: "gate.unit".to_owned(),
+            }),
         }
     }
 
@@ -759,6 +893,111 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
     }
 
+    // #95 gap 1, §8.3 and §10 test 3. `None` is exactly what a review
+    // deserializes to when the field is entirely absent — see
+    // `GateAdequacy::mutation_evidence` — so this also stands in for "an
+    // operator who wrote a verdict with no `mutation_evidence` key at all".
+    //
+    // Mutation (§11.2): delete the `None => { ... }` arm (or the whole
+    // `match` this belongs to) from `ReviewRecord::validate`. This test must
+    // fail — `validate()` would then return `Ok(())` for a review with no
+    // mutation evidence at all.
+    #[test]
+    fn a_review_with_no_mutation_evidence_is_refused() {
+        let mut invalid = review(Decision::Approved, vec![]);
+        invalid.gate_adequacy.mutation_evidence = None;
+        let error = invalid.validate().expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+        assert!(
+            error.to_string().contains("mutation"),
+            "the refusal must name what is missing: {error}"
+        );
+    }
+
+    // §10 test 3, the #117 shape named in §11.4. A `Demonstrated` value is
+    // present — the key exists, `serde` accepted the document — but its
+    // fields are empty, which is a different fact from absent and must not
+    // be silently treated as filled in.
+    //
+    // Mutation (§11.4): delete the `mutation.trim().is_empty() || ...` guard
+    // inside the `Some(MutationEvidence::Demonstrated { .. })` arm. This test
+    // must fail — an empty-but-present `Demonstrated` would then validate.
+    #[test]
+    fn a_present_but_empty_demonstrated_mutation_is_refused() {
+        let mut invalid = review(Decision::Approved, vec![]);
+        invalid.gate_adequacy.mutation_evidence = Some(MutationEvidence::Demonstrated {
+            mutation: String::new(),
+            failing_test: String::new(),
+            oracle: String::new(),
+        });
+        let error = invalid.validate().expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+        assert!(
+            error
+                .to_string()
+                .contains("a reviewer cannot distinguish an empty field from an unconsidered one"),
+            "the #117 rationale must survive for this field too: {error}"
+        );
+    }
+
+    /// Each field of `Demonstrated` is checked independently: a mutation that
+    /// only guarded the first field would let the other two through empty.
+    #[test]
+    fn each_field_of_a_demonstrated_mutation_is_checked() {
+        for (mutation, failing_test, oracle) in [
+            ("", "rejects_below_absolute_zero", "gate.unit"),
+            ("removed the guard", "", "gate.unit"),
+            ("removed the guard", "rejects_below_absolute_zero", ""),
+        ] {
+            let mut invalid = review(Decision::Approved, vec![]);
+            invalid.gate_adequacy.mutation_evidence = Some(MutationEvidence::Demonstrated {
+                mutation: mutation.to_owned(),
+                failing_test: failing_test.to_owned(),
+                oracle: oracle.to_owned(),
+            });
+            let error = invalid.validate().expect_err("must refuse");
+            assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+        }
+    }
+
+    // §10 test 3, the #117 shape, on the other variant: an exemption whose
+    // `reason` is blank is present-but-empty in exactly the same way an
+    // unfilled `Demonstrated` is, and must be refused for the same reason.
+    //
+    // Mutation (§11.4): delete the `reason.trim().is_empty()` guard inside
+    // the `Some(MutationEvidence::Exempt { .. })` arm. This test must fail.
+    #[test]
+    fn an_exemption_with_no_reason_is_refused() {
+        let mut invalid = review(Decision::Approved, vec![]);
+        invalid.gate_adequacy.mutation_evidence = Some(MutationEvidence::Exempt {
+            reason: "   ".to_owned(),
+        });
+        let error = invalid.validate().expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
+        assert!(
+            error
+                .to_string()
+                .contains("a reviewer cannot distinguish an empty field from an unconsidered one"),
+            "{error}"
+        );
+    }
+
+    // The positive half of §8.3: an exemption is a real way through, not a
+    // refusal wearing a different shape. #95's trap runs both directions —
+    // this is the "a required field that cannot honestly be filled invites a
+    // fabricated one" half; the two tests above are the "an `Option` that is
+    // always `None` teaches nothing" half.
+    #[test]
+    fn a_review_may_declare_an_exemption_from_mutation_evidence() {
+        let mut declared = review(Decision::Approved, vec![]);
+        declared.gate_adequacy.mutation_evidence = Some(MutationEvidence::Exempt {
+            reason: "documentation-only card; no behavior to mutate".to_owned(),
+        });
+        declared
+            .validate()
+            .expect("a declared, non-empty exemption is honest and must be accepted");
+    }
+
     #[test]
     fn a_review_may_approve_while_reporting_inadequate_gates() {
         // The spike's reviewers approved corrected candidates while recording
@@ -769,6 +1008,11 @@ mod tests {
             gates_observe_acceptance: false,
             unobserved_behaviors: vec!["raises ValueError below absolute zero".to_owned()],
             basis: "mutation-tested the suite; it passes with the guard removed".to_owned(),
+            mutation_evidence: Some(MutationEvidence::Demonstrated {
+                mutation: "removed the absolute-zero guard".to_owned(),
+                failing_test: "none — this is the unobserved behavior".to_owned(),
+                oracle: "gate.unit".to_owned(),
+            }),
         };
         honest
             .validate()
@@ -1195,5 +1439,118 @@ mod tests {
     #[test]
     fn a_review_names_its_canonicalization_algorithm() {
         assert_eq!(ReviewRecord::canonical_algorithm(), CANONICAL_ALGORITHM);
+    }
+
+    // #95 gap 1, §4 and §10 test 1. Verified §4 counts (2026-08-07): the
+    // control repository at `~/Documents/Code/change-harness-control` holds
+    // exactly 72 files under `reviews/`, and every one of their
+    // `gate_adequacy` objects carries exactly the three keys
+    // `gates_observe_acceptance`, `unobserved_behaviors`, and `basis` --
+    // verified with a script reading all 72, not merely one. This is one of
+    // those 72, `reviews/RV-000005.json`, embedded byte-for-byte as read from
+    // disk -- not a synthetic fixture built to look like one. It predates
+    // `mutation_evidence` entirely: no such key appears anywhere below.
+    //
+    // Mutation (§11.3): edit the constant below to add
+    // `deny_unknown_fields`-breaking content (an extra key inside
+    // `gate_adequacy`, for instance), or otherwise break backward
+    // compatibility -- for instance, by giving `mutation_evidence` a
+    // `#[serde(default)]` that does not actually satisfy `deny_unknown_fields`
+    // on a document lacking the key, or by removing `#[serde(default)]`
+    // outright. This test must fail either way: it is reading a real record,
+    // not a convenient one, so a mutation to the fixture below is exactly as
+    // load-bearing as a mutation to the production deserializer.
+    const REAL_PRE_EXISTING_REVIEW_RV_000005: &str = r#"{
+  "schema": "harness.review/v1",
+  "review_id": "RV-000005",
+  "card_id": "F-005",
+  "card_revision": 1,
+  "card_digest": "sha256:57679db3d3c1fb461530536ff9f262608c7e6ce3fd8dd932eb052fcb6870fb05",
+  "cycle_id": "C-004",
+  "baseline_sha": "8dfe3b9fa8752d5205708898172b5143af9d1a02",
+  "candidate_sha": "794f046f8fb2cb1718043f531e6e7193c2f902ab",
+  "handoff_id": "H-000006",
+  "handoff_digest": "sha256:31ec24776f7f94f0d28f3bf93b51b225262cfd0a8051b571cb68eaaa06ddb511",
+  "reviewer_actor_id": "f005-reviewer",
+  "feature_actor_id": "operator",
+  "decision": "approved",
+  "findings": [
+    {
+      "severity": "medium",
+      "location": "src/commands/work.rs",
+      "detail": "Recorded again for this card: the review was made by a distinct declared actor but not from a genuinely fresh context.",
+      "disposition": "accepted_risk"
+    }
+  ],
+  "gate_adequacy": {
+    "gates_observe_acceptance": true,
+    "unobserved_behaviors": [],
+    "basis": "Mutation-tested both behaviors. Removing Ready from resumes_to_active fails a_card_revised_while_allocated_can_be_resumed; skipping the locator check for the ready case fails resuming_a_revised_card_still_checks_the_locator. Neither passes without its mechanism."
+  },
+  "residual_risks": [],
+  "supersedes": null,
+  "reviewed_at": "2026-07-29T05:07:28Z",
+  "canonical_algorithm": "harness.canonical-json/v1"
+}
+"#;
+
+    #[test]
+    fn a_real_pre_existing_review_record_still_projects() {
+        let record: ReviewRecord = serde_json::from_str(REAL_PRE_EXISTING_REVIEW_RV_000005)
+            .expect("a review recorded before mutation_evidence existed must still deserialize");
+
+        // It really does predate the field: reading it back must not have
+        // manufactured content the file never had.
+        assert_eq!(record.review_id.to_string(), "RV-000005");
+        assert!(record.gate_adequacy.mutation_evidence.is_none());
+
+        // Half of §4's claim is deserialization; the other half is that a
+        // record already digested under the old schema must keep digesting
+        // to the same value now that a new field exists on the type, because
+        // `integration::member_implementers` recomputes a review's digest
+        // from a fresh read and refuses when it no longer matches what an
+        // integration pinned -- the exact meaning of "orphaned" this harness
+        // already guards elsewhere. `skip_serializing_if` on
+        // `mutation_evidence` is what keeps that recomputation from moving:
+        // this value was captured with `ReviewRecord::digest()` on the
+        // unmodified pre-#95 code, from this exact fixture's content, before
+        // `mutation_evidence` was added at all.
+        assert_eq!(
+            record.digest().unwrap().as_str(),
+            "sha256:b826c2bab33d692053c1608a7d872f545071585259898bd139e97325b8d6d14a",
+            "adding mutation_evidence must not move the digest of a record that predates it"
+        );
+
+        // And the mechanism, not just its result: re-serializing this record
+        // must not write out a key the stored file never had.
+        let reencoded = serde_json::to_string(&record).unwrap();
+        assert!(
+            !reencoded.contains("mutation_evidence"),
+            "a record with no mutation evidence must omit the key entirely, not write it out \
+             as null or as an empty value: {reencoded}"
+        );
+    }
+
+    /// §10 test 4, for the type this card adds specifically: both
+    /// `MutationEvidence` variants, written and read back.
+    #[test]
+    fn mutation_evidence_round_trips_both_variants() {
+        let demonstrated = review(Decision::Approved, vec![]);
+        let encoded = serde_json::to_string_pretty(&demonstrated).unwrap();
+        let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, demonstrated);
+        assert_eq!(
+            decoded.gate_adequacy.mutation_evidence,
+            demonstrated.gate_adequacy.mutation_evidence
+        );
+
+        let mut exempted = review(Decision::Approved, vec![]);
+        exempted.gate_adequacy.mutation_evidence = Some(MutationEvidence::Exempt {
+            reason: "documentation-only card; no behavior to mutate".to_owned(),
+        });
+        let encoded = serde_json::to_string_pretty(&exempted).unwrap();
+        let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, exempted);
+        assert_eq!(decoded.digest().unwrap(), exempted.digest().unwrap());
     }
 }

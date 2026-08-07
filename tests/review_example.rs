@@ -15,7 +15,9 @@ use std::{collections::BTreeSet, fs};
 
 use change_harness::{
     commands::review::Verdict,
-    domain::review::{Decision, Disposition, Finding, FindingSeverity, GateAdequacy},
+    domain::review::{
+        Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationEvidence,
+    },
 };
 use support::Workspace;
 
@@ -107,6 +109,11 @@ fn reference_verdict() -> Verdict {
             gates_observe_acceptance: true,
             unobserved_behaviors: vec![],
             basis: "reference basis".to_owned(),
+            mutation_evidence: Some(MutationEvidence::Demonstrated {
+                mutation: "reference mutation".to_owned(),
+                failing_test: "reference_failing_test".to_owned(),
+                oracle: "reference oracle".to_owned(),
+            }),
         },
         residual_risks: vec!["reference risk".to_owned()],
         human_reviewer: true,
@@ -245,6 +252,73 @@ fn the_emitted_example_text_mode_stdout_is_accepted_by_review_record() {
          actually run: {envelope}"
     );
     assert_eq!(envelope["data"]["review"]["decision"], "approved");
+    assert_eq!(
+        envelope["data"]["review"]["candidate_sha"], reviewed,
+        "the review binds to the exact candidate the fixture handed off"
+    );
+}
+
+// #95 gap 1, §10 test 2. Distinct from the test above: that one proves
+// stdout round-trips through `review record` unchanged, full stop, and would
+// stay green even if `mutation_evidence` were dropped from the emitter,
+// because nothing about that fixture card's write scope needed it. This one
+// asserts the new shape is actually present on stdout — not `--output json`
+// — before ever handing it to `review record`.
+//
+// Mutation (§11.1): drop `mutation_evidence` from `example_verdict` (or blank
+// it via `#[serde(skip_serializing_if)]` firing on real content, which cannot
+// happen for a required, non-empty `Demonstrated` value, but a regression
+// that made it happen would be exactly the failure mode this guards). This
+// test must fail on the shape assertion below before it ever reaches
+// `review record`.
+#[test]
+fn the_emitted_example_carries_mutation_evidence_on_stdout_and_is_accepted() {
+    let (workspace, reviewed) = handed_off();
+
+    let output = Workspace::run(&["review".to_owned(), "example".to_owned()]);
+    assert!(
+        output.status.success(),
+        "review example must succeed (exit {:?})",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // The new shape, on stdout, before this ever touches `review record`.
+    // `status: demonstrated` is `MutationEvidence`'s serde tag (internally
+    // tagged, `tag = "status"`); the other three are `Demonstrated`'s fields.
+    for needle in [
+        "mutation_evidence",
+        "status: demonstrated",
+        "mutation:",
+        "failing_test:",
+        "oracle:",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "stdout must carry `{needle}`, the new mutation-evidence shape: {stdout}"
+        );
+    }
+
+    let path = workspace
+        .root
+        .join("captured-stdout-mutation-evidence.yaml");
+    fs::write(&path, &stdout).unwrap();
+
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+    ]);
+    assert_eq!(
+        envelope["status"], "success",
+        "the example carrying mutation_evidence must still be accepted by `review record`: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["gate_adequacy"]["mutation_evidence"]["status"], "demonstrated",
+        "the recorded review must carry what stdout showed, not a stripped-down version of it"
+    );
     assert_eq!(
         envelope["data"]["review"]["candidate_sha"], reviewed,
         "the review binds to the exact candidate the fixture handed off"

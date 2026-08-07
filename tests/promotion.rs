@@ -714,7 +714,7 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n",
+        "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let recorded = workspace.review_raw(&[

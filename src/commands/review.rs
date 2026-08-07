@@ -26,8 +26,8 @@ use crate::{
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
         review::{
-            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, REVIEW_DIR,
-            REVIEW_SCHEMA, ReviewRecord, check_independence,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationEvidence,
+            REVIEW_DIR, REVIEW_SCHEMA, ReviewRecord, check_independence,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -533,6 +533,13 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 /// left at its empty value is `reason_category`: it answers "why is this
 /// being returned", and this example is an approval, which returns nothing to
 /// answer for. See [`Verdict::reason_category`] for when it becomes required.
+///
+/// `gate_adequacy.mutation_evidence` is shown as [`MutationEvidence::Demonstrated`]
+/// — the ordinary case — describing the same finding the example already
+/// carries, so a reader sees one coherent story rather than two unrelated
+/// fixtures. See [`GateAdequacy::mutation_evidence`] for
+/// [`MutationEvidence::Exempt`], the declared-exemption case this example
+/// does not need.
 fn example_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-example".to_owned(),
@@ -549,6 +556,11 @@ fn example_verdict() -> Verdict {
             unobserved_behaviors: vec![],
             basis: "ran the registered gates and probed each acceptance behavior directly"
                 .to_owned(),
+            mutation_evidence: Some(MutationEvidence::Demonstrated {
+                mutation: "widened the upper boundary in src/example.rs:42 by one".to_owned(),
+                failing_test: "rejects_the_value_at_the_upper_boundary".to_owned(),
+                oracle: "gate.unit".to_owned(),
+            }),
         },
         residual_risks: vec!["none identified".to_owned()],
         human_reviewer: true,
