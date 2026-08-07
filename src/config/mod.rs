@@ -614,7 +614,33 @@ impl ProjectConfig {
             let (field, code) = if let Some(name) = unknown_field_name(&message) {
                 (name, ErrorCode::ConfigUnknownField)
             } else {
-                (String::from("<document>"), ErrorCode::ConfigMalformed)
+                // #142: the `ConfigMalformed` branch here — a syntax error,
+                // or a schema error `unknown_field_name` above did not
+                // match (a missing field, a wrong type, ...) — is left on
+                // the shared fallback recovery deliberately, same reasoning
+                // as `run_validate` in `src/commands/project.rs`:
+                // `HarnessError::Config` has no per-site recovery field the
+                // way `HarnessError::Control` gained `ControlWithRecovery`
+                // in #106, and adding one would need either an
+                // `src/error.rs` change #142 §7/§9 do not clearly authorize
+                // here (this card does not convert every `ConfigMalformed`
+                // site, so §9's "if you convert every site" trigger for
+                // touching that file is not met), or swapping this
+                // construction to a different `HarnessError` variant, which
+                // would change the error's `Display` prefix and drop the
+                // `"field"` key from its JSON `details()` — a shape change
+                // beyond recovery text. Reached from two call sites with
+                // different natures — `commands::project::run_validate`'s
+                // arbitrary, operator-supplied `--config` file, and
+                // `ControlRepository::project()`'s re-read of this
+                // project's own already-initialized, control-managed
+                // document, where a failure here means external corruption
+                // rather than an operator's typo — which is a second,
+                // independent reason a single recovery string here would
+                // need to stay honest for two different stories, same as
+                // `CardDraft::parse`'s `DRAFT_PARSE_RECOVERY` in
+                // `src/domain/card.rs`.
+                (String::from("<document>"), ErrorCode::ConfigMalformed) // #142-fallback-ok: HarnessError::Config has no per-site recovery, see comment above
             };
             HarnessError::Config {
                 field,

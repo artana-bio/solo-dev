@@ -208,11 +208,19 @@ pub fn execute(command: &CardCommand, clock: &dyn Clock) -> Result<CommandOutcom
     }
 }
 
+/// #142: B1's second reproduction (#142 §1) is this exact site — `card
+/// create --draft <missing path>` used to answer "Correct the JSON or YAML
+/// syntax of the document" for a file that did not exist at all. Distinct
+/// call site from [`CardDraft::parse`]'s own parse failure, so it needs no
+/// introspection to tell apart from a schema failure.
+const CARD_DRAFT_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the draft file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
 /// Reads and parses a draft file.
 fn read_draft(path: &PathBuf) -> Result<CardDraft, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("cannot read draft {}: {source}", path.display()),
         code: ErrorCode::ConfigMalformed,
+        recovery: CARD_DRAFT_READ_RECOVERY,
     })?;
     CardDraft::parse(&raw)
 }

@@ -646,6 +646,19 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
     )
 }
 
+/// #142: distinct call site from the parse below, so the read failure needs
+/// no introspection to tell apart from a schema failure. Mirrors
+/// `CONVERGENCE_POLICY_READ_RECOVERY` in `src/commands/project.rs` — same
+/// duplication this function's own doc comment already flags, kept in step
+/// for the same reason.
+const CONVERGENCE_POLICY_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the convergence policy file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// Mirrors `CONVERGENCE_POLICY_SCHEMA_RECOVERY` in `src/commands/project.rs`.
+const CONVERGENCE_POLICY_SCHEMA_RECOVERY: &str = "This convergence policy is valid JSON but does not match the schema; the message above names the missing or invalid field. Compare it against `project example`'s output, a complete, valid convergence policy.";
+
+/// The syntax-failure sibling of [`CONVERGENCE_POLICY_SCHEMA_RECOVERY`].
+const CONVERGENCE_POLICY_SYNTAX_RECOVERY: &str = "This convergence policy is not valid JSON; the message above names the exact line and column to fix.";
+
 /// Reads, parses, and validates the convergence policy named by `--policy`.
 ///
 /// Mirrors `commands::project::read_convergence_policy` step for step: same
@@ -657,18 +670,26 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
 /// place `read_convergence_policy`'s shape is duplicated in this card, and
 /// it exists only because the original is unreachable from this file.
 fn read_new_policy(path: &Path) -> Result<ConvergencePolicy, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!(
             "cannot read convergence policy {}: {source}",
             path.display()
         ),
         code: ErrorCode::ConfigMalformed,
+        recovery: CONVERGENCE_POLICY_READ_RECOVERY,
     })?;
-    let policy: ConvergencePolicy =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let policy: ConvergencePolicy = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            CONVERGENCE_POLICY_SCHEMA_RECOVERY
+        } else {
+            CONVERGENCE_POLICY_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!("convergence policy is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
 }

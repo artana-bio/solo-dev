@@ -497,15 +497,28 @@ pub const EVALUATION_CRITERIA: [&str; 10] = [
     "maintainability by another human or agent",
 ];
 
+/// #142: distinct call site from the parse below, so the read failure needs
+/// no introspection to tell apart from a schema failure.
+const VERDICT_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the verdict file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+/// `serde_yaml_ng` (v0.10.0) exposes no public equivalent of
+/// `serde_json::Error::classify()` — see `GATE_DEFINITION_PARSE_RECOVERY` in
+/// `src/commands/gate.rs` for the full finding. Same choice here: one
+/// recovery, honest for both a syntax and a schema failure, naming `review
+/// example` either way.
+const VERDICT_PARSE_RECOVERY: &str = "This verdict could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. Compare it against `review example`'s output, a complete, valid verdict.";
+
 /// Reads and parses a reviewer's verdict.
 fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("cannot read verdict {}: {source}", path.display()),
         code: ErrorCode::ConfigMalformed,
+        recovery: VERDICT_READ_RECOVERY,
     })?;
-    serde_yaml_ng::from_str(&raw).map_err(|source| HarnessError::Control {
+    serde_yaml_ng::from_str(&raw).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!("verdict is malformed: {source}"),
         code: ErrorCode::ConfigMalformed,
+        recovery: VERDICT_PARSE_RECOVERY,
     })
 }
 
