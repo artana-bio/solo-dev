@@ -75,6 +75,8 @@ fn run_cycle(workspace: &Workspace, cycle: &str, card: &str, file: &str) -> Stri
         card,
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 
     let id =

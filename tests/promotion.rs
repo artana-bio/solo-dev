@@ -717,6 +717,12 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
         "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
+    // #120: `--actor` must agree with the verdict's `reviewer_actor_id`, or
+    // `require_actor_agreement` refuses before this test's own check ever
+    // runs. `STRASSE` is plain ASCII, so it must be named here too — the
+    // point under test is the *handoff* actor `STRAẞE`'s non-ASCII capital
+    // sharp S, which only `check_independence` (downstream of the agreement
+    // check) refuses.
     let recorded = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -724,7 +730,7 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
         "--verdict",
         &verdict.display().to_string(),
         "--actor",
-        "reviewer",
+        "STRASSE",
     ]);
     assert_eq!(recorded.status.code(), Some(5));
     assert_eq!(error_code(&recorded), "CH-POLICY-INCOMPLETE-REVIEW");

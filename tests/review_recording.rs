@@ -136,7 +136,15 @@ fn changes_requested_is_recordable_after_the_branch_moves() {
     assert_ne!(reviewed, moved_on, "the fixture must move the candidate");
 
     let path = verdict_file(&workspace, "changes_requested");
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(envelope["status"], "success");
     assert_eq!(
@@ -152,7 +160,15 @@ fn blocked_is_recordable_after_the_branch_moves() {
     move_the_branch(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(envelope["status"], "success");
     assert_eq!(envelope["data"]["review"]["candidate_sha"], reviewed);
@@ -176,6 +192,8 @@ fn an_approval_after_the_branch_moves_is_still_refused() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
@@ -196,6 +214,8 @@ fn an_approval_against_the_current_candidate_still_succeeds() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(envelope["data"]["review"]["decision"], "approved");
     assert_eq!(envelope["data"]["review"]["candidate_sha"], reviewed);
@@ -212,7 +232,15 @@ fn the_recorded_verdict_survives_the_sequence_that_used_to_lose_it() {
     move_the_branch(&workspace);
 
     let path = verdict_file(&workspace, "changes_requested");
-    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
     let recorded = inspected["data"]["reviews"]
@@ -246,7 +274,15 @@ fn blocked_against_a_revoked_handoff_is_still_recordable() {
     revoke_the_handoff(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(envelope["status"], "success");
     assert_eq!(
@@ -266,7 +302,15 @@ fn changes_requested_against_a_revoked_handoff_is_still_recordable() {
     revoke_the_handoff(&workspace);
 
     let path = verdict_file(&workspace, "changes_requested");
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(envelope["status"], "success");
     assert_eq!(envelope["data"]["review"]["decision"], "changes_requested");
@@ -306,7 +350,15 @@ fn an_active_card_with_no_handoff_at_all_cannot_be_reviewed() {
     workspace.work(&["start", "--card-id", "F-001"]);
 
     let path = verdict_file(&workspace, "changes_requested");
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_ne!(
         output.status.code(),
@@ -350,7 +402,15 @@ fn recording_a_verdict_now_requires_that_a_review_began() {
         ]);
 
         let path = verdict_file(&workspace, decision);
-        let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+        let output = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+        ]);
         assert_eq!(
             output.status.code(),
             Some(5),
@@ -393,13 +453,23 @@ fn an_approval_against_a_revoked_never_reviewed_handoff_still_reports_stale() {
     fs::write(&path, body).unwrap();
     let path = path.display().to_string();
 
-    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     let preview = workspace.review_raw(&[
         "record",
         "--card-id",
         "F-001",
         "--verdict",
         &path,
+        "--actor",
+        "reviewer-session-a",
         "--dry-run",
     ]);
     assert_eq!(error_code(&real), "CH-POLICY-STALE-HANDOFF");
@@ -422,13 +492,23 @@ fn a_dry_run_previews_the_review_not_begun_refusal() {
         "withdrawn before any review began",
     ]);
     let path = verdict_file(&workspace, "blocked");
-    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     let preview = workspace.review_raw(&[
         "record",
         "--card-id",
         "F-001",
         "--verdict",
         &path,
+        "--actor",
+        "reviewer-session-a",
         "--dry-run",
     ]);
     let real_env: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
@@ -449,7 +529,15 @@ fn the_verdict_against_a_revoked_handoff_reaches_the_record() {
     revoke_the_handoff(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
     let recorded = inspected["data"]["reviews"]
@@ -475,7 +563,15 @@ fn a_non_approval_against_a_revised_card_is_refused_for_the_true_reason() {
     revise_the_card(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(
@@ -508,6 +604,8 @@ fn an_approval_against_a_revoked_handoff_is_still_refused() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
@@ -522,7 +620,15 @@ fn a_revised_card_refuses_a_verdict_even_when_the_handoff_was_revoked() {
     revise_the_card(&workspace);
 
     let path = verdict_file(&workspace, "blocked");
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
@@ -553,6 +659,8 @@ fn a_recorded_review_s_mutation_evidence_writes_and_reads_back_off_disk() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(envelope["status"], "success");
     let review_id = envelope["data"]["review"]["review_id"]
@@ -581,4 +689,119 @@ fn a_recorded_review_s_mutation_evidence_writes_and_reads_back_off_disk() {
     assert_eq!(evidence["mutation"], "removed the guard at src/a.rs:1");
     assert_eq!(evidence["failing_test"], "rejects_the_missing_guard");
     assert_eq!(evidence["oracle"], "gate.unit");
+}
+
+// #120: `--actor` was accepted on `review record` and never read — attribution
+// came entirely from the verdict's `reviewer_actor_id`, so `record --actor
+// reviewer-b` against a verdict declaring `reviewer_actor_id: implementer-a`
+// silently attributed the review to `implementer-a`. The three tests below
+// pin the fix: `--actor` and the verdict's declared reviewer must agree, in
+// both directions, normalized the same way `check_independence` already
+// normalizes a self-review comparison.
+
+/// A clean approval naming `reviewer`, for the three tests below — distinct
+/// from `verdict_file`, which hardcodes `reviewer-session-a`: these tests
+/// need to control the declared reviewer themselves.
+fn approval_by(reviewer: &str) -> String {
+    format!(
+        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n"
+    )
+}
+
+#[test]
+fn record_refuses_when_an_explicit_actor_disagrees_with_the_verdict() {
+    // Neither name is `operator` (the fixture's feature actor), so
+    // `check_independence` has nothing to say here — only the new agreement
+    // check can refuse this. Reproduces #120's own motivating example
+    // verbatim: `--actor reviewer-b` against a verdict naming someone else.
+    let (workspace, _) = under_review();
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, approval_by("implementer-a")).unwrap();
+    let path = path.display().to_string();
+
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-b",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    let message = error_message(&output);
+    assert!(
+        message.contains("reviewer-b") && message.contains("implementer-a"),
+        "the refusal must name both disagreeing declarations: {message}"
+    );
+
+    // No review may have been recorded: `implementer-a` must not be attributed
+    // the review `--actor reviewer-b` was asked for, and neither declaration
+    // gets to win silently.
+    let inspected = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    assert_eq!(
+        inspected["data"]["reviews"]
+            .as_array()
+            .expect("the review history")
+            .len(),
+        0,
+        "a disagreement must not be resolved by recording either declaration"
+    );
+}
+
+#[test]
+fn record_refuses_when_the_default_actor_disagrees_with_the_verdict() {
+    // The same disagreement, reached by omitting `--actor` rather than typing
+    // a wrong one. `--actor` defaults to `operator`, and this fixture's
+    // verdict deliberately does not name `operator`, so this exercises the
+    // agreement check on the flag's default value, not only its explicit
+    // one — an implementer who checks agreement only when the flag is
+    // written out would pass every test above and still leave the common
+    // case (an operator who never passes `--actor` at all) exactly as silent
+    // as #120 found it.
+    let (workspace, _) = under_review();
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, approval_by("reviewer-b")).unwrap();
+    let path = path.display().to_string();
+
+    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    let message = error_message(&output);
+    assert!(
+        message.contains("operator") && message.contains("reviewer-b"),
+        "the refusal must name both the default actor and the verdict's declared reviewer: {message}"
+    );
+}
+
+#[test]
+fn record_accepts_an_actor_and_verdict_that_agree_only_after_normalization() {
+    // The positive control for the two refusals above, and the pin for #120
+    // §9 mutation 4: whitespace and case must not defeat the comparison, the
+    // same normalization `check_independence` already applies via
+    // `policy::actors::same`. An operator who types `Reviewer-B` for a
+    // verdict declaring `reviewer-b` must get an accepted review, not an
+    // accidental refusal.
+    let (workspace, reviewed) = under_review();
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, approval_by("reviewer-b")).unwrap();
+    let path = path.display().to_string();
+
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        " Reviewer-B\t",
+    ]);
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["data"]["review"]["decision"], "approved");
+    assert_eq!(envelope["data"]["review"]["candidate_sha"], reviewed);
+    assert_eq!(
+        envelope["data"]["review"]["reviewer_actor_id"],
+        "reviewer-b"
+    );
 }

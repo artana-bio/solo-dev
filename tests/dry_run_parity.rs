@@ -193,7 +193,19 @@ fn review_record_previews_a_staleness_refusal() {
     .unwrap();
     let path = verdict.display().to_string();
 
-    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    // #120: `--actor` must agree with the verdict's `reviewer_actor_id`, or
+    // `require_actor_agreement` — which runs ahead of every other check on
+    // both forms — refuses first, for a reason unrelated to what this
+    // fixture exercises.
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_parity(
         "review record",
         &real,
@@ -203,6 +215,8 @@ fn review_record_previews_a_staleness_refusal() {
             "F-001",
             "--verdict",
             &path,
+            "--actor",
+            "reviewer-session-a",
             "--dry-run",
         ]),
     );
@@ -327,6 +341,88 @@ fn review_record_previews_a_missing_mutation_evidence_refusal() {
     .unwrap();
     let path = verdict.display().to_string();
 
+    // #120: `--actor` must agree with the verdict's `reviewer_actor_id`, or
+    // `require_actor_agreement` — which runs ahead of every other check on
+    // both forms — refuses first, for a reason unrelated to what this
+    // fixture exercises. Coincidentally the same code
+    // (`CH-POLICY-INCOMPLETE-REVIEW`) as the mutation-evidence refusal below,
+    // which is exactly why this must be pinned rather than left to chance.
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_parity(
+        "review record",
+        &real,
+        &workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-POLICY-INCOMPLETE-REVIEW",
+        "the fixture must exercise the mutation-evidence refusal, not something else"
+    );
+}
+
+#[test]
+fn review_record_previews_an_actor_disagreement_refusal() {
+    // #120: `--actor` was accepted on `review record` and never read, so a
+    // verdict declaring a different `reviewer_actor_id` was recorded under
+    // that declaration, silently. `require_actor_agreement` now refuses the
+    // disagreement, called once in `run_record` ahead of the `--dry-run`
+    // branch — so the same call answers both forms, and this pins that
+    // neither can drift from the other the way the seven gaps #189
+    // catalogued did for other checks that were duplicated instead.
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // No `--actor` on either `record` call below: it defaults to `operator`,
+    // which disagrees with the verdict's declared `reviewer-session-a`.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
+    )
+    .unwrap();
+    let path = verdict.display().to_string();
+
     let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
     assert_parity(
         "review record",
@@ -343,7 +439,7 @@ fn review_record_previews_a_missing_mutation_evidence_refusal() {
     assert_eq!(
         code(&real),
         "CH-POLICY-INCOMPLETE-REVIEW",
-        "the fixture must exercise the mutation-evidence refusal, not something else"
+        "the fixture must exercise the actor-agreement refusal, not something else"
     );
 }
 

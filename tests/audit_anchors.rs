@@ -110,6 +110,8 @@ fn landed(workspace: &Workspace, cycle: &str, card: &str, file: &str) -> (String
         card,
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 
     let id =

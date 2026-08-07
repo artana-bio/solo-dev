@@ -96,6 +96,8 @@ fn promote_one_cycle(workspace: &Workspace, cycle: &str, card: &str) {
         card,
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 
     let integration =

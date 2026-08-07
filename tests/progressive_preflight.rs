@@ -107,6 +107,8 @@ fn handoff_and_approve(workspace: &Workspace, card_id: &str) {
         card_id,
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 }
 
