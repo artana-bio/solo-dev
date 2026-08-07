@@ -46,6 +46,14 @@ pub enum HandoffCommand {
     Inspect(CardArgs),
     /// Withdraw a handoff, returning the card to work.
     Revoke(RevokeArgs),
+    /// Print a complete, valid handoff declaration example.
+    ///
+    /// Built by constructing a real `ActorDeclaration` and serializing it,
+    /// so this can never disagree with what `handoff create` accepts — see
+    /// #108. #180 added this alongside `card example`, closing the second
+    /// of the two document kinds #142 §11 had found with no generated
+    /// example at all.
+    Example(ExampleArgs),
 }
 
 impl HandoffCommand {
@@ -60,6 +68,7 @@ impl HandoffCommand {
             Self::Create(..) => "handoff.create",
             Self::Inspect(..) => "handoff.inspect",
             Self::Revoke(..) => "handoff.revoke",
+            Self::Example(..) => "handoff.example",
         }
     }
 }
@@ -117,6 +126,16 @@ pub struct RevokeArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `handoff example`.
+///
+/// Deliberately empty, and deliberately not [`CommonArgs`]: #108 constraint 1
+/// requires this to be reachable before an operator has a control repository
+/// or a card to point it at, so it names neither — the same reasoning
+/// `review::ExampleArgs`, `project::ExampleArgs`, and `card::ExampleArgs`
+/// already give.
+#[derive(Debug, Args)]
+pub struct ExampleArgs {}
+
 /// Executes a `handoff` subcommand.
 ///
 /// # Errors
@@ -130,6 +149,7 @@ pub fn execute(
         HandoffCommand::Create(args) => run_create(args, clock),
         HandoffCommand::Inspect(args) => run_inspect(args),
         HandoffCommand::Revoke(args) => run_revoke(args, clock),
+        HandoffCommand::Example(..) => run_example(),
     }
 }
 
@@ -332,17 +352,21 @@ fn resolve_dependency_bindings(
 /// no introspection to tell apart from a schema failure.
 const HANDOFF_DECLARATION_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the declaration file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
 
-/// No `handoff` subcommand emits a declaration example — `SKILL.md`'s
-/// "Verify and hand off" section carries a hand-authored template instead of
-/// a generated one, and #142 §11 is specifically about naming a *command*,
-/// so this does not invent a reference to a document section instead
-/// (`src/error.rs`'s own `the_card_recovery_names_no_specification_section`
-/// test pins exactly this mistake shut for a different code, after it
-/// shipped once as "Section 10.3"). `serde_yaml_ng` also offers no
-/// syntax/schema split — see `GATE_DEFINITION_PARSE_RECOVERY` in
-/// `src/commands/gate.rs` — so this is one honest-for-both message naming
-/// the field or position the message above already gives.
-const HANDOFF_DECLARATION_PARSE_RECOVERY: &str = "This handoff declaration could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. There is no generated example for a handoff declaration document; re-check the position or field the message names.";
+/// #180 added `handoff example` (below), which prints a complete, valid
+/// handoff declaration by constructing a real `ActorDeclaration` and
+/// serializing it — so this recovery now names that command instead of
+/// #142's original "there is no generated example" wording, which #180 §2
+/// made false the moment the command existed:
+/// `tests/config_malformed_example_claims.rs` fails on this exact constant
+/// the moment `handoff example` is real, and would keep failing on the old
+/// wording forever after (`src/error.rs`'s own
+/// `the_card_recovery_names_no_specification_section` test pins a related
+/// mistake shut for a different code, after it shipped once as "Section
+/// 10.3" — naming a command, not a document section, is the same discipline
+/// applied here). `serde_yaml_ng` still offers no syntax/schema split — see
+/// `GATE_DEFINITION_PARSE_RECOVERY` in `src/commands/gate.rs` — so this
+/// remains one message, honest for both failure shapes.
+const HANDOFF_DECLARATION_PARSE_RECOVERY: &str = "This handoff declaration could not be parsed as YAML, or it parsed but does not match the schema; the message above names the position or the field. Compare it against `handoff example`'s output, a complete, valid handoff declaration.";
 
 /// Reads and parses an actor declaration.
 fn read_declaration(path: &PathBuf) -> Result<ActorDeclaration, HarnessError> {
@@ -356,6 +380,163 @@ fn read_declaration(path: &PathBuf) -> Result<ActorDeclaration, HarnessError> {
         code: ErrorCode::ConfigMalformed,
         recovery: HANDOFF_DECLARATION_PARSE_RECOVERY,
     })
+}
+
+/// `cafebabe`, another classic hexspeak placeholder — deliberately not
+/// `deadbeef`, which `card example`'s `base_sha` already uses, so the two
+/// generated documents never show the same 40 characters and invite reading
+/// them as the same commit — repeated to fill the 40 hex characters
+/// `delivered_sha` requires (`ActorDeclaration::validate`). See
+/// `EXAMPLE_BASE_SHA` in `src/commands/card.rs` for the full argument that a
+/// constructed hexspeak string cannot be mistaken for a real object id.
+/// [`run_example`]'s warning below says outright that it must be replaced
+/// with the exact commit `git rev-parse HEAD` reports in the allocated
+/// worktree before `handoff create` is run for anything but this example —
+/// unlike `base_sha`, which `card create` never checks against reality (see
+/// `EXAMPLE_BASE_SHA`'s own doc comment), `delivered_sha` is checked the
+/// moment `handoff create` resolves a candidate (`check_delivered_sha`,
+/// `candidate_of`), so no fixed placeholder could ever be accepted as-is by
+/// the real command; a generator cannot know a caller's future commit
+/// ahead of time.
+const EXAMPLE_DELIVERED_SHA: &str = "cafebabecafebabecafebabecafebabecafebabe";
+
+/// A complete, valid actor declaration, for `handoff example` to emit.
+///
+/// #180: unlike `CardDraft`, `ActorDeclaration` (`src/domain/handoff.rs`)
+/// has exactly one field carrying `#[serde(default)]` —
+/// `gate_failures`, added by 71-R3 after every other field already existed,
+/// with `skip_serializing_if = "Vec::is_empty"` besides. Every other field
+/// here (`assumptions`, `known_limitations`, `residual_risks` included) has
+/// no default: the key must be present even where an empty list is a
+/// legitimate value, exactly as
+/// `domain::handoff::tests::an_absent_key_fails_deserialization_and_never_reaches_validate`
+/// pins for `implementation_decisions`. Every field is still populated
+/// here, non-empty, for the reason `example_card_draft`'s own doc comment
+/// gives: an example that omits a field, or leaves a list looking
+/// structurally empty, teaches a reader less about its shape than one that
+/// does not. `gate_failures` needs this most of all — left at its default
+/// `vec![]`, `skip_serializing_if` would drop the key entirely, and
+/// [`optional_fields`] (below) can only discover a key that is actually
+/// present to remove.
+///
+/// The narrative fields reuse `SKILL.md`'s own "Verify and hand off"
+/// template phrasing (`behavior_delivered`, `implementation_decisions`,
+/// `assumptions`, `known_limitations`, `residual_risks`, `rollback_notes`)
+/// deliberately: this document and that section describe the same shape,
+/// and matching wording means a reader who has seen one recognizes the
+/// other rather than wondering whether they disagree.
+///
+/// `gate_failures` declares one entry naming `gate.unit` — the feature-gate
+/// name every fixture in this crate registers
+/// (`tests/support::Workspace::initialized`) — with `reason_category:
+/// regression`, one of the two reasons `AttemptKind::GateFailure` admits
+/// (`policy::convergence::AttemptKind::admits`). [`run_example`]'s warning
+/// says to omit it, or leave it `[]`, for a delivery that hit no admitted
+/// gate failure — the common case this example is not.
+fn example_declaration() -> ActorDeclaration {
+    ActorDeclaration {
+        delivered_sha: EXAMPLE_DELIVERED_SHA.to_owned(),
+        behavior_delivered: "What the candidate actually does.".to_owned(),
+        implementation_decisions: vec!["A choice you made and why.".to_owned()],
+        assumptions: vec!["Something inferred rather than specified.".to_owned()],
+        known_limitations: vec!["Something deliberately not done.".to_owned()],
+        residual_risks: vec!["Something that could still be wrong.".to_owned()],
+        rollback_notes: "revert the landing commit on the protected branch".to_owned(),
+        gate_failures: vec![DeclaredGateFailure {
+            gate_id: "gate.unit".to_owned(),
+            reason_category: ReasonCategory::Regression,
+        }],
+    }
+}
+
+/// Which of `declaration`'s top-level fields `ActorDeclaration`'s
+/// deserializer accepts as absent.
+///
+/// Mirrors [`crate::commands::review::optional_fields`] and
+/// `crate::commands::card::optional_fields` exactly — same technique, same
+/// reasoning, kept as its own copy rather than shared for the same reason
+/// `card.rs`'s copy is: the function each mirrors is private to its own
+/// file, and #180's frozen file scope does not add a shared home for it.
+/// `ActorDeclaration` has only one `#[serde(default)]` field today, so this
+/// is expected to report a single-element list — but that expectation is
+/// exactly the kind of hand-maintained claim #108 exists to stop from
+/// silently drifting from what the parser actually accepts, so it is
+/// computed here rather than written down as a constant.
+///
+/// # Errors
+///
+/// Returns an error when `declaration` cannot be serialized to inspect.
+fn optional_fields(declaration: &ActorDeclaration) -> Result<Vec<String>, HarnessError> {
+    let value = serde_json::to_value(declaration)?;
+    let object = value.as_object().ok_or_else(|| HarnessError::Control {
+        reason: "the example declaration did not serialize to a document with fields".to_owned(),
+        code: ErrorCode::InternalEncoding,
+    })?;
+    let mut optional: Vec<String> = object
+        .keys()
+        .filter(|key| {
+            let mut reduced = object.clone();
+            reduced.remove(key.as_str());
+            serde_json::from_value::<ActorDeclaration>(serde_json::Value::Object(reduced)).is_ok()
+        })
+        .cloned()
+        .collect();
+    optional.sort();
+    Ok(optional)
+}
+
+/// Emits a complete, valid handoff-declaration example.
+///
+/// #108 constraint 1: reachable without a control repository or a card —
+/// [`ExampleArgs`] carries nothing to open one with. #108 constraint 2:
+/// listed under `handoff --help` because it is an ordinary [`HandoffCommand`]
+/// variant like any other.
+///
+/// The document is YAML: [`read_declaration`], above, parses with
+/// `serde_yaml_ng` directly — unlike [`crate::commands::card::read_draft`],
+/// which goes through `CardDraft::parse`, this reads straight into
+/// `ActorDeclaration` with no intermediate — and `serde_yaml_ng` accepts
+/// JSON as the YAML it syntactically is, so YAML is the strictly more
+/// general of the two accepted shapes. This mirrors `review example` and
+/// `card example`; see `run_example` in `src/commands/review.rs` for the
+/// full argument.
+///
+/// Built by constructing an [`ActorDeclaration`] and serializing it, never
+/// by writing the document out by hand, so this and [`read_declaration`] can
+/// never disagree about the shape: they are the same `serde` implementation.
+///
+/// # Errors
+///
+/// Returns an error when the example cannot be rendered.
+fn run_example() -> Result<CommandOutcome, HarnessError> {
+    let declaration = example_declaration();
+    let example =
+        serde_yaml_ng::to_string(&declaration).map_err(|source| HarnessError::Control {
+            reason: format!("failed to render the example handoff declaration: {source}"),
+            code: ErrorCode::InternalEncoding,
+        })?;
+    let optional = optional_fields(&declaration)?;
+    Ok(CommandOutcome::new(
+        "handoff.example",
+        example.clone(),
+        serde_json::json!({
+            "format": "yaml",
+            "example": example,
+            "optional_fields": optional,
+        }),
+    )
+    .with_warning(format!(
+        "every value above is illustrative, not a template to copy verbatim: `delivered_sha` \
+         is the hexspeak placeholder `cafebabe` repeated to fill 40 hex characters — not a \
+         real commit in any repository — which must be replaced with the exact commit `git \
+         rev-parse HEAD` reports in the allocated worktree before `handoff create` is run for \
+         real, since that command checks this field against the branch it finds \
+         (`check_delivered_sha`) and refuses any mismatch; `gate_failures` is shown populated \
+         only so its shape is visible; omit it, or leave it `[]`, for a delivery that hit no \
+         admitted gate failure. Every field above is shown so its shape is visible, including \
+         these, which default when the key is absent: {}",
+        optional.join(", ")
+    )))
 }
 
 /// Collects the gate evidence in force for a candidate, refusing if it is not.
