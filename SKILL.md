@@ -502,6 +502,21 @@ and `redesign` refuse a second call outright, because the card is already
 terminal. `renew` is the exception by design — the same dimension can be
 renewed again the next time it escalates.
 
+`project example-final-authorization` prints a complete valid policy,
+serialized from the type `project set-final-authorization-policy`
+deserializes:
+
+```bash
+change-harness project example-final-authorization
+change-harness project set-final-authorization-policy --policy policy.json
+```
+
+Its two `authorizer_actor_ids` are placeholder slot names, not real actors:
+replace both with actor ids this project has actually declared before
+installing the document, or the installed policy authorizes nobody. `project
+init --final-authorizer-actor-id <id>` (repeatable) installs the same policy
+shape at adoption time instead — see "Repository adoption".
+
 ### The cycle-level budget
 
 A cycle carries its own budget, on integration failures, and there is no
@@ -549,3 +564,9 @@ Initialization seeds a new authority from the candidate's protected branch.
 Later cycle activation freezes the authority head, not whichever commit happens
 to be in a local checkout. Re-running init accepts identical configuration but
 refuses rebinding or unchecked control content.
+
+Repeat `--final-authorizer-actor-id <id>` to install a final-authorization
+policy at the same time — the same set of actor ids that later authorizes a
+disposition and a sealed cycle's final acceptance; see "Who may record a
+disposition" for the document shape and the route to install or change one
+afterwards.
