@@ -209,9 +209,12 @@ structured result for authority.
 ### 1. Register reviewed gates
 
 Cards can name only registered gates. Register an explicit command definition
-and inspect it before use:
+and inspect it before use. `gate example` prints a complete valid definition to
+start from — it is serialized from the same type `gate register` deserializes,
+so it cannot describe a shape the command would refuse:
 
 ```bash
+change-harness gate example
 change-harness gate register --definition gate.test.json
 change-harness gate list
 ```
@@ -338,7 +341,13 @@ SHAs, complete diff, relevant contract changes, gate receipts, and reproducible
 evidence. They do not receive the implementer's private reasoning or an
 instruction to approve.
 
+`review example` prints a complete valid verdict to start from, serialized from
+the type `review record` deserializes. Do not hand-write the verdict from this
+guide's prose: the shape carries fields no sentence here names, including
+`gate_adequacy` and a per-finding `disposition`.
+
 ```bash
+change-harness review example
 change-harness review begin --card-id F-001 --actor reviewer-b
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
 ```
@@ -401,6 +410,15 @@ revisions — plus one cycle dimension, integration failures. A card's
 declared `risk` selects which set of limits applies to it. No budget exists
 unless a policy is configured: a project without one reports
 `legacy_unassessed`, and nothing is enforced.
+
+`project example` prints a complete valid policy, serialized from the type
+`project set-convergence-policy` deserializes. The same document shape is what
+`disposition rebaseline --policy` takes:
+
+```bash
+change-harness project example
+change-harness project set-convergence-policy --policy policy.json
+```
 
 ### Escalation
 

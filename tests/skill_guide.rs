@@ -17,7 +17,10 @@
 //!   (or end of file). A `### ` subheading does not end the section.
 //! - Inside that span, only lines inside ` ```bash ` fences are read.
 //! - Within a fenced block, only lines starting with `change-harness ` are
-//!   treated as invocations — one invocation per line, no `\` continuations.
+//!   treated as invocations. A line ending in `\` continues onto the next
+//!   line, which is joined to it whatever that line starts with; a fenced
+//!   block that ends mid-continuation panics rather than dropping the
+//!   invocation it was building.
 //! - A value containing spaces (a `--rationale` or `--risk`) must be wrapped
 //!   in `"..."`; the splitter below is quote-aware but otherwise splits on
 //!   whitespace.
@@ -48,6 +51,8 @@ const COVERED_SECTIONS: &[&str] = &[
     "## Convergence budgets and escalation",
     "## What the Harness guarantees",
     "## Lifecycle",
+    "## Orient first",
+    "## Repository adoption",
 ];
 
 /// Reads `SKILL.md` from the repository root.
@@ -98,6 +103,8 @@ fn split_invocation(line: &str) -> Vec<String> {
 fn command_invocations(section: &str) -> Vec<Vec<String>> {
     let mut invocations = Vec::new();
     let mut in_bash_block = false;
+    // `Some` only between a line ending in `\` and the line that completes it.
+    let mut continued: Option<String> = None;
     for line in section.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```bash") {
@@ -105,11 +112,28 @@ fn command_invocations(section: &str) -> Vec<Vec<String>> {
             continue;
         }
         if in_bash_block && trimmed.starts_with("```") {
+            if let Some(unterminated) = continued.take() {
+                panic!(
+                    "a SKILL.md fenced block ends with an unterminated `\\` continuation, \
+                     leaving this invocation unverified: {unterminated}"
+                );
+            }
             in_bash_block = false;
             continue;
         }
-        if in_bash_block && trimmed.starts_with("change-harness ") {
-            invocations.push(split_invocation(trimmed));
+        if !in_bash_block {
+            continue;
+        }
+        // A pending continuation absorbs this line whatever it starts with —
+        // that is the point of the `\`. Otherwise only an invocation opens one.
+        let invocation = match continued.take() {
+            Some(prefix) => format!("{prefix} {trimmed}"),
+            None if trimmed.starts_with("change-harness ") => trimmed.to_string(),
+            None => continue,
+        };
+        match invocation.strip_suffix('\\') {
+            Some(prefix) => continued = Some(prefix.trim_end().to_string()),
+            None => invocations.push(split_invocation(&invocation)),
         }
     }
     invocations
