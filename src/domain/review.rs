@@ -289,6 +289,67 @@ pub enum MutationEvidence {
     },
 }
 
+impl GateAdequacy {
+    /// Checks that `mutation_evidence` is filled, honestly, one way or the
+    /// other.
+    ///
+    /// #95 gap 1, §8.3, extracted so `ReviewRecord::validate` and
+    /// `review record --dry-run`'s preview share exactly one implementation
+    /// of this rule rather than two that can drift. Before this extraction,
+    /// `validate` had the only call site — inside `run_record`'s real
+    /// transaction, on a fully-built `ReviewRecord` — and the preview path
+    /// never constructs one, so it never asked this question: a verdict
+    /// with no mutation evidence at all was accepted by `--dry-run` and
+    /// refused by the real command, exactly the failure
+    /// `tests/dry_run_parity.rs`'s module doc names. This method takes only
+    /// `&self`, so either caller can run it against what it already has —
+    /// `self.gate_adequacy` on a constructed record, or `verdict.gate_adequacy`
+    /// on the reviewer's submitted document, before a `ReviewRecord` exists at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy error when the field is absent, or present but empty.
+    pub fn validate_mutation_evidence(&self) -> Result<(), HarnessError> {
+        match &self.mutation_evidence {
+            None => Err(HarnessError::Control {
+                reason: "a review must record the mutation its gate-adequacy claim was earned by — what was changed, which test failed, and at which oracle — or declare, on the record, why none applies".to_owned(),
+                code: ErrorCode::PolicyIncompleteReview,
+            }),
+            Some(MutationEvidence::Demonstrated {
+                mutation,
+                failing_test,
+                oracle,
+            }) => {
+                if mutation.trim().is_empty()
+                    || failing_test.trim().is_empty()
+                    || oracle.trim().is_empty()
+                {
+                    // #117's shape, one field short of that card rather than
+                    // this one: a value is present but empty, which is not
+                    // the same fact as absent and must not be read as it.
+                    Err(HarnessError::Control {
+                        reason: "mutation evidence is present but empty; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Some(MutationEvidence::Exempt { reason }) => {
+                if reason.trim().is_empty() {
+                    Err(HarnessError::Control {
+                        reason: "mutation evidence declares an exemption but gives no reason; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 /// One recorded review of one exact candidate.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -499,47 +560,11 @@ impl ReviewRecord {
             });
         }
 
-        // #95 gap 1, §8.3. `None` is the shape a record written before this
-        // field existed deserializes to — see `GateAdequacy::mutation_evidence`
-        // — but every review recorded from here on is new, and a new review
-        // that leaves the question unanswered is refused exactly as one with
-        // an empty `basis` is above: required, with a declared exemption, not
-        // optional and silent. An operator can still say "none applies", but
-        // only by writing `Exempt` and a reason — never by omission.
-        match &self.gate_adequacy.mutation_evidence {
-            None => {
-                return Err(HarnessError::Control {
-                    reason: "a review must record the mutation its gate-adequacy claim was earned by — what was changed, which test failed, and at which oracle — or declare, on the record, why none applies".to_owned(),
-                    code: ErrorCode::PolicyIncompleteReview,
-                });
-            }
-            Some(MutationEvidence::Demonstrated {
-                mutation,
-                failing_test,
-                oracle,
-            }) => {
-                if mutation.trim().is_empty()
-                    || failing_test.trim().is_empty()
-                    || oracle.trim().is_empty()
-                {
-                    // #117's shape, one field short of that card rather than
-                    // this one: a value is present but empty, which is not
-                    // the same fact as absent and must not be read as it.
-                    return Err(HarnessError::Control {
-                        reason: "mutation evidence is present but empty; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
-                        code: ErrorCode::PolicyIncompleteReview,
-                    });
-                }
-            }
-            Some(MutationEvidence::Exempt { reason }) => {
-                if reason.trim().is_empty() {
-                    return Err(HarnessError::Control {
-                        reason: "mutation evidence declares an exemption but gives no reason; a reviewer cannot distinguish an empty field from an unconsidered one".to_owned(),
-                        code: ErrorCode::PolicyIncompleteReview,
-                    });
-                }
-            }
-        }
+        // #95 gap 1, §8.3. Required, with a declared exemption, not optional
+        // and silent — see `GateAdequacy::validate_mutation_evidence` for the
+        // rule itself and why it is shared with `review record --dry-run`'s
+        // preview rather than living only here.
+        self.gate_adequacy.validate_mutation_evidence()?;
 
         Ok(())
     }
