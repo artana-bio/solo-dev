@@ -4709,6 +4709,102 @@ mod disposition_renew {
         );
         assert_eq!(disposition_recorded_events(&workspace).len(), 1);
     }
+
+    // #179: `disposition renew`'s two `PolicyNotAccepted` sites (no policy
+    // configured; actor not authorized) share their recovery text,
+    // word-for-word, with `acceptance record`'s own B2 site
+    // (`tests/policy_not_accepted_recovery.rs`) — the situations are the
+    // same regardless of which command, or which file, triggers them. The
+    // two constants live in `src/commands/acceptance.rs` as `pub(crate)`,
+    // so they cannot be imported into this external test crate; each
+    // expected string below is copied verbatim, the same way
+    // `tests/per_site_recovery.rs`'s own `FINAL_INTEGRATION_RECOVERY`
+    // copies its migrated site's text rather than importing it.
+
+    /// `FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim.
+    const POLICY_NOT_CONFIGURED_RECOVERY: &str = "`final_authorization_policy` is not configured for this project (or was removed since an earlier check relied on it); run `project example-final-authorization` for a complete, valid document, then install one with `project set-final-authorization-policy`.";
+
+    /// `FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY`
+    /// (`src/commands/acceptance.rs`), copied verbatim — the exact text
+    /// B2 (#179 §1, §8) requires.
+    const ACTOR_NOT_AUTHORIZED_RECOVERY: &str = "This actor is not among `final_authorization_policy.authorizer_actor_ids`; run `project example-final-authorization` to see a configured policy's shape, then retry as one of the listed actors or add this one with `project set-final-authorization-policy`.";
+
+    #[test]
+    fn renew_with_no_final_authorization_policy_gets_group_1s_recovery() {
+        // `opened_with_policy` installs a convergence policy but never a
+        // final-authorization one (it runs plain `Workspace::initialized`,
+        // which passes no `--final-authorizer-actor-id`) — exactly the
+        // "no policy at all" situation group 1 covers.
+        let workspace = opened_with_policy(1, 3);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "no policy configured",
+                "--actor",
+                "owner",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "a renewal with no final-authorization policy configured must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let recovery = envelope["error"]["recovery"]
+            .as_str()
+            .expect("a recovery string");
+        assert_eq!(
+            recovery, POLICY_NOT_CONFIGURED_RECOVERY,
+            "a disposition.rs site sharing group 1 must carry byte-identical text to \
+             acceptance.rs's own copy of the same constant; got: {recovery:?}"
+        );
+    }
+
+    #[test]
+    fn renew_by_an_unauthorized_actor_gets_group_2s_recovery_identical_to_b2() {
+        // Only `owner` is a configured authorizer; `intern` is not.
+        let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        escalate_via_review_returns(&workspace, "F-001");
+
+        let output = disposition_renew_raw(
+            &workspace,
+            &[
+                "--card-id",
+                "F-001",
+                "--dimension",
+                "review-returns",
+                "--rationale",
+                "unauthorized actor",
+                "--actor",
+                "intern",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "a renewal by an actor absent from authorizer_actor_ids must refuse"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-NOT-ACCEPTED");
+
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let recovery = envelope["error"]["recovery"]
+            .as_str()
+            .expect("a recovery string");
+        assert_eq!(
+            recovery, ACTOR_NOT_AUTHORIZED_RECOVERY,
+            "a disposition.rs site sharing group 2 must carry byte-identical text to B2's own \
+             `acceptance record` refusal (tests/policy_not_accepted_recovery.rs); got: \
+             {recovery:?}"
+        );
+    }
 }
 
 // 74-4: `disposition rebaseline`, run by an actor authorized under
