@@ -361,7 +361,7 @@ reviewers needed to say things a binary verdict cannot express.
 
 ```bash
 change-harness review begin  --control $CONTROL --card-id F-001
-change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml
+change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example
 ```
 
 **7. See what is waiting.** `integration ready` answers "what is approved and
