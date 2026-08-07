@@ -269,7 +269,8 @@ between active cards are refused here, not discovered at merge time.
 
 ```bash
 change-harness work start --card-id F-001
-change-harness gate run --card-id F-001 --gate-id gate.unit
+change-harness gate reserve --card-id F-001 --gate-id gate.unit
+change-harness gate run --card-id F-001 --gate-id gate.unit --reservation-id VR-000001
 ```
 
 > **Your project must ignore whatever its gates write.** Gates run inside the
