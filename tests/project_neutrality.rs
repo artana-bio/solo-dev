@@ -107,7 +107,7 @@ fn a_project_with_no_rust_completes_the_whole_lifecycle() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: ran the compile gate against a deliberate syntax error\nresidual_risks: []\n",
+        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: ran the compile gate against a deliberate syntax error\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     workspace.review(&[

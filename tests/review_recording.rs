@@ -79,7 +79,7 @@ fn move_the_branch(workspace: &Workspace) -> String {
 
 fn verdict_file(workspace: &Workspace, decision: &str) -> String {
     let body = format!(
-        "reviewer_actor_id: reviewer-session-a\ndecision: {decision}\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed the guard directly\nresidual_risks: []\n"
+        "reviewer_actor_id: reviewer-session-a\ndecision: {decision}\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed the guard directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n"
     );
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
@@ -166,7 +166,7 @@ fn an_approval_after_the_branch_moves_is_still_refused() {
     let (workspace, _) = under_review();
     move_the_branch(&workspace);
 
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
 
@@ -186,7 +186,7 @@ fn an_approval_against_the_current_candidate_still_succeeds() {
     // The other half: nothing about the ordinary path changed.
     let (workspace, reviewed) = under_review();
 
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
 
@@ -388,7 +388,7 @@ fn an_approval_against_a_revoked_never_reviewed_handoff_still_reports_stale() {
         "withdrawn before any review began",
     ]);
 
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
     let path = path.display().to_string();
@@ -498,7 +498,7 @@ fn an_approval_against_a_revoked_handoff_is_still_refused() {
     let (workspace, _) = under_review();
     revoke_the_handoff(&workspace);
 
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
 
@@ -531,4 +531,54 @@ fn a_revised_card_refuses_a_verdict_even_when_the_handoff_was_revoked() {
         message.contains("card digest"),
         "the surviving question is the one about the card: {message}"
     );
+}
+
+// #95 gap 1, §10 test 4: "write, read back, compare", taken literally rather
+// than as an in-memory `serde` round trip. `review record` writes
+// `reviews/RV-000001.json` into the control repository; this reads that exact
+// file back off disk — not through `review inspect`, a second code path this
+// test does not want to depend on for its own soundness — and compares its
+// `mutation_evidence` against what the verdict actually declared.
+#[test]
+fn a_recorded_review_s_mutation_evidence_writes_and_reads_back_off_disk() {
+    let (workspace, _) = under_review();
+
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: removed the guard at src/a.rs:1\n    failing_test: rejects_the_missing_guard\n    oracle: gate.unit\nresidual_risks: []\n";
+    let path = workspace.root.join("verdict.yaml");
+    fs::write(&path, body).unwrap();
+
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+    ]);
+    assert_eq!(envelope["status"], "success");
+    let review_id = envelope["data"]["review"]["review_id"]
+        .as_str()
+        .expect("the recorded review names its own id")
+        .to_owned();
+
+    // Read back: not the JSON envelope the write returned, and not `review
+    // inspect` — the stored file itself, straight off disk.
+    let stored_path = workspace
+        .control
+        .join("reviews")
+        .join(format!("{review_id}.json"));
+    let stored_raw = fs::read_to_string(&stored_path).unwrap_or_else(|error| {
+        panic!("stored review file must exist at {stored_path:?}: {error}")
+    });
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored_raw).expect("the stored file is well-formed JSON");
+
+    // Compare against what the verdict actually declared, not against the
+    // envelope `review record` already echoed back — a defect that recorded
+    // one thing and reported another would pass a comparison against the
+    // envelope and still be a real defect in what landed on disk.
+    let evidence = &stored["gate_adequacy"]["mutation_evidence"];
+    assert_eq!(evidence["status"], "demonstrated");
+    assert_eq!(evidence["mutation"], "removed the guard at src/a.rs:1");
+    assert_eq!(evidence["failing_test"], "rejects_the_missing_guard");
+    assert_eq!(evidence["oracle"], "gate.unit");
 }

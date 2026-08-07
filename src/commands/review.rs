@@ -26,8 +26,8 @@ use crate::{
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
         review::{
-            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, REVIEW_DIR,
-            REVIEW_SCHEMA, ReviewRecord, check_independence,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationEvidence,
+            REVIEW_DIR, REVIEW_SCHEMA, ReviewRecord, check_independence,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -533,6 +533,13 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 /// left at its empty value is `reason_category`: it answers "why is this
 /// being returned", and this example is an approval, which returns nothing to
 /// answer for. See [`Verdict::reason_category`] for when it becomes required.
+///
+/// `gate_adequacy.mutation_evidence` is shown as [`MutationEvidence::Demonstrated`]
+/// — the ordinary case — describing the same finding the example already
+/// carries, so a reader sees one coherent story rather than two unrelated
+/// fixtures. See [`GateAdequacy::mutation_evidence`] for
+/// [`MutationEvidence::Exempt`], the declared-exemption case this example
+/// does not need.
 fn example_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-example".to_owned(),
@@ -549,6 +556,11 @@ fn example_verdict() -> Verdict {
             unobserved_behaviors: vec![],
             basis: "ran the registered gates and probed each acceptance behavior directly"
                 .to_owned(),
+            mutation_evidence: Some(MutationEvidence::Demonstrated {
+                mutation: "widened the upper boundary in src/example.rs:42 by one".to_owned(),
+                failing_test: "rejects_the_value_at_the_upper_boundary".to_owned(),
+                oracle: "gate.unit".to_owned(),
+            }),
         },
         residual_risks: vec!["none identified".to_owned()],
         human_reviewer: true,
@@ -735,27 +747,48 @@ fn require_review_return_reason(
 /// was never called here at all. It now asks exactly what `run_record` asks,
 /// with the same `HandoffScope` split by decision.
 ///
-/// Order matters here, not just presence, and this now checks five things in
+/// Order matters here, not just presence, and this now checks six things in
 /// the same order `run_record` does: whether the verdict declares an
 /// admissible reason for a review return, then whether the card's
 /// convergence budget is spent, then whether a review round ever opened for
-/// this handoff, then staleness, then independence. A verdict that is both a
-/// self-review and stale is refused as stale first — the independence check
-/// pre-existed the staleness fix and ran first; moved it after staleness so a
-/// case failing both reasons reports the same one in both forms, which is
-/// the entire point of a preview. Caught by review round 1 of this exact
-/// card, on the fixture where a revoked handoff is also a self-review. The
-/// review-begun check runs ahead of staleness and independence because it
-/// asks the most basic question: whether there is a review to be stale or
-/// self-reviewing about at all. The reason-declaration check runs ahead of
-/// everything else: 71-R2 requires it to refuse before anything is written,
-/// and nothing above it needs a card, a handoff, or a worktree to answer —
-/// it needs only the project's configured policy and the verdict the caller
-/// already supplied. The convergence-budget check (72-2) runs immediately
-/// after: it is the first thing that needs the loaded card record, so it is
-/// the first check able to refuse once that record exists, ahead of the
-/// review-begun, staleness, and independence checks below, which all need a
-/// handoff besides.
+/// this handoff, then staleness, then independence, then mutation evidence.
+/// A verdict that is both a self-review and stale is refused as stale first
+/// — the independence check pre-existed the staleness fix and ran first;
+/// moved it after staleness so a case failing both reasons reports the same
+/// one in both forms, which is the entire point of a preview. Caught by
+/// review round 1 of this exact card, on the fixture where a revoked handoff
+/// is also a self-review. The review-begun check runs ahead of staleness and
+/// independence because it asks the most basic question: whether there is a
+/// review to be stale or self-reviewing about at all. The reason-declaration
+/// check runs ahead of everything else: 71-R2 requires it to refuse before
+/// anything is written, and nothing above it needs a card, a handoff, or a
+/// worktree to answer — it needs only the project's configured policy and
+/// the verdict the caller already supplied. The convergence-budget check
+/// (72-2) runs immediately after: it is the first thing that needs the
+/// loaded card record, so it is the first check able to refuse once that
+/// record exists, ahead of the review-begun, staleness, and independence
+/// checks below, which all need a handoff besides.
+///
+/// The mutation-evidence check runs last, mirroring where
+/// [`GateAdequacy::validate_mutation_evidence`] sits inside
+/// [`ReviewRecord::validate`] relative to `check_independence` — the only
+/// other piece of `validate` this preview mirrors. #95 gap 1's review found
+/// that `validate` itself has exactly one call site, deep in `run_record`'s
+/// real transaction on a fully-built `ReviewRecord`, so nothing in it ever
+/// ran here: a verdict missing mutation evidence entirely was accepted by
+/// `--dry-run` and refused by the real command. `validate_mutation_evidence`
+/// takes only `&self` and reads nothing a `ReviewRecord` has that `Verdict`
+/// does not, which is what makes calling it here — on `verdict.gate_adequacy`
+/// rather than on a record this function has no reason to construct —
+/// possible without wider surgery. `validate`'s other rules — an empty
+/// `basis`; approving over open findings; a re-review dropping or inventing
+/// a carried-forward finding; `changes_requested` with no finding —
+/// have the same gap and are deliberately not fixed here: each would start
+/// refusing a preview that currently succeeds, for a question unrelated to
+/// this card's field, and closing that class (along with `check_risk_policy`
+/// and `check_supersedes`, called from `run_record` beside `validate` and
+/// mirrored here not at all) is a wider change than this targeted fix, left
+/// for a card that owns that decision.
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
@@ -778,6 +811,7 @@ fn preview_record(
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
+    verdict.gate_adequacy.validate_mutation_evidence()?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(

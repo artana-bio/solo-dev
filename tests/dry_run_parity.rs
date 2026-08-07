@@ -127,7 +127,7 @@ fn review_record_previews_a_self_review_refusal() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();
@@ -188,7 +188,7 @@ fn review_record_previews_a_staleness_refusal() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();
@@ -254,7 +254,7 @@ fn review_record_previews_a_stale_self_review_as_stale() {
     let verdict = workspace.root.join("verdict.yaml");
     fs::write(
         &verdict,
-        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+        "reviewer_actor_id: operator\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
     )
     .unwrap();
     let path = verdict.display().to_string();
@@ -276,6 +276,74 @@ fn review_record_previews_a_stale_self_review_as_stale() {
         code(&real),
         "CH-POLICY-STALE-HANDOFF",
         "the real command must resolve this in favor of staleness, not independence"
+    );
+}
+
+#[test]
+fn review_record_previews_a_missing_mutation_evidence_refusal() {
+    // #95 gap 1 added ReviewRecord::validate's mutation_evidence check, but
+    // validate() has exactly one call site — inside run_record's real
+    // transaction, after a full ReviewRecord is built — and preview_record
+    // never reaches it. A verdict with no mutation evidence at all was
+    // accepted by the dry run and refused by the real command: Tier 3
+    // defect 24, reproduced on this card's own field.
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // Otherwise a clean, distinct-reviewer approval — every other check this
+    // file and `ReviewRecord::validate` enforce is satisfied. The only thing
+    // wrong with it is the field this card added: `gate_adequacy` carries
+    // none of the three original keys' problems, and no `mutation_evidence`
+    // key at all.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\nresidual_risks: []\n",
+    )
+    .unwrap();
+    let path = verdict.display().to_string();
+
+    let real = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    assert_parity(
+        "review record",
+        &real,
+        &workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-POLICY-INCOMPLETE-REVIEW",
+        "the fixture must exercise the mutation-evidence refusal, not something else"
     );
 }
 
