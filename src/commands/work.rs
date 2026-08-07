@@ -19,7 +19,7 @@ use crate::{
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
         card::{CardRecord, CardState},
-        clock::Clock,
+        clock::{Clock, Timestamp},
         ids::{CardId, LeaseId},
         lease::{
             LEASE_DIR, LEASE_SCHEMA, LeaseRecord, LeaseStatus, ProgressNote, WORKTREE_LINK_SCHEMA,
@@ -192,11 +192,12 @@ fn next_lease_id(control: &ControlRepository) -> Result<LeaseId, HarnessError> {
     format!("L-{:06}", highest + 1).parse()
 }
 
-/// Every lease for one card, oldest first.
-fn leases_for(
-    control: &ControlRepository,
-    card_id: &CardId,
-) -> Result<Vec<LeaseRecord>, HarnessError> {
+/// Every lease record in the control repository, oldest id first.
+///
+/// Factored out of `leases_for` so the per-card filter and
+/// [`silent_leases`]'s project-wide scan share one reader instead of two
+/// definitions of "how leases are listed and parsed."
+fn all_leases(control: &ControlRepository) -> Result<Vec<LeaseRecord>, HarnessError> {
     let directory = control.path(LEASE_DIR);
     if !directory.exists() {
         return Ok(Vec::new());
@@ -223,11 +224,107 @@ fn leases_for(
                 reason: format!("lease {name} is malformed: {source}"),
                 code: ErrorCode::InternalControlCorrupt,
             })?;
-        if lease.card_id == *card_id {
-            leases.push(lease);
-        }
+        leases.push(lease);
     }
     Ok(leases)
+}
+
+/// Every lease for one card, oldest first.
+fn leases_for(
+    control: &ControlRepository,
+    card_id: &CardId,
+) -> Result<Vec<LeaseRecord>, HarnessError> {
+    Ok(all_leases(control)?
+        .into_iter()
+        .filter(|lease| lease.card_id == *card_id)
+        .collect())
+}
+
+/// True when a card's own work is finished, so a lease still recorded
+/// `held` against it is a bookkeeping leftover rather than a sign anyone is
+/// still meant to be watching it.
+///
+/// #80 follow-up repair: nothing in this codebase ever writes
+/// `LeaseStatus::Released` (that lifecycle question belongs to a future
+/// card; see this repair's report), so `is_held()` alone never excludes a
+/// finished card's lease, and every lease ever granted would read as
+/// silent forever once it crossed the threshold. Card state is the axis
+/// that actually distinguishes "quiet because nobody is home" from "quiet
+/// because there is nothing left to do."
+///
+/// Exhaustively matched on purpose: a future `CardState` variant then
+/// forces a decision here at compile time instead of silently defaulting
+/// one way or the other.
+///
+/// `Approved`, `Integrating`, and `Accepted` are included as "over" even
+/// though `CardState::successors` leaves a path back to `Active` from
+/// `Approved` (an invalidated approval) and from `Blocked` reached out of
+/// `Integrating` (Section 11.2's own `blocked -> active`): while a card
+/// sits in one of these states, its lease is waiting on someone else's
+/// process, not on its actor, and if a candidate change or a block does
+/// send it back to `Active`, the actor's next `work checkpoint` or
+/// `work resume` is itself a fresh sign of life that clears the report.
+/// `Landed` is included on the strength of `work reclaim`'s own doc
+/// comment (`src/commands/work.rs`), which already treats "landed or
+/// abandoned" as the pair that makes a lease cleanup candidate via
+/// `archive close`.
+///
+/// What this still misses: a card legitimately reactivated from `Approved`
+/// or `Blocked` is invisible for one threshold window immediately after
+/// the bounce-back, until enough time passes for its own silence to
+/// re-cross the threshold from that later point — the same lag every
+/// elapsed-time detector has at a state boundary, not something this
+/// predicate could remove without watching transitions instead of state.
+const fn card_work_is_over(state: CardState) -> bool {
+    match state {
+        CardState::Draft
+        | CardState::Ready
+        | CardState::Leased
+        | CardState::Active
+        | CardState::HandedOff
+        | CardState::ReviewPending
+        | CardState::ChangesRequested
+        | CardState::Blocked => false,
+        CardState::Approved
+        | CardState::Integrating
+        | CardState::Accepted
+        | CardState::Landed
+        | CardState::Closed
+        | CardState::Abandoned => true,
+    }
+}
+
+/// Held leases with no recorded sign of life for at least
+/// [`crate::domain::lease::SILENT_LEASE_THRESHOLD_SECONDS`], as of `now`,
+/// excluding any lease whose card's own work is already over (see
+/// [`card_work_is_over`]).
+///
+/// Mirrors `stranded_execution_permits` (`src/commands/gate.rs`): the one
+/// place that scans every lease to ask which are quiet too long, so
+/// `project status` and `project recover` (`src/commands/project.rs`) share
+/// one definition of "silent" instead of each reimplementing "held, and
+/// idle past the threshold" on its own. See #80.
+///
+/// # Errors
+///
+/// Returns an error when the lease store, or a candidate's card, cannot be
+/// read.
+pub(crate) fn silent_leases(
+    control: &ControlRepository,
+    now: Timestamp,
+) -> Result<Vec<LeaseRecord>, HarnessError> {
+    let mut silent = Vec::new();
+    for lease in all_leases(control)? {
+        if !lease.is_silent(now) {
+            continue;
+        }
+        let (_, state) = load_card(control, &lease.card_id)?;
+        if card_work_is_over(state.state) {
+            continue;
+        }
+        silent.push(lease);
+    }
+    Ok(silent)
 }
 
 /// The lease currently held for a card, if any.
