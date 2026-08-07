@@ -741,12 +741,15 @@ impl Workspace {
             "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
         )
         .unwrap();
+        // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
         self.review(&[
             "record",
             "--card-id",
             card_id,
             "--verdict",
             &verdict.display().to_string(),
+            "--actor",
+            "reviewer-session",
         ]);
         head
     }
@@ -795,12 +798,15 @@ impl Workspace {
             "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
         )
         .unwrap();
+        // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
         self.review(&[
             "record",
             "--card-id",
             card_id,
             "--verdict",
             &verdict.display().to_string(),
+            "--actor",
+            "reviewer-session",
         ]);
     }
 

@@ -88,7 +88,15 @@ fn an_approval_by_a_distinct_actor_is_recorded() {
     let (workspace, head) = handed_off();
     let path = verdict(&workspace, &approval("reviewer-session-a"));
 
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(envelope["data"]["review"]["decision"], "approved");
     assert_eq!(envelope["data"]["review"]["candidate_sha"], head);
@@ -142,7 +150,15 @@ fn approving_over_an_open_finding_is_refused() {
     let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-OPEN-FINDINGS");
 }
@@ -155,7 +171,15 @@ fn approving_over_a_dispositioned_finding_is_permitted() {
     let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings:\n  - severity: high\n    location: tests/\n    detail: no coverage of behavior 4\n    disposition: out_of_scope\ngate_adequacy:\n  gates_observe_acceptance: false\n  unobserved_behaviors: [raises on invalid input]\n  basis: mutation-tested the suite; it passes with the guard removed\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: [behavior 4 stays ungated]\n";
     let path = verdict(&workspace, body);
 
-    let output = workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(
@@ -178,7 +202,15 @@ fn changes_requested_returns_the_card_to_work() {
     let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings:\n  - severity: critical\n    location: src/a.rs\n    detail: missing guard\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(envelope["data"]["state"], "changes_requested");
     assert_eq!(
         workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
@@ -192,7 +224,15 @@ fn requesting_changes_without_a_finding_is_refused() {
     let body = "reviewer_actor_id: reviewer-session-a\ndecision: changes_requested\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n";
     let path = verdict(&workspace, body);
 
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
 }
@@ -208,7 +248,15 @@ fn a_review_must_state_how_gate_adequacy_was_established() {
         ),
     );
 
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
 }
@@ -233,7 +281,15 @@ fn a_verdict_with_no_mutation_evidence_is_refused_by_the_cli() {
     );
     let path = verdict(&workspace, &stripped);
 
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
 }
@@ -247,7 +303,15 @@ fn a_declared_exemption_is_recorded_and_visible() {
     let (workspace, _) = handed_off();
     let path = verdict(&workspace, &approval("reviewer-session-a"));
 
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(envelope["status"], "success");
     let evidence = &envelope["data"]["review"]["gate_adequacy"]["mutation_evidence"];
     assert_eq!(evidence["status"], "exempt");
@@ -270,7 +334,15 @@ fn a_declared_exemption_is_recorded_and_visible() {
 fn a_candidate_change_invalidates_an_approval() {
     let (workspace, _) = handed_off();
     let path = verdict(&workspace, &approval("reviewer-session-a"));
-    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
 
     let before = workspace.review_json(&["inspect", "--card-id", "F-001"]);
     assert_eq!(before["data"]["has_current_approval"], true);
@@ -293,7 +365,15 @@ fn a_candidate_change_invalidates_an_approval() {
 fn a_card_revision_invalidates_an_approval() {
     let (workspace, _) = handed_off();
     let path = verdict(&workspace, &approval("reviewer-session-a"));
-    workspace.review(&["record", "--card-id", "F-001", "--verdict", &path]);
+    workspace.review(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(
         workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
         true
@@ -319,7 +399,15 @@ fn reviewing_a_superseded_handoff_is_refused() {
     support::git(&worktree, &["commit", "-q", "-m", "feat: sneak in b.rs"]);
 
     let path = verdict(&workspace, &approval("reviewer-session-a"));
-    let output = workspace.review_raw(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-STALE-HANDOFF");
 }
@@ -336,6 +424,8 @@ fn findings_remain_visible_after_a_later_approval() {
         "F-001",
         "--verdict",
         &verdict(&workspace, rejection),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     // Section 11.2: the card must come back to active before it can be handed
@@ -378,6 +468,8 @@ fn findings_remain_visible_after_a_later_approval() {
         "F-001",
         "--verdict",
         &verdict(&workspace, resolution),
+        "--actor",
+        "reviewer-session-b",
     ]);
 
     let envelope = workspace.review_json(&["inspect", "--card-id", "F-001"]);
@@ -420,6 +512,8 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
         "F-001",
         "--verdict",
         &verdict(&workspace, rejection),
+        "--actor",
+        "reviewer-session-a",
     ]);
     workspace.work(&["resume", "--card-id", "F-001"]);
 
@@ -455,6 +549,8 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
         "F-001",
         "--verdict",
         &verdict(&workspace, &approval("reviewer-session-b")),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert!(
         !silent.status.success(),
@@ -475,6 +571,8 @@ fn an_approval_may_not_drop_a_prior_open_finding() {
         "F-001",
         "--verdict",
         &verdict(&workspace, dispositioned),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert_eq!(
         workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
@@ -531,6 +629,8 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
         "F-001",
         "--verdict",
         &verdict(&workspace, opened),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     next_round(&workspace, "narrowed");
@@ -543,6 +643,8 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
         "F-001",
         "--verdict",
         &verdict(&workspace, carried),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     // It is in the record as carried rather than freshly raised, which is what
@@ -561,6 +663,8 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
         "F-001",
         "--verdict",
         &verdict(&workspace, premature),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert!(
         !refused.status.success(),
@@ -590,6 +694,8 @@ fn a_finding_can_be_carried_forward_as_still_open_and_still_refuses_an_approval(
         "F-001",
         "--verdict",
         &verdict(&workspace, settled),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert_eq!(
         workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
@@ -615,6 +721,8 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
         "F-001",
         "--verdict",
         &verdict(&workspace, two),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     next_round(&workspace, "fixed-one");
@@ -626,6 +734,8 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
         "F-001",
         "--verdict",
         &verdict(&workspace, half),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert!(
         !refused.status.success(),
@@ -649,6 +759,8 @@ fn one_resolution_cannot_approve_away_two_findings_at_one_location() {
         "F-001",
         "--verdict",
         &verdict(&workspace, both),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert_eq!(
         workspace.review_json(&["inspect", "--card-id", "F-001"])["data"]["has_current_approval"],
@@ -670,6 +782,8 @@ fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
         "F-001",
         "--verdict",
         &verdict(&workspace, opened),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     next_round(&workspace, "elsewhere");
@@ -681,6 +795,8 @@ fn carrying_forward_a_finding_no_earlier_review_raised_is_refused() {
         "F-001",
         "--verdict",
         &verdict(&workspace, invented),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert!(!refused.status.success());
     assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
@@ -703,6 +819,8 @@ fn the_first_review_of_a_card_cannot_carry_a_finding_forward() {
         "F-001",
         "--verdict",
         &verdict(&workspace, carried),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert!(!refused.status.success());
     assert_eq!(error_code(&refused), "CH-POLICY-OPEN-FINDINGS");
@@ -727,6 +845,8 @@ fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
         "F-001",
         "--verdict",
         &verdict(&workspace, first),
+        "--actor",
+        "reviewer-session-a",
     ]);
     workspace.work(&["resume", "--card-id", "F-001"]);
 
@@ -761,6 +881,8 @@ fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
         "F-001",
         "--verdict",
         &verdict(&workspace, second),
+        "--actor",
+        "reviewer-session-b",
     ]);
     assert!(
         !output.status.success(),
@@ -773,7 +895,15 @@ fn a_re_review_requesting_changes_may_not_drop_a_prior_finding_either() {
 fn the_review_is_versioned_and_recorded_as_an_event() {
     let (workspace, head) = handed_off();
     let path = verdict(&workspace, &approval("reviewer-session-a"));
-    let envelope = workspace.review_json(&["record", "--card-id", "F-001", "--verdict", &path]);
+    let envelope = workspace.review_json(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
     let review_id = envelope["data"]["review"]["review_id"].as_str().unwrap();
 
     let tracked = workspace.control_tracked_files();
@@ -805,6 +935,8 @@ fn a_dry_run_records_nothing() {
         "F-001",
         "--verdict",
         &path,
+        "--actor",
+        "reviewer-session-a",
         "--dry-run",
     ]);
     assert_eq!(envelope["data"]["dry_run"], true);
@@ -832,6 +964,8 @@ fn a_reviewer_can_record_that_a_card_is_blocked() {
         "F-001",
         "--verdict",
         &verdict(&workspace, blocked),
+        "--actor",
+        "reviewer-session-a",
     ]);
 
     let envelope = workspace.review_json(&["inspect", "--card-id", "F-001"]);
@@ -874,6 +1008,8 @@ fn a_card_whose_candidate_moved_during_review_can_be_taken_back() {
         "F-001",
         "--verdict",
         &verdict(&workspace, &approval("reviewer-session-a")),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(error_code(&refused), "CH-POLICY-STALE-HANDOFF");
 
@@ -934,6 +1070,8 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
         "F-001",
         "--verdict",
         &verdict(&workspace, &approval("reviewer-session-a")),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert!(
         !output.status.success(),
@@ -957,6 +1095,8 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
         "F-001",
         "--verdict",
         &verdict(&workspace, human),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(
@@ -976,6 +1116,8 @@ fn a_low_risk_card_needs_no_human_declaration() {
         "F-001",
         "--verdict",
         &verdict(&workspace, &approval("reviewer-session-a")),
+        "--actor",
+        "reviewer-session-a",
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(envelope["data"]["review"]["human_reviewer"], false);

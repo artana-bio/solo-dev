@@ -182,6 +182,8 @@ fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, de
         card_id,
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 
     // And the verdict really is bound to the candidate that was read, not to

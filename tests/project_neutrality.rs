@@ -116,6 +116,8 @@ fn a_project_with_no_rust_completes_the_whole_lifecycle() {
         "F-001",
         "--verdict",
         &verdict.display().to_string(),
+        "--actor",
+        "reviewer-session",
     ]);
 
     let id = workspace.integration_json(&[

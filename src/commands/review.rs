@@ -32,7 +32,10 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, inspect},
-    policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, Round, Trend},
+    policy::{
+        actors,
+        convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, Round, Trend},
+    },
 };
 
 /// Subcommands under `review`.
@@ -93,6 +96,10 @@ pub struct BeginArgs {
 }
 
 /// Arguments accepted by `review record`.
+///
+/// `common.actor` must agree with the verdict's declared `reviewer_actor_id`
+/// (#120) — both declare who is reviewing, and the command refuses rather
+/// than silently preferring one. See [`require_actor_agreement`].
 #[derive(Debug, Args)]
 pub struct RecordArgs {
     #[command(flatten)]
@@ -931,6 +938,57 @@ fn require_review_begun(
     })
 }
 
+/// Refuses when `--actor` and the verdict's declared reviewer disagree.
+///
+/// #120: `--actor` was accepted on `review record` and never read —
+/// attribution came entirely from the verdict's `reviewer_actor_id`, so
+/// `review record --actor reviewer-b` against a verdict declaring
+/// `reviewer_actor_id: implementer-a` silently attributed the review to
+/// `implementer-a`. Both are declarations of the same fact from two
+/// different places — the flag the operator typed, and the document the
+/// reviewer authored — and neither is authoritative over the other, so a
+/// disagreement is refused here rather than resolved by preferring one and
+/// discarding the other. This is the same shape `check_delivered_sha`
+/// already uses for `handoff create`'s `delivered_sha` against the branch
+/// head: two declarations of one fact, required to agree.
+///
+/// Called once, in `run_record`, ahead of the `--dry-run` branch — before
+/// either `preview_record` or the real transaction is reached — so this
+/// refusal cannot exist on one path and not the other; see #189.
+///
+/// Compared with [`actors::same`], the exact normalization
+/// [`check_independence`] already uses (whitespace-collapsed,
+/// ASCII-lowercased), so `--actor Reviewer-B` agrees with a verdict
+/// declaring `reviewer_actor_id: reviewer-b ` and the class of Unicode bug
+/// three rounds of fixes already closed in `policy::actors` does not reopen
+/// here by comparing raw strings instead.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicyIncompleteReview`] — reused rather than a new
+/// variant; #120 forbids adding one, and this is the same bucket
+/// `require_review_return_reason` and `policy::actors::refuse_unusable`
+/// already use for a review whose declared inputs cannot be acted on until
+/// the caller supplies something consistent — when either identifier cannot
+/// be compared at all ([`actors::refuse_unusable`]), or when both are usable
+/// but disagree.
+fn require_actor_agreement(flag_actor: &str, verdict: &Verdict) -> Result<(), HarnessError> {
+    actors::refuse_unusable("actor passed to --actor", flag_actor)?;
+    actors::refuse_unusable("verdict's reviewer_actor_id", &verdict.reviewer_actor_id)?;
+    if actors::same(flag_actor, &verdict.reviewer_actor_id) {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "--actor `{flag_actor}` disagrees with the verdict's declared reviewer_actor_id \
+             `{}`; both declare who is reviewing and the harness will not silently prefer one — \
+             pass --actor the same reviewer the verdict names, or correct whichever one is wrong",
+            verdict.reviewer_actor_id
+        ),
+        code: ErrorCode::PolicyIncompleteReview,
+    })
+}
+
 // 71-R2's reason refusal and its fact emission both have to run inside this
 // one transaction, in this exact program order relative to the writes around
 // them — splitting either into a helper the length limit would otherwise
@@ -939,6 +997,9 @@ fn require_review_begun(
 fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
     let verdict = read_verdict(&args.verdict)?;
+    // #120: run once, ahead of the dry-run branch, so preview and the real
+    // command can never disagree about it — see `require_actor_agreement`.
+    require_actor_agreement(&args.common.actor, &verdict)?;
 
     if args.dry_run {
         return preview_record(args, &card_id, &verdict);

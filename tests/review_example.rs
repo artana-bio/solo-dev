@@ -183,6 +183,14 @@ fn the_emitted_example_is_accepted_by_review_record() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        // #120: `review record` now refuses when `--actor` disagrees with
+        // the verdict's declared `reviewer_actor_id`. The captured example
+        // (unchanged, per this file's whole point) always declares
+        // `reviewer-example` (`example_verdict` in `src/commands/review.rs`),
+        // so this must name the same reviewer or the fixture would be
+        // refused for a reason unrelated to what this file tests.
+        "--actor",
+        "reviewer-example",
     ]);
     assert_eq!(
         envelope["status"], "success",
@@ -244,6 +252,14 @@ fn the_emitted_example_text_mode_stdout_is_accepted_by_review_record() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        // #120: `review record` now refuses when `--actor` disagrees with
+        // the verdict's declared `reviewer_actor_id`. The captured example
+        // (unchanged, per this file's whole point) always declares
+        // `reviewer-example` (`example_verdict` in `src/commands/review.rs`),
+        // so this must name the same reviewer or the fixture would be
+        // refused for a reason unrelated to what this file tests.
+        "--actor",
+        "reviewer-example",
     ]);
     assert_eq!(
         envelope["status"], "success",
@@ -310,6 +326,14 @@ fn the_emitted_example_carries_mutation_evidence_on_stdout_and_is_accepted() {
         "F-001",
         "--verdict",
         &path.display().to_string(),
+        // #120: `review record` now refuses when `--actor` disagrees with
+        // the verdict's declared `reviewer_actor_id`. The captured example
+        // (unchanged, per this file's whole point) always declares
+        // `reviewer-example` (`example_verdict` in `src/commands/review.rs`),
+        // so this must name the same reviewer or the fixture would be
+        // refused for a reason unrelated to what this file tests.
+        "--actor",
+        "reviewer-example",
     ]);
     assert_eq!(
         envelope["status"], "success",
