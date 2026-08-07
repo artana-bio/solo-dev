@@ -216,6 +216,12 @@ authorization requires a separate identity or operating-system boundary.
 
 ## Installation
 
+> **New to Change Harness?** [`QUICKSTART.md`](./QUICKSTART.md) is a
+> hands-on walkthrough — install, adopt a project, register two gates, hand
+> off, review, and land a change on the protected branch — every command run
+> for real before it was written down. Budget 30–40 minutes the first time;
+> ten after that.
+
 ### Quick install
 
 ```sh
