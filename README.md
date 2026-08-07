@@ -6,21 +6,24 @@ other — and know what actually landed without reading every diff.
 
 ## Why this exists
 
-Coordinating agents is the half that gets solved for you. Worktree isolation,
-fan-out, dependency ordering, retries: those ship inside the agent tools
-themselves and improve with every release. Writing another orchestrator means
-racing the vendors on their own ground.
+The mechanics of running agents in parallel are becoming commodity. Worktree
+isolation, fan-out, dependency ordering, retries: those ship inside the agent
+tools themselves and improve with every release. Writing another orchestrator
+means racing the vendors on their own ground.
 
-The half that does not get solved by adding more agents is knowing whether what
-they report is true. An agent that says "tests pass" is making a claim. An agent
-supervising other agents is making a claim about claims — the same failure
-modes one level up, and persuadable the way any language model is persuadable.
+What parallelism scales instead is the volume of claims a person must
+validate. An agent that says "tests pass" is making a claim. An agent
+supervising other agents is making a claim about claims, and a verifier adds
+trust only when it holds independent evidence and a separate authority
+boundary — not merely because a second model read the first one's summary.
 That ceiling is what actually bounds delegation: hand over more work and your
 own review capacity becomes the bottleneck you were trying to remove.
 
-Change Harness puts something non-probabilistic in that loop. Three questions
-get hard to answer the moment an agent can move code, and it makes all three
-mechanical rather than a matter of trust:
+Change Harness supplies that boundary by changing the unit of authorization:
+not "an agent reviewed this diff," but "this exact artifact satisfied a
+previously declared argument for promotion." Three questions get hard to
+answer the moment an agent can move code, and it makes all three mechanically
+verifiable rather than a matter of trust:
 
 - did the exact code that was reviewed reach the protected branch, unchanged?
 - did the tests that ran belong to that same commit, or to something adjacent?
@@ -32,12 +35,16 @@ commit SHA — not a branch name, not whatever is checked out right now. A card
 cannot be approved and then quietly changed before it lands. A gate cannot pass
 on uncommitted content and be presented as evidence about a commit. Two changes
 cannot land together without the combined result being verified as its own
-thing, separately from either change alone. A refusal is an exit code, not an
-opinion: nothing in this loop can be talked into "close enough."
+thing, separately from either change alone. The gate is non-conversational: a
+refusal is an exit code, not an opinion, and nothing in this loop can be talked
+into "close enough." Absence of evidence is a first-class failure state —
+unproven refuses exactly as failed does, where a language model would collapse
+uncertainty into plausible approval.
 
 It is a mechanical control, not a judgment call. The harness does not decide
-whether code is *good* — only that the thing being promoted is provably the
-thing that was reviewed.
+whether code is *good*. It proves that the required argument for the change is
+complete under the declared contract and policy, and that it is about the
+artifact that actually lands — nothing more, and nothing less is mechanical.
 
 ## What it is for
 
@@ -491,3 +498,7 @@ See:
   authoritative requirements, work packages, acceptance gates, decision and
   risk registers, and current status.
 - [Architecture](./docs/ARCHITECTURE.md) for the shorter design summary.
+- [Thesis](./docs/THESIS.md) for the product argument as it survived external
+  adversarial review, the three kinds of truth the harness does and does not
+  provide, and the one experiment — with kill thresholds fixed in advance —
+  that remains capable of falsifying the idea.
