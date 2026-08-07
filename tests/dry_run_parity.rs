@@ -146,6 +146,92 @@ fn review_record_previews_a_self_review_refusal() {
     );
 }
 
+// #28 §12 mutation 5. `check_review_conduct` has the same shape defect
+// `check_independence` and `validate_mutation_evidence` were each already
+// fixed for here: without a call inside `preview_record`, `--dry-run` would
+// report success for a same-context-conduct verdict the real command
+// refuses. #189 already lists seven checks with this defect; #120 closed one
+// by running it ahead of the dry-run branch. This card follows that
+// solution — `check_review_conduct` is called directly inside
+// `preview_record`, in the same relative position `check_independence` is.
+//
+// Mutation (§11.5): remove the `check_review_conduct` call from
+// `preview_record` (leaving it only in `run_record`'s real transaction, which
+// sits textually after the `--dry-run` early return — the literal "move the
+// refusal after the `--dry-run` branch" this mutation names). This test must
+// fail: the dry run would then report success for the same fixture the real
+// command refuses.
+#[test]
+fn review_record_previews_a_same_context_conduct_refusal() {
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let path = workspace.worktrees.join("F-001");
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(path.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&path, &["add", "-A"]);
+    support::git(&path, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&path, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+
+    // `activate_card`'s fixture declares `review_policy: independent` (the
+    // default every workspace helper uses). A distinct reviewer, so this is
+    // not the self-review case the test above already pins — the only thing
+    // wrong with this verdict is the conduct it declares.
+    let verdict = workspace.root.join("verdict.yaml");
+    fs::write(
+        &verdict,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: same_context\n",
+    )
+    .unwrap();
+    let path = verdict.display().to_string();
+
+    let real = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path,
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_parity(
+        "review record",
+        &real,
+        &workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(
+        code(&real),
+        "CH-POLICY-SELF-REVIEW",
+        "the fixture must exercise the same-context-conduct refusal, not something else"
+    );
+}
+
 #[test]
 fn review_record_previews_a_staleness_refusal() {
     // `preview_record` called `check_independence` but never

@@ -649,7 +649,7 @@ fn a_revised_card_refuses_a_verdict_even_when_the_handoff_was_revoked() {
 fn a_recorded_review_s_mutation_evidence_writes_and_reads_back_off_disk() {
     let (workspace, _) = under_review();
 
-    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: removed the guard at src/a.rs:1\n    failing_test: rejects_the_missing_guard\n    oracle: gate.unit\nresidual_risks: []\n";
+    let body = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: removed the guard at src/a.rs:1\n    failing_test: rejects_the_missing_guard\n    oracle: gate.unit\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\n";
     let path = workspace.root.join("verdict.yaml");
     fs::write(&path, body).unwrap();
 
@@ -689,6 +689,11 @@ fn a_recorded_review_s_mutation_evidence_writes_and_reads_back_off_disk() {
     assert_eq!(evidence["mutation"], "removed the guard at src/a.rs:1");
     assert_eq!(evidence["failing_test"], "rejects_the_missing_guard");
     assert_eq!(evidence["oracle"], "gate.unit");
+    // #28: the same fixture also declares the two fields that card adds, so
+    // this proves they write and read back off disk exactly as the three
+    // original keys above do.
+    assert_eq!(evidence["authorship"], "reviewer_devised");
+    assert_eq!(stored["review_conduct"], "separate_process");
 }
 
 // #120: `--actor` was accepted on `review record` and never read — attribution

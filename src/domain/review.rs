@@ -13,6 +13,16 @@
 //! whether the gates could actually observe the acceptance behaviors, because
 //! both spike reviewers discovered independently that a green receipt proved
 //! nothing about the behavior it appeared to support.
+//!
+//! #28 closes a gap in that last sentence: the record could say a green
+//! receipt was inadequate, but never who had produced the mutation behind
+//! that claim, and nothing distinguished a card whose review ran in a fresh
+//! process from one where it did not — 31 records claim `reviewer_actor_id:
+//! codex`, one is known false, and nothing in any of them tells the other
+//! thirty apart from it. [`ReviewConduct`] and [`MutationAuthorship`] are the
+//! two declared facts that close it. D-013 and R-012 still hold: both are
+//! declared, not proven, in exactly the register [`check_independence`]
+//! already uses.
 
 use std::collections::BTreeMap;
 
@@ -75,6 +85,36 @@ impl Decision {
             Self::Blocked => "blocked",
         }
     }
+}
+
+/// Where a review was actually carried out.
+///
+/// #28's decision: an `independent`-policy card needs a genuinely separate
+/// process, not merely a distinct declared identity — the control repository
+/// holds 31 review records claiming `reviewer_actor_id: codex`, one of them
+/// known false, and nothing in any of the 31 distinguishes it from the other
+/// thirty. This is the field that lets a review say which it was.
+///
+/// Lives on the review itself ([`ReviewRecord::review_conduct`] /
+/// [`crate::commands::review::Verdict::review_conduct`]), not inside
+/// [`GateAdequacy`] or [`MutationEvidence`]. See [`check_review_conduct`]'s
+/// doc for the argument that conduct and mutation authorship are different
+/// claims and belong on different objects.
+///
+/// Declared, not proven — D-013 and R-012 hold here exactly as they do for
+/// [`check_independence`]: nothing in this tool can observe which process a
+/// reviewer actually worked in. What changes is that the record stops being
+/// silent about it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewConduct {
+    /// The reviewer worked in a process genuinely separate from the one that
+    /// produced the candidate: a fresh context, holding only the review
+    /// packet.
+    SeparateProcess,
+    /// The review was carried out in the same context as the work under
+    /// review.
+    SameContext,
 }
 
 /// How serious a finding is.
@@ -281,12 +321,45 @@ pub enum MutationEvidence {
         failing_test: String,
         /// The gate or command whose run reported the failure.
         oracle: String,
+        /// Whose mutation this is. See [`MutationAuthorship`].
+        authorship: MutationAuthorship,
     },
     /// No mutation applies to this review, and why.
     Exempt {
         /// Why this review has no mutation to demonstrate.
         reason: String,
     },
+}
+
+/// Whose mutation a [`MutationEvidence::Demonstrated`] claim rests on.
+///
+/// #28's gap in #95 gap 1's field: `mutation_evidence` recorded *a* mutation
+/// from the day it landed, never *whose*. #28 §2 is explicit about why that
+/// matters: what made separate review actually find defects "was not the
+/// identity string. It was that the reviewer chose a different thing to
+/// mutate." A reviewer who restates the implementer's own mutation as their
+/// "evidence" has not done that, even when every other fact on the review —
+/// including a genuinely separate [`ReviewConduct::SeparateProcess`] — is
+/// true. The wave this card ships in produced four reviews in exactly that
+/// state, which is why this is a fact recorded separately from conduct
+/// rather than folded into it; see [`check_review_conduct`]'s doc.
+///
+/// Required, with no `#[serde(default)]`: unlike [`GateAdequacy::mutation_evidence`]
+/// itself, this field has no population of pre-existing records to stay
+/// compatible with. Verified, not assumed — no review record in the control
+/// repository carries `mutation_evidence` at all yet (`git --git-dir=$HOME/Documents/Code/change-harness-control/.git grep -l mutation_evidence HEAD -- reviews/`
+/// returns nothing), so there is no stored `Demonstrated` value anywhere for
+/// a bare required field to orphan. That makes this exactly as new as
+/// [`MutationEvidence::Demonstrated`]'s other three fields, which carry no
+/// compatibility shim of their own either.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationAuthorship {
+    /// The reviewer devised this mutation independently.
+    ReviewerDevised,
+    /// The reviewer is restating a mutation the implementer already ran or
+    /// described, not one they produced themselves.
+    ImplementerRestated,
 }
 
 impl GateAdequacy {
@@ -320,6 +393,12 @@ impl GateAdequacy {
                 mutation,
                 failing_test,
                 oracle,
+                // `authorship` is checked by nothing here: it is an enum, not
+                // a `String`, so there is no empty state for it to be caught
+                // in silently the way #117's shape catches blank text — the
+                // deserializer already refuses any value that is not one of
+                // `MutationAuthorship`'s two variants.
+                authorship: _,
             }) => {
                 if mutation.trim().is_empty()
                     || failing_test.trim().is_empty()
@@ -396,6 +475,29 @@ pub struct ReviewRecord {
     /// Whether a human performed this review. Declared, not proven; see D-013.
     #[serde(default)]
     pub human_reviewer: bool,
+    /// Where this review was actually carried out. Declared, not proven; see
+    /// [`ReviewConduct`] and D-013.
+    ///
+    /// `Option`, for the same reason [`GateAdequacy::mutation_evidence`] is:
+    /// the roughly 72 reviews already recorded in the control repository
+    /// predate this field entirely, and [`ReviewRecord`] derives
+    /// `deny_unknown_fields`, so a bare required field would orphan every one
+    /// of them on read. `#[serde(default)]` is what lets an old record still
+    /// deserialize; `skip_serializing_if` is what keeps re-serializing one
+    /// from writing out a key it never had, which would move
+    /// [`ReviewRecord::digest`] for a record nothing about actually changed —
+    /// see `mutation_evidence`'s doc for the full argument, identical here.
+    ///
+    /// Unlike `mutation_evidence`, absence is not refused by
+    /// [`ReviewRecord::validate`] for every review — only [`check_review_conduct`]
+    /// reads it, and only for a card whose `review_policy` is exactly
+    /// `"independent"`, and even then only a *declared*
+    /// [`ReviewConduct::SameContext`] is refused. A review that never
+    /// declares its conduct at all is accepted exactly as it was before this
+    /// field existed; see `check_review_conduct`'s doc for why that gap is
+    /// left open rather than closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_conduct: Option<ReviewConduct>,
     /// The review this one supersedes, when it is a re-review.
     pub supersedes: Option<ReviewId>,
     /// When it was recorded.
@@ -754,6 +856,90 @@ pub fn check_independence(reviewer: &str, feature_actor: &str) -> Result<(), Har
     Ok(())
 }
 
+/// Refuses a review that declares same-context conduct for a card whose
+/// review policy demands genuine separation.
+///
+/// #28 §1: "a genuinely separate process is required for an
+/// `independent`-policy card." §4 of the same card established that
+/// `CardDraft::review_policy` (`src/domain/card.rs`) had never been read for
+/// its value anywhere in this codebase — validated only for non-emptiness —
+/// so this is the first place `review_policy` becomes load-bearing.
+///
+/// A free function, not a method on [`ReviewRecord`] or folded into
+/// [`ReviewRecord::validate`], for a reason [`check_independence`] does not
+/// have to answer: `review_policy` lives on the card, not on the review, and
+/// `validate` takes only `&self`. Changing its signature to thread
+/// `review_policy` through would touch every one of its call sites in this
+/// module's own tests for a question `validate` otherwise has no stake in.
+/// The shape this mirrors instead is [`ReviewRecord::check_risk_policy`]:
+/// both are a declared fact on the review, checked against an external fact
+/// the card carries, called next to `validate` rather than inside it. Unlike
+/// `check_risk_policy` — which `commands::review::preview_record`'s own doc
+/// names as a check `--dry-run` deliberately does not mirror — this one
+/// must run on both paths: #189 already lists seven checks that skip
+/// `review record --dry-run`, and #120 closed one by running it ahead of the
+/// dry-run branch rather than only inside the real transaction. This card
+/// follows that solution, not the count: `commands::review::preview_record`
+/// calls this directly, in the same relative position `check_independence`
+/// holds there, so a preview cannot report success for a verdict the real
+/// command would refuse.
+///
+/// # What this refuses, precisely, and what it does not
+///
+/// The obvious rule, and only the obvious rule: `review_policy` compared
+/// byte-for-byte against `"independent"`, and `conduct` compared against
+/// exactly [`ReviewConduct::SameContext`]. Two things that misses, both
+/// deliberately:
+///
+/// - A `review_policy` of `"Independent"`, `"independent-ish"`, or any other
+///   string that is not the exact literal `"independent"` is not refused,
+///   whatever conduct is declared. §8 of #28 forbids widening
+///   `CardDraft.review_policy`'s type or validation — it stays a free-form
+///   `String` — so there is no enum this function could match against
+///   instead, and no normalization this function invents is authorized by
+///   the card that owns the field. A card author who misspells the policy
+///   they meant gets silence, not a refusal, from this check.
+/// - A review that never declares `conduct` at all — `None`, exactly what an
+///   old review deserializes to, and exactly what a new one deserializes to
+///   if the reviewer never writes the key — is not refused either, on any
+///   `review_policy`. This is not an oversight: before this card, nothing
+///   asked the question at all, and a review that still does not answer it
+///   is in the same state it was always in, not a new one this card
+///   introduced. Refusing `None` on an `independent` card would refuse every
+///   one of the roughly 72 reviews already on disk were any of them
+///   re-validated, and would refuse a verdict written against the schema
+///   `review example` emitted before this field existed. Only a review that
+///   *asserts* `same_context` is refused; one that says nothing is not read
+///   as though it asserted anything.
+///
+/// Both gaps are real and both are named here rather than closed silently.
+/// D-013 already commits this tool to declared-not-proven facts; a check
+/// that only catches the spelling and the candor of whoever fills in the
+/// form is consistent with that, not a departure from it.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::PolicySelfReview`] when `review_policy` is exactly
+/// `"independent"` and `conduct` is declared [`ReviewConduct::SameContext`].
+/// The closest existing code, reused rather than added — #28 §8 forbids a
+/// new `ErrorCode` variant, and this is the same underlying concern
+/// `check_independence` already reports under it: a review that admits it
+/// was not independent of the work it reviews. The identity check and this
+/// one differ in which declared fact fails, not in what kind of failure it
+/// is.
+pub fn check_review_conduct(
+    review_policy: &str,
+    conduct: Option<ReviewConduct>,
+) -> Result<(), HarnessError> {
+    if review_policy != "independent" || conduct != Some(ReviewConduct::SameContext) {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: "review_policy `independent` requires a genuinely separate review process, and this review declares `same_context` conduct; independence is procedural, so the harness can only refuse the declared case".to_owned(),
+        code: ErrorCode::PolicySelfReview,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +957,7 @@ mod tests {
                 mutation: "removed the absolute-zero guard in fahrenheit_to_celsius".to_owned(),
                 failing_test: "rejects_below_absolute_zero".to_owned(),
                 oracle: "gate.unit".to_owned(),
+                authorship: MutationAuthorship::ReviewerDevised,
             }),
         }
     }
@@ -795,6 +982,7 @@ mod tests {
             gate_adequacy: adequacy(),
             residual_risks: vec![],
             human_reviewer: false,
+            review_conduct: None,
             supersedes: None,
             reviewed_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
             canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
@@ -954,6 +1142,7 @@ mod tests {
             mutation: String::new(),
             failing_test: String::new(),
             oracle: String::new(),
+            authorship: MutationAuthorship::ReviewerDevised,
         });
         let error = invalid.validate().expect_err("must refuse");
         assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
@@ -979,6 +1168,7 @@ mod tests {
                 mutation: mutation.to_owned(),
                 failing_test: failing_test.to_owned(),
                 oracle: oracle.to_owned(),
+                authorship: MutationAuthorship::ReviewerDevised,
             });
             let error = invalid.validate().expect_err("must refuse");
             assert_eq!(error.code(), ErrorCode::PolicyIncompleteReview);
@@ -1037,6 +1227,7 @@ mod tests {
                 mutation: "removed the absolute-zero guard".to_owned(),
                 failing_test: "none — this is the unobserved behavior".to_owned(),
                 oracle: "gate.unit".to_owned(),
+                authorship: MutationAuthorship::ReviewerDevised,
             }),
         };
         honest
@@ -1485,6 +1676,15 @@ mod tests {
     // outright. This test must fail either way: it is reading a real record,
     // not a convenient one, so a mutation to the fixture below is exactly as
     // load-bearing as a mutation to the production deserializer.
+    //
+    // #28 §9: re-verified the same count today (2026-08-07) and re-checked
+    // whether any of the 72 already carry `mutation_evidence` -- none do
+    // (`git --git-dir=$HOME/Documents/Code/change-harness-control/.git grep
+    // -l mutation_evidence HEAD -- reviews/` returns nothing), so this same
+    // fixture is also the only real record available to prove compatibility
+    // for `review_conduct`, the field this card adds: it predates that field
+    // exactly as it predates `mutation_evidence`. No second fixture is
+    // fabricated for it below -- see the added assertions in the test itself.
     const REAL_PRE_EXISTING_REVIEW_RV_000005: &str = r#"{
   "schema": "harness.review/v1",
   "review_id": "RV-000005",
@@ -1528,6 +1728,10 @@ mod tests {
         // manufactured content the file never had.
         assert_eq!(record.review_id.to_string(), "RV-000005");
         assert!(record.gate_adequacy.mutation_evidence.is_none());
+        // #28: it predates `review_conduct` exactly as it predates
+        // `mutation_evidence`, and for the same reason must read back `None`
+        // rather than manufacture a declaration this record never made.
+        assert!(record.review_conduct.is_none());
 
         // Half of §4's claim is deserialization; the other half is that a
         // record already digested under the old schema must keep digesting
@@ -1539,11 +1743,16 @@ mod tests {
         // `mutation_evidence` is what keeps that recomputation from moving:
         // this value was captured with `ReviewRecord::digest()` on the
         // unmodified pre-#95 code, from this exact fixture's content, before
-        // `mutation_evidence` was added at all.
+        // `mutation_evidence` was added at all. The same digest, unchanged
+        // again here, is therefore also proof that `review_conduct` --
+        // added after that capture, under the identical
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        // shape -- does not move it either.
         assert_eq!(
             record.digest().unwrap().as_str(),
             "sha256:b826c2bab33d692053c1608a7d872f545071585259898bd139e97325b8d6d14a",
-            "adding mutation_evidence must not move the digest of a record that predates it"
+            "adding mutation_evidence and review_conduct must not move the digest of a record \
+             that predates both"
         );
 
         // And the mechanism, not just its result: re-serializing this record
@@ -1553,6 +1762,10 @@ mod tests {
             !reencoded.contains("mutation_evidence"),
             "a record with no mutation evidence must omit the key entirely, not write it out \
              as null or as an empty value: {reencoded}"
+        );
+        assert!(
+            !reencoded.contains("review_conduct"),
+            "a record with no declared conduct must omit the key entirely too: {reencoded}"
         );
     }
 
@@ -1577,5 +1790,168 @@ mod tests {
         let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, exempted);
         assert_eq!(decoded.digest().unwrap(), exempted.digest().unwrap());
+    }
+
+    /// #28 §10 test 4 (`ReviewConduct`'s half): both variants, written and
+    /// read back, plus the undeclared case old records and old verdicts both
+    /// deserialize to.
+    #[test]
+    fn review_conduct_round_trips_both_variants() {
+        for conduct in [ReviewConduct::SeparateProcess, ReviewConduct::SameContext] {
+            let mut declared = review(Decision::Approved, vec![]);
+            declared.review_conduct = Some(conduct);
+            let encoded = serde_json::to_string_pretty(&declared).unwrap();
+            let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, declared);
+            assert_eq!(decoded.review_conduct, Some(conduct));
+        }
+
+        let undeclared = review(Decision::Approved, vec![]);
+        assert_eq!(undeclared.review_conduct, None);
+        let encoded = serde_json::to_string_pretty(&undeclared).unwrap();
+        assert!(
+            !encoded.contains("review_conduct"),
+            "an undeclared conduct must not be written out as a null or empty value: {encoded}"
+        );
+        let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, undeclared);
+    }
+
+    /// #28 §10 test 4 (`MutationAuthorship`'s half). Distinct from
+    /// `mutation_evidence_round_trips_both_variants` above, which only
+    /// exercises `ReviewerDevised` incidentally through the shared `review()`
+    /// fixture; this pins `ImplementerRestated` too.
+    #[test]
+    fn mutation_authorship_round_trips_both_variants() {
+        for authorship in [
+            MutationAuthorship::ReviewerDevised,
+            MutationAuthorship::ImplementerRestated,
+        ] {
+            let mut declared = review(Decision::Approved, vec![]);
+            declared.gate_adequacy.mutation_evidence = Some(MutationEvidence::Demonstrated {
+                mutation: "removed the absolute-zero guard".to_owned(),
+                failing_test: "rejects_below_absolute_zero".to_owned(),
+                oracle: "gate.unit".to_owned(),
+                authorship,
+            });
+            let encoded = serde_json::to_string_pretty(&declared).unwrap();
+            let decoded: ReviewRecord = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, declared);
+            assert_eq!(
+                decoded.gate_adequacy.mutation_evidence,
+                declared.gate_adequacy.mutation_evidence
+            );
+        }
+    }
+
+    // #28 §12 mutation 1. Mutation: delete the `Some(ReviewConduct::SameContext)`
+    // arm (or the whole early-return `if`) from `check_review_conduct`. This
+    // test must fail -- the function would then return `Ok(())` for the
+    // declared-same-context, independent-policy case it exists to refuse.
+    #[test]
+    fn an_independent_policy_card_refuses_declared_same_context_conduct() {
+        let error = check_review_conduct("independent", Some(ReviewConduct::SameContext))
+            .expect_err("must refuse");
+        assert_eq!(error.code(), ErrorCode::PolicySelfReview);
+        assert!(
+            error.to_string().contains("procedural"),
+            "the message must not overclaim what this check proves, in the register \
+             `check_independence` already uses: {error}"
+        );
+    }
+
+    #[test]
+    fn an_independent_policy_card_accepts_declared_separate_process_conduct() {
+        check_review_conduct("independent", Some(ReviewConduct::SeparateProcess))
+            .expect("the honest declaration this check exists to require must be accepted");
+    }
+
+    /// §10.3: named as a deliberate gap, not an oversight. A review that
+    /// never declares its conduct is in the same state every review was in
+    /// before this card existed, and refusing it now would refuse the
+    /// roughly 72 reviews already on disk were any of them re-validated.
+    #[test]
+    fn an_independent_policy_card_accepts_undeclared_conduct() {
+        check_review_conduct("independent", None)
+            .expect("an undeclared conduct is not read as an assertion of same-context conduct");
+    }
+
+    // #28 §12 mutation 2, the false-positive direction. Mutation: make the
+    // refusal fire regardless of `review_policy` (drop the `review_policy !=
+    // "independent"` half of the guard, or the parameter entirely). This test
+    // must fail -- a card whose policy is not `independent` would then have
+    // its same-context conduct refused too, which #28 never asks for: the
+    // decision is scoped to `independent`-policy cards specifically.
+    #[test]
+    fn a_non_independent_policy_card_accepts_declared_same_context_conduct() {
+        for policy in ["solo", "pair", ""] {
+            check_review_conduct(policy, Some(ReviewConduct::SameContext)).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "policy `{policy}` must not trigger the independent-only refusal: {error}"
+                    )
+                },
+            );
+        }
+    }
+
+    /// §10.3: the obvious rule is an exact match against the literal
+    /// `"independent"`. A spelling or casing variant is not read as meaning
+    /// the same thing, because #28 §8 forbids this card from turning
+    /// `CardDraft.review_policy` into anything other than the free-form
+    /// `String` it already is, and no normalization here is authorized by
+    /// the card that owns that field. Documented as a real gap, not fixed:
+    /// a card author who misspells `independent` gets silence, not a
+    /// refusal.
+    #[test]
+    fn a_misspelled_or_miscased_independent_policy_is_not_refused() {
+        for policy in [
+            "Independent",
+            "INDEPENDENT",
+            "independent-ish",
+            " independent",
+        ] {
+            check_review_conduct(policy, Some(ReviewConduct::SameContext)).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "policy `{policy}` is not the exact literal `independent`, so this check \
+                     must not refuse it: {error}"
+                    )
+                },
+            );
+        }
+    }
+
+    /// #28 §10.1 and §10.2, made concrete. §10.2's evidence for keeping
+    /// conduct and mutation authorship as two separate fields rather than
+    /// collapsing them into one: "a review that is separate but whose
+    /// mutation is the implementer's restated is a real state and the wave
+    /// produced four of them." That state is `SeparateProcess` conduct
+    /// paired with `ImplementerRestated` authorship, and it must validate —
+    /// neither field's rule reads the other, so the combination is neither
+    /// refused by `check_review_conduct` (conduct is honestly
+    /// `SeparateProcess`) nor by `GateAdequacy::validate_mutation_evidence`
+    /// (authorship is filled, not empty). Collapsing the two into one field
+    /// would need a third value purely to name this combination; keeping
+    /// them apart names it for free as the cross product of two fields that
+    /// already have two values each.
+    #[test]
+    fn a_separate_review_may_honestly_restate_the_implementer_s_mutation() {
+        let mut record = review(Decision::Approved, vec![]);
+        record.review_conduct = Some(ReviewConduct::SeparateProcess);
+        record.gate_adequacy.mutation_evidence = Some(MutationEvidence::Demonstrated {
+            mutation:
+                "removed the absolute-zero guard, as the implementer's handoff already described"
+                    .to_owned(),
+            failing_test: "rejects_below_absolute_zero".to_owned(),
+            oracle: "gate.unit".to_owned(),
+            authorship: MutationAuthorship::ImplementerRestated,
+        });
+
+        record.validate().expect(
+            "a separate review restating the implementer's own mutation is honest and real",
+        );
+        check_review_conduct("independent", record.review_conduct)
+            .expect("declared separate-process conduct is never refused, whatever the mutation's authorship");
     }
 }
