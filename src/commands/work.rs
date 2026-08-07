@@ -244,13 +244,19 @@ fn leases_for(
 /// `held` against it is a bookkeeping leftover rather than a sign anyone is
 /// still meant to be watching it.
 ///
-/// #80 follow-up repair: nothing in this codebase ever writes
-/// `LeaseStatus::Released` (that lifecycle question belongs to a future
-/// card; see this repair's report), so `is_held()` alone never excludes a
-/// finished card's lease, and every lease ever granted would read as
-/// silent forever once it crossed the threshold. Card state is the axis
-/// that actually distinguishes "quiet because nobody is home" from "quiet
-/// because there is nothing left to do."
+/// #80 follow-up repair: `is_held()` alone never excludes a finished
+/// card's lease, so every lease ever granted would read as silent forever
+/// once it crossed the threshold. Card state is the axis that actually
+/// distinguishes "quiet because nobody is home" from "quiet because there
+/// is nothing left to do."
+///
+/// [`release_lease`] now writes `LeaseStatus::Released`, which narrows
+/// this predicate's job without removing it. Release happens at `archive
+/// close`, the end of the line — so a card sitting in `Approved`,
+/// `Integrating`, `Accepted`, or `Landed` still holds its lease and its
+/// worktree, and an abandoned card never joins an integration at all, so
+/// `archive close` never reaches it and its lease stays held forever
+/// (#199). Those are precisely the states below, which is why this stays.
 ///
 /// Exhaustively matched on purpose: a future `CardState` variant then
 /// forces a decision here at compile time instead of silently defaulting
@@ -347,6 +353,42 @@ fn store_lease(control: &ControlRepository, lease: &LeaseRecord) -> Result<(), H
         &LeaseRecord::relative_path(&lease.lease_id),
         &format!("{}\n", serde_json::to_string_pretty(lease)?),
     )
+}
+
+/// Ends a lease, freeing the allocation it held.
+///
+/// The one place `LeaseStatus::Released` and `released_at` are written.
+/// Until this existed the variant was constructed only by `lease.rs`'s own
+/// unit tests, so `is_held()` was true for every lease that had ever been
+/// granted and [`held_lease`] never returned `None` once a card was
+/// started — which is what [`card_work_is_over`] had to work around to
+/// keep #80's silent-lease report from naming every finished card forever.
+///
+/// The owner is deallocation, not any one command. A lease binds a card to
+/// an actor, a branch, and a worktree, so it ends when that binding does:
+/// `clean_up_card` (`src/commands/archive.rs`) is the only caller today
+/// because removing the worktree and deleting the branch is the only thing
+/// in this codebase that ends it. A cleanup path for abandoned cards —
+/// which never join an integration, so `archive close` never reaches them
+/// (#199) — belongs here too, rather than growing a second account of what
+/// release means.
+///
+/// Deliberately not called by `handoff create` or `work reclaim`. Both
+/// change who holds a card while the branch and worktree survive intact,
+/// which is why [`run_reclaim`] moves `actor_id` on the existing record
+/// instead of ending it and granting another.
+///
+/// # Errors
+///
+/// Returns an error when the lease cannot be written.
+pub(crate) fn release_lease(
+    control: &ControlRepository,
+    lease: &mut LeaseRecord,
+    now: Timestamp,
+) -> Result<(), HarnessError> {
+    lease.status = LeaseStatus::Released;
+    lease.released_at = Some(now);
+    store_lease(control, lease)
 }
 
 /// The branch name a card's work uses.
@@ -1213,8 +1255,13 @@ pub struct ReclaimArgs {
 /// and every commit on it survive: a lease says who is responsible for a card,
 /// not what the work is worth, and an abandoned lease is a coordination
 /// problem rather than a reason to destroy code. Cleanup, if it is wanted, is
-/// `archive close` after the card has landed or been abandoned on its own
-/// terms.
+/// `archive close` after the card has landed, which is also what releases the
+/// lease (see [`release_lease`]).
+///
+/// A card abandoned on its own terms has no such path, though this comment
+/// long claimed it did: an abandoned card never joins an integration, so
+/// `archive close` never reaches it, and its branch, worktree, and lease
+/// survive indefinitely with nothing that would clean them up. See #199.
 ///
 /// # Errors
 ///
