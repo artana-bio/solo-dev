@@ -459,6 +459,190 @@ fn final_prepare_keeps_an_explicitly_abandoned_member_auditable() {
     );
 }
 
+/// #178: a sealed cycle that never had a card declared into it is refused
+/// under `--final`, distinctly from the all-abandoned case
+/// (`final_prepare_succeeds_and_reports_delivering_nothing_when_every_member_was_abandoned`
+/// below), and the refusal names a real command to recover with — not just
+/// the bare fact that nothing is there.
+#[test]
+fn final_prepare_refuses_a_sealed_cycle_that_never_had_a_card() {
+    let workspace = cycle_with(0);
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+    let before = workspace.control_head();
+
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("nothing was abandoned"),
+        "the refusal must say this is not the all-abandoned case: {stdout}"
+    );
+    assert!(
+        stdout.contains("cycle abandon"),
+        "the refusal must name a real recovery command, not just state the fact and stop: {stdout}"
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "refusal must not record a plan"
+    );
+}
+
+/// #178 companion to the refusal above: when a sealed cycle's members were
+/// all abandoned, `--final` succeeds — and the outcome says so plainly
+/// rather than looking like an ordinary integration that happens to have
+/// zero members.
+#[test]
+fn final_prepare_succeeds_and_reports_delivering_nothing_when_every_member_was_abandoned() {
+    let workspace = cycle_with(2);
+    workspace.card(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
+    workspace.card(&["abandon", "--card-id", "F-002", "--reason", "superseded"]);
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert!(
+        merge_order(&envelope).is_empty(),
+        "an all-abandoned final integration has no members: {envelope}"
+    );
+    assert_eq!(envelope["data"]["final_for_cycle"], true);
+    assert_eq!(
+        envelope["data"]["abandoned_card_ids"],
+        serde_json::json!(["F-001", "F-002"])
+    );
+    assert_eq!(
+        envelope["data"]["delivers_no_cards"], true,
+        "an all-abandoned final integration must say plainly that it delivers no cards, \
+         not look like an ordinary integration: {envelope}"
+    );
+}
+
+/// #178: the `delivers_no_cards` marker is specific to the all-abandoned
+/// case, not a blanket property of every `--final` integration.
+#[test]
+fn ordinary_final_integration_is_not_marked_as_delivering_nothing() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--final",
+    ]);
+    assert_eq!(
+        envelope["data"]["delivers_no_cards"], false,
+        "a final integration that actually delivers a card must not carry the empty marker: {envelope}"
+    );
+}
+
+/// #178 repair, from review of `4eb45ac`: a mutation that broke only
+/// `report_integration`'s text branch (`let mut text = if delivers_no_cards
+/// { .. } else { .. }` -> `if false { .. }`, leaving the JSON field intact)
+/// left `cargo test --test integration_plan` green, because every other
+/// `--final` test in this file reads the outcome through
+/// `Workspace::integration_json` / `integration_raw`, which always pass
+/// `--output json`. Three independent cold-start operator protocols ran
+/// without that flag, so text mode — not JSON — is the channel that
+/// actually needed pinning; see the two tests above this one, which cover
+/// the JSON payload alone and would not have caught this.
+///
+/// Deliberately not routed through `Workspace::integration_raw` /
+/// `integration_json`: text mode is the entire point. `Workspace::run` is
+/// the same unmediated invocation `tests/card_example.rs` already uses for
+/// exactly this reason — see
+/// `the_emitted_card_draft_example_text_mode_stdout_is_accepted_by_card_create`
+/// and `the_emitted_card_draft_example_warns_that_base_sha_must_be_replaced`
+/// there. No new helper was added to `tests/support/mod.rs`: `Workspace::run`
+/// already exists and already omits `--output` and `--control`, which is
+/// exactly what an operator's own invocation would.
+///
+/// Pins the load-bearing claim ("delivers no cards"), not the surrounding
+/// prose verbatim — the exact wording is expected to be reworded over time,
+/// and a verbatim test would then be deleted rather than fixed.
+///
+/// Mutation that must make this fail: `let mut text = if delivers_no_cards`
+/// -> `let mut text = if false` in `report_integration`.
+#[test]
+fn final_prepare_text_mode_says_delivers_no_cards_only_for_the_all_abandoned_case() {
+    let all_abandoned = cycle_with(2);
+    all_abandoned.card(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
+    all_abandoned.card(&["abandon", "--card-id", "F-002", "--reason", "superseded"]);
+    all_abandoned.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let all_abandoned_output = Workspace::run(&[
+        "integration".to_owned(),
+        "prepare".to_owned(),
+        "--cycle-id".to_owned(),
+        "C-001".to_owned(),
+        "--actor-id".to_owned(),
+        "coordinator".to_owned(),
+        "--final".to_owned(),
+        "--control".to_owned(),
+        all_abandoned.control.display().to_string(),
+    ]);
+    assert!(
+        all_abandoned_output.status.success(),
+        "an all-abandoned final integration must still succeed in text mode (exit {:?}): {}",
+        all_abandoned_output.status.code(),
+        String::from_utf8_lossy(&all_abandoned_output.stderr)
+    );
+    let all_abandoned_stdout = String::from_utf8_lossy(&all_abandoned_output.stdout).into_owned();
+    assert!(
+        all_abandoned_stdout.contains("delivers no cards"),
+        "the default text-mode output an operator actually sees must say plainly that this \
+         integration delivers no cards — the JSON payload's `delivers_no_cards` field alone is \
+         not enough, since `--output json` is not the default and three cold-start protocols ran \
+         without it: {all_abandoned_stdout}"
+    );
+
+    let ordinary = cycle_with(1);
+    ordinary.approve_card("F-001", "src/F-001/a.rs");
+    ordinary.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let ordinary_output = Workspace::run(&[
+        "integration".to_owned(),
+        "prepare".to_owned(),
+        "--cycle-id".to_owned(),
+        "C-001".to_owned(),
+        "--actor-id".to_owned(),
+        "coordinator".to_owned(),
+        "--final".to_owned(),
+        "--control".to_owned(),
+        ordinary.control.display().to_string(),
+    ]);
+    assert!(
+        ordinary_output.status.success(),
+        "an ordinary final integration must still succeed in text mode (exit {:?}): {}",
+        ordinary_output.status.code(),
+        String::from_utf8_lossy(&ordinary_output.stderr)
+    );
+    let ordinary_stdout = String::from_utf8_lossy(&ordinary_output.stdout).into_owned();
+    assert!(
+        !ordinary_stdout.contains("delivers no cards"),
+        "an ordinary final integration's text-mode output must not carry the empty-marker \
+         phrase, or the assertion above could pass by matching text that is always present \
+         regardless of whether anything was actually abandoned: {ordinary_stdout}"
+    );
+}
+
 #[test]
 fn dependencies_are_merged_before_their_dependents() {
     let workspace = Workspace::initialized();

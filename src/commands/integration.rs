@@ -1176,6 +1176,20 @@ fn final_cycle_binding(
     Ok((true, Some(Digest::of_canonical(cycle)?), abandoned_card_ids))
 }
 
+/// Recovery guidance for `integration prepare --final` when a sealed cycle
+/// never had a card, distinct from every other empty-selection outcome.
+///
+/// `final_cycle_binding`'s own loop over `cycle.card_ids` requires each
+/// member to end up either abandoned or selected — anything else refuses
+/// earlier with `PolicyFinalCycleIncomplete`. So when that loop finishes
+/// with `abandoned_card_ids` still empty, the only way `cycle.card_ids`
+/// could also be non-empty is contradicted; it must have been empty from
+/// the start. `PreconditionNotFound`'s shared-table default ("Create the
+/// named record, or correct the identifier") reads as though the cycle
+/// identifier were wrong, and it is not — this is a real, sealed cycle that
+/// simply never had a card declared into it. #178.
+const FINAL_EMPTY_SEAL_RECOVERY: &str = "This cycle was sealed with no cards, so there is nothing to integrate and nothing was abandoned — `--final`'s allowance for an all-abandoned cycle does not apply here. A sealed cycle cannot return to `active` to accept cards. If it was sealed by mistake, run `cycle abandon` with `--cycle-id` and `--reason` to close it out, then start the intended work in a new cycle with `cycle create`.";
+
 /// Validates a selection and derives its plan, changing nothing.
 fn build_plan(
     control: &ControlRepository,
@@ -1205,7 +1219,27 @@ fn build_plan(
     let selected = select(&assessed, requested)?;
     let (final_for_cycle, sealed_cycle_digest, abandoned_card_ids) =
         final_cycle_binding(cycle, &assessed, &selected, args.final_for_cycle)?;
-    if selected.is_empty() && !args.final_for_cycle {
+    // An empty selection is refused unless `--final` can account for it by
+    // abandonment. `abandoned_card_ids` is non-empty here if and only if the
+    // sealed cycle held cards and every one of them was abandoned — see
+    // `final_cycle_binding`'s own loop, which requires each of
+    // `cycle.card_ids` to be classified abandoned or selected before it
+    // returns successfully. A sealed cycle that never had a card reaches
+    // this same `selected.is_empty()` with `abandoned_card_ids` empty too:
+    // there was nothing to select and nothing to abandon, so the exemption
+    // does not apply and `--final` is refused the same as an ordinary
+    // empty selection, with guidance specific to the sealed-and-empty case.
+    if selected.is_empty() && abandoned_card_ids.is_empty() {
+        if args.final_for_cycle {
+            return Err(HarnessError::ControlWithRecovery {
+                reason: format!(
+                    "cycle {} was sealed with no cards: `--final` has nothing to integrate and nothing was abandoned",
+                    cycle.cycle_id
+                ),
+                code: ErrorCode::PreconditionNotFound,
+                recovery: FINAL_EMPTY_SEAL_RECOVERY,
+            });
+        }
         return Err(HarnessError::Control {
             reason: format!("cycle {} has no cards ready to integrate", cycle.cycle_id),
             code: ErrorCode::PreconditionNotFound,
@@ -1326,15 +1360,42 @@ fn report_integration(
         .iter()
         .map(|member| format!("{} at {}", member.card_id, &member.candidate_sha))
         .collect();
-    let mut text = format!(
-        "Integration {} ({})\ncycle: {}\nmode: {}\nexpected authority baseline: {}\nmerge order:\n  {}",
-        record.integration_id,
-        record.status.name(),
-        record.cycle_id,
-        record.mode.name(),
-        record.expected_main_sha,
-        order.join("\n  ")
-    );
+    // A final integration whose sealed cycle held cards but saw every one of
+    // them abandoned (see `final_cycle_binding`) is a real, deliberate
+    // record: an integration with zero members. Reusing the ordinary "merge
+    // order:" heading over an empty list would render a blank line under
+    // it — reading as a truncated report, not the surprising thing this
+    // actually is (§8, #178). `delivers_no_cards` names it explicitly, both
+    // here in the human text and in the JSON payload below, rather than
+    // leaving a reader to notice `members` is empty and infer why.
+    let delivers_no_cards = record.final_for_cycle && record.members.is_empty();
+    let mut text = if delivers_no_cards {
+        format!(
+            "Integration {} ({}) delivers no cards: every member of sealed cycle {} was abandoned\ncycle: {}\nmode: {}\nexpected authority baseline: {}\nabandoned: {}",
+            record.integration_id,
+            record.status.name(),
+            record.cycle_id,
+            record.cycle_id,
+            record.mode.name(),
+            record.expected_main_sha,
+            record
+                .abandoned_card_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    } else {
+        format!(
+            "Integration {} ({})\ncycle: {}\nmode: {}\nexpected authority baseline: {}\nmerge order:\n  {}",
+            record.integration_id,
+            record.status.name(),
+            record.cycle_id,
+            record.mode.name(),
+            record.expected_main_sha,
+            order.join("\n  ")
+        )
+    };
     if let Some(head) = &record.integration_head {
         let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nintegration head: {head}"));
     }
@@ -1367,6 +1428,7 @@ fn report_integration(
             "status": record.status.name(),
             "mode": record.mode.name(),
             "final_for_cycle": record.final_for_cycle,
+            "delivers_no_cards": delivers_no_cards,
             "sealed_cycle_digest": record.sealed_cycle_digest,
             "abandoned_card_ids": record.abandoned_card_ids,
             "baseline_sha": record.baseline_sha,
