@@ -693,6 +693,44 @@ fn state_is_accepted(state: CardState) -> bool {
     )
 }
 
+/// Enforces execution-mode overlap symmetrically at every work admission.
+/// Sequential work excludes every other active card; joint starts cannot
+/// overlap any active card outside their requested atomic set.
+fn require_execution_overlap_policy(
+    control: &ControlRepository,
+    plan: &CyclePlan,
+    requested: &std::collections::BTreeSet<String>,
+    joint: bool,
+) -> Result<(), HarnessError> {
+    let requested_sequential = requested.iter().any(|card_id| {
+        plan.cards.iter().any(|planned| {
+            planned.card_id == *card_id && planned.distribution == Distribution::Sequential
+        })
+    });
+    for active in &plan.cards {
+        if requested.contains(&active.card_id) {
+            continue;
+        }
+        let active_id = active.card_id.parse()?;
+        if !matches!(
+            planned_state(control, &active_id)?,
+            CardState::Leased | CardState::Active
+        ) {
+            continue;
+        }
+        if joint || requested_sequential || active.distribution == Distribution::Sequential {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "execution plan forbids overlapping active work: {} is active while {:?} starts",
+                    active.card_id, requested
+                ),
+                code: ErrorCode::PolicyOwnershipOverlap,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Enforces dependency and distribution admission before individual work.
 ///
 /// # Errors
@@ -733,6 +771,8 @@ pub fn require_work_admission(
             code: ErrorCode::PolicyInvalidCycle,
         });
     }
+    let requested = std::collections::BTreeSet::from([card_id.to_string()]);
+    require_execution_overlap_policy(control, &plan, &requested, false)?;
     for dependency in &planned.depends_on {
         let dependency_id: crate::domain::ids::CardId = dependency.parse()?;
         if !state_is_accepted(planned_state(control, &dependency_id)?) {
@@ -755,22 +795,6 @@ pub fn require_work_admission(
                     ),
                     code: ErrorCode::PolicyInvalidTransition,
                 });
-            }
-        }
-        for other in &plan.cards {
-            if other.card_id != card_id.to_string() {
-                let other_id = other.card_id.parse()?;
-                if matches!(
-                    planned_state(control, &other_id)?,
-                    CardState::Leased | CardState::Active
-                ) {
-                    return Err(HarnessError::Control {
-                        reason: format!(
-                            "sequential plan {plan_id} forbids overlapping active work while {card_id} starts"
-                        ),
-                        code: ErrorCode::PolicyOwnershipOverlap,
-                    });
-                }
             }
         }
     }
@@ -816,6 +840,7 @@ pub fn require_joint_work_admission(
             code: ErrorCode::PolicyInvalidCycle,
         });
     }
+    require_execution_overlap_policy(control, &plan, &requested, true)?;
     for planned in planned_joint {
         for dependency in &planned.depends_on {
             let dependency_id: crate::domain::ids::CardId = dependency.parse()?;

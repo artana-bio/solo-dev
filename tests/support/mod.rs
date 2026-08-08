@@ -1076,11 +1076,27 @@ impl Workspace {
         distribution: &str,
         assignment: &str,
     ) {
+        let card_count = self.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["card_ids"]
+            .as_array()
+            .unwrap()
+            .len();
+        let distributions = vec![distribution; card_count];
+        self.bind_fixture_plan_with_distributions(plan_id, &distributions, assignment);
+    }
+
+    /// Binds a complete fixture plan with one execution class per card.
+    pub fn bind_fixture_plan_with_distributions(
+        &self,
+        plan_id: &str,
+        distributions: &[&str],
+        assignment: &str,
+    ) {
         let cycle = self.cycle_json(&["status", "--cycle-id", "C-001"]);
         let card_ids = cycle["data"]["card_ids"].as_array().unwrap();
         let cards = card_ids
             .iter()
-            .map(|id| {
+            .enumerate()
+            .map(|(index, id)| {
                 let card_id = id.as_str().unwrap();
                 let card: serde_json::Value = serde_json::from_slice(
                     &fs::read(self.control.join(format!("cards/{card_id}/r1.json"))).unwrap(),
@@ -1109,7 +1125,10 @@ impl Workspace {
                     "assignment": assignment,
                     "assignment_principal_id": "implementer-principal",
                     "assignment_session_id": "implementer-session",
-                    "distribution": distribution,
+                    "distribution": distributions
+                        .get(index)
+                        .copied()
+                        .unwrap_or("parallel"),
                     "acceptance_behaviors": card["acceptance"]["behaviors"],
                 })
             })

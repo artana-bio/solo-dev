@@ -1489,6 +1489,105 @@ fn dependency_and_distribution_admission_is_enforced_before_work_mutation() {
 }
 
 #[test]
+fn mixed_execution_modes_enforce_symmetric_overlap_without_side_effects() {
+    let start = |workspace: &Workspace, card_id: &str| {
+        workspace.work(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+    };
+    let refuse_start = |workspace: &Workspace, card_id: &str| {
+        let before = workspace.control_head();
+        let output = workspace.work_raw(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(error_code(&output), "CH-POLICY-OWNERSHIP-OVERLAP");
+        assert_eq!(workspace.control_head(), before);
+    };
+
+    let sequential_then_parallel = cycle_with(2);
+    sequential_then_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-SEQ-PAR-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    start(&sequential_then_parallel, "F-001");
+    refuse_start(&sequential_then_parallel, "F-002");
+
+    let parallel_then_sequential = cycle_with(2);
+    parallel_then_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-PAR-SEQ-001",
+        &["parallel", "sequential"],
+        "operator",
+    );
+    start(&parallel_then_sequential, "F-001");
+    refuse_start(&parallel_then_sequential, "F-002");
+
+    let parallel = cycle_with(2);
+    parallel.bind_fixture_plan("PLAN-MIXED-PAR-PAR-001", "parallel");
+    start(&parallel, "F-001");
+    start(&parallel, "F-002");
+
+    let joint_after_sequential = cycle_with(3);
+    joint_after_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-SEQ-JOINT-001",
+        &["sequential", "joint_integration", "joint_integration"],
+        "operator",
+    );
+    start(&joint_after_sequential, "F-001");
+    let before = joint_after_sequential.control_head();
+    let refused = joint_after_sequential.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-002",
+        "--card-id",
+        "F-003",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(joint_after_sequential.control_head(), before);
+
+    let joint_after_parallel = cycle_with(3);
+    joint_after_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-PAR-JOINT-001",
+        &["parallel", "joint_integration", "joint_integration"],
+        "operator",
+    );
+    start(&joint_after_parallel, "F-001");
+    let before = joint_after_parallel.control_head();
+    let refused = joint_after_parallel.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-002",
+        "--card-id",
+        "F-003",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(joint_after_parallel.control_head(), before);
+}
+
+#[test]
 fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
