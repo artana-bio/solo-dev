@@ -63,6 +63,8 @@ pub enum ProjectCommand {
     Validate(ValidateArgs),
     /// Report project and control state.
     Status(StatusArgs),
+    /// Report a typed, read-only operational snapshot.
+    Snapshot(SnapshotArgs),
     /// Report interrupted operations and how to resolve them.
     Recover(RecoverArgs),
     /// Install a convergence policy on an already-initialized project.
@@ -99,6 +101,7 @@ impl ProjectCommand {
             Self::Init(..) => "project.init",
             Self::Validate(..) => "project.validate",
             Self::Status(..) => "project.status",
+            Self::Snapshot(..) => "project.snapshot",
             Self::Recover(..) => "project.recover",
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
             Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
@@ -158,6 +161,14 @@ pub struct ValidateArgs {
 /// Arguments accepted by `project status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+}
+
+/// Arguments accepted by `project snapshot`.
+#[derive(Debug, Args)]
+pub struct SnapshotArgs {
     /// Path to the control repository.
     #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
@@ -246,6 +257,7 @@ pub fn execute(
         ProjectCommand::Init(args) => run_init(args, clock),
         ProjectCommand::Validate(args) => run_validate(args),
         ProjectCommand::Status(args) => run_status(args, clock),
+        ProjectCommand::Snapshot(args) => crate::commands::project_snapshot::run(args, clock),
         ProjectCommand::Recover(args) => run_recover(args, clock),
         ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
         ProjectCommand::SetFinalAuthorizationPolicy(args) => {
