@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 58 |
-| Plan date | 2026-08-02 |
+| Plan revision | 59 |
+| Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `card/F-026` |
-| Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 858 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects; every one is now fixed with a mutation proof or explicitly, deliberately left open with a named reason, per `docs/DEFECT-REGISTER.md`. Criterion 9 (no critical or high open defect) now reads `MET` — see Section 19.3. What remains open is criterion 2 (an honest, unresolved bound on scenario-coverage soundness, not a pass or a fail) and the acceptance owner's own signature. |
-| Next executable work package | Acceptance owner resolves Section 19.3 criterion 2 (a larger mutation-audit effort, or a named acceptance of residual risk) and signs the release record; then `WP-530` and `WP-540` |
+| Active branch | `alvaro/project-snapshot-observability` |
+| Current release stage | Hardened single-repository release |
+| Current implementation status | `WP-550` is `IN_PROGRESS`: one read-only project snapshot will provide the same authoritative operational view to the CLI and external UIs. Implementation is split into bounded commits by Luna High and each exact commit is reviewed independently by Terra High before the next chunk. |
+| Next executable work package | Complete and independently review `WP-550`, then open a draft pull request. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2743,6 +2743,58 @@ Delivered notes:
 
 | D-059 | Require a class on every generated declaration rather than defaulting one | Accepted | A default would have to be either transient — silently forbidding a file somebody committed on purpose — or per-card, silently granting a card ownership of something integration should produce. Both restore the ambiguity the classification exists to remove, and neither failure is visible at the point it is made. Requiring the class costs one line per declaration and makes the ownership decision explicit where it belongs, in the card under review. |
 
+### WP-550 — Project snapshot and operational visibility
+
+| Field | Value |
+| --- | --- |
+| Status | `IN_PROGRESS` |
+| Dependencies | `WP-510`, `WP-530` |
+| Target release | Hardened single-repository release |
+| Owner | Luna High, coordinated by Codex; independent review by Terra High |
+| Started | 2026-08-08 |
+| Branch | `alvaro/project-snapshot-observability` |
+| Worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
+
+Purpose:
+
+Provide one trustworthy, read-only operational projection for people watching
+work in the CLI and applications consuming the same data. This package does
+not add a dashboard server, a second database, or an authorization path.
+
+Deliverables:
+
+- `project snapshot` with text and JSON rendering from one typed read model;
+- stable `harness.project-snapshot/v1` data inside the existing command
+  envelope;
+- one captured control commit for authoritative records, with a clearly
+  separated ephemeral overlay for live locks, journals, and running work;
+- card and cycle state, current actor and phase, wall-clock age, last activity,
+  gate attempts/failures/timeouts/duration, review returns and repair attempts,
+  integration readiness, bottlenecks, and completion-stage counts;
+- optional structured test-case totals from declared JUnit reports, with
+  `not_reported` when structured evidence is absent;
+- `--watch` for terminal refresh without persistent state or a daemon;
+- default redaction that excludes raw logs, free-form progress text,
+  environment values, and filesystem paths from the machine-facing snapshot.
+
+Acceptance:
+
+- one snapshot is internally consistent with its reported `control_head`;
+- the command is read-only: control/candidate/authority refs, indexes,
+  worktrees, and files are unchanged after text, JSON, and watch sampling;
+- text and JSON views are produced from the same typed snapshot;
+- retries, failed tests, timeouts, elapsed wall-clock durations, silent leases,
+  review rework, and integration blockers are represented when evidence exists;
+- test-case counts are never inferred from arbitrary logs and report
+  `not_reported` without a declared structured report;
+- missing, malformed, duplicate, or cross-subject evidence fails closed or is
+  surfaced explicitly rather than silently omitted;
+- snapshot defaults contain no raw gate output, free-form checkpoint text,
+  environment values, or filesystem paths;
+- focused unit and temporary-repository regressions cover the projection, and
+  `cargo fmt --check`, `cargo test`, and strict Clippy pass from a clean branch.
+
 ### WP-600 — Workspace manifest
 
 | Field | Value |
@@ -3266,6 +3318,7 @@ Tier 1 of the register is closed.
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
 | Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
+| Operational visibility | `IN_PROGRESS` | `WP-550` tracker entry | Complete Luna/Terra implementation and review chunks |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3273,15 +3326,15 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None |
-| Active card | `F-026` — first public binary distribution |
-| Status | Implementation complete, independently re-verified outside the sandbox (native release build run and its binary executed; `install.sh` run unmodified against a hand-built fake release, including a deliberate checksum-mismatch and an unsupported-OS case), committed, and handed to gate/handoff/review |
-| Active implementation branch | `card/F-026` |
-| Active implementation worktree | `/Users/alvaro/Documents/Code/change-harness-worktrees/F-026` |
-| Active owner | Codex, landed by the acceptance owner |
-| Active blocker | None. `LICENSE` is now tracked and committed alongside the rest of this card's diff. |
-| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | `cargo fmt --check` passed; all 877 tests passed with the sandbox-only `ps` shim noted above; strict Clippy passed; `cargo build --release` produced a binary reporting `change-harness 0.1.0`; PyYAML parsed the workflow and confirmed the `v*` trigger and four targets; installer tests passed for piped success/overwrite, checksum mismatch, unsupported OS, and unsupported architecture. |
+| Active work package | `WP-550` — project snapshot and operational visibility |
+| Active card | Not allocated: the live authority is behind GitHub `main`; this PR uses ordinary Git commits with exact-SHA independent review and records the governance drift as a blocker to claiming a Harness-governed card. |
+| Status | `IN_PROGRESS` |
+| Active implementation branch | `alvaro/project-snapshot-observability` |
+| Active implementation worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
+| Active owner | Luna High, coordinated by Codex; independent review by Terra High |
+| Active blocker | Full self-hosting cannot start honestly: Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside `WP-550`; no authority ref will be moved by this package. |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
+| Acceptance evidence | Pending focused regressions, full quality gate, and exact-SHA Terra High review. |
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
