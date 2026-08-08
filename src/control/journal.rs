@@ -442,6 +442,19 @@ mod tests {
     }
 
     #[test]
+    fn discarding_a_provisional_operation_is_idempotent_and_unresolved_free() {
+        let (_temp, control) = control();
+        let journal = Journal::new(&control);
+        let record = journal.begin("work.start", None, &clock()).unwrap();
+
+        journal.discard(&record).unwrap();
+        journal.discard(&record).unwrap();
+
+        assert!(journal.unresolved().unwrap().is_empty());
+        assert!(journal.read(&record.operation_id).is_err());
+    }
+
+    #[test]
     fn a_clean_failure_does_not_block_but_a_partial_one_does() {
         let (_temp, control) = control();
         let journal = Journal::new(&control);

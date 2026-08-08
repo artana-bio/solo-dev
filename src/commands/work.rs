@@ -14,7 +14,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{CardStateRecord, load_card, require_convergence_budget, store_card_state},
-        transaction::{Steps, with_transaction},
+        transaction::{Steps, pure_recheck, with_transaction},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
@@ -596,7 +596,7 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             let (record, state) = load_card(control, &card_id)?;
             let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
             let (base, branch, path) =
-                preflight_start(control, &config, &card_id, &record, &state)?;
+                pure_recheck(preflight_start(control, &config, &card_id, &record, &state))?;
             crate::commands::cycle::require_plan_assignment(
                 control,
                 &cycle,
@@ -764,7 +764,13 @@ fn run_start_batch(
                 .map_err(HarnessError::no_persist)?;
             let mut leases = Vec::with_capacity(fresh_members.len());
             for (record, state) in fresh_members {
-                preflight_start(control, &config, &record.card_id, &record, &state)?;
+                pure_recheck(preflight_start(
+                    control,
+                    &config,
+                    &record.card_id,
+                    &record,
+                    &state,
+                ))?;
                 leases.push(allocate_member(
                     control,
                     events,
@@ -820,7 +826,13 @@ fn allocate_member(
     steps: &mut Steps<'_>,
     clock: &dyn Clock,
 ) -> Result<crate::domain::lease::LeaseRecord, HarnessError> {
-    let (base, branch, path) = preflight_start(control, config, &record.card_id, record, state)?;
+    let (base, branch, path) = pure_recheck(preflight_start(
+        control,
+        config,
+        &record.card_id,
+        record,
+        state,
+    ))?;
     let scope = GitScope::work_tree(&config.repository);
     let lease_id = next_lease_id(control)?;
     allocate_worktree(&scope, &branch, &base, &path, &record.card_id, steps)?;
@@ -1218,20 +1230,20 @@ fn resume_to_active(
             // transaction commits on is read at commit time, not assumed
             // from before it began.
             if state.state == CardState::Ready {
-                require_convergence_budget(control, &config, &record)?;
+                pure_recheck(require_convergence_budget(control, &config, &record))?;
             }
-            verify_locator(control, &lease, &config.project_id)?;
+            pure_recheck(verify_locator(control, &lease, &config.project_id))?;
             // Section 11.2 routes `ready` to `active` through `leased`, which
             // is the same path `work start` takes. Stepping through it rather
             // than widening the state machine keeps one definition of what a
             // legal transition is.
             let mut state = state;
             if state.state == CardState::Ready {
-                state.state.check_transition(CardState::Leased)?;
+                pure_recheck(state.state.check_transition(CardState::Leased))?;
                 store_card_state(control, &record, &state, CardState::Leased)?;
                 state.state = CardState::Leased;
             }
-            state.state.check_transition(CardState::Active)?;
+            pure_recheck(state.state.check_transition(CardState::Active))?;
             store_card_state(control, &record, &state, CardState::Active)?;
 
             events.append(

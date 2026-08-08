@@ -30,6 +30,21 @@ pub struct Steps<'a> {
     record: &'a mut OperationRecord,
 }
 
+/// Converts a policy or validation recheck into a non-persisting transaction
+/// abort. Call this for checks performed after [`with_transaction`] has opened
+/// its provisional journal and before the command begins a governed mutation.
+///
+/// Keeping the conversion in one helper makes the boundary explicit at every
+/// call site and preserves the original error code and message through the
+/// transaction wrapper.
+///
+/// # Errors
+///
+/// Returns the original error wrapped for provisional-journal cleanup.
+pub fn pure_recheck<T>(result: Result<T, HarnessError>) -> Result<T, HarnessError> {
+    result.map_err(HarnessError::no_persist)
+}
+
 impl Steps<'_> {
     /// Records that the operation reached a named boundary.
     ///
@@ -186,6 +201,22 @@ mod tests {
             reason: "test".to_owned(),
             code,
         }
+    }
+
+    #[test]
+    fn pure_recheck_preserves_the_original_policy_error() {
+        let original = HarnessError::Control {
+            reason: "lease became unavailable during admission recheck".to_owned(),
+            code: ErrorCode::PolicyOwnershipOverlap,
+        };
+        let mapped = pure_recheck::<()>(Err(original)).expect_err("recheck must refuse");
+        assert!(matches!(mapped, HarnessError::NoPersist(_)));
+        assert_eq!(mapped.code(), ErrorCode::PolicyOwnershipOverlap);
+        assert!(
+            mapped
+                .to_string()
+                .contains("lease became unavailable during admission recheck")
+        );
     }
 
     #[test]
