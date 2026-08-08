@@ -25,10 +25,12 @@ use crate::{
         digest::CANONICAL_ALGORITHM,
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
+        mutation::{MutationExemption, MutationReceipt},
         review::{
-            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationAuthorship,
-            MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct, ReviewRecord,
-            check_independence, check_review_conduct,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
+            MutationAuthorship, MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct,
+            ReviewRecord, ReviewerKind, ReviewerProvenance, check_independence,
+            check_review_conduct,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -145,6 +147,18 @@ pub struct ExampleArgs {}
 pub struct Verdict {
     /// Who reviewed.
     pub reviewer_actor_id: String,
+    /// Typed reviewer identity. Omission is accepted only for legacy verdicts.
+    #[serde(default)]
+    pub reviewer_kind: Option<ReviewerKind>,
+    #[serde(default)]
+    pub reviewer_provenance: Option<ReviewerProvenance>,
+    #[serde(default)]
+    pub human_attestation: Option<HumanAttestation>,
+    /// IDs of executable mutation receipts stored in control state.
+    #[serde(default)]
+    pub mutation_receipt_ids: Vec<String>,
+    #[serde(default)]
+    pub mutation_exemption: Option<MutationExemption>,
     /// The conclusion.
     pub decision: Decision,
     /// Why the work is being returned.
@@ -572,6 +586,27 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 fn example_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-example".to_owned(),
+        reviewer_kind: Some(ReviewerKind::Human),
+        reviewer_provenance: Some(ReviewerProvenance {
+            provider: Some("local".to_owned()),
+            model: None,
+            session_id: Some("review-example-session".to_owned()),
+            principal_id: Some("human-reviewer".to_owned()),
+        }),
+        human_attestation: Some(HumanAttestation {
+            evidence_id: "AT-EXAMPLE-001".to_owned(),
+            attestor_actor_id: "attestor-example".to_owned(),
+            attestor_principal_id: Some("human-attestor".to_owned()),
+            attestor_session_id: Some("attestor-session".to_owned()),
+            statement: "I independently attest that a human reviewed this candidate".to_owned(),
+            independently_created: true,
+        }),
+        mutation_receipt_ids: vec![],
+        mutation_exemption: Some(MutationExemption {
+            code: "example_fixture".to_owned(),
+            reason: "the generated example has no executable candidate to mutate".to_owned(),
+            approved_by: "example-generator".to_owned(),
+        }),
         decision: Decision::Approved,
         reason_category: None,
         findings: vec![Finding {
@@ -1125,6 +1160,11 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 handoff_id: handoff.handoff_id.clone(),
                 handoff_digest: handoff.digest()?,
                 reviewer_actor_id: verdict.reviewer_actor_id.clone(),
+                reviewer_kind: verdict.reviewer_kind,
+                reviewer_provenance: verdict.reviewer_provenance.clone(),
+                human_attestation: verdict.human_attestation.clone(),
+                mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
+                mutation_exemption: verdict.mutation_exemption.clone(),
                 feature_actor_id: handoff.actor_id.clone(),
                 decision: verdict.decision,
                 findings: verdict.findings.clone(),
@@ -1136,6 +1176,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 reviewed_at: clock.now(),
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
+            validate_mutation_receipts(control, &review)?;
             review.validate()?;
             // #28: kept separate from `validate()` rather than folded into
             // it — see `check_review_conduct`'s doc for why — but must still
@@ -1233,6 +1274,34 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             ))
         },
     )
+}
+
+fn validate_mutation_receipts(
+    control: &ControlRepository,
+    review: &ReviewRecord,
+) -> Result<(), HarnessError> {
+    for receipt_id in &review.mutation_receipt_ids {
+        let relative = MutationReceipt::relative_path(receipt_id);
+        let receipt: MutationReceipt =
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!("mutation receipt {receipt_id} is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })?;
+        receipt.validate()?;
+        if receipt.candidate_sha != review.candidate_sha
+            || !actors::same(&receipt.reviewer_actor_id, &review.reviewer_actor_id)
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation receipt {receipt_id} is not bound to this candidate and reviewer"
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Turns a committed review into the command's outcome.

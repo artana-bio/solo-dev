@@ -16,6 +16,7 @@ use crate::{
     domain::{
         clock::Clock,
         cycle::{AtomicGroup, CYCLE_SCHEMA, CycleRecord, CycleStatus, status_from_events},
+        cycle_plan::{CYCLE_PLAN_SCHEMA, CyclePlan},
         digest::Digest,
         ids::CycleId,
     },
@@ -37,6 +38,8 @@ pub enum CycleCommand {
     Seal(SealArgs),
     /// Declare a set of cards that must land together.
     DeclareGroup(DeclareGroupArgs),
+    /// Validate and persist the complete cycle distribution manifest.
+    Plan(PlanArgs),
     /// Report a cycle's derived status.
     Status(StatusArgs),
     /// List every cycle in authoritative identifier order.
@@ -64,6 +67,7 @@ impl CycleCommand {
             Self::Activate(..) => "cycle.activate",
             Self::Seal(..) => "cycle.seal",
             Self::DeclareGroup(..) => "cycle.declare-group",
+            Self::Plan(..) => "cycle.plan",
             Self::Status(..) => "cycle.status",
             Self::List(..) => "cycle.list",
             Self::Replay(..) => "cycle.replay",
@@ -147,6 +151,16 @@ pub struct DeclareGroupArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct PlanArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[arg(long)]
+    pub plan_id: String,
+    #[arg(long)]
+    pub file: PathBuf,
+}
+
 /// Arguments accepted by `cycle status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -204,6 +218,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
         CycleCommand::Activate(args) => run_activate(args, clock),
         CycleCommand::Seal(args) => run_seal(args, clock),
         CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
+        CycleCommand::Plan(args) => run_plan(args),
         CycleCommand::Status(args) => run_status(args),
         CycleCommand::List(args) => run_list(args),
         // The process entry point routes `cycle replay` through
@@ -218,6 +233,49 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
         ),
         CycleCommand::Abandon(args) => run_abandon(args, clock),
     }
+}
+
+fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let raw = fs::read_to_string(&args.file).map_err(|source| HarnessError::WorkspaceAccess {
+        path: args.file.clone(),
+        source,
+    })?;
+    let plan: CyclePlan =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::ControlWithRecovery {
+            reason: format!("cycle plan is malformed: {source}"),
+            code: ErrorCode::ConfigMalformed,
+            recovery: "Fix the cycle-plan JSON and rerun `cycle plan`; no plan was persisted.",
+        })?;
+    if plan.schema != CYCLE_PLAN_SCHEMA || plan.plan_id != args.plan_id {
+        return Err(HarnessError::Control {
+            reason: "cycle plan id or schema does not match the requested plan".to_owned(),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    plan.validate()?;
+    let relative = format!("plans/{}.json", plan.plan_id);
+    if control.path(&relative).exists() {
+        return Err(HarnessError::Control {
+            reason: format!("cycle plan {} already exists", plan.plan_id),
+            code: ErrorCode::PreconditionBranchExists,
+        });
+    }
+    control.write_atomic(
+        &relative,
+        &format!("{}\n", serde_json::to_string_pretty(&plan)?),
+    )?;
+    let expected = control.head()?;
+    control.commit(
+        expected.as_deref(),
+        &format!("cycle: persist plan {}", plan.plan_id),
+    )?;
+    Ok(CommandOutcome::new(
+        "cycle.plan",
+        format!("Persisted cycle plan {}", plan.plan_id),
+        serde_json::to_value(&plan)?,
+    )
+    .with_project(control.project()?.project_id))
 }
 
 /// How long each replay frame is shown before the next replaces it.

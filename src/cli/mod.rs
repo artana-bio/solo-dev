@@ -13,8 +13,8 @@ use crate::{
         acceptance::AcceptanceCommand, archive::ArchiveCommand, audit::AuditCommand,
         backup::BackupCommand, card::CardCommand, cycle::CycleCommand, demo::DemoArgs,
         disposition::DispositionCommand, doctor::DoctorArgs, gate::GateCommand,
-        handoff::HandoffCommand, integration::IntegrationCommand, project::ProjectCommand,
-        review::ReviewCommand, work::WorkCommand,
+        handoff::HandoffCommand, integration::IntegrationCommand, mutation::MutationCommand,
+        project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -106,6 +106,12 @@ pub enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+
+    /// Record and inspect executable mutation evidence.
+    Mutation {
+        #[command(subcommand)]
+        command: MutationCommand,
     },
 
     /// Record the decision that authorizes promotion.

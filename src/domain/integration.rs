@@ -708,11 +708,32 @@ pub struct Interaction {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InvariantCheck {
+    /// Stable proof-map entry identifier, when the cycle/card declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_entry_id: Option<String>,
     /// The invariant as the cycle stated it.
     pub invariant: String,
     /// Whether any gate could observe it. Always false for now; free-text
     /// invariants are a reviewer's judgment, not a machine's.
     pub machine_checked: bool,
+    /// Receipt ids that mechanically support this classification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_receipt_ids: Vec<String>,
+    /// Explicit claim classification; old records remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<ClaimClassification>,
+}
+
+/// Stable evidence classification used by verification and claim reports.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimClassification {
+    MechanicallyEnforced,
+    MachineChecked,
+    ReviewerAttested,
+    ExternallyObserved,
+    NotTested,
+    Failed,
 }
 
 /// The result of running every required gate against the landing commit.

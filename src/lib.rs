@@ -50,6 +50,7 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         | Command::Review { .. }
         | Command::Disposition { .. }
         | Command::Integration { .. }
+        | Command::Mutation { .. }
         | Command::Acceptance { .. }
         | Command::Archive { .. }
         | Command::Backup { .. }
@@ -73,6 +74,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Review { command } => command.path(),
         Command::Disposition { command } => command.path(),
         Command::Integration { command } => command.path(),
+        Command::Mutation { command } => command.path(),
         Command::Acceptance { command } => command.path(),
         Command::Archive { command } => command.path(),
         Command::Backup { command } => command.path(),
@@ -182,6 +184,9 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         }),
         Command::Integration { command } => dispatch(cli.output, |clock| {
             commands::integration::execute(&command, clock)
+        }),
+        Command::Mutation { command } => dispatch(cli.output, |clock| {
+            commands::mutation::execute(&command, clock)
         }),
         Command::Acceptance { command } => dispatch(cli.output, |clock| {
             commands::acceptance::execute(&command, clock)

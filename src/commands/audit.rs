@@ -47,6 +47,8 @@ pub enum AuditCommand {
     /// Verify that every control head a landing commit anchored is still an
     /// ancestor of the control record.
     Anchors(AnchorsArgs),
+    /// Emit a stable claim/evidence classification for a cycle.
+    Report(ReportArgs),
 }
 
 impl AuditCommand {
@@ -60,6 +62,7 @@ impl AuditCommand {
         match self {
             Self::Cycle(..) => "audit.cycle",
             Self::Anchors(..) => "audit.anchors",
+            Self::Report(..) => "audit.report",
         }
     }
 }
@@ -85,6 +88,15 @@ pub struct AnchorsArgs {
     /// Path to the control repository.
     #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
+}
+
+/// Arguments accepted by `audit report`.
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub cycle_id: String,
 }
 
 /// Something the record says that the objects do not bear out.
@@ -343,7 +355,56 @@ pub fn execute(command: &AuditCommand, _clock: &dyn Clock) -> Result<CommandOutc
     match command {
         AuditCommand::Cycle(args) => run_cycle(args),
         AuditCommand::Anchors(args) => run_anchors(args),
+        AuditCommand::Report(args) => run_report(args),
     }
+}
+
+fn run_report(args: &ReportArgs) -> Result<CommandOutcome, HarnessError> {
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let cycle: CycleRecord = serde_json::from_str(
+        &control.read(&CycleRecord::relative_path(&cycle_id))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("cycle {cycle_id} is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let evidence = cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
+    let classification = if evidence.discrepancies.is_empty() {
+        "reviewer_attested"
+    } else {
+        "failed"
+    };
+    let claims: Vec<serde_json::Value> = cycle
+        .release_invariants
+        .iter()
+        .enumerate()
+        .map(|(index, claim)| {
+            serde_json::json!({
+                "claim_id": format!("{cycle_id}-INV-{:03}", index + 1),
+                "claim": claim,
+                "classification": classification,
+                "baseline_sha": cycle.baseline_sha,
+                "receipt_ids": [],
+                "policy": "cycle-seal-and-review-policy",
+                "missing_evidence": if classification == "failed" { serde_json::json!(evidence.discrepancies) } else { serde_json::json!([]) },
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "schema": "harness.claim-report/v1",
+        "cycle_id": cycle_id.to_string(),
+        "claims": claims,
+        "discrepancies": evidence.discrepancies,
+        "classification_vocabulary": ["mechanically_enforced", "machine_checked", "reviewer_attested", "externally_observed", "not_tested", "failed"],
+    });
+    Ok(CommandOutcome::new(
+        "audit.report",
+        serde_json::to_string_pretty(&report)?,
+        report,
+    )
+    .with_project(config.project_id))
 }
 
 /// Checks that a commit named by the record still exists.

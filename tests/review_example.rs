@@ -15,9 +15,10 @@ use std::{collections::BTreeSet, fs};
 
 use change_harness::{
     commands::review::Verdict,
+    domain::mutation::MutationExemption,
     domain::review::{
-        Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationAuthorship,
-        MutationEvidence, ReviewConduct,
+        Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
+        MutationAuthorship, MutationEvidence, ReviewConduct, ReviewerKind, ReviewerProvenance,
     },
 };
 use support::Workspace;
@@ -98,6 +99,27 @@ fn captured_example() -> String {
 fn reference_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-reference".to_owned(),
+        reviewer_kind: Some(ReviewerKind::Human),
+        reviewer_provenance: Some(ReviewerProvenance {
+            provider: Some("local".to_owned()),
+            model: None,
+            session_id: Some("review-session".to_owned()),
+            principal_id: Some("human".to_owned()),
+        }),
+        human_attestation: Some(HumanAttestation {
+            evidence_id: "AT-001".to_owned(),
+            attestor_actor_id: "attestor".to_owned(),
+            attestor_principal_id: None,
+            attestor_session_id: None,
+            statement: "independent human attestation".to_owned(),
+            independently_created: true,
+        }),
+        mutation_receipt_ids: vec![],
+        mutation_exemption: Some(MutationExemption {
+            code: "reference_fixture".to_owned(),
+            reason: "reference verdict has no executable candidate".to_owned(),
+            approved_by: "reference".to_owned(),
+        }),
         decision: Decision::Approved,
         reason_category: None,
         findings: vec![Finding {

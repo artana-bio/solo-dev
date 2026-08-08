@@ -42,9 +42,9 @@ use crate::{
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, IntegrationId},
         integration::{
-            INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember, IntegrationMode,
-            IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck, VERIFICATION_SCHEMA,
-            VerificationRecord, interactions, topological_order,
+            ClaimClassification, INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember,
+            IntegrationMode, IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck,
+            VERIFICATION_SCHEMA, VerificationRecord, interactions, topological_order,
         },
         review::ReviewRecord,
     },
@@ -3273,8 +3273,11 @@ fn store_verification(
             .release_invariants
             .iter()
             .map(|invariant| InvariantCheck {
+                proof_entry_id: None,
                 invariant: invariant.clone(),
                 machine_checked: false,
+                observed_receipt_ids: vec![],
+                classification: Some(ClaimClassification::ReviewerAttested),
             })
             .collect(),
         interactions: member_interactions(control, record)?,

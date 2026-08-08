@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 58 |
+| Plan revision | 59 |
 | Plan date | 2026-08-02 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 858 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects; every one is now fixed with a mutation proof or explicitly, deliberately left open with a named reason, per `docs/DEFECT-REGISTER.md`. Criterion 9 (no critical or high open defect) now reads `MET` — see Section 19.3. What remains open is criterion 2 (an honest, unresolved bound on scenario-coverage soundness, not a pass or a fail) and the acceptance owner's own signature. |
-| Next executable work package | Acceptance owner resolves Section 19.3 criterion 2 (a larger mutation-audit effort, or a named acceptance of residual risk) and signs the release record; then `WP-530` and `WP-540` |
+| Current implementation status | Existing MVP/hardening packages remain complete. Governance extension `WP-600` is **IN_PROGRESS**: typed reviewer identity/attestation, executable mutation receipt contracts, proof/oracle binding fields, cycle-plan validation, and `audit report` are implemented and focused-tested. End-to-end receipt persistence, assurance probe execution, full card-plan CLI distribution, and final-authorization default migration remain explicit follow-up work; they are not claimed complete. |
+| Next executable work package | Complete `WP-600` persistence/CLI slices and independently review them before resolving the older Section 19.3 release record. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -3500,3 +3500,51 @@ When the plan changes:
 2. record the reason in the decision register;
 3. update dependencies, acceptance, status, and release gates together;
 4. do not silently reinterpret an existing work package.
+
+## 26. Governance extension WP-600
+
+| Field | Value |
+| --- | --- |
+| Status | `IN_PROGRESS` |
+| Scope | P0/P1 evidence-governance contract hardening from the experiment review |
+| Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
+| Focused evidence | `cargo test domain::review:: --quiet`; `cargo test domain::mutation::tests --quiet`; `cargo test domain::cycle_plan::tests --quiet`; `cargo fmt --check` |
+
+Delivered in this slice:
+
+- `ReviewerKind`, reviewer provenance, and independently-created human
+  attestation are additive typed review fields. Legacy `human_reviewer` records
+  remain readable as a migration bridge; new typed human declarations require
+  attestation and reject self-attestation.
+- `MutationReceipt` is a structured executable-evidence contract bound to card
+  revision, candidate SHA, reviewer/session, mutation and patch digests,
+  command/oracle, expected and observed failure, and restoration proof.
+- Proof entries can carry stable IDs and explicit gate/oracle bindings;
+  `validate_strict` refuses unbound entries. Verification invariant records can
+  carry receipt IDs and an explicit claim classification without rewriting old
+  records.
+- `CyclePlan` validates complete-card planning facts, assignments, evidence
+  plans, acceptance coverage, missing/circular dependencies, and parallel scope
+  overlap. Natural-language decomposition remains outside the domain model.
+- `audit report` emits `harness.claim-report/v1` classifications and preserves
+  discrepancies instead of dropping unsupported claims.
+
+Known incomplete requirements, deliberately recorded rather than implied:
+
+- The mutation receipt has a domain contract and review binding field, but this
+  slice does not yet add the control-repository `mutation receipt create`
+  lifecycle or mechanically resolve receipt IDs during approval.
+- Assurance probes for denied network, stale SHA, out-of-scope writes,
+  same-session review, and missing attestation are not yet wired as a dedicated
+  disposable probe command. Existing negative tests remain separate evidence.
+- Cycle plans are validated as a domain representation but are not yet stored
+  and distributed by a `cycle plan` command.
+- Final authorization remains explicit-policy-first for compatibility. The
+  default sealed-cycle path refuses an absent policy; a versioned migration to
+  an installed default policy still needs a dedicated compatibility test before
+  changing old-project behavior.
+
+These gaps block `WP-600` completion and any claim that all P0/P1 outcomes are
+implemented. The next slice must add focused regression tests first for each
+missing lifecycle boundary, then update this section with exact receipts and an
+independent review result.

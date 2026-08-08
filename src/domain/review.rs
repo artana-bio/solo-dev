@@ -46,6 +46,38 @@ pub const REVIEW_SCHEMA: &str = "harness.review/v1";
 /// Directory holding reviews, relative to the control repository.
 pub const REVIEW_DIR: &str = "reviews";
 
+/// The declared kind of actor that authored a review.  This is deliberately
+/// a declaration, not an identity proof; the harness can require the shape
+/// without pretending a local process has proven who is behind it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerKind {
+    Agent,
+    Human,
+}
+
+/// Optional provenance for a reviewer declaration.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerProvenance {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session_id: Option<String>,
+    pub principal_id: Option<String>,
+}
+
+/// Independently created evidence for a human-required review.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAttestation {
+    pub evidence_id: String,
+    pub attestor_actor_id: String,
+    pub attestor_principal_id: Option<String>,
+    pub attestor_session_id: Option<String>,
+    pub statement: String,
+    pub independently_created: bool,
+}
+
 /// What a reviewer concluded.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -462,6 +494,19 @@ pub struct ReviewRecord {
     pub handoff_digest: Digest,
     /// Who reviewed. Declared, not proven; see D-013 and R-012.
     pub reviewer_actor_id: String,
+    /// Typed actor kind. `None` is the compatibility representation for
+    /// records written before the typed contract shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_kind: Option<ReviewerKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_provenance: Option<ReviewerProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_attestation: Option<HumanAttestation>,
+    /// First-class executable mutation receipts supporting this review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation_receipt_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_exemption: Option<crate::domain::mutation::MutationExemption>,
     /// Who produced the candidate.
     pub feature_actor_id: String,
     /// The conclusion.
@@ -611,6 +656,12 @@ impl ReviewRecord {
     pub fn validate(&self) -> Result<(), HarnessError> {
         check_independence(&self.reviewer_actor_id, &self.feature_actor_id)?;
 
+        validate_reviewer_identity(
+            &self.reviewer_actor_id,
+            self.reviewer_kind,
+            self.human_attestation.as_ref(),
+        )?;
+
         if self.decision == Decision::Approved && !self.open_findings().is_empty() {
             let open: Vec<&str> = self
                 .open_findings()
@@ -670,6 +721,28 @@ impl ReviewRecord {
         // preview rather than living only here.
         self.gate_adequacy.validate_mutation_evidence()?;
 
+        if self.decision == Decision::Approved
+            && self.reviewer_kind.is_some()
+            && self.mutation_receipt_ids.is_empty()
+            && self.mutation_exemption.is_none()
+        {
+            return Err(HarnessError::Control {
+                reason: "an approval using the typed reviewer contract must reference an executable mutation receipt or a policy-valid typed exemption".to_owned(),
+                code: ErrorCode::PolicyIncompleteReview,
+            });
+        }
+
+        if let Some(exemption) = &self.mutation_exemption
+            && (exemption.code.trim().is_empty()
+                || exemption.reason.trim().is_empty()
+                || exemption.approved_by.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason: "mutation exemption must name a code, reason, and approver".to_owned(),
+                code: ErrorCode::PolicyIncompleteReview,
+            });
+        }
+
         Ok(())
     }
 
@@ -697,6 +770,7 @@ impl ReviewRecord {
         if self.decision != Decision::Approved
             || !risk.requires_human_review()
             || self.human_reviewer
+            || self.reviewer_kind == Some(ReviewerKind::Human)
         {
             return Ok(());
         }
@@ -829,6 +903,62 @@ impl ReviewRecord {
         }
 
         Ok(())
+    }
+}
+
+/// Validates the new typed reviewer contract while preserving old records.
+/// New `human` declarations require an independently created attestation;
+/// the legacy boolean remains readable only as a migration bridge.
+///
+/// # Errors
+///
+/// Returns a policy error when the typed declaration contradicts attestation
+/// evidence or the reviewer self-creates that evidence.
+pub fn validate_reviewer_identity(
+    reviewer_actor_id: &str,
+    kind: Option<ReviewerKind>,
+    attestation: Option<&HumanAttestation>,
+) -> Result<(), HarnessError> {
+    match kind {
+        Some(ReviewerKind::Agent) => {
+            if attestation.is_some() {
+                Err(HarnessError::Control {
+                    reason: "an agent-authored verdict cannot carry human-attestation evidence"
+                        .to_owned(),
+                    code: ErrorCode::PolicyRiskReview,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Some(ReviewerKind::Human) => {
+            let evidence = attestation.ok_or_else(|| HarnessError::Control {
+                reason:
+                    "a human reviewer requires independently created human-attestation evidence"
+                        .to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            })?;
+            if evidence.evidence_id.trim().is_empty()
+                || evidence.statement.trim().is_empty()
+                || !evidence.independently_created
+            {
+                return Err(HarnessError::Control {
+                    reason:
+                        "human-attestation evidence must be independently created and non-empty"
+                            .to_owned(),
+                    code: ErrorCode::PolicyRiskReview,
+                });
+            }
+            if actors::same(reviewer_actor_id, &evidence.attestor_actor_id) {
+                return Err(HarnessError::Control {
+                    reason: "the reviewer cannot self-create the human-attestation evidence"
+                        .to_owned(),
+                    code: ErrorCode::PolicyRiskReview,
+                });
+            }
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
@@ -1010,6 +1140,11 @@ mod tests {
             handoff_id: "F-001-r1-aaaaaaaaaaaa".to_owned(),
             handoff_digest: Digest::of_bytes(b"handoff"),
             reviewer_actor_id: "reviewer-session-a".to_owned(),
+            reviewer_kind: None,
+            reviewer_provenance: None,
+            human_attestation: None,
+            mutation_receipt_ids: vec![],
+            mutation_exemption: None,
             feature_actor_id: "implementer-session-1".to_owned(),
             decision,
             findings,

@@ -626,6 +626,8 @@ fn example_definition() -> GateDefinition {
     GateDefinition {
         schema: GATE_SCHEMA.to_owned(),
         gate_id: "gate.example".to_owned(),
+        purpose: Some("example validation".to_owned()),
+        semantics: Some("exit zero means the example contract holds".to_owned()),
         revision: 1,
         argv: vec!["true".to_owned()],
         working_directory: ".".to_owned(),

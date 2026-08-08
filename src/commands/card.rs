@@ -357,10 +357,12 @@ fn example_card_draft() -> CardDraft {
         proof_map: Some(ProofMap {
             schema: PROOF_MAP_SCHEMA.to_owned(),
             entries: vec![ProofMapEntry {
+                id: Some("proof-1".to_owned()),
                 invariant: "The declared behavior stays true.".to_owned(),
                 precondition: "A focused fixture exercises exactly this behavior.".to_owned(),
                 assertion: "The check observes the behavior directly.".to_owned(),
                 mutation: "A discriminating change that must make the assertion fail.".to_owned(),
+                gate_oracle: Some("gate.example".to_owned()),
             }],
             claim_boundary: "Only the behavior named above; nothing wider is claimed.".to_owned(),
         }),

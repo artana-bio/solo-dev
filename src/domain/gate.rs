@@ -120,6 +120,12 @@ pub struct GateDefinition {
     pub schema: String,
     /// Names the gate. Cards reference this, never a command.
     pub gate_id: String,
+    /// Why this gate exists in the lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// What the gate semantically establishes; distinct from its command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<String>,
     /// Starts at 1 and increases by exactly one.
     pub revision: u32,
     /// The executable and its arguments. Never a shell string.
@@ -285,6 +291,8 @@ mod tests {
         GateDefinition {
             schema: GATE_SCHEMA.to_owned(),
             gate_id: "gate.unit".to_owned(),
+            purpose: Some("focused regression".to_owned()),
+            semantics: Some("must fail on the declared mutation".to_owned()),
             revision: 1,
             argv: vec!["cargo".to_owned(), "test".to_owned()],
             working_directory: ".".to_owned(),
