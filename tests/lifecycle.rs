@@ -453,7 +453,18 @@ fn stateful_dry_runs_do_not_change_state() {
     let reviewing = Workspace::initialized();
     prepare_handoff(&reviewing, "F-001", "src/F-001/a.rs");
     assert_dry_run_unchanged(&reviewing, "review begin", || {
-        reviewing.review_raw(&["begin", "--card-id", "F-001", "--dry-run"])
+        reviewing.review_raw(&[
+            "begin",
+            "--card-id",
+            "F-001",
+            "--actor",
+            "reviewer",
+            "--actor-principal-id",
+            "reviewer-principal",
+            "--actor-session-id",
+            "reviewer-session",
+            "--dry-run",
+        ])
     });
     reviewing.review(&["begin", "--card-id", "F-001"]);
 

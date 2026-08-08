@@ -222,7 +222,7 @@ change-harness handoff create --card-id F-001 --declaration decl.yaml --actor im
 ## 8. Review — a different actor
 
 ```bash
-change-harness review begin --card-id F-001 --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 change-harness review example > verdict.yaml
 ```
 
@@ -244,7 +244,7 @@ gate_adequacy:
 ```
 
 ```bash
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
 `--actor` must match `reviewer_actor_id`, and it must differ from the implementer.

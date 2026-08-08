@@ -83,6 +83,12 @@ pub struct CommonArgs {
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
     pub actor: String,
+    /// Declared reviewer principal; not host-attested.
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    /// Declared reviewer session; not host-attested.
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
 }
 
 /// Arguments accepted by `review begin`.
@@ -428,8 +434,28 @@ pub fn dependency_standings(
     Ok(standings)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
+
+    let validate_identity = |handoff: &crate::domain::handoff::HandoffRecord| {
+        check_independence(&args.common.actor, &handoff.actor_id)?;
+        let reviewer_provenance = (args.common.actor_principal_id.is_some()
+            || args.common.actor_session_id.is_some())
+        .then(|| ReviewerProvenance {
+            provider: None,
+            model: None,
+            session_id: args.common.actor_session_id.clone(),
+            principal_id: args.common.actor_principal_id.clone(),
+        });
+        refuse_shared_reviewer_boundary(
+            &args.common.actor,
+            reviewer_provenance.as_ref(),
+            &handoff.actor_id,
+            handoff.actor_principal_id.as_deref(),
+            handoff.actor_session_id.as_deref(),
+        )
+    };
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
@@ -437,10 +463,11 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         let (record, state) = load_card(&control, &card_id)?;
         let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
         crate::commands::cycle::require_active_plan(&control, &cycle)?;
-        latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+        let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
             reason: format!("card {card_id} has no handoff to review"),
             code: ErrorCode::PreconditionNotFound,
         })?;
+        validate_identity(&handoff)?;
         // The dry run must ask this too: a preview that skips a check the
         // real command enforces is worse than no preview, per
         // `preview_record`'s "Tier 3 defect 24" note.
@@ -451,6 +478,15 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             format!("Dry run: would open review for card {card_id}; nothing was changed"),
             serde_json::json!({ "dry_run": true, "card_id": card_id.to_string() }),
         ));
+    }
+
+    {
+        let control = ControlRepository::open(&args.common.control)?;
+        let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no handoff to review"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+        validate_identity(&handoff)?;
     }
 
     with_transaction(
@@ -471,6 +507,7 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
+            steps.recheck(validate_identity(&handoff))?;
             state.state.check_transition(CardState::ReviewPending)?;
             if handoff.status == HandoffStatus::Revoked {
                 return Err(HarnessError::Control {

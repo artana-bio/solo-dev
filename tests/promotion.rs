@@ -708,37 +708,10 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
         "--actor",
         AUTHOR,
     ]);
-    workspace.review(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
-
-    // The double-s spelling is the same name to a reader and was a different
-    // actor to the previous comparison. It never gets the chance to be either.
-    let verdict = workspace.root.join("verdict.yaml");
-    fs::write(
-        &verdict,
-        "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
-    )
-    .unwrap();
-    // #120: `--actor` must agree with the verdict's `reviewer_actor_id`, or
-    // `require_actor_agreement` refuses before this test's own check ever
-    // runs. `STRASSE` is plain ASCII, so it must be named here too — the
-    // point under test is the *handoff* actor `STRAẞE`'s non-ASCII capital
-    // sharp S, which only `check_independence` (downstream of the agreement
-    // check) refuses.
-    let recorded = workspace.review_raw(&[
-        "record",
-        "--card-id",
-        "F-001",
-        "--verdict",
-        &verdict.display().to_string(),
-        "--actor",
-        "STRASSE",
-    ]);
-    assert_eq!(recorded.status.code(), Some(5));
-    assert_eq!(error_code(&recorded), "CH-POLICY-INCOMPLETE-REVIEW");
-    assert!(
-        String::from_utf8_lossy(&recorded.stdout).contains("ASCII"),
-        "the refusal must say why, or the author cannot act on it"
-    );
+    let begun = workspace.review_raw(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
+    assert_eq!(begun.status.code(), Some(5));
+    assert_eq!(error_code(&begun), "CH-POLICY-INCOMPLETE-REVIEW");
+    assert!(String::from_utf8_lossy(&begun.stdout).contains("ASCII"));
 }
 
 #[test]

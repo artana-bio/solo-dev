@@ -112,6 +112,99 @@ fn review_contract_verdict(case: &str) -> String {
     }
 }
 
+fn review_begin_identity_fixture() -> Workspace {
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let worktree = workspace.worktrees.join("F-001");
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace
+}
+
+fn control_snapshot(workspace: &Workspace) -> (String, usize) {
+    let head = support::capture(&workspace.control, &["rev-parse", "HEAD"]);
+    let journals = workspace.control.join("journal");
+    let count = fs::read_dir(journals).map_or(0, std::iter::Iterator::count);
+    (head, count)
+}
+
+#[test]
+fn review_begin_identity_refusal_has_dry_run_parity_and_no_side_effects() {
+    for (actor, principal, session, expected) in [
+        (
+            "operator",
+            "implementer-principal",
+            "implementer-session",
+            "CH-POLICY-SELF-REVIEW",
+        ),
+        (
+            "reviewer",
+            "reviewer-principal",
+            "implementer-session",
+            "CH-POLICY-SAME-ACTOR",
+        ),
+    ] {
+        let workspace = review_begin_identity_fixture();
+        let args = [
+            "begin",
+            "--card-id",
+            "F-001",
+            "--actor",
+            actor,
+            "--actor-principal-id",
+            principal,
+            "--actor-session-id",
+            session,
+        ];
+        let before = control_snapshot(&workspace);
+        let real = workspace.review_raw(&args);
+        let after_real = control_snapshot(&workspace);
+        let dry_args = [
+            "begin",
+            "--card-id",
+            "F-001",
+            "--actor",
+            actor,
+            "--actor-principal-id",
+            principal,
+            "--actor-session-id",
+            session,
+            "--dry-run",
+        ];
+        let dry = workspace.review_raw(&dry_args);
+        let after_dry = control_snapshot(&workspace);
+        assert!(!real.status.success());
+        assert!(!dry.status.success());
+        assert_eq!(code(&real), expected);
+        assert_eq!(code(&dry), expected);
+        assert_eq!(before, after_real, "real refusal must be side-effect free");
+        assert_eq!(
+            after_real, after_dry,
+            "dry-run refusal must be side-effect free"
+        );
+    }
+}
+
 #[test]
 fn work_start_previews_a_held_lease_refusal() {
     let workspace = active_cycle();

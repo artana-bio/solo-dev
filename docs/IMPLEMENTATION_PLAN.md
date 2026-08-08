@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 72 |
+| Plan revision | 74 |
 | Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Governance extension `WP-600` is **DONE**; focused admission/migration tests, mutation evidence, the normalized full suite, formatting, clippy, and diff checks all pass. |
-| Next executable work package | Independent review and promotion of this candidate. |
+| Current implementation status | Governance extension `WP-600` is **IN_PROGRESS**; focused transactional-plan, executable-probe, evidence-report, identity, and migration-contract gates pass on this candidate. Definitive final gates remain pending. |
+| Next executable work package | Complete final validation and independent review of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -876,7 +876,7 @@ change-harness handoff create
 change-harness handoff inspect
 change-harness handoff revoke
 
-change-harness review begin
+change-harness review begin --actor reviewer --actor-principal-id reviewer --actor-session-id review-session
 change-harness review record
 change-harness review inspect
 
@@ -3505,10 +3505,10 @@ When the plan changes:
 
 | Field | Value |
 | --- | --- |
-| Status | `DONE` |
+| Status | `IN_PROGRESS` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | Prior P0 evidence remains valid. This repair adds pre-journal plan admission for work/review, dependency and sequential/parallel/joint execution enforcement, atomic `work start-batch`, creation-time `plan_required_v1` provenance, and event-backed one-time legacy eligibility. Focused admission, dependency-binding, lifecycle, recovery, quickstart, skill-guide, promotion, and worktree-allocation regressions pass. The symmetric execution-overlap guard was mutated to `if false`; the mixed-mode matrix failed, and the exact guard was restored. The mixed-mode matrix covers sequential→parallel refusal, parallel→sequential refusal, parallel concurrency, joint conflicts, and unchanged control state on refusal. Resume dry-run and record now share the same pre-journal admission check; typed `NoPersist` transaction aborts discard provisional journals for TOCTOU policy refusals while preserving journals for real mutations and interruptions. The resume parity/zero-side-effect matrix passed, its preflight guard was mutated and the owning regression failed, and the guard was restored. A phase-aware `pure_recheck` adapter now covers post-journal start, joint allocation, resume, and renewal rechecks; once a durable effect begins, later policy errors remain journaled. The first-member-effect/later-member-refusal regression passed, the phase guard mutation failed its owning phase/transaction test, and the guard was restored. `mutation_started` is persisted in the operation journal; resume control writes are marked before the next recheck, and terminal classification forces `FailedPartial` unless rollback is explicitly proven. The post-control-write refusal regression passed. Batch start now preflights every member before opening its transaction and retains the phase-aware recheck before each actual allocation. A pre-existing F-002 worktree collision is rejected before the transaction, leaving F-001 inactive and the journal count unchanged. A deterministic post-checkout hook creates F-002 only while F-001 is being allocated; the immediate F-002 recheck then returns the original `CH-PRECONDITION-WORKTREE-EXISTS` path error after F-001 has taken effect, retaining exactly one unresolved `FailedPartial` `work.start-batch` journal with `mutation_started` and `project recover` reporting `recovery_required`. The phase guard mutation failed its owning phase/transaction test and was exactly restored. Journal discard is idempotent and removes provisional entries. Normalized sequential `cargo test --all --quiet` exited 0; `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
+| Focused evidence | Prior P0 evidence remains valid. This repair adds transactional cycle-plan persistence with captured-head CAS, held-lock refusal, fresh locked revalidation, pinned-plan replacement refusal, and named failure boundaries. The static stale card/membership regression and the injected post-preflight card-revision disappearance regression pass with unchanged control HEAD, status, card bytes, bindings, and journal set. Removing the locked `Steps::recheck` made the owning TOCTOU regression fail on a retained provisional journal; the exact guard was restored. The post-checkout late-member collision regression retains the original refusal and `FailedPartial` recovery journal after the first allocation, while pre-existing collision preflight has no effect or journal. The executable probe file reaches all six target oracles with exact observed codes; denied network remains explicitly `not_tested` and unenforced. The report corruption matrix covers foreign/failed/stale receipts, landing SHA/tree, proof ID/oracle, and policy digest drift; invalid evidence cannot remain `machine_checked`, and a mutation removing the failed-classification branch made the case-specific matrix fail before restoration. The reviewer-principal/session syntax inventory found and repaired the QUICKSTART and README guide contract examples; the first targeted migration matrix passed with `TARGET_MATRIX_EXIT=0`. The transitive plan-fixture inventory found direct publishers in integration-plan, lifecycle, worktree-allocation, quickstart, skill-guide, promotion, and recovery plus indirect `tests/support` consumers; the expanded 22-binary matrix passed with `TRANSITIVE_MATRIX_EXIT=0`. The compatibility refresh is test-only and never invokes production plan replacement; pinned-plan refusal remains production-tested. Definitive full-suite, format, clippy, and diff evidence is pending for this final tree. |
 
 Delivered in this slice:
 
@@ -3529,7 +3529,7 @@ Delivered in this slice:
 - `audit report` emits `harness.claim-report/v1` classifications and preserves
   discrepancies instead of dropping unsupported claims.
 
-Requirement audit: complete against the second Terra-high review. (1) typed reviewer kind, provenance, independent human
+Requirement audit: implementation is in progress against the current Terra review; the transactional plan and executable probe/report slices below are focused evidence, not final acceptance. (1) typed reviewer kind, provenance, independent human
 attestation, and compatibility fields are enforced in review recording; every
 new approval requires nonblank typed principal/session provenance plus
 executable mutation evidence or a typed policy-valid exemption; (2) mutation
@@ -3545,14 +3545,16 @@ session boundaries are used for review and integration separation and review
 begin fails before mutation without a handoff; (6) cycle plans are versioned,
 validated against complete cycle membership, pinned through integration, and
 revalidated at acceptance/promotion; (7)
-`audit probes` covers all named negative probes with honest synthetic/not-tested
-classification where host enforcement is unavailable, and network output
+`audit probes` now executes disposable production command paths for all six
+named negative probes with exact observed codes; only network remains
+`not_tested` because host enforcement is unavailable, and network output
 distinguishes declared from enforced; (8) `audit report` reads persisted integrations and
 verification receipts, binds claims to exact SHAs and policy digests, and
 preserves missing/contradictory evidence.
 
-Acceptance evidence: `env -u NO_COLOR TERM=xterm cargo test --quiet`,
-`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-and `git diff --check` all pass. The denied-network probe
+Acceptance evidence: focused evidence above is current; the definitive
+`env -u NO_COLOR TERM=xterm cargo test --all --quiet`, `cargo fmt --check`,
+strict clippy, and `git diff --check` gates remain to be run against the final
+unchanged tree. The denied-network probe
 is intentionally classified `not_tested` because the runner does not enforce
 host network isolation; this is an explicit limitation, not a security claim.

@@ -6,11 +6,6 @@
 
 use serde::Serialize;
 
-use crate::{
-    domain::{gate::NetworkPolicy, mutation::MutationReceipt, review::validate_reviewer_identity},
-    policy::actors,
-};
-
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeKind {
@@ -50,126 +45,18 @@ impl ProbeKind {
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct ProbeResult {
+    pub run_id: String,
+    pub probe_id: String,
     pub probe: String,
     pub oracle: String,
+    pub expected_error_code: Option<String>,
+    pub observed_error_code: Option<String>,
+    pub command_path: String,
     pub refused: bool,
     pub classification: String,
     pub network_declared: Option<String>,
     pub network_enforced: Option<bool>,
+    pub state_change_evidence: String,
+    pub cleanup_completed: bool,
     pub detail: String,
-}
-
-#[must_use]
-pub fn run(kind: ProbeKind) -> ProbeResult {
-    let (refused, oracle, detail, classification, declared, enforced) = match kind {
-        ProbeKind::OutOfScopeWrite => (
-            true,
-            "write-scope policy",
-            "a write outside the declared card scope is refused",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::StaleSha => (
-            true,
-            "exact-SHA binding",
-            "a receipt or review bound to a different SHA is refused",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::SelfReview => (
-            actors::same("implementer", "IMPLEMENTER"),
-            "actor separation",
-            "the implementer cannot review its own candidate",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::SameSessionReview => (
-            actors::ActorIdentity {
-                actor_kind: "agent",
-                actor_id: "reviewer",
-                principal_id: Some("p"),
-                session_id: Some("s"),
-            }
-            .same_boundary(&actors::ActorIdentity {
-                actor_kind: "agent",
-                actor_id: "other",
-                principal_id: Some("q"),
-                session_id: Some("s"),
-            }),
-            "principal/session separation",
-            "a reviewer in the implementer's session is refused",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::MissingMutationReceipt => (
-            MutationReceipt::missing_for_probe().is_err(),
-            "mutation receipt requirement",
-            "approval without an executable receipt or typed exemption is refused",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::MissingHumanAttestation => (
-            validate_reviewer_identity(
-                "human-reviewer",
-                Some(crate::domain::review::ReviewerKind::Human),
-                None,
-            )
-            .is_err(),
-            "human attestation requirement",
-            "a human reviewer without independent attestation is refused",
-            "synthetic",
-            None,
-            None,
-        ),
-        ProbeKind::DeniedNetwork => (
-            false,
-            "network policy",
-            "network denial is declared but not enforced by this runner",
-            "not_tested",
-            Some(NetworkPolicy::Denied.describe().to_owned()),
-            Some(NetworkPolicy::ENFORCED),
-        ),
-    };
-    ProbeResult {
-        probe: kind.name().to_owned(),
-        oracle: oracle.to_owned(),
-        refused,
-        classification: classification.to_owned(),
-        network_declared: declared,
-        network_enforced: enforced,
-        detail: detail.to_owned(),
-    }
-}
-
-pub fn run_all() -> Vec<ProbeResult> {
-    ProbeKind::ALL.into_iter().map(run).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_required_negative_probe_has_a_stable_result() {
-        let results = run_all();
-        assert_eq!(results.len(), 7);
-        assert!(
-            results
-                .iter()
-                .all(|result| result.refused || result.classification == "not_tested")
-        );
-        assert_eq!(
-            results
-                .iter()
-                .find(|r| r.probe == "denied_network")
-                .unwrap()
-                .network_enforced,
-            Some(false)
-        );
-    }
 }

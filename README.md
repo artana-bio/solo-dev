@@ -366,8 +366,8 @@ gates could actually observe the acceptance behaviors — both because spike
 reviewers needed to say things a binary verdict cannot express.
 
 ```bash
-change-harness review begin  --control $CONTROL --card-id F-001
-change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example
+change-harness review begin  --control $CONTROL --card-id F-001 --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
+change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
 ```
 
 **7. See what is waiting.** `integration ready` answers "what is approved and

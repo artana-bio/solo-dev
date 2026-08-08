@@ -333,9 +333,9 @@ changes, receipts, and handoff decisions, assumptions, and limitations — comes
 from current Harness state rather than a coordinator's summary:
 
 ```bash
-change-harness review begin --card-id F-001 --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 change-harness review example
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
 Copy and fill this prompt when creating the reviewer task:
@@ -574,8 +574,8 @@ guide's prose: the shape carries fields no sentence here names, including
 
 ```bash
 change-harness review example
-change-harness review begin --card-id F-001 --actor reviewer-b
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
 The reviewer must run at least one mutation the implementer did **not**

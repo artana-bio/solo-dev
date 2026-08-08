@@ -6,7 +6,11 @@
 
 mod support;
 
-use std::fs;
+use change_harness::{
+    control::lock::ProjectLock,
+    domain::{card::CardRecord, clock::SystemClock, ids::CardId},
+};
+use std::{fs, process::Command};
 
 use support::Workspace;
 
@@ -32,6 +36,17 @@ fn error_code(output: &std::process::Output) -> String {
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("an error envelope");
     envelope["error"]["code"].as_str().unwrap().to_owned()
+}
+
+fn journal_count(workspace: &Workspace) -> usize {
+    fs::read_dir(workspace.control.join("journal")).map_or(0, std::iter::Iterator::count)
+}
+
+fn journal_names(workspace: &Workspace) -> std::collections::BTreeSet<String> {
+    fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The card identifiers listed as ready, in report order.
@@ -1281,6 +1296,8 @@ fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
         .to_owned();
 
     let pinned = workspace.control.join("plans/PLAN-001.json");
+    let before_tampered_acceptance_head = workspace.control_head();
+    let before_tampered_acceptance_journals = journal_count(&workspace);
     let mut replacement: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&pinned).unwrap()).unwrap();
     replacement["objective"] = serde_json::json!("tampered objective");
@@ -1302,6 +1319,11 @@ fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
         String::from_utf8_lossy(&refused.stdout).contains("stale or contradictory active plan"),
         "tampered plan refusal must name the plan binding: {}",
         String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(workspace.control_head(), before_tampered_acceptance_head);
+    assert_eq!(
+        journal_count(&workspace),
+        before_tampered_acceptance_journals
     );
 }
 
@@ -1941,4 +1963,245 @@ fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
         String::from_utf8_lossy(&valid_start.stdout),
         String::from_utf8_lossy(&valid_start.stderr)
     );
+}
+
+#[test]
+fn cycle_plan_failure_boundaries_retain_partial_recovery_evidence() {
+    for boundary in [
+        "plan-written",
+        "cycle-plan-bound",
+        "card-plan-bound-F-001",
+        "plan-commit",
+    ] {
+        let workspace = Workspace::initialized();
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["src/F-001/**"]);
+        let plan = workspace.root.join(format!("{boundary}.json"));
+        fs::write(
+            &plan,
+            r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-BOUNDARY","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+            .args([
+                "cycle",
+                "plan",
+                "--control",
+                &workspace.control.display().to_string(),
+                "--plan-id",
+                "PLAN-BOUNDARY",
+                "--file",
+                &plan.display().to_string(),
+                "--output",
+                "json",
+            ])
+            .env("CHANGE_HARNESS_FAIL_AT", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "failure boundary {boundary} unexpectedly passed"
+        );
+        let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+            .collect();
+        let journal = journals
+            .iter()
+            .find(|record| record["command"] == "cycle.plan")
+            .unwrap_or_else(|| panic!("missing cycle.plan journal at {boundary}"));
+        assert_eq!(journal["mutation_started"], true, "boundary {boundary}");
+        assert_eq!(journal["state"], "failed_partial", "boundary {boundary}");
+        let status = Workspace::run(&[
+            "project".into(),
+            "status".into(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--output".into(),
+            "json".into(),
+        ]);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert!(
+            !status["data"]["unresolved_operations"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "boundary {boundary}: {status}"
+        );
+    }
+}
+
+fn simple_plan_file(workspace: &Workspace, plan_id: &str) -> std::path::PathBuf {
+    let plan = workspace.root.join(format!("{plan_id}.json"));
+    fs::write(
+        &plan,
+        format!(
+            r#"{{"schema":"harness.cycle-plan/v1","plan_id":"{plan_id}","cycle_id":"C-001","objective":"slice","cards":[{{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}}]}}"#
+        ),
+    )
+    .unwrap();
+    plan
+}
+
+fn planned_single_card() -> (Workspace, std::path::PathBuf) {
+    let workspace = cycle_with(1);
+    let plan = simple_plan_file(&workspace, "PLAN-RACE");
+    (workspace, plan)
+}
+
+#[test]
+fn cycle_plan_refuses_while_the_project_lock_is_held_without_journal_side_effects() {
+    let (workspace, plan) = planned_single_card();
+    let before_head = workspace.control_head();
+    let before_journals = journal_count(&workspace);
+    let before_journal_names = journal_names(&workspace);
+    let card_path = workspace.control.join(CardRecord::relative_path(
+        &"F-001".parse::<CardId>().unwrap(),
+        1,
+    ));
+    let before_card = fs::read(&card_path).unwrap();
+    let before_status = support::capture(&workspace.control, &["status", "--porcelain"]);
+    let lock = ProjectLock::acquire(&workspace.control, "test-held-lock", &SystemClock).unwrap();
+    let refused = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "PLAN-RACE",
+        "--file",
+        &plan.display().to_string(),
+    ]);
+    drop(lock);
+    assert_eq!(error_code(&refused), "CH-POLICY-LOCK-HELD");
+    assert_eq!(workspace.control_head(), before_head);
+    assert_eq!(journal_count(&workspace), before_journals);
+    assert_eq!(journal_names(&workspace), before_journal_names);
+    assert_eq!(fs::read(&card_path).unwrap(), before_card);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        before_status
+    );
+}
+
+#[test]
+fn cycle_plan_uses_captured_head_and_refuses_a_control_head_race() {
+    let (workspace, plan) = planned_single_card();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "cycle",
+            "plan",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--plan-id",
+            "PLAN-RACE",
+            "--file",
+            &plan.display().to_string(),
+            "--output",
+            "json",
+        ])
+        .env("CHANGE_HARNESS_PLAN_CAS_RACE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(error_code(&output), "CH-CONFLICT-CONTROL-HEAD-MOVED");
+    assert!(workspace.control.join("plans/PLAN-RACE.json").exists());
+    let competitor_tree = Command::new("git")
+        .args(["show", "HEAD:plans/PLAN-RACE.json"])
+        .current_dir(&workspace.control)
+        .output()
+        .unwrap();
+    assert!(
+        !competitor_tree.status.success(),
+        "the competing head must not contain this command's plan write"
+    );
+    let expected_tree = support::capture(&workspace.control, &["rev-parse", "HEAD^{tree}"]);
+    let parent_tree = support::capture(&workspace.control, &["rev-parse", "HEAD^1^{tree}"]);
+    assert_eq!(
+        expected_tree, parent_tree,
+        "competitor must preserve the original tree"
+    );
+    let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    let journal = journals
+        .iter()
+        .find(|record| record["command"] == "cycle.plan")
+        .unwrap();
+    assert_eq!(journal["mutation_started"], true);
+    assert_eq!(journal["state"], "failed_partial");
+}
+
+#[test]
+fn cycle_plan_revalidates_stale_card_revision_and_membership_without_side_effects() {
+    for (plan_id, card_revision, cards) in [
+        (
+            "PLAN-STALE-CARD",
+            99,
+            "[{\"card_id\":\"F-001\",\"card_revision\":99,\"scope\":[\"src/F-001/**\"],\"depends_on\":[],\"proof_entries\":[\"fixture-proof\"],\"mutation_plan\":[\"fixture mutation\"],\"risk\":\"low\",\"reviewer_requirements\":[\"independent\"],\"assignment\":\"operator\",\"assignment_principal_id\":\"implementer-principal\",\"assignment_session_id\":\"implementer-session\",\"distribution\":\"parallel\",\"acceptance_behaviors\":[\"it works\"]}]",
+        ),
+        ("PLAN-MEMBERSHIP", 1, "[]"),
+    ] {
+        let workspace = cycle_with(1);
+        let plan = workspace.root.join(format!("{plan_id}.json"));
+        fs::write(
+            &plan,
+            format!(
+                r#"{{"schema":"harness.cycle-plan/v1","plan_id":"{plan_id}","cycle_id":"C-001","objective":"slice","cards":{cards}}}"#
+            ),
+        )
+        .unwrap();
+        let before_head = workspace.control_head();
+        let before_journals = journal_count(&workspace);
+        let refused = workspace.cycle_raw(&[
+            "plan",
+            "--plan-id",
+            plan_id,
+            "--file",
+            &plan.display().to_string(),
+        ]);
+        assert!(!refused.status.success());
+        assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+        assert_eq!(workspace.control_head(), before_head);
+        assert_eq!(
+            journal_count(&workspace),
+            before_journals,
+            "journal side effect for {plan_id}"
+        );
+        let _ = card_revision;
+    }
+}
+
+#[test]
+fn cycle_plan_locked_stale_recheck_discards_its_provisional_journal() {
+    let (workspace, plan) = planned_single_card();
+    let before_head = workspace.control_head();
+    let before_journals = journal_count(&workspace);
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "cycle",
+            "plan",
+            "--output",
+            "json",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--plan-id",
+            "PLAN-RACE",
+            "--file",
+            &plan.display().to_string(),
+        ])
+        .env("CHANGE_HARNESS_PLAN_STALE_RECHECK", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), before_head);
+    assert_eq!(journal_count(&workspace), before_journals);
+    assert!(!workspace.control.join("plans/PLAN-RACE.json").exists());
 }

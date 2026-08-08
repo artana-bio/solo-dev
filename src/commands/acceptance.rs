@@ -623,6 +623,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         return preview_record(args, &integration_id, decision);
     }
 
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let record = load_integration(&control, &integration_id)?;
+        require_plan_binding(&control, &record)?;
+    }
+
     with_transaction(
         &args.control,
         "acceptance.record",
@@ -631,7 +637,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
-            require_plan_binding(control, &record)?;
+            steps.recheck(require_plan_binding(control, &record))?;
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;

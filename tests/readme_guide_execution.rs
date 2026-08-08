@@ -6,9 +6,9 @@
 //! lets `--help` short-circuit before any flag value is ever acted on, so
 //! two individually well-formed, real-shaped lines can still contradict the
 //! state the harness actually enforces once run for real. #120's own
-//! defect — `review record --actor` accepted and never read — was exactly
-//! this class: `--help` cannot see it, because `--actor` is a real, valid
-//! flag on `record` either way.
+//! defect — a documented reviewer flag was accepted but not enforced — was
+//! exactly this class: `--help` cannot see whether actor, principal, and
+//! session provenance is actually carried into the recorded review.
 //!
 //! # What this reproduces
 //!
@@ -16,8 +16,8 @@
 //! before #120's repair:
 //!
 //! ```text
-//! change-harness review begin  --control $CONTROL --card-id F-001
-//! change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml
+//! change-harness review begin  --control $CONTROL --card-id F-001 --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
+//! change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
 //! ```
 //!
 //! README never shows `verdict.yaml`'s content — like `decl.yaml`,
@@ -31,14 +31,9 @@
 //! hand-written approximation — matching `tests/review_example.rs`'s own
 //! discipline.
 //!
-//! Before #120's repair, the documented `review record` line carried no
-//! `--actor` at all. `--actor` defaults to `operator`, which disagreed with
-//! the example verdict's declared `reviewer_actor_id: reviewer-example` —
-//! refused, `CH-POLICY-INCOMPLETE-REVIEW`, for a reader who typed exactly
-//! what the document said, on a command the document claimed would work.
-//! The repair added `--actor reviewer-example`, matching `SKILL.md:368`'s
-//! form (`--verdict verdict.yaml --actor <name>`) with the one name that is
-//! actually correct here: the reviewer `review example` itself declares.
+//! The documented review commands carry the same actor, principal, and
+//! session provenance through begin and record. This is required because
+//! review identity is a typed protocol fact, not merely a display label.
 //!
 //! # `$CONTROL`
 //!
@@ -226,16 +221,15 @@ fn fixture_ready_for_review() -> Workspace {
 
 /// The documented review step — `review begin` then `review record`,
 /// exactly as `README.md` writes them today — runs for real against a live
-/// fixture, and the recorded review carries the exact attribution the
-/// documented `--actor` names.
+/// fixture, and the recorded review carries the exact actor, principal, and
+/// session attribution documented by both commands.
 ///
 /// Fails, and names exactly why, if: README's `review record` line drops
-/// `--actor` (or names one that disagrees with the verdict document's own
-/// `reviewer_actor_id`) — `require_actor_agreement` refuses, unconditionally,
-/// on the real CLI's own exit code, before this test's own assertions past
-/// that point ever run; the two lines are reordered; or `review example`'s
-/// emitted `reviewer_actor_id` ever stops being `reviewer-example`, the
-/// value README's own `--actor` now names.
+/// any provenance flag (or names one that disagrees with the verdict
+/// document's own `reviewer_actor_id`) — the real CLI refuses before this
+/// test's assertions past that point ever run; the two lines are reordered;
+/// or `review example`'s emitted actor stops being `reviewer-example`, the
+/// value README's commands name.
 #[test]
 fn documented_review_step_executes_and_records_the_documented_actor() {
     let readme = readme_md();
