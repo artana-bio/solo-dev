@@ -661,6 +661,16 @@ impl ReviewRecord {
             self.reviewer_kind,
             self.human_attestation.as_ref(),
         )?;
+        if self.reviewer_kind == Some(ReviewerKind::Human) {
+            validate_human_attestation_boundary(
+                &self.reviewer_actor_id,
+                self.reviewer_provenance.as_ref(),
+                self.human_attestation.as_ref(),
+                &self.feature_actor_id,
+                None,
+                None,
+            )?;
+        }
 
         if self.decision == Decision::Approved && !self.open_findings().is_empty() {
             let open: Vec<&str> = self
@@ -969,6 +979,64 @@ pub fn validate_reviewer_identity(
         }
         None => Ok(()),
     }
+}
+
+/// Validates the declared provenance boundary for independently-created
+/// human attestation evidence. These identifiers are caller-declared, not
+/// host-attested, but the protocol still refuses reused principal or session
+/// boundaries hidden behind different actor labels.
+///
+/// # Errors
+///
+/// Returns a policy error when attestor provenance is missing, blank, or
+/// shared with the reviewer or persisted implementer boundary.
+pub fn validate_human_attestation_boundary(
+    reviewer_actor_id: &str,
+    reviewer_provenance: Option<&ReviewerProvenance>,
+    attestation: Option<&HumanAttestation>,
+    implementer_actor_id: &str,
+    implementer_principal_id: Option<&str>,
+    implementer_session_id: Option<&str>,
+) -> Result<(), HarnessError> {
+    let evidence = attestation.ok_or_else(|| HarnessError::Control {
+        reason: "a human reviewer requires independently created human-attestation evidence"
+            .to_owned(),
+        code: ErrorCode::PolicyRiskReview,
+    })?;
+    let principal = evidence
+        .attestor_principal_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| HarnessError::Control {
+            reason: "human attestation requires a nonblank attestor principal_id".to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        })?;
+    let session = evidence
+        .attestor_session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| HarnessError::Control {
+            reason: "human attestation requires a nonblank attestor session_id".to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        })?;
+    if actors::same(reviewer_actor_id, &evidence.attestor_actor_id)
+        || reviewer_provenance
+            .and_then(|provenance| provenance.principal_id.as_deref())
+            .is_some_and(|id| actors::same(id, principal))
+        || reviewer_provenance
+            .and_then(|provenance| provenance.session_id.as_deref())
+            .is_some_and(|id| actors::same(id, session))
+        || actors::same(implementer_actor_id, &evidence.attestor_actor_id)
+        || implementer_principal_id.is_some_and(|id| actors::same(id, principal))
+        || implementer_session_id.is_some_and(|id| actors::same(id, session))
+    {
+        return Err(HarnessError::Control {
+            reason: "human attestation must come from a distinct declared actor, principal, and session boundary"
+                .to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a review whose reviewer is the feature actor.

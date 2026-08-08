@@ -3508,7 +3508,7 @@ When the plan changes:
 | Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | Terra-high repair regressions cover default sealed-cycle final authorization, exact legacy migration provenance, typed approval principal/session, blank attestors, mutation-session binding, and downstream plan tamper refusal. The 683-test library suite and all integration binaries pass sequentially; `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
+| Focused evidence | Terra-high repair regressions cover default sealed-cycle final authorization, exact legacy migration provenance, typed approval principal/session, blank and reused attestor boundaries, mutation-session binding, dry-run/record parity, and downstream plan tamper refusal. The 683-test library suite and all integration binaries pass sequentially; `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
 
 Delivered in this slice:
 

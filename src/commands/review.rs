@@ -30,7 +30,7 @@ use crate::{
             Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
             MutationAuthorship, MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct,
             ReviewRecord, ReviewerKind, ReviewerProvenance, check_independence,
-            check_review_conduct,
+            check_review_conduct, validate_human_attestation_boundary,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -881,10 +881,68 @@ fn require_review_return_reason(
 /// and `check_supersedes`, called from `run_record` beside `validate` and
 /// mirrored here not at all) is a wider change than this targeted fix, left
 /// for a card that owns that decision.
+fn build_review_record(
+    record: &crate::domain::card::CardRecord,
+    state: &crate::commands::card::CardStateRecord,
+    handoff: &crate::domain::handoff::HandoffRecord,
+    verdict: &Verdict,
+    review_id: ReviewId,
+    previous: Option<&ReviewRecord>,
+    clock: &dyn Clock,
+) -> Result<ReviewRecord, HarnessError> {
+    Ok(ReviewRecord {
+        schema: REVIEW_SCHEMA.to_owned(),
+        review_id,
+        card_id: record.card_id.clone(),
+        card_revision: state.current_revision,
+        card_digest: state.current_digest.clone(),
+        cycle_id: record.cycle_id.clone(),
+        baseline_sha: handoff.baseline_sha.clone(),
+        candidate_sha: handoff.candidate_sha.clone(),
+        dependency_bindings: handoff.dependency_bindings.clone(),
+        handoff_id: handoff.handoff_id.clone(),
+        handoff_digest: handoff.digest()?,
+        reviewer_actor_id: verdict.reviewer_actor_id.clone(),
+        reviewer_kind: verdict.reviewer_kind,
+        reviewer_provenance: verdict.reviewer_provenance.clone(),
+        human_attestation: verdict.human_attestation.clone(),
+        mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
+        mutation_exemption: verdict.mutation_exemption.clone(),
+        feature_actor_id: handoff.actor_id.clone(),
+        decision: verdict.decision,
+        findings: verdict.findings.clone(),
+        gate_adequacy: verdict.gate_adequacy.clone(),
+        residual_risks: verdict.residual_risks.clone(),
+        human_reviewer: verdict.human_reviewer,
+        review_conduct: verdict.review_conduct,
+        supersedes: previous.map(|review| review.review_id.clone()),
+        reviewed_at: clock.now(),
+        canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
+    })
+}
+
+fn validate_review_candidate(
+    control: &ControlRepository,
+    record: &crate::domain::card::CardRecord,
+    verdict: &Verdict,
+    review: &ReviewRecord,
+    previous: Option<&ReviewRecord>,
+) -> Result<(), HarnessError> {
+    review.validate()?;
+    check_review_conduct(&record.review_policy, review.review_conduct)?;
+    review.check_risk_policy(record.risk)?;
+    if let Some(superseded) = previous {
+        review.check_supersedes(superseded)?;
+    }
+    require_typed_reviewer_contract(record, verdict)?;
+    validate_mutation_receipts(control, review)
+}
+
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
     verdict: &Verdict,
+    clock: &dyn Clock,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
@@ -910,9 +968,30 @@ fn preview_record(
         handoff.actor_principal_id.as_deref(),
         handoff.actor_session_id.as_deref(),
     )?;
-    check_review_conduct(&record.review_policy, verdict.review_conduct)?;
-    verdict.gate_adequacy.validate_mutation_evidence()?;
-    require_typed_reviewer_contract(&record, verdict)?;
+    if verdict.reviewer_kind == Some(ReviewerKind::Human) {
+        validate_human_attestation_boundary(
+            &verdict.reviewer_actor_id,
+            verdict.reviewer_provenance.as_ref(),
+            verdict.human_attestation.as_ref(),
+            &handoff.actor_id,
+            handoff.actor_principal_id.as_deref(),
+            handoff.actor_session_id.as_deref(),
+        )?;
+    }
+    let next_state = state_for(verdict.decision);
+    state.state.check_transition(next_state)?;
+    let previous = reviews_for(&control, card_id)?.into_iter().next_back();
+    let review_id = next_review_id(&control)?;
+    let review = build_review_record(
+        &record,
+        &state,
+        &handoff,
+        verdict,
+        review_id,
+        previous.as_ref(),
+        clock,
+    )?;
+    validate_review_candidate(&control, &record, verdict, &review, previous.as_ref())?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(
@@ -1190,7 +1269,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     require_actor_agreement(&args.common.actor, &verdict)?;
 
     if args.dry_run {
-        return preview_record(args, &card_id, &verdict);
+        return preview_record(args, &card_id, &verdict, clock);
     }
 
     with_transaction(
@@ -1255,53 +1334,32 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 handoff.actor_principal_id.as_deref(),
                 handoff.actor_session_id.as_deref(),
             )?;
+            if verdict.reviewer_kind == Some(ReviewerKind::Human) {
+                validate_human_attestation_boundary(
+                    &verdict.reviewer_actor_id,
+                    verdict.reviewer_provenance.as_ref(),
+                    verdict.human_attestation.as_ref(),
+                    &handoff.actor_id,
+                    handoff.actor_principal_id.as_deref(),
+                    handoff.actor_session_id.as_deref(),
+                )?;
+            }
 
             let next_state = state_for(verdict.decision);
             state.state.check_transition(next_state)?;
 
             let previous = reviews_for(control, &card_id)?.into_iter().next_back();
             let review_id = next_review_id(control)?;
-            let review = ReviewRecord {
-                schema: REVIEW_SCHEMA.to_owned(),
-                review_id: review_id.clone(),
-                card_id: card_id.clone(),
-                card_revision: state.current_revision,
-                card_digest: state.current_digest.clone(),
-                cycle_id: record.cycle_id.clone(),
-                baseline_sha: handoff.baseline_sha.clone(),
-                candidate_sha: handoff.candidate_sha.clone(),
-                dependency_bindings: handoff.dependency_bindings.clone(),
-                handoff_id: handoff.handoff_id.clone(),
-                handoff_digest: handoff.digest()?,
-                reviewer_actor_id: verdict.reviewer_actor_id.clone(),
-                reviewer_kind: verdict.reviewer_kind,
-                reviewer_provenance: verdict.reviewer_provenance.clone(),
-                human_attestation: verdict.human_attestation.clone(),
-                mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
-                mutation_exemption: verdict.mutation_exemption.clone(),
-                feature_actor_id: handoff.actor_id.clone(),
-                decision: verdict.decision,
-                findings: verdict.findings.clone(),
-                gate_adequacy: verdict.gate_adequacy.clone(),
-                residual_risks: verdict.residual_risks.clone(),
-                human_reviewer: verdict.human_reviewer,
-                review_conduct: verdict.review_conduct,
-                supersedes: previous.as_ref().map(|review| review.review_id.clone()),
-                reviewed_at: clock.now(),
-                canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
-            };
-            review.validate()?;
-            // #28: kept separate from `validate()` rather than folded into
-            // it — see `check_review_conduct`'s doc for why — but must still
-            // run in the real transaction exactly as `preview_record` runs it
-            // on the dry-run path, so the two cannot disagree.
-            check_review_conduct(&record.review_policy, review.review_conduct)?;
-            review.check_risk_policy(record.risk)?;
-            if let Some(superseded) = previous.as_ref() {
-                review.check_supersedes(superseded)?;
-            }
-            require_typed_reviewer_contract(&record, &verdict)?;
-            validate_mutation_receipts(control, &review)?;
+            let review = build_review_record(
+                &record,
+                &state,
+                &handoff,
+                &verdict,
+                review_id.clone(),
+                previous.as_ref(),
+                clock,
+            )?;
+            validate_review_candidate(control, &record, &verdict, &review, previous.as_ref())?;
             let digest = review.digest()?;
 
             control.write_atomic(

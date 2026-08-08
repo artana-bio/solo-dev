@@ -61,6 +61,57 @@ fn active_cycle() -> Workspace {
     workspace
 }
 
+fn review_contract_fixture() -> Workspace {
+    let workspace = active_cycle();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let worktree = workspace.worktrees.join("F-001");
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/a.rs"), "fn main() {}\n").unwrap();
+    support::git(&worktree, &["add", "-A"]);
+    support::git(&worktree, &["commit", "-q", "-m", "feat: add a.rs"]);
+    workspace.gate(&["run", "--card-id", "F-001", "--gate-id", "gate.unit"]);
+    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+    let declaration = workspace.root.join("declaration.yaml");
+    fs::write(
+        &declaration,
+        format!(
+            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+        ),
+    )
+    .unwrap();
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        &declaration.display().to_string(),
+    ]);
+    workspace.review(&["begin", "--card-id", "F-001"]);
+    workspace
+}
+
+fn review_contract_verdict(case: &str) -> String {
+    let identity = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: review-session\n  principal_id: reviewer-principal\n";
+    let common = "decision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: no executable mutation\nresidual_risks: []\nreview_conduct: separate_process\n";
+    match case {
+        "human-no-attestation" => format!(
+            "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\n{common}mutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-attestor\n"
+        ),
+        "same-principal-attestation" => format!(
+            "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation\n  attestor_actor_id: different-actor\n  attestor_principal_id: reviewer-principal\n  attestor_session_id: attestor-session\n  statement: independent\n  independently_created: true\n{common}mutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: different-approver\n"
+        ),
+        "invalid-exemption" => format!(
+            "{identity}{common}mutation_exemption:\n  code: ''\n  reason: no mutation\n  approved_by: independent-attestor\n"
+        ),
+        "missing-receipt" => format!("{identity}mutation_receipt_ids: [MR-999]\n{common}"),
+        "valid" => format!(
+            "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation\n  attestor_actor_id: independent-attestor\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: independent\n  independently_created: true\n{common}mutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-approver\n"
+        ),
+        _ => unreachable!("unknown review contract case"),
+    }
+}
+
 #[test]
 fn work_start_previews_a_held_lease_refusal() {
     let workspace = active_cycle();
@@ -542,6 +593,74 @@ fn review_record_previews_a_missing_mutation_evidence_refusal() {
         "CH-POLICY-INCOMPLETE-REVIEW",
         "the fixture must exercise the mutation-evidence refusal, not something else"
     );
+}
+
+#[test]
+fn review_record_dry_run_matches_record_for_attestation_and_evidence_contracts() {
+    let cases = [
+        ("human-no-attestation", "CH-POLICY-RISK-REVIEW"),
+        ("same-principal-attestation", "CH-POLICY-RISK-REVIEW"),
+        ("invalid-exemption", "CH-POLICY-INCOMPLETE-REVIEW"),
+        ("missing-receipt", "CH-INTERNAL-CONTROL-CORRUPT"),
+    ];
+    for (case, expected) in cases {
+        let workspace = review_contract_fixture();
+        let verdict = workspace.root.join(format!("{case}.yaml"));
+        fs::write(&verdict, review_contract_verdict(case)).unwrap();
+        let path = verdict.display().to_string();
+        let real = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+        ]);
+        let preview = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path,
+            "--actor",
+            "reviewer-session-a",
+            "--dry-run",
+        ]);
+        assert_parity(case, &real, &preview);
+        assert_eq!(code(&real), expected, "{case} owning refusal changed");
+    }
+
+    let real_workspace = review_contract_fixture();
+    let real_verdict = real_workspace.root.join("valid.yaml");
+    fs::write(&real_verdict, review_contract_verdict("valid")).unwrap();
+    let real_output = real_workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &real_verdict.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert!(real_output.status.success());
+
+    let preview_workspace = review_contract_fixture();
+    let preview_verdict = preview_workspace.root.join("valid.yaml");
+    fs::write(&preview_verdict, review_contract_verdict("valid")).unwrap();
+    let before = preview_workspace.control_head();
+    let preview_output = preview_workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &preview_verdict.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+        "--dry-run",
+    ]);
+    assert!(preview_output.status.success());
+    assert_eq!(preview_workspace.control_head(), before);
 }
 
 #[test]
