@@ -53,6 +53,23 @@ fn receipt_path(workspace: &Workspace) -> PathBuf {
         .expect("a gate receipt")
 }
 
+fn first_json_path(directory: &Path) -> PathBuf {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .expect("a JSON control record")
+}
+
+fn copy_control_record(workspace: &Workspace, source: &str, destination: &str) {
+    fs::copy(
+        workspace.control.join(source),
+        workspace.control.join(destination),
+    )
+    .unwrap();
+    commit_control(workspace);
+}
+
 fn commit_control(workspace: &Workspace) {
     let add = Command::new("git")
         .args(["-C", workspace.control.to_str().unwrap(), "add", "--all"])
@@ -286,5 +303,105 @@ fn integration_receipt_reference_must_exist() {
     snapshot_refusal(
         &workspace,
         "project snapshot receipt integrity: receipt_integration_reference_invalid",
+    );
+}
+
+#[test]
+fn duplicate_cycle_records_are_rejected_before_projection() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "Snapshot"]);
+
+    copy_control_record(&workspace, "cycles/C-001.json", "cycles/C-001-copy.json");
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: duplicate_cycle_identity",
+    );
+}
+
+#[test]
+fn duplicate_card_revisions_are_rejected_before_projection() {
+    let workspace = approved_workspace();
+
+    copy_control_record(&workspace, "cards/F-001/r1.json", "cards/F-001/r2.json");
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: duplicate_card_revision_identity",
+    );
+}
+
+#[test]
+fn duplicate_review_records_are_rejected_before_projection() {
+    let workspace = approved_workspace();
+    let review = first_json_path(&workspace.control.join("reviews"));
+    let review_name = review.file_name().unwrap().to_str().unwrap();
+
+    copy_control_record(
+        &workspace,
+        &format!("reviews/{review_name}"),
+        "reviews/duplicate.json",
+    );
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: duplicate_review_identity",
+    );
+}
+
+#[test]
+fn duplicate_integration_records_are_rejected_before_projection() {
+    let workspace = approved_workspace();
+    let prepared = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    let integration_id = prepared["data"]["integration_id"].as_str().unwrap();
+
+    copy_control_record(
+        &workspace,
+        &format!("integrations/{integration_id}.json"),
+        "integrations/duplicate.json",
+    );
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: duplicate_integration_identity",
+    );
+}
+
+#[test]
+fn non_receipt_record_file_name_must_match_its_identity() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "Snapshot"]);
+    fs::rename(
+        workspace.control.join("cycles/C-001.json"),
+        workspace.control.join("cycles/not-the-id.json"),
+    )
+    .unwrap();
+    commit_control(&workspace);
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: cycle_file_name_mismatch",
+    );
+}
+
+#[test]
+fn card_revision_file_name_must_match_its_composite_identity() {
+    let workspace = approved_workspace();
+    let path = workspace.control.join("cards/F-001/r1-copy.json");
+    fs::copy(workspace.control.join("cards/F-001/r1.json"), &path).unwrap();
+    let mut card: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    card["revision"] = 2.into();
+    fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+    commit_control(&workspace);
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: card_revision_file_name_mismatch",
     );
 }
