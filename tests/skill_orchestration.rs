@@ -8,6 +8,7 @@
 
 const ORCHESTRATION_HEADING: &str = "## Multi-agent orchestration";
 const IMPLEMENTER_PROMPT_HEADING: &str = "### Start an implementer task";
+const BOTTLENECK_HEADING: &str = "### Stop and untangle a bottleneck";
 const REVIEWER_PROMPT_HEADING: &str = "### Start a genuinely fresh reviewer task";
 
 fn skill_md() -> String {
@@ -95,6 +96,35 @@ fn implementer_prompt_carries_the_complete_assignment_and_reporting_contract() {
             "This packet is the complete assigned context",
         ],
         "implementer prompt",
+    );
+}
+
+#[test]
+fn orchestration_stops_repeated_attempts_and_convenes_a_diagnostic_group() {
+    let guide = skill_md();
+    let body = section(&guide, BOTTLENECK_HEADING, "### ");
+
+    assert_contains_all(
+        body,
+        &[
+            "two materially similar attempts fail",
+            "repeat the same hypothesis without new evidence",
+            "Formal convergence-budget exhaustion also triggers this protocol",
+            "stops changing the candidate",
+            "short bottleneck packet",
+            "fresh diagnostic\ntasks",
+            "greater reasoning capacity or relevant specialist\nexperience",
+            "investigate independently",
+            "not extra implementers",
+            "root-cause assessment",
+            "challenge the current approach",
+            "replace a flawed implementation inside the existing card boundary",
+            "revise or split the card",
+            "redesign the approach behind a replacement card",
+            "records the decision and rationale",
+            "Repeated renewal without a\nnew hypothesis is not recovery",
+        ],
+        "bottleneck escalation procedure",
     );
 }
 
