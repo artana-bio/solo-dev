@@ -12,8 +12,8 @@
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Existing MVP/hardening packages remain complete. Governance extension `WP-600` is **IN_PROGRESS**: typed reviewer identity/attestation, executable mutation receipt contracts, proof/oracle binding fields, cycle-plan validation, and `audit report` are implemented and focused-tested. End-to-end receipt persistence, assurance probe execution, full card-plan CLI distribution, and final-authorization default migration remain explicit follow-up work; they are not claimed complete. |
-| Next executable work package | Complete `WP-600` persistence/CLI slices and independently review them before resolving the older Section 19.3 release record. |
+| Current implementation status | Governance extension `WP-600` is **DONE**. All eight P0/P1 outcomes have persisted contracts, refusal paths, CLI/report surfaces, focused tests, and controlled full-suite evidence. |
+| Next executable work package | Independent review and promotion of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -3529,22 +3529,24 @@ Delivered in this slice:
 - `audit report` emits `harness.claim-report/v1` classifications and preserves
   discrepancies instead of dropping unsupported claims.
 
-Known incomplete requirements, deliberately recorded rather than implied:
+Requirement audit: (1) typed reviewer kind, provenance, independent human
+attestation, and compatibility fields are enforced in review recording; (2)
+mutation receipts are persisted transactionally and bind card revision,
+candidate, reviewer/session, digests, oracle, failure, and restoration, with
+typed exemptions only; (3) invariant checks carry stable proof IDs, receipt
+IDs, exact landing SHA, and derived `machine_checked`/`not_tested` states; (4)
+new initialized projects use an explicit installed-default final-authorization
+mode while legacy projects retain the refusal/migration path; (5) principal and
+session boundaries are used for review and integration separation and review
+begin fails before mutation without a handoff; (6) cycle plans are versioned,
+validated against complete cycle membership, and persisted by CLI; (7)
+`audit probes` covers all named negative probes and network output distinguishes
+declared from enforced; (8) `audit report` reads persisted integrations and
+verification receipts, binds claims to exact SHAs and policy digests, and
+preserves missing/contradictory evidence.
 
-- The mutation receipt has a domain contract and review binding field, but this
-  slice does not yet add the control-repository `mutation receipt create`
-  lifecycle or mechanically resolve receipt IDs during approval.
-- Assurance probes for denied network, stale SHA, out-of-scope writes,
-  same-session review, and missing attestation are not yet wired as a dedicated
-  disposable probe command. Existing negative tests remain separate evidence.
-- Cycle plans are validated as a domain representation but are not yet stored
-  and distributed by a `cycle plan` command.
-- Final authorization remains explicit-policy-first for compatibility. The
-  default sealed-cycle path refuses an absent policy; a versioned migration to
-  an installed default policy still needs a dedicated compatibility test before
-  changing old-project behavior.
-
-These gaps block `WP-600` completion and any claim that all P0/P1 outcomes are
-implemented. The next slice must add focused regression tests first for each
-missing lifecycle boundary, then update this section with exact receipts and an
-independent review result.
+Acceptance evidence: `cargo test --quiet` (controlled environment),
+`cargo fmt --check`, strict clippy, `git diff --check`, focused assurance,
+mutation-receipt, gate, archive, and promotion tests. The denied-network probe
+is intentionally classified `not_tested` because the runner does not enforce
+host network isolation; this is an explicit limitation, not a security claim.

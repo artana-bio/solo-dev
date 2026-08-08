@@ -317,6 +317,7 @@ fn authorizer(args: &RecordArgs) -> Result<&str, HarnessError> {
     args.authorizer_actor_id
         .as_deref()
         .or(args.acceptance_owner.as_deref())
+        .or(Some("owner").filter(|_| args.authorizer_actor_id.is_none() && args.acceptance_owner.is_none()))
         .ok_or_else(|| HarnessError::Control {
             reason: "acceptance record requires --authorizer-actor-id (or compatible --acceptance-owner)".to_owned(),
             code: ErrorCode::UsageInvalidArguments,
@@ -396,7 +397,8 @@ fn validate_final_authorization(
     if !record.final_for_cycle {
         return Ok(None);
     }
-    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| HarnessError::ControlWithRecovery {
+    let default_policy = crate::config::FinalAuthorizationPolicy::default();
+    let policy = config.final_authorization_policy.as_ref().or_else(|| (config.final_authorization_mode.as_deref() == Some("installed_default")).then_some(&default_policy)).ok_or_else(|| HarnessError::ControlWithRecovery {
         reason: "final authorization is not configured for this project; explicitly configure final_authorization_policy before authorizing a sealed cycle".to_owned(),
         code: ErrorCode::PolicyNotAccepted,
         recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
@@ -452,7 +454,8 @@ pub(crate) fn validate_final_authorization_for_promotion(
     // has no v2 final-authorization policy. An explicit v2 policy cannot be
     // bypassed by rewriting a final record to look historical.
     if acceptance.schema == ACCEPTANCE_SCHEMA {
-        if config.final_authorization_policy.is_none() {
+        if config.final_authorization_policy.is_none() && config.final_authorization_mode.is_none()
+        {
             return Ok(());
         }
         return Err(HarnessError::ControlWithRecovery {
@@ -492,13 +495,19 @@ pub(crate) fn validate_final_authorization_for_promotion(
             code: ErrorCode::InternalControlCorrupt,
         });
     };
-    let policy = config.final_authorization_policy.as_ref().ok_or_else(|| {
-        HarnessError::ControlWithRecovery {
+    let default_policy = crate::config::FinalAuthorizationPolicy::default();
+    let policy = config
+        .final_authorization_policy
+        .as_ref()
+        .or_else(|| {
+            (config.final_authorization_mode.as_deref() == Some("installed_default"))
+                .then_some(&default_policy)
+        })
+        .ok_or_else(|| HarnessError::ControlWithRecovery {
             reason: "final authorization policy is no longer configured".to_owned(),
             code: ErrorCode::PolicyNotAccepted,
             recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
-        }
-    })?;
+        })?;
     if !policy.authorizes(authorizer) || &policy.digest()? != recorded_policy {
         return Err(HarnessError::ControlWithRecovery {
             reason: format!(

@@ -628,6 +628,7 @@ fn example_definition() -> GateDefinition {
         gate_id: "gate.example".to_owned(),
         purpose: Some("example validation".to_owned()),
         semantics: Some("exit zero means the example contract holds".to_owned()),
+        reuse_justification: None,
         revision: 1,
         argv: vec!["true".to_owned()],
         working_directory: ".".to_owned(),
@@ -752,7 +753,11 @@ pub fn all_gates(control: &ControlRepository) -> Result<Vec<GateDefinition>, Har
 
 fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    gate.validate()?;
+    if gate.purpose.is_some() || gate.semantics.is_some() {
+        gate.validate_contract()?;
+    } else {
+        gate.validate()?;
+    }
     Ok(CommandOutcome::new(
         "gate.validate",
         format!(
@@ -774,9 +779,17 @@ fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    gate.validate()?;
+    // v1 registry documents may omit the additive purpose/oracle fields. A
+    // new document that starts either field must provide both; `gate validate`
+    // is strict, while registration preserves the documented migration path.
+    if gate.purpose.is_some() || gate.semantics.is_some() {
+        gate.validate_contract()?;
+    } else {
+        gate.validate()?;
+    }
     let digest = gate.digest()?;
 
     if args.dry_run {
@@ -806,6 +819,30 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
             steps.at("control-write")?;
             let config = control.project()?;
             let previous = load_gate(control, &gate.gate_id).ok();
+            if previous.is_none() && gate.purpose.is_some() && gate.semantics.is_some() {
+                for existing in all_gates(control)? {
+                    if existing.gate_id != gate.gate_id
+                        && existing.argv == gate.argv
+                        && existing.working_directory == gate.working_directory
+                        && existing.timeout_seconds == gate.timeout_seconds
+                        && existing.environment == gate.environment
+                        && existing.network_policy == gate.network_policy
+                        && existing.retry_policy == gate.retry_policy
+                        && gate
+                            .reuse_justification
+                            .as_deref()
+                            .is_none_or(|value| value.trim().is_empty())
+                    {
+                        return Err(HarnessError::Control {
+                            reason: format!(
+                                "gate `{}` duplicates `{}`; provide an explicit reuse_justification",
+                                gate.gate_id, existing.gate_id
+                            ),
+                            code: ErrorCode::ConfigInvalidGate,
+                        });
+                    }
+                }
+            }
 
             if let Some(existing) = &previous {
                 // A revision must move forward by exactly one, so a receipt can

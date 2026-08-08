@@ -3,6 +3,7 @@
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
+    commands::transaction::with_transaction,
     control::repository::ControlRepository,
     domain::{
         clock::Clock,
@@ -10,6 +11,7 @@ use crate::{
         mutation::{MUTATION_RECEIPT_SCHEMA, MutationReceipt},
     },
     error::{ErrorCode, HarnessError},
+    git::{command::GitScope, inspect},
 };
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -86,7 +88,6 @@ pub fn execute(
 }
 
 fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
-    let control = ControlRepository::open(&args.control)?;
     let receipt = MutationReceipt {
         schema: MUTATION_RECEIPT_SCHEMA.to_owned(),
         receipt_id: args.receipt_id.clone(),
@@ -106,28 +107,48 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
         exemption: None,
     };
     receipt.validate()?;
-    let relative = MutationReceipt::relative_path(&receipt.receipt_id);
-    if control.path(&relative).exists() {
-        return Err(HarnessError::Control {
-            reason: format!("mutation receipt {} already exists", receipt.receipt_id),
-            code: ErrorCode::PreconditionBranchExists,
-        });
-    }
-    control.write_atomic(
-        &relative,
-        &format!("{}\n", serde_json::to_string_pretty(&receipt)?),
-    )?;
-    let expected = control.head()?;
-    control.commit(
-        expected.as_deref(),
-        &format!("mutation: record {}", receipt.receipt_id),
-    )?;
-    Ok(CommandOutcome::new(
+    with_transaction(
+        &args.control,
         "mutation.create",
-        format!("Recorded mutation receipt {}", receipt.receipt_id),
-        serde_json::to_value(&receipt)?,
+        clock,
+        |control, _events, expected, steps| {
+            steps.at("control-write")?;
+            let config = control.project()?;
+            inspect::resolve_commit(
+                &GitScope::work_tree(&config.repository),
+                &receipt.candidate_sha,
+            )
+            .map_err(|_| HarnessError::ControlWithRecovery {
+                reason: format!(
+                    "candidate SHA {} does not exist in the configured repository",
+                    receipt.candidate_sha
+                ),
+                code: ErrorCode::GateEvidenceStale,
+                recovery: "Use the exact committed candidate SHA reviewed by the reviewer.",
+            })?;
+            let relative = MutationReceipt::relative_path(&receipt.receipt_id);
+            if control.path(&relative).exists() {
+                return Err(HarnessError::Control {
+                    reason: format!("mutation receipt {} already exists", receipt.receipt_id),
+                    code: ErrorCode::PreconditionBranchExists,
+                });
+            }
+            control.write_atomic(
+                &relative,
+                &format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+            )?;
+            control.commit(
+                expected,
+                &format!("mutation: record {}", receipt.receipt_id),
+            )?;
+            Ok(CommandOutcome::new(
+                "mutation.create",
+                format!("Recorded mutation receipt {}", receipt.receipt_id),
+                serde_json::to_value(&receipt)?,
+            )
+            .with_project(config.project_id))
+        },
     )
-    .with_project(control.project()?.project_id))
 }
 
 fn inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {

@@ -593,6 +593,11 @@ pub struct ProjectConfig {
     /// compatible v1 default while every v2 acceptance pins its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_authorization_policy: Option<FinalAuthorizationPolicy>,
+    /// `installed_default` is written by new project initialization and makes
+    /// the sealed-cycle path deterministic; `None` preserves old projects and
+    /// their explicit migration refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_authorization_mode: Option<String>,
     /// Omission is deliberately not a default: old projects are reported as
     /// `legacy_unassessed` rather than silently receiving new budgets.
     #[serde(default, skip_serializing_if = "Option::is_none")]

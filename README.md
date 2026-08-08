@@ -508,3 +508,7 @@ See:
   adversarial review, the three kinds of truth the harness does and does not
   provide, and the one experiment — with kill thresholds fixed in advance —
   that remains capable of falsifying the idea.
+
+Governance evidence is executable: `audit probes` runs stable negative probes,
+`mutation create` persists receipts for typed approvals, and `audit report`
+leaves claims without exact receipt coverage as `not_tested`.

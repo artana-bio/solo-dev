@@ -508,6 +508,7 @@ mod tests {
             gate_id: "gate.test".to_owned(),
             purpose: Some("runner test".to_owned()),
             semantics: Some("process exit status is the oracle".to_owned()),
+            reuse_justification: None,
             revision: 1,
             argv: argv.iter().map(|value| (*value).to_owned()).collect(),
             working_directory: ".".to_owned(),

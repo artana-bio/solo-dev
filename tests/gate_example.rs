@@ -175,6 +175,7 @@ fn the_emitted_gate_example_is_complete() {
         gate_id: "reference".to_owned(),
         purpose: Some("reference gate".to_owned()),
         semantics: Some("true exits successfully".to_owned()),
+        reuse_justification: None,
         revision: 1,
         argv: vec!["true".to_owned()],
         working_directory: ".".to_owned(),

@@ -244,4 +244,9 @@ $ git log --oneline -2
 
 And in the control repository: the card's frozen contract, the receipt proving `gate.unit` ran against that exact commit in a clean tree, the handoff binding the reviewed SHA, the reviewer's identity, and the mutation they used to prove the test could fail.
 
+Run `change-harness audit probes --output json` for the required negative
+assurance checks. Record executable mutation evidence with `mutation create`,
+then use `audit report --cycle-id <cycle-id> --output json`; unsupported claims
+remain explicitly `not_tested`.
+
 That last one is the difference between "a test passed" and "a test could have caught this."

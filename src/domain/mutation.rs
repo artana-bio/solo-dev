@@ -19,6 +19,30 @@ pub struct MutationExemption {
     pub approved_by: String,
 }
 
+impl MutationExemption {
+    /// # Errors
+    ///
+    /// Returns a policy error when the exemption is incomplete or self-approved.
+    pub fn validate(&self, reviewer_actor_id: &str) -> Result<(), HarnessError> {
+        if self.code.trim().is_empty()
+            || self.reason.trim().is_empty()
+            || self.approved_by.trim().is_empty()
+        {
+            return Err(invalid(
+                "exemption",
+                "typed mutation exemptions require code, reason, and approver",
+            ));
+        }
+        if crate::policy::actors::same(&self.approved_by, reviewer_actor_id) {
+            return Err(invalid(
+                "exemption",
+                "the reviewer cannot approve their own mutation exemption",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Immutable evidence that a declared mutation was actually executed.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +66,15 @@ pub struct MutationReceipt {
 }
 
 impl MutationReceipt {
+    /// # Errors
+    ///
+    /// Always returns the stable missing-receipt policy refusal.
+    pub fn missing_for_probe() -> Result<(), HarnessError> {
+        Err(HarnessError::Control {
+            reason: "mutation receipt missing".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        })
+    }
     #[must_use]
     pub fn relative_path(receipt_id: &str) -> String {
         format!("{MUTATION_RECEIPT_DIR}/{receipt_id}.json")
@@ -83,6 +116,16 @@ impl MutationReceipt {
             return Err(invalid(
                 "exemption",
                 "an executed mutation receipt cannot also be an exemption",
+            ));
+        }
+        if !self
+            .restoration_proof
+            .to_ascii_lowercase()
+            .contains("restor")
+        {
+            return Err(invalid(
+                "restoration_proof",
+                "restoration proof must identify how the mutation was restored",
             ));
         }
         Ok(())

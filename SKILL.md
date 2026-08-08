@@ -796,3 +796,8 @@ policy at the same time — the same set of actor ids that later authorizes a
 disposition and a sealed cycle's final acceptance; see "Who may record a
 disposition" for the document shape and the route to install or change one
 afterwards.
+
+New projects record an `installed_default` final-authorization mode. Existing
+documents without that marker retain the compatibility refusal until migrated.
+Run `audit probes` for the disposable negative assurance contract and use
+`audit report` for the typed evidence/claim projection.

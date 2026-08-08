@@ -8,7 +8,10 @@
 //! commit a receipt refers to that no longer exists, is a *finding* — never a
 //! line quietly left out because it could not be resolved.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand};
 
@@ -28,6 +31,9 @@ use crate::{
         clock::Clock,
         cycle::CycleRecord,
         ids::{CardId, CycleId},
+        integration::{
+            ClaimClassification, INTEGRATION_DIR, IntegrationRecord, VerificationRecord,
+        },
     },
     error::{ErrorCode, HarnessError},
     git::{
@@ -49,6 +55,8 @@ pub enum AuditCommand {
     Anchors(AnchorsArgs),
     /// Emit a stable claim/evidence classification for a cycle.
     Report(ReportArgs),
+    /// Execute the disposable negative assurance probes.
+    Probes,
 }
 
 impl AuditCommand {
@@ -63,6 +71,7 @@ impl AuditCommand {
             Self::Cycle(..) => "audit.cycle",
             Self::Anchors(..) => "audit.anchors",
             Self::Report(..) => "audit.report",
+            Self::Probes => "audit.probes",
         }
     }
 }
@@ -356,7 +365,22 @@ pub fn execute(command: &AuditCommand, _clock: &dyn Clock) -> Result<CommandOutc
         AuditCommand::Cycle(args) => run_cycle(args),
         AuditCommand::Anchors(args) => run_anchors(args),
         AuditCommand::Report(args) => run_report(args),
+        AuditCommand::Probes => run_probes(),
     }
+}
+
+fn run_probes() -> Result<CommandOutcome, HarnessError> {
+    let probes = crate::domain::assurance::run_all();
+    let report = serde_json::json!({
+        "schema": "harness.assurance-probes/v1",
+        "probes": probes,
+        "network_denial_enforced": crate::domain::gate::NetworkPolicy::ENFORCED,
+    });
+    Ok(CommandOutcome::new(
+        "audit.probes",
+        serde_json::to_string_pretty(&report)?,
+        report,
+    ))
 }
 
 fn run_report(args: &ReportArgs) -> Result<CommandOutcome, HarnessError> {
@@ -371,27 +395,73 @@ fn run_report(args: &ReportArgs) -> Result<CommandOutcome, HarnessError> {
         code: ErrorCode::InternalControlCorrupt,
     })?;
     let evidence = cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
-    let classification = if evidence.discrepancies.is_empty() {
-        "reviewer_attested"
-    } else {
-        "failed"
-    };
-    let claims: Vec<serde_json::Value> = cycle
-        .release_invariants
-        .iter()
-        .enumerate()
-        .map(|(index, claim)| {
-            serde_json::json!({
-                "claim_id": format!("{cycle_id}-INV-{:03}", index + 1),
-                "claim": claim,
-                "classification": classification,
-                "baseline_sha": cycle.baseline_sha,
-                "receipt_ids": [],
-                "policy": "cycle-seal-and-review-policy",
-                "missing_evidence": if classification == "failed" { serde_json::json!(evidence.discrepancies) } else { serde_json::json!([]) },
-            })
-        })
-        .collect();
+    let mut claims = Vec::new();
+    let integration_dir = control.path(INTEGRATION_DIR);
+    if integration_dir.exists() {
+        let mut entries: Vec<_> = fs::read_dir(&integration_dir)
+            .map_err(|source| HarnessError::ControlIo {
+                path: integration_dir.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let integration: IntegrationRecord =
+                serde_json::from_str(&fs::read_to_string(entry.path()).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: entry.path(),
+                        source,
+                    }
+                })?)
+                .map_err(|source| HarnessError::Control {
+                    reason: format!("integration record is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?;
+            if integration.cycle_id != cycle_id {
+                continue;
+            }
+            let verification_path = VerificationRecord::relative_path(&integration.integration_id);
+            if control.path(&verification_path).exists() {
+                let verification: VerificationRecord =
+                    serde_json::from_str(&control.read(&verification_path)?).map_err(|source| {
+                        HarnessError::Control {
+                            reason: format!("verification is malformed: {source}"),
+                            code: ErrorCode::InternalControlCorrupt,
+                        }
+                    })?;
+                for check in verification.invariants {
+                    let classification = if evidence.discrepancies.is_empty() {
+                        check
+                            .classification
+                            .unwrap_or(ClaimClassification::NotTested)
+                    } else {
+                        ClaimClassification::Failed
+                    };
+                    claims.push(serde_json::json!({
+                        "claim_id": format!("{cycle_id}-INV-{}", check.proof_entry_id.as_deref().unwrap_or(&check.invariant)),
+                        "claim": check.invariant,
+                        "classification": classification,
+                        "landing_sha": verification.landing_sha,
+                        "receipt_ids": check.observed_receipt_ids,
+                        "verification_receipt_ids": verification.receipt_ids,
+                        "policy": config.final_authorization_policy.as_ref().and_then(|p| p.digest().ok()).map_or_else(|| "legacy-or-installed-default".to_owned(), |d| d.to_string()),
+                        "missing_evidence": if classification == ClaimClassification::NotTested || classification == ClaimClassification::Failed { serde_json::json!(evidence.discrepancies) } else { serde_json::json!([]) },
+                    }));
+                }
+            }
+        }
+    }
+    if claims.is_empty() {
+        claims = cycle.release_invariants.iter().enumerate().map(|(index, claim)| serde_json::json!({
+            "claim_id": format!("{cycle_id}-INV-{:03}", index + 1), "claim": claim,
+            "classification": "not_tested", "baseline_sha": cycle.baseline_sha,
+            "receipt_ids": [], "policy": "no persisted verification", "missing_evidence": evidence.discrepancies,
+        })).collect();
+    }
     let report = serde_json::json!({
         "schema": "harness.claim-report/v1",
         "cycle_id": cycle_id.to_string(),

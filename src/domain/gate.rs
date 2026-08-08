@@ -126,6 +126,9 @@ pub struct GateDefinition {
     /// What the gate semantically establishes; distinct from its command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantics: Option<String>,
+    /// Required when a new gate intentionally duplicates another gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_justification: Option<String>,
     /// Starts at 1 and increases by exactly one.
     pub revision: u32,
     /// The executable and its arguments. Never a shell string.
@@ -263,6 +266,38 @@ impl GateDefinition {
 
         Ok(())
     }
+
+    /// Validates the public executable-gate contract.  The optional fields
+    /// remain readable for legacy v1 records, but every newly registered gate
+    /// must state its purpose and semantic oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a gate configuration error when either field is absent.
+    pub fn validate_contract(&self) -> Result<(), HarnessError> {
+        self.validate()?;
+        if self
+            .purpose
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason: format!("gate `{}` must declare a purpose", self.gate_id),
+                code: ErrorCode::ConfigInvalidGate,
+            });
+        }
+        if self
+            .semantics
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason: format!("gate `{}` must declare semantics", self.gate_id),
+                code: ErrorCode::ConfigInvalidGate,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Requires a working directory to stay inside the evaluation worktree.
@@ -293,6 +328,7 @@ mod tests {
             gate_id: "gate.unit".to_owned(),
             purpose: Some("focused regression".to_owned()),
             semantics: Some("must fail on the declared mutation".to_owned()),
+            reuse_justification: None,
             revision: 1,
             argv: vec!["cargo".to_owned(), "test".to_owned()],
             working_directory: ".".to_owned(),

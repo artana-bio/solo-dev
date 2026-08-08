@@ -435,6 +435,10 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         let control = ControlRepository::open(&args.common.control)?;
         let config = control.project()?;
         let (record, state) = load_card(&control, &card_id)?;
+        latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no handoff to review"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
         // The dry run must ask this too: a preview that skips a check the
         // real command enforces is worse than no preview, per
         // `preview_record`'s "Tier 3 defect 24" note.
@@ -458,13 +462,12 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             // 72-2: the first check that can refuse, before anything is
             // written — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
-            state.state.check_transition(CardState::ReviewPending)?;
-
             let handoff =
                 latest_handoff(control, &card_id)?.ok_or_else(|| HarnessError::Control {
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
+            state.state.check_transition(CardState::ReviewPending)?;
             if handoff.status == HandoffStatus::Revoked {
                 return Err(HarnessError::Control {
                     reason: format!("handoff {} was revoked", handoff.handoff_id),
@@ -1280,6 +1283,23 @@ fn validate_mutation_receipts(
     control: &ControlRepository,
     review: &ReviewRecord,
 ) -> Result<(), HarnessError> {
+    if let Some(exemption) = &review.mutation_exemption {
+        if !review.mutation_receipt_ids.is_empty() {
+            return Err(HarnessError::Control {
+                reason: "a review cannot combine executable mutation receipts with an exemption"
+                    .to_owned(),
+                code: ErrorCode::PolicyIncompleteReview,
+            });
+        }
+        exemption.validate(&review.reviewer_actor_id)?;
+        return Ok(());
+    }
+    if review.decision == Decision::Approved
+        && review.reviewer_kind.is_some()
+        && review.mutation_receipt_ids.is_empty()
+    {
+        return Err(HarnessError::Control { reason: "an approved review requires an executable mutation receipt or typed policy-valid exemption".to_owned(), code: ErrorCode::PolicyIncompleteReview });
+    }
     for receipt_id in &review.mutation_receipt_ids {
         let relative = MutationReceipt::relative_path(receipt_id);
         let receipt: MutationReceipt =
@@ -1290,6 +1310,19 @@ fn validate_mutation_receipts(
                 }
             })?;
         receipt.validate()?;
+        if let Some(session_id) = review
+            .reviewer_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.session_id.as_deref())
+            && receipt.reviewer_session_id.as_deref() != Some(session_id)
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation receipt {receipt_id} is not bound to the reviewer's declared session"
+                ),
+                code: ErrorCode::PolicySameActor,
+            });
+        }
         if receipt.candidate_sha != review.candidate_sha
             || !actors::same(&receipt.reviewer_actor_id, &review.reviewer_actor_id)
         {

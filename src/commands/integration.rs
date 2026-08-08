@@ -3261,25 +3261,46 @@ fn store_verification(
         receipt_ids.push(receipt.receipt_id.to_string());
     }
 
+    let landing_sha = record.landing_sha.clone().unwrap_or_default();
+    let invariant_checks = cycle
+        .release_invariants
+        .iter()
+        .map(|invariant| {
+            // An invariant is machine-checked only when its stable binding is the
+            // gate identifier and a passed receipt for that exact landing SHA is
+            // persisted. Everything else remains explicitly unproven.
+            let matching: Vec<String> = receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.passed
+                        && receipt.gate_id == *invariant
+                        && receipt.evaluated_sha == landing_sha
+                })
+                .map(|receipt| receipt.receipt_id.to_string())
+                .collect();
+            let checked = !matching.is_empty();
+            InvariantCheck {
+                proof_entry_id: checked.then(|| invariant.clone()),
+                invariant: invariant.clone(),
+                machine_checked: checked,
+                observed_receipt_ids: matching,
+                classification: Some(if checked {
+                    ClaimClassification::MachineChecked
+                } else {
+                    ClaimClassification::NotTested
+                }),
+            }
+        })
+        .collect();
     Ok(VerificationRecord {
         schema: VERIFICATION_SCHEMA.to_owned(),
         integration_id: record.integration_id.clone(),
         cycle_id: record.cycle_id.clone(),
-        landing_sha: record.landing_sha.clone().unwrap_or_default(),
+        landing_sha,
         landing_tree: record.integration_tree.clone().unwrap_or_default(),
         receipt_ids,
         failed_gates,
-        invariants: cycle
-            .release_invariants
-            .iter()
-            .map(|invariant| InvariantCheck {
-                proof_entry_id: None,
-                invariant: invariant.clone(),
-                machine_checked: false,
-                observed_receipt_ids: vec![],
-                classification: Some(ClaimClassification::ReviewerAttested),
-            })
-            .collect(),
+        invariants: invariant_checks,
         interactions: member_interactions(control, record)?,
         worktree_clean_after,
         verified_by: actor_id.to_owned(),
@@ -3660,6 +3681,26 @@ fn refuse_verifier_reviewing(
     Ok(())
 }
 
+fn refuse_member_implementer_reviewing(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    reviewer_actor_id: &str,
+) -> Result<(), HarnessError> {
+    let implementers = member_implementers(control, record)?;
+    if implementers
+        .iter()
+        .any(|(_, actor)| actors::same(actor, reviewer_actor_id))
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "{reviewer_actor_id} implemented a member card and cannot review the integration"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
+}
+
 fn run_integration_review(
     args: &ReviewArgs,
     clock: &dyn Clock,
@@ -3710,6 +3751,7 @@ fn run_integration_review(
             let verification = load_verification(control, &integration_id)?;
 
             refuse_verifier_reviewing(&verification, &args.reviewer_actor_id)?;
+            refuse_member_implementer_reviewing(control, &record, &args.reviewer_actor_id)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 
             record.status = IntegrationStatus::Reviewed;

@@ -254,6 +254,30 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
         });
     }
     plan.validate()?;
+    let cycle_id: CycleId = plan.cycle_id.parse().map_err(|_| HarnessError::Control {
+        reason: format!("cycle plan {} names an invalid cycle id", plan.plan_id),
+        code: ErrorCode::PolicyInvalidCycle,
+    })?;
+    let cycle: CycleRecord = serde_json::from_str(
+        &control.read(&CycleRecord::relative_path(&cycle_id))?,
+    )
+    .map_err(|_| HarnessError::Control {
+        reason: format!("cycle {cycle_id} is not available for this plan"),
+        code: ErrorCode::PreconditionNotFound,
+    })?;
+    let planned: std::collections::BTreeSet<_> =
+        plan.cards.iter().map(|card| card.card_id.clone()).collect();
+    let members: std::collections::BTreeSet<_> =
+        cycle.card_ids.iter().map(ToString::to_string).collect();
+    if planned != members {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle plan {} does not cover exactly the cycle's complete card membership",
+                plan.plan_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
     let relative = format!("plans/{}.json", plan.plan_id);
     if control.path(&relative).exists() {
         return Err(HarnessError::Control {
