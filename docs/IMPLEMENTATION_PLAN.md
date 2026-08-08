@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 59 |
+| Plan revision | 60 |
 | Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -868,6 +868,8 @@ change-harness doctor
 change-harness project init
 change-harness project validate
 change-harness project status
+change-harness project snapshot
+change-harness project snapshot --watch [--interval-ms <100..=3600000>]
 change-harness project recover
 
 change-harness cycle create
@@ -915,6 +917,15 @@ change-harness archive close
 
 Commands are introduced only by their owning work package. Help output MUST
 mark unimplemented commands absent rather than presenting placeholders.
+
+`project snapshot` is read-only and collects one typed projection from one
+captured control commit. The default is one text frame; `--output json` emits
+one `harness.command-result/v1` envelope whose `data.schema` is
+`harness.project-snapshot/v1`. `--watch` is a text-only terminal refresh: it
+recollects the projection at each frame, emits one frame and exits for non-TTY
+output, and uses `--interval-ms` only when the option is present with bounds
+`100..=3600000`. Watch mode has no persistent state or daemon and cannot be
+combined with `--output json`.
 
 ### 12.4 Stable command output envelope
 
@@ -2814,6 +2825,24 @@ Acceptance:
 - focused unit and temporary-repository regressions cover the projection, and
   `cargo fmt --check`, `cargo test`, and strict Clippy pass from a clean branch.
 
+Approved integrated lane SHAs (prior exact-SHA reviews):
+
+- snapshot core: `0d33343841eb8b87db8b7d78bfdeb8b92ef0b548`,
+  `4baf9d71e5919d694e2c034e9c213432812c0205`,
+  `d1d5c35726862080671086414fc437c19d26b6e6`;
+- watch: `38441a1dd727dd5e41ef85dae550b739cdcc3890`;
+- declared JUnit metrics and failed-report receipts:
+  `43ba98d4e88f514918b172c1a75c5088ee08b5ae`,
+  `e545aae0c454ed39a455638b77c16eca0c9e46ee`.
+
+Remaining final gate: the integrated full suite and final Terra High review of
+the complete exact-SHA chain, including this documentation closeout. WP-550
+remains `IN_PROGRESS` until both are complete; this closeout does not claim
+`DONE`. The authority limitation also remains: Harness authority
+`9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main`
+`5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside WP-550,
+so this package does not move that ref or claim self-hosted authority.
+
 ### WP-600 — Workspace manifest
 
 | Field | Value |
@@ -3353,7 +3382,7 @@ Tier 1 of the register is closed.
 | Active owner | Luna High, coordinated by Codex; independent review by Terra High |
 | Active blocker | Full self-hosting cannot start honestly: Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside `WP-550`; no authority ref will be moved by this package. |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | Pending focused regressions, full quality gate, and exact-SHA Terra High review. |
+| Acceptance evidence | Prior lane SHAs are recorded in the WP-550 entry. Documentation-contract regressions and this closeout commit remain subject to the integrated full suite and final exact-SHA Terra High review. |
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and

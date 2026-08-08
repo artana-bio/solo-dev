@@ -114,7 +114,9 @@ does not exist yet, tracked by D-070.
 Every Single-repository MVP work package is implemented, along with all five
 hardening packages: failure injection at every journaled boundary, stale-lock
 diagnosis with explicit lease reclaim, verified backups, cycle auditing with
-evidence cross-checking, and generated-artifact classification. 858 tests pass.
+evidence cross-checking, and generated-artifact classification. The current
+release work is documented in the implementation plan rather than summarized
+by a stale test-count claim.
 
 That was previously reported here as "eleven of the twelve Section 19.3 release
 criteria are met; the remaining one is the acceptance owner's signature". An
@@ -219,8 +221,7 @@ authorization requires a separate identity or operating-system boundary.
 > **New to Change Harness?** [`QUICKSTART.md`](./QUICKSTART.md) is a
 > hands-on walkthrough — install, adopt a project, register two gates, hand
 > off, review, and land a change on the protected branch — every command run
-> for real before it was written down. Budget 30–40 minutes the first time;
-> ten after that.
+> for real before it was written down.
 
 ### Quick install
 
@@ -271,6 +272,55 @@ project will happily drive a command meant for another, and the command will
 succeed — correctly, against the wrong records. `project status` reports when
 the worktree you are standing in belongs to a different control repository than
 the one in use, which is the case that catches most of it.
+
+## Project snapshot
+
+`project snapshot` is the read-only operational view for a person or an
+external application. The default is one concise text frame:
+
+```bash
+change-harness project snapshot --control "$CHANGE_HARNESS_CONTROL"
+```
+
+For an external application, request one JSON command envelope. Its `data`
+field is the stable `harness.project-snapshot/v1` projection:
+
+```bash
+change-harness project snapshot --control "$CHANGE_HARNESS_CONTROL" --output json
+```
+
+For a terminal that should refresh, use text-only watch mode:
+
+```bash
+change-harness project snapshot --control "$CHANGE_HARNESS_CONTROL" --watch --interval-ms 1000
+```
+
+`--watch` refreshes a TTY and emits one frame for non-TTY output; it never
+creates persistent state or a daemon. `--output json` and `--watch` cannot be
+combined because JSON remains one complete envelope per command. The interval
+is bounded to 100–3,600,000 milliseconds and applies only to watch mode.
+
+Every snapshot captures one control commit and reports it as `control_head`.
+All durable cards, events, reviews, receipts, and integration records in that
+snapshot come from that exact commit; if the control HEAD moves while it is
+being read, collection refuses instead of returning a mixed view. Lock state,
+journal state, repository cleanliness, and current repository heads are an
+ephemeral observation alongside that durable projection, not a second authority
+store.
+
+Snapshot ages and gate durations are wall-clock facts derived from recorded
+timestamps and the snapshot's capture time. They do not measure human effort,
+typing, or thinking. The default projection omits raw logs, free-form progress,
+environment values, and filesystem paths. Actor fields are recorded claims from
+the control records, not proof of a person's identity.
+
+Test-case counts are reported only from declared `junit_reports` files in a
+trusted gate definition. Without a declared structured report, the snapshot
+uses `status: not_reported` rather than guessing from stdout or stderr. A
+declared report that is missing, unsafe, stale, malformed, inconsistent,
+duplicate, oversized, depth-limited, or unreadable makes that gate attempt fail
+with an auditable receipt carrying `status: invalid`, a closed-set `error_code`,
+and zero counts. Report contents are not copied into the snapshot.
 
 ## Three repositories
 
