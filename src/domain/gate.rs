@@ -29,6 +29,9 @@ pub const GATE_DIR: &str = "gates";
 /// and "wait indefinitely" is never the right answer for an automated check.
 pub const MAX_TIMEOUT_SECONDS: u64 = 3_600;
 
+/// Maximum number of explicitly declared structured reports on one gate.
+const MAX_JUNIT_REPORTS: usize = 32;
+
 /// Environment variables never passed to a gate, whatever the allowlist says.
 ///
 /// Section 14.1 requires the candidate process not to inherit production
@@ -136,6 +139,11 @@ pub struct GateDefinition {
     pub retry_policy: RetryPolicy,
     /// Files it produces that should be retained.
     pub artifacts: Vec<String>,
+    /// `JUnit` XML reports produced by this gate, relative to its working
+    /// directory. Empty is omitted from canonical serialization so existing
+    /// gate digests remain stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub junit_reports: Vec<String>,
 }
 
 impl GateDefinition {
@@ -241,6 +249,8 @@ impl GateDefinition {
 
         validate_working_directory(&self.working_directory).map_err(reject)?;
 
+        validate_junit_reports(&self.gate_id, &self.junit_reports).map_err(reject)?;
+
         for name in self
             .environment
             .allow
@@ -257,6 +267,42 @@ impl GateDefinition {
 
         Ok(())
     }
+}
+
+fn validate_junit_reports(gate_id: &str, reports: &[String]) -> Result<(), String> {
+    if reports.len() > MAX_JUNIT_REPORTS {
+        return Err(format!(
+            "gate `{gate_id}` declares more than {MAX_JUNIT_REPORTS} JUnit reports"
+        ));
+    }
+    let mut report_paths = std::collections::BTreeSet::new();
+    for report in reports {
+        validate_report_path(report)
+            .map_err(|reason| format!("gate `{gate_id}` JUnit report: {reason}"))?;
+        if !report_paths.insert(report) {
+            return Err(format!(
+                "gate `{gate_id}` declares duplicate JUnit report `{report}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Requires a report path to be a non-empty repository-relative path.
+fn validate_report_path(value: &str) -> Result<(), String> {
+    if value.is_empty() || value == "." {
+        return Err("path must name a report file".to_owned());
+    }
+    if value.starts_with('/') || value.contains('\0') {
+        return Err("path must be relative to the gate working directory".to_owned());
+    }
+    if std::path::Path::new(value)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("path must not traverse outside the gate working directory".to_owned());
+    }
+    Ok(())
 }
 
 /// Requires a working directory to stay inside the evaluation worktree.
@@ -293,6 +339,7 @@ mod tests {
             network_policy: NetworkPolicy::Denied,
             retry_policy: RetryPolicy::default(),
             artifacts: vec![],
+            junit_reports: vec![],
         }
     }
 
@@ -463,6 +510,19 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(base, changed.digest().unwrap());
         }
+    }
+
+    #[test]
+    fn an_empty_junit_declaration_preserves_legacy_gate_digest() {
+        let original = gate();
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("junit_reports");
+        let decoded: GateDefinition = serde_json::from_value(legacy).unwrap();
+        assert_eq!(original.digest().unwrap(), decoded.digest().unwrap());
+
+        let mut reported = original;
+        reported.junit_reports = vec!["target/junit.xml".to_owned()];
+        assert_ne!(decoded.digest().unwrap(), reported.digest().unwrap());
     }
 
     #[test]

@@ -599,6 +599,7 @@ environment.set{}
 network_policy
 retry_policy
 artifacts[]
+junit_reports[]       (optional; paths relative to working_directory)
 ```
 
 Rules:
@@ -610,6 +611,11 @@ Rules:
 - MVP network policy is declarative and reported; hard enforcement is deferred
   until a sandbox executor exists.
 - A gate revision changes its digest and invalidates older receipts.
+- `junit_reports[]` is an optional trusted declaration of bounded JUnit XML
+  files produced by the gate. Paths must remain relative to the gate's
+  working directory, and duplicate declarations are refused. An empty field
+  is omitted from canonical serialization so existing gate digests do not
+  change merely because this optional capability exists.
 
 ### 10.6 Receipt
 
@@ -636,6 +642,7 @@ termination
 stdout_digest
 stderr_digest
 artifact_digests{}
+test_results            (optional typed summary: total, passed, failed, errors, skipped, status)
 log_location
 attempt
 ```
@@ -645,6 +652,12 @@ attempt
 Exactly one subject is always present: `card_id` with `card_digest` for a
 gate run against one card's candidate, or `integration_id` for a combined
 verification run against a landing commit. See D-046.
+
+`test_results` is omitted on legacy receipts and is optional for compatibility;
+new receipts carry `status: not_reported` when their trusted gate declares no
+JUnit report. When reports are declared, the runner records only validated
+counts on the exact receipt. Snapshot aggregation uses validated subject-bound
+receipts and never parses gate output.
 
 ### 10.7 Handoff
 

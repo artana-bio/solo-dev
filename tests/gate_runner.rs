@@ -36,6 +36,53 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+fn snapshot_json(workspace: &Workspace) -> Value {
+    let output = Workspace::run(&[
+        "project".into(),
+        "snapshot".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        output.status.success(),
+        "snapshot failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn junit_gate_definition(gate_id: &str, script: &str, reports: &str, max_attempts: u32) -> String {
+    let argv = serde_json::to_string(&["sh", "-c", script]).unwrap();
+    format!(
+        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: {argv}\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: {max_attempts}\nartifacts: []\njunit_reports: {reports}\n"
+    )
+}
+
+fn junit_workspace(gate_id: &str, script: &str, reports: &str, max_attempts: u32) -> Workspace {
+    let workspace = Workspace::initialized();
+    let path = workspace.gate_definition(
+        gate_id,
+        &junit_gate_definition(gate_id, script, reports, max_attempts),
+    );
+    workspace.gate(&["register", "--definition", &path]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "JUnit metrics",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &[gate_id]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    workspace
+}
+
+const VALID_JUNIT: &str = "<testsuite tests=\"4\" failures=\"1\" errors=\"1\" skipped=\"1\"><testcase/><testcase><failure>do not expose this</failure></testcase><testcase><error>do not expose this</error></testcase><testcase><skipped/></testcase></testsuite>";
+
 /// Extracts every backtick-delimited span from `text`, in source order.
 /// Mirrors the extraction rule `tests/recovery_text.rs` uses to check
 /// command references named in `src/error.rs`'s recovery text against the
@@ -135,6 +182,156 @@ fn a_passing_gate_produces_a_receipt_bound_to_the_exact_commit() {
             .contains("gate.unit"),
         "provenance records only digests of executable context, never the argv or raw output"
     );
+}
+
+#[test]
+fn a_declared_junit_report_is_recorded_as_redacted_typed_counts() {
+    let script = format!("printf '%s' '{VALID_JUNIT}' > report.xml");
+    let workspace = junit_workspace("gate.junit", &script, "[report.xml]", 1);
+    let receipt = workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.junit"]);
+
+    assert_eq!(receipt["data"]["test_results"]["status"], "reported");
+    assert_eq!(receipt["data"]["test_results"]["total"], 4);
+    assert_eq!(receipt["data"]["test_results"]["passed"], 1);
+    assert_eq!(receipt["data"]["test_results"]["failed"], 1);
+    assert_eq!(receipt["data"]["test_results"]["errors"], 1);
+    assert_eq!(receipt["data"]["test_results"]["skipped"], 1);
+    assert!(
+        !serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("do not expose this")
+    );
+
+    let snapshot = snapshot_json(&workspace);
+    let rendered = serde_json::to_string(&snapshot).unwrap();
+    assert_eq!(snapshot["data"]["test_metrics"]["status"], "reported");
+    assert_eq!(snapshot["data"]["test_metrics"]["total"], 4);
+    assert!(!rendered.contains("do not expose this"));
+    assert!(!rendered.contains(workspace.root.to_str().unwrap()));
+}
+
+#[test]
+fn an_undeclared_report_is_not_reported_and_is_not_inferred_from_output() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "JUnit metrics",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+
+    let snapshot = snapshot_json(&workspace);
+    assert_eq!(snapshot["data"]["test_metrics"]["status"], "not_reported");
+    assert_eq!(snapshot["data"]["test_metrics"]["total"], 0);
+}
+
+#[test]
+fn malformed_and_inconsistent_declared_reports_fail_closed() {
+    for (name, xml) in [
+        ("gate.malformed", "<testsuite><testcase>"),
+        (
+            "gate.inconsistent",
+            "<testsuite tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"0\"><testcase/></testsuite>",
+        ),
+    ] {
+        let script = format!("printf '%s' '{xml}' > report.xml");
+        let workspace = junit_workspace(name, &script, "[report.xml]", 1);
+        let output = reserved_run_raw(&workspace, "F-001", name);
+        assert!(
+            !output.status.success(),
+            "{name} must refuse invalid evidence"
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("JUnit report validation failed"), "{text}");
+    }
+}
+
+#[test]
+fn path_escape_and_duplicate_report_declarations_are_refused() {
+    let workspace = Workspace::initialized();
+    let escaped = workspace.gate_definition(
+        "gate.escape",
+        &junit_gate_definition("gate.escape", "true", "[../report.xml]", 1),
+    );
+    let escaped_output = workspace.gate_raw(&["register", "--definition", &escaped]);
+    assert!(!escaped_output.status.success());
+
+    let duplicate = workspace.gate_definition(
+        "gate.duplicate",
+        &junit_gate_definition("gate.duplicate", "true", "[report.xml, report.xml]", 1),
+    );
+    let duplicate_output = workspace.gate_raw(&["register", "--definition", &duplicate]);
+    assert!(!duplicate_output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_declared_report_is_refused() {
+    let workspace = Workspace::initialized();
+    let outside = workspace.root.join("outside.xml");
+    fs::write(&outside, VALID_JUNIT).unwrap();
+    let script = format!("ln -s '{}' report.xml", outside.display());
+    let path = workspace.gate_definition(
+        "gate.symlink",
+        &junit_gate_definition("gate.symlink", &script, "[report.xml]", 1),
+    );
+    workspace.gate(&["register", "--definition", &path]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "JUnit symlink",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.symlink"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let output = reserved_run_raw(&workspace, "F-001", "gate.symlink");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("traverses a symlink"),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn retry_attempts_are_aggregated_without_reusing_the_first_report() {
+    let script = format!("printf '%s' '{VALID_JUNIT}' > report.xml");
+    let workspace = junit_workspace("gate.retry-junit", &script, "[report.xml]", 2);
+    let first =
+        workspace.gate_json(&["run", "--card-id", "F-001", "--gate-id", "gate.retry-junit"]);
+    assert_eq!(first["data"]["attempt"], 1);
+
+    let receipt_path = fs::read_dir(workspace.control.join("receipts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .unwrap();
+    let mut retry: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    retry["receipt_id"] = "R-000002".into();
+    retry["attempt"] = 2.into();
+    fs::write(
+        workspace.control.join("receipts/R-000002.json"),
+        serde_json::to_vec_pretty(&retry).unwrap(),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "--all"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "test: retry receipt"],
+    );
+
+    let snapshot = snapshot_json(&workspace);
+    assert_eq!(snapshot["data"]["test_metrics"]["status"], "reported");
+    assert_eq!(snapshot["data"]["test_metrics"]["total"], 8);
+    assert_eq!(snapshot["data"]["gate_metrics"]["attempts"], 2);
 }
 
 #[test]

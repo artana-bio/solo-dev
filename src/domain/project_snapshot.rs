@@ -17,6 +17,7 @@ use crate::{
     control::repository::ControlRepository,
     domain::clock::{Clock, Timestamp},
     error::HarnessError,
+    runner::receipt::TestResultSummary,
 };
 
 /// Stable schema for the operational projection.
@@ -46,6 +47,8 @@ pub struct ProjectSnapshot {
     pub active_cards: Vec<ActiveCardSnapshot>,
     /// Aggregate and per-gate receipt metrics.
     pub gate_metrics: GateMetrics,
+    /// Aggregate structured test counts from exact subject-bound receipts.
+    pub test_metrics: TestResultSummary,
     /// Existing review-return and repair-attempt facts.
     pub review_metrics: ReviewMetrics,
     /// Readiness and blockers visible from the captured lifecycle records.

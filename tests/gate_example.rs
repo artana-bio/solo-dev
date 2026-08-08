@@ -181,6 +181,7 @@ fn the_emitted_gate_example_is_complete() {
         network_policy: NetworkPolicy::Denied,
         retry_policy: RetryPolicy::default(),
         artifacts: vec![],
+        junit_reports: vec![],
     };
     let reference_keys = top_level_keys(
         &serde_json::to_string(&reference).expect("reference gate definition serializes"),

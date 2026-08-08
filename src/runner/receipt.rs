@@ -43,6 +43,81 @@ const REUSE_DIMENSIONS: [ProvenanceDimension; 7] = [
 /// Directory holding receipts, relative to the control repository.
 pub const RECEIPT_DIR: &str = "receipts";
 
+/// Whether a receipt carries a validated structured test result.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestResultStatus {
+    /// Counts were parsed from one or more declared reports.
+    Reported,
+    /// No structured report was declared for this gate.
+    NotReported,
+}
+
+impl TestResultStatus {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::NotReported => "not_reported",
+        }
+    }
+}
+
+/// Redacted test-result counts attached to one exact gate attempt.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultSummary {
+    pub total: u64,
+    pub passed: u64,
+    pub failed: u64,
+    pub errors: u64,
+    pub skipped: u64,
+    pub status: TestResultStatus,
+}
+
+impl TestResultSummary {
+    /// Creates the compatibility value for a gate with no report declaration.
+    #[must_use]
+    pub const fn not_reported() -> Self {
+        Self {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            errors: 0,
+            skipped: 0,
+            status: TestResultStatus::NotReported,
+        }
+    }
+
+    /// Checks the arithmetic and status invariants before projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when counts overflow, disagree, or carry a non-zero
+    /// value while the status is `not_reported`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let classified = self
+            .passed
+            .checked_add(self.failed)
+            .and_then(|value| value.checked_add(self.errors))
+            .and_then(|value| value.checked_add(self.skipped))
+            .ok_or("test result counts overflow")?;
+        if self.total != classified {
+            return Err("test result counts are internally inconsistent");
+        }
+        if self.status == TestResultStatus::NotReported
+            && (self.total != 0
+                || self.passed != 0
+                || self.failed != 0
+                || self.errors != 0
+                || self.skipped != 0)
+        {
+            return Err("not_reported test results must have zero counts");
+        }
+        Ok(())
+    }
+}
+
 /// Directory holding gate logs, relative to the control repository.
 ///
 /// Logs live outside Git history: they are large, uninteresting when passing,
@@ -600,6 +675,10 @@ pub struct Receipt {
     pub stderr_digest: Digest,
     /// Digests of declared artifacts that were produced.
     pub artifact_digests: BTreeMap<String, String>,
+    /// Optional validated counts from explicitly declared `JUnit` reports.
+    /// Omission preserves the canonical digest of existing receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_results: Option<TestResultSummary>,
     /// Where the logs were written.
     pub log_location: PathBuf,
     /// Which attempt this was, starting at 1.
@@ -811,6 +890,7 @@ mod tests {
             stdout_digest: Digest::of_bytes(b""),
             stderr_digest: Digest::of_bytes(b""),
             artifact_digests: BTreeMap::new(),
+            test_results: None,
             log_location: PathBuf::from("/logs/gate.unit/attempt-1"),
             attempt,
             passed,

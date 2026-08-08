@@ -10,6 +10,7 @@
 //! the next gate run then fails for reasons that have nothing to do with the
 //! code under test.
 
+pub(crate) mod junit;
 pub mod receipt;
 
 use std::{
@@ -63,6 +64,8 @@ pub struct AttemptOutcome {
     pub duration_ms: u64,
     /// Digests of declared artifacts that were produced.
     pub artifact_digests: std::collections::BTreeMap<String, String>,
+    /// Validated counts from reports declared by the gate, if any.
+    pub test_results: Option<receipt::TestResultSummary>,
 }
 
 impl AttemptOutcome {
@@ -141,6 +144,7 @@ pub fn run_attempt_with_validation_cache(
     validation_cache: Option<&Path>,
 ) -> Result<AttemptOutcome, HarnessError> {
     let working_directory = resolve_working_directory(gate, worktree)?;
+    let report_before = junit::capture_before(gate, &working_directory, worktree, attempt)?;
     let (stdout_path, stderr_path) = attempt_log_paths(log_root, &gate.gate_id, attempt);
     if let Some(parent) = stdout_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {
@@ -251,6 +255,7 @@ pub fn run_attempt_with_validation_cache(
     let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
     let termination = classify(timed_out, status.as_ref(), exit_code);
     let artifact_digests = digest_artifacts(gate, &working_directory);
+    let test_results = junit::collect(gate, &working_directory, worktree, &report_before, attempt)?;
     let _ = started_at;
 
     Ok(AttemptOutcome {
@@ -266,6 +271,7 @@ pub fn run_attempt_with_validation_cache(
             .map_or_else(|| log_root.to_path_buf(), Path::to_path_buf),
         duration_ms,
         artifact_digests,
+        test_results,
     })
 }
 
@@ -514,6 +520,7 @@ mod tests {
             network_policy: NetworkPolicy::Denied,
             retry_policy: RetryPolicy::default(),
             artifacts: vec![],
+            junit_reports: vec![],
         }
     }
 

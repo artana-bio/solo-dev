@@ -93,6 +93,7 @@ pub(super) fn collect_at_head(
     let active_cards =
         project_snapshot_metrics::active_cards(&cards, &card_states, &events, &leases, captured_at);
     let gate_metrics = project_snapshot_metrics::gate_metrics(&receipts);
+    let test_metrics = project_snapshot_metrics::test_metrics(&receipts)?;
     let review_metrics = project_snapshot_metrics::review_metrics(&events);
     let integration = project_snapshot_metrics::integration_summary(
         &cycles,
@@ -138,6 +139,7 @@ pub(super) fn collect_at_head(
         card_state_counts,
         active_cards,
         gate_metrics,
+        test_metrics,
         review_metrics,
         integration,
         silent_leases,
@@ -358,6 +360,13 @@ fn validate_receipts(
         }
         if receipt.project_id != config.project_id {
             return Err(receipt_corrupt("receipt_project_mismatch"));
+        }
+        if receipt
+            .test_results
+            .as_ref()
+            .is_some_and(|results| results.validate().is_err())
+        {
+            return Err(receipt_corrupt("test_result_summary_invalid"));
         }
 
         match (

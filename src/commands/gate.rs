@@ -61,7 +61,7 @@ use crate::{
         receipt::{
             LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject, RECEIPT_DIR,
             RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
-            ValidationReservationBinding, evidence_is_acceptable,
+            TestResultSummary, ValidationReservationBinding, evidence_is_acceptable,
         },
         run_attempt, run_attempt_with_validation_cache,
     },
@@ -637,6 +637,7 @@ fn example_definition() -> GateDefinition {
         network_policy: NetworkPolicy::Denied,
         retry_policy: RetryPolicy::default(),
         artifacts: vec![],
+        junit_reports: vec![],
     }
 }
 
@@ -3065,6 +3066,12 @@ fn settle_governed_gate_execution(
                 stdout_digest: outcome.stdout_digest.clone(),
                 stderr_digest: outcome.stderr_digest.clone(),
                 artifact_digests: outcome.artifact_digests.clone(),
+                test_results: Some(
+                    outcome
+                        .test_results
+                        .clone()
+                        .unwrap_or_else(TestResultSummary::not_reported),
+                ),
                 log_location: outcome.log_location.clone(),
                 attempt: execution.attempt,
                 passed: outcome.passed(),
@@ -3364,6 +3371,12 @@ fn run_gate_locked(args: &RunArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
                 stdout_digest: outcome.stdout_digest.clone(),
                 stderr_digest: outcome.stderr_digest.clone(),
                 artifact_digests: outcome.artifact_digests.clone(),
+                test_results: Some(
+                    outcome
+                        .test_results
+                        .clone()
+                        .unwrap_or_else(TestResultSummary::not_reported),
+                ),
                 log_location: outcome.log_location.clone(),
                 attempt,
                 passed: outcome.passed(),
@@ -3910,6 +3923,7 @@ mod progressive_tests {
             stdout_digest: Digest::of_bytes(b""),
             stderr_digest: Digest::of_bytes(b""),
             artifact_digests: BTreeMap::new(),
+            test_results: None,
             log_location: PathBuf::from("/tmp/gate"),
             attempt: 1,
             passed: true,

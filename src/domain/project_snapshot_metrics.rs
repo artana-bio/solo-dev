@@ -19,8 +19,9 @@ use crate::{
         lease::LeaseRecord,
         review::{Decision, ReviewRecord},
     },
+    error::{ErrorCode, HarnessError},
     git::command::{GitScope, run},
-    runner::receipt::{Receipt, Termination},
+    runner::receipt::{Receipt, Termination, TestResultStatus, TestResultSummary},
 };
 
 const CYCLE_STATE_NAMES: &[&str] = &[
@@ -176,6 +177,65 @@ pub(super) fn gate_metrics(receipts: &[Receipt]) -> GateMetrics {
         }
     }
     metrics
+}
+
+pub(super) fn test_metrics(receipts: &[Receipt]) -> Result<TestResultSummary, HarnessError> {
+    let mut summary = TestResultSummary::not_reported();
+    for receipt in receipts {
+        let Some(test_results) = receipt.test_results.as_ref() else {
+            continue;
+        };
+        test_results
+            .validate()
+            .map_err(|reason| HarnessError::Control {
+                reason: format!("project snapshot receipt integrity: {reason}"),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        if test_results.status == TestResultStatus::NotReported {
+            continue;
+        }
+        summary.status = TestResultStatus::Reported;
+        summary.total = summary
+            .total
+            .checked_add(test_results.total)
+            .ok_or_else(|| HarnessError::Control {
+                reason: "project snapshot test metrics overflow".to_owned(),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        summary.passed = summary
+            .passed
+            .checked_add(test_results.passed)
+            .ok_or_else(|| HarnessError::Control {
+                reason: "project snapshot test metrics overflow".to_owned(),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        summary.failed = summary
+            .failed
+            .checked_add(test_results.failed)
+            .ok_or_else(|| HarnessError::Control {
+                reason: "project snapshot test metrics overflow".to_owned(),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        summary.errors = summary
+            .errors
+            .checked_add(test_results.errors)
+            .ok_or_else(|| HarnessError::Control {
+                reason: "project snapshot test metrics overflow".to_owned(),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+        summary.skipped = summary
+            .skipped
+            .checked_add(test_results.skipped)
+            .ok_or_else(|| HarnessError::Control {
+                reason: "project snapshot test metrics overflow".to_owned(),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
+    }
+    summary.validate().map_err(|reason| HarnessError::Control {
+        reason: format!("project snapshot receipt integrity: {reason}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    Ok(summary)
 }
 
 pub(super) fn review_metrics(events: &[crate::control::event_store::Event]) -> ReviewMetrics {
