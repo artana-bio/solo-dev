@@ -340,6 +340,30 @@ state; do not accept "done" in chat as a handoff.
 
 ### Stop and untangle a bottleneck
 
+Start from deterministic state rather than waiting for a conversation to notice
+the pattern:
+
+```bash
+change-harness card status --card-id F-001 --output json
+change-harness project status --output json
+```
+
+An activated card's `data.bottleneck` is a
+`harness.bottleneck-projection/v1` document. It combines declared scope,
+review trend, configured convergence-attempt counters, and hard escalation.
+`project status` collects every non-clear card under `data.bottlenecks`.
+Models should match the closed `status`, signal `kind`, `recommended_action`,
+and `authority_action` fields; prose `detail` is for explanation, not control.
+
+`attention_required` and `stop_required` recommend
+`convene_bottleneck_group`. `stop_required` also preserves the Harness's real
+next authority action, such as `record_authorized_disposition`; diagnosis
+does not release that refusal. Attempt-based detection reports
+`legacy_unassessed` when no convergence policy exists. The Harness can count
+repeated recorded attempts, but it cannot determine whether two
+natural-language hypotheses are materially similar. The implementer must
+still apply that semantic stop rule.
+
 Do not let a card consume repeated attempts without changing what the team
 knows. Pause ordinary implementation when either condition is true:
 

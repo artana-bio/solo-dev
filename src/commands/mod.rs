@@ -12,6 +12,7 @@ pub mod acceptance;
 pub mod archive;
 pub mod audit;
 pub mod backup;
+pub mod bottleneck;
 pub mod card;
 pub mod cycle;
 pub mod demo;

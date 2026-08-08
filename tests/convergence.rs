@@ -670,6 +670,91 @@ fn findings_moving_to_new_areas_are_flagged_even_while_the_count_falls() {
     assert!(warned.contains("src/e.rs"), "and it names where: {warned}");
 }
 
+#[test]
+fn card_status_projects_a_broad_card_as_an_advisory_for_agents() {
+    let workspace = opened();
+    let paths = (0..13)
+        .map(|index| format!("src/policy/file-{index}.rs"))
+        .collect::<Vec<_>>();
+    draft_with_scope(&workspace, "F-001", &paths);
+    workspace.card(&["activate", "--card-id", "F-001"]);
+
+    let status = workspace.card_json(&["status", "--card-id", "F-001"]);
+    let bottleneck = &status["data"]["bottleneck"];
+    assert_eq!(bottleneck["schema"], "harness.bottleneck-projection/v1");
+    assert_eq!(bottleneck["status"], "advisory");
+    assert_eq!(bottleneck["attempt_coverage"], "legacy_unassessed");
+    assert_eq!(bottleneck["recommended_action"], "consider_card_split");
+    assert!(bottleneck["authority_action"].is_null());
+    assert_eq!(bottleneck["signals"][0]["kind"], "broad_scope");
+    assert_eq!(bottleneck["signals"][0]["severity"], "advisory");
+    assert_eq!(bottleneck["signals"][0]["count"], 13);
+    assert_eq!(bottleneck["signals"][0]["threshold"], 12);
+}
+
+#[test]
+fn status_surfaces_a_review_plateau_and_project_status_aggregates_it() {
+    let workspace = opened();
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    review_round(&workspace, "F-001", 1, &[], &["src/a.rs", "src/b.rs"]);
+    review_round(
+        &workspace,
+        "F-001",
+        2,
+        &["src/a.rs", "src/b.rs"],
+        &["src/a.rs", "src/b.rs"],
+    );
+    review_round(
+        &workspace,
+        "F-001",
+        3,
+        &["src/a.rs", "src/b.rs"],
+        &["src/a.rs", "src/b.rs"],
+    );
+
+    let status = workspace.card_json(&["status", "--card-id", "F-001"]);
+    let bottleneck = &status["data"]["bottleneck"];
+    assert_eq!(bottleneck["status"], "attention_required");
+    assert_eq!(bottleneck["recommended_action"], "convene_bottleneck_group");
+    assert!(
+        bottleneck["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|signal| signal["kind"] == "review_plateau")
+    );
+
+    let output = Workspace::run(&[
+        "project".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    assert!(
+        output.status.success(),
+        "project status failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let project: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(project["data"]["bottleneck_count"], 1);
+    assert_eq!(project["data"]["bottlenecks"][0]["card_id"], "F-001");
+    assert_eq!(
+        project["data"]["bottlenecks"][0]["bottleneck"]["status"],
+        "attention_required"
+    );
+    assert!(
+        project["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("convene_bottleneck_group")
+    );
+}
+
 // 71-R2: a `changes_requested` review return, under a configured convergence
 // policy, declares its reason and appends exactly one bound
 // `convergence.attempt_recorded` fact in the same transaction as
