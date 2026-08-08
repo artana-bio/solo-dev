@@ -158,13 +158,27 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                 ],
             )?
             .require_success()?;
+            let oracle = crate::commands::gate::load_gate(control, &receipt.gate_oracle)?;
+            let baseline_oracle = runner::run_attempt(
+                &oracle,
+                &worktree,
+                scratch.path().join("logs-before").as_path(),
+                1,
+                clock,
+            )?;
+            if !baseline_oracle.passed() {
+                return Err(HarnessError::Control {
+                    reason: "mutation oracle must pass on the exact candidate before mutation"
+                        .to_owned(),
+                    code: ErrorCode::PolicyIncompleteReview,
+                });
+            }
             let mut mutation = std::process::Command::new(&receipt.command[0]);
             mutation.args(&receipt.command[1..]).current_dir(&worktree);
             let mutation_output = mutation.output().map_err(|source| HarnessError::Control {
                 reason: format!("mutation command could not start: {source}"),
                 code: ErrorCode::PolicyIncompleteReview,
             })?;
-            let oracle = crate::commands::gate::load_gate(control, &receipt.gate_oracle)?;
             let oracle_outcome = runner::run_attempt(
                 &oracle,
                 &worktree,
@@ -179,6 +193,21 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                         mutation_output.status.code(),
                         oracle_outcome.passed()
                     ),
+                    code: ErrorCode::PolicyIncompleteReview,
+                });
+            }
+            let mut observed_patch =
+                run(&GitScope::work_tree(&worktree), ["diff", "--binary"])?.stdout;
+            if observed_patch.trim().is_empty() {
+                let status =
+                    run(&GitScope::work_tree(&worktree), ["status", "--porcelain"])?.stdout;
+                if !status.trim().is_empty() {
+                    observed_patch = status;
+                }
+            }
+            if observed_patch.trim().is_empty() {
+                return Err(HarnessError::Control {
+                    reason: "mutation command produced no tracked tree change".to_owned(),
                     code: ErrorCode::PolicyIncompleteReview,
                 });
             }
@@ -200,6 +229,8 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
             }
             let restored = inspect::resolve_commit(&GitScope::work_tree(&worktree), "HEAD")?;
             let mut receipt = receipt;
+            receipt.mutation_digest = Digest::of_bytes(observed_patch.as_bytes());
+            receipt.patch_digest = receipt.mutation_digest.clone();
             receipt.observed_result = format!(
                 "mutation_exit={:?}; oracle_exit={:?}; oracle_passed={}",
                 mutation_output.status.code(),

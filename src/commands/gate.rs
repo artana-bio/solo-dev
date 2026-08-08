@@ -754,11 +754,7 @@ pub fn all_gates(control: &ControlRepository) -> Result<Vec<GateDefinition>, Har
 
 fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    if gate.schema != GATE_SCHEMA || gate.purpose.is_some() || gate.semantics.is_some() {
-        gate.validate_contract()?;
-    } else {
-        gate.validate()?;
-    }
+    validate_authored_definition(&gate)?;
     Ok(CommandOutcome::new(
         "gate.validate",
         format!(
@@ -783,14 +779,7 @@ fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
 #[allow(clippy::too_many_lines)]
 fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    // v1 registry documents may omit the additive purpose/oracle fields. A
-    // new document that starts either field must provide both; `gate validate`
-    // is strict, while registration preserves the documented migration path.
-    if gate.schema != GATE_SCHEMA || gate.purpose.is_some() || gate.semantics.is_some() {
-        gate.validate_contract()?;
-    } else {
-        gate.validate()?;
-    }
+    validate_authored_definition(&gate)?;
     let digest = gate.digest()?;
 
     if args.dry_run {
@@ -915,6 +904,24 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
             .with_project(config.project_id.clone()))
         },
     )
+}
+
+fn validate_authored_definition(gate: &GateDefinition) -> Result<(), HarnessError> {
+    gate.validate_contract()?;
+    if gate.schema == GATE_SCHEMA
+        && gate.purpose.is_none()
+        && gate.semantics.is_none()
+        && gate.migration.as_deref() != Some("legacy_v1")
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "newly authored gate `{}` is semantics-free; use gate/v2 semantics or explicitly mark legacy_v1 migration",
+                gate.gate_id
+            ),
+            code: ErrorCode::ConfigInvalidGate,
+        });
+    }
+    Ok(())
 }
 
 fn run_list(args: &CommonArgs) -> Result<CommandOutcome, HarnessError> {

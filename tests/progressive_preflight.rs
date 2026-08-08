@@ -98,7 +98,7 @@ fn handoff_and_approve(workspace: &Workspace, card_id: &str) {
     let verdict = workspace.root.join(format!("{card_id}-verdict.yaml"));
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct proof\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct proof\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
     )
     .unwrap();
     workspace.review(&[

@@ -459,6 +459,8 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
+            crate::commands::cycle::require_card_plan_binding(control, &cycle, &card_id)?;
             // 72-2: the first check that can refuse, before anything is
             // written — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
@@ -906,6 +908,8 @@ fn preview_record(
         &verdict.reviewer_actor_id,
         verdict.reviewer_provenance.as_ref(),
         &handoff.actor_id,
+        handoff.actor_principal_id.as_deref(),
+        handoff.actor_session_id.as_deref(),
     )?;
     check_review_conduct(&record.review_policy, verdict.review_conduct)?;
     verdict.gate_adequacy.validate_mutation_evidence()?;
@@ -947,6 +951,8 @@ fn refuse_shared_reviewer_boundary(
     reviewer_actor_id: &str,
     provenance: Option<&ReviewerProvenance>,
     feature_actor_id: &str,
+    feature_principal_id: Option<&str>,
+    feature_session_id: Option<&str>,
 ) -> Result<(), HarnessError> {
     let Some(provenance) = provenance else {
         return Ok(());
@@ -955,13 +961,13 @@ fn refuse_shared_reviewer_boundary(
         actor_kind: "reviewer",
         actor_id: reviewer_actor_id,
         principal_id: provenance.principal_id.as_deref(),
-        session_id: None,
+        session_id: provenance.session_id.as_deref(),
     };
     let feature = actors::ActorIdentity {
         actor_kind: "implementer",
         actor_id: feature_actor_id,
-        principal_id: Some(feature_actor_id),
-        session_id: provenance.session_id.as_deref(),
+        principal_id: feature_principal_id.or(Some(feature_actor_id)),
+        session_id: feature_session_id,
     };
     if reviewer.same_boundary(&feature) {
         return Err(HarnessError::Control {
@@ -1205,6 +1211,8 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &verdict.reviewer_actor_id,
                 verdict.reviewer_provenance.as_ref(),
                 &handoff.actor_id,
+                handoff.actor_principal_id.as_deref(),
+                handoff.actor_session_id.as_deref(),
             )?;
 
             let next_state = state_for(verdict.decision);
@@ -1241,7 +1249,6 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 reviewed_at: clock.now(),
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
-            validate_mutation_receipts(control, &review)?;
             review.validate()?;
             // #28: kept separate from `validate()` rather than folded into
             // it — see `check_review_conduct`'s doc for why — but must still
@@ -1252,6 +1259,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             if let Some(superseded) = previous.as_ref() {
                 review.check_supersedes(superseded)?;
             }
+            validate_mutation_receipts(control, &review)?;
             let digest = review.digest()?;
 
             control.write_atomic(
@@ -1356,11 +1364,11 @@ fn validate_mutation_receipts(
         exemption.validate(&review.reviewer_actor_id)?;
         return Ok(());
     }
-    if review.decision == Decision::Approved
-        && review.reviewer_kind.is_some()
-        && review.mutation_receipt_ids.is_empty()
-    {
-        return Err(HarnessError::Control { reason: "an approved review requires an executable mutation receipt or typed policy-valid exemption".to_owned(), code: ErrorCode::PolicyIncompleteReview });
+    if review.decision == Decision::Approved && review.mutation_receipt_ids.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "every new approved review requires an executable mutation receipt or typed policy-valid exemption".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        });
     }
     for receipt_id in &review.mutation_receipt_ids {
         let relative = MutationReceipt::relative_path(receipt_id);

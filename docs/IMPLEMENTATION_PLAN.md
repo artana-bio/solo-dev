@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 60 |
-| Plan date | 2026-08-02 |
+| Plan revision | 61 |
+| Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Governance extension `WP-600` is **DONE**. Terra-high repairs are committed and all focused/full quality gates pass. |
+| Current implementation status | Governance extension `WP-600` is **DONE**; the second Terra-high repair findings are closed and final gates pass. |
 | Next executable work package | Independent review and promotion of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -1314,7 +1314,7 @@ why it is outside the package gate.
 
 | Field | Value |
 | --- | --- |
-| Status | `DONE` |
+| Status | `IN_PROGRESS` |
 | Commit | `4729d18` |
 | Dependencies | None |
 | Owner | Codex |
@@ -3185,7 +3185,7 @@ Status: `DEFERRED`.
 All must be true:
 
 - hardened single-repository release accepted;
-- `WP-600` and `WP-610` are `DONE`;
+- `WP-600-MR` and `WP-610` remain `DEFERRED`;
 - exact-SHA manifest demonstrated with at least two repositories;
 - partial landing is detected and recovered;
 - cross-repository test evidence is retained;
@@ -3508,7 +3508,7 @@ When the plan changes:
 | Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | `cargo test --test review --test integration_plan --test gate_registry --test card_model --test progressive_preflight --quiet`; deliberate human-identity mutation was rejected; `cargo test --test promotion historical_v1_final_acceptance_remains_promotable_without_a_new_policy --quiet`; full suite 682 unit tests plus all integration binaries passed. |
+| Focused evidence | Typed-review, executable-mutation, principal/session, cycle-plan, proof/oracle, gate-migration, final-authorization, and evidence-report regressions pass. The sequential full suite, `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
 
 Delivered in this slice:
 
@@ -3529,19 +3529,22 @@ Delivered in this slice:
 - `audit report` emits `harness.claim-report/v1` classifications and preserves
   discrepancies instead of dropping unsupported claims.
 
-Requirement audit: complete. (1) typed reviewer kind, provenance, independent human
-attestation, and compatibility fields are enforced in review recording; (2)
-mutation receipts are persisted transactionally and bind card revision,
+Requirement audit: complete against the second Terra-high review. (1) typed reviewer kind, provenance, independent human
+attestation, and compatibility fields are enforced in review recording; every
+new approval requires executable mutation evidence or a typed policy-valid
+exemption; (2) mutation receipts are persisted transactionally and bind card revision,
 candidate, reviewer/session, digests, oracle, failure, and restoration, with
 typed exemptions only; (3) invariant checks carry stable proof IDs, receipt
 IDs, exact landing SHA, and derived `machine_checked`/`not_tested` states; (4)
-new initialized projects use an explicit installed-default final-authorization
-mode while legacy projects retain the refusal/migration path; (5) principal and
+new initialized projects use an explicit final-authorization mode: an installed
+default when an authorizer is supplied and migration-required refusal otherwise;
+legacy projects retain the refusal/migration path; (5) principal and
 session boundaries are used for review and integration separation and review
 begin fails before mutation without a handoff; (6) cycle plans are versioned,
 validated against complete cycle membership, and persisted by CLI; (7)
-`audit probes` covers all named negative probes and network output distinguishes
-declared from enforced; (8) `audit report` reads persisted integrations and
+`audit probes` covers all named negative probes with honest synthetic/not-tested
+classification where host enforcement is unavailable, and network output
+distinguishes declared from enforced; (8) `audit report` reads persisted integrations and
 verification receipts, binds claims to exact SHAs and policy digests, and
 preserves missing/contradictory evidence.
 

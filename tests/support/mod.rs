@@ -211,6 +211,11 @@ impl Workspace {
     /// Writes a gate definition file and returns its path.
     pub fn gate_definition(&self, name: &str, body: &str) -> String {
         let path = self.root.join(format!("{name}.yaml"));
+        let body = if body.contains("schema: harness.gate/v1") && !body.contains("migration:") {
+            format!("{body}migration: legacy_v1\n")
+        } else {
+            body.to_owned()
+        };
         fs::write(&path, body).unwrap();
         path.display().to_string()
     }
@@ -490,6 +495,23 @@ impl Workspace {
 
     /// Runs a `review` subcommand, asserting success.
     pub fn review(&self, args: &[&str]) -> Output {
+        if let Some(index) = args.iter().position(|arg| *arg == "--verdict")
+            && let Some(path) = args.get(index + 1)
+        {
+            let verdict_path = PathBuf::from(path);
+            if let Ok(body) = fs::read_to_string(&verdict_path)
+                && body.contains("decision: approved")
+                && !body.contains("mutation_exemption:")
+            {
+                fs::write(
+                    &verdict_path,
+                    format!(
+                        "{body}mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
+                    ),
+                )
+                .unwrap();
+            }
+        }
         let output = self.review_raw(args);
         assert!(
             output.status.success(),
@@ -738,7 +760,7 @@ impl Workspace {
         let verdict = self.root.join(format!("{card_id}-rework-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
@@ -795,7 +817,7 @@ impl Workspace {
         let verdict = self.root.join(format!("{card_id}-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.

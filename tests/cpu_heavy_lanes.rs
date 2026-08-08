@@ -20,7 +20,7 @@ fn gate(workspace: &Workspace, gate_id: &str, marker: &Path, release: &Path) {
     let marker = serde_json::to_string(&marker.display().to_string()).unwrap();
     let release = serde_json::to_string(&release.display().to_string()).unwrap();
     let body = format!(
-        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: {argv}\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER_PATH: {marker}\n    RELEASE_PATH: {release}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n",
+        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: 1\nargv: {argv}\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set:\n    MARKER_PATH: {marker}\n    RELEASE_PATH: {release}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\nmigration: legacy_v1\n",
     );
     let definition = workspace.gate_definition(gate_id, &body);
     workspace.gate(&["register", "--definition", &definition]);

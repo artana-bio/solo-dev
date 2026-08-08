@@ -50,6 +50,12 @@ Three repositories, deliberately separate: **your code**, the **control** reposi
 export CHANGE_HARNESS_CONTROL=/abs/path/to/myapp-control
 ```
 
+New projects always record an explicit final-authorization mode. Without
+`--final-authorizer-actor-id`, initialization records `migration_required` and
+sealed-cycle acceptance refuses until a policy is installed. Supplying one or
+more `--final-authorizer-actor-id` values installs the documented default
+policy and enforces it on the sealed-cycle path.
+
 ---
 
 ## 2. Register **two** gates — not one

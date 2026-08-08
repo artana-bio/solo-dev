@@ -19,7 +19,15 @@ fn handed_off() -> (Workspace, String) {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/**"]);
-    workspace.work(&["start", "--card-id", "F-001"]);
+    workspace.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
 
     let path = workspace.worktrees.join("F-001");
     fs::create_dir_all(path.join("src")).unwrap();
@@ -51,6 +59,13 @@ fn handed_off() -> (Workspace, String) {
 /// Writes a verdict file and returns its path.
 fn verdict(workspace: &Workspace, body: &str) -> String {
     let path = workspace.root.join("verdict.yaml");
+    let body = if body.contains("decision: approved") && !body.contains("mutation_exemption:") {
+        format!(
+            "{body}mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
+        )
+    } else {
+        body.to_owned()
+    };
     fs::write(&path, body).unwrap();
     path.display().to_string()
 }
@@ -58,7 +73,7 @@ fn verdict(workspace: &Workspace, body: &str) -> String {
 /// A clean approval by a distinct reviewer.
 fn approval(reviewer: &str) -> String {
     format!(
-        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n"
+        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
     )
 }
 
@@ -123,6 +138,22 @@ fn self_review_is_refused() {
         String::from_utf8_lossy(&output.stdout).contains("procedural"),
         "the message must not overclaim what this check proves"
     );
+}
+
+#[test]
+fn different_actor_in_the_implementer_session_is_refused() {
+    let (workspace, _) = handed_off();
+    let body = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: agent\n  session_id: implementer-session\n  principal_id: other-principal\ndecision: changes_requested\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: same session must be refused\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: non-approval fixture\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, body),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
 }
 
 #[test]
@@ -1133,4 +1164,25 @@ fn a_low_risk_card_needs_no_human_declaration() {
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(envelope["data"]["review"]["human_reviewer"], false);
+}
+
+#[test]
+fn every_new_low_risk_approval_needs_typed_mutation_evidence() {
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("unbound-approval.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: prose only\nresidual_risks: []\nreview_conduct: separate_process\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
 }

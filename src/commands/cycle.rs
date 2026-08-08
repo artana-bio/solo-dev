@@ -336,6 +336,33 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
         &relative,
         &format!("{}\n", serde_json::to_string_pretty(&plan)?),
     )?;
+    let plan_digest = plan.digest()?;
+    let mut bound_cycle = cycle;
+    bound_cycle.plan_id = Some(plan.plan_id.clone());
+    bound_cycle.plan_digest = Some(plan_digest.clone());
+    bound_cycle.plan_revision = Some(crate::domain::cycle_plan::CYCLE_PLAN_REVISION);
+    control.write_atomic(
+        &CycleRecord::relative_path(&cycle_id),
+        &format!("{}\n", serde_json::to_string_pretty(&bound_cycle)?),
+    )?;
+    for planned_card in &plan.cards {
+        let card_id: crate::domain::ids::CardId = planned_card.card_id.parse()?;
+        let state_path = crate::commands::card::CardStateRecord::relative_path(&card_id);
+        let mut state: crate::commands::card::CardStateRecord =
+            serde_json::from_str(&control.read(&state_path)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!("card {} state is malformed: {source}", planned_card.card_id),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })?;
+        state.plan_id = Some(plan.plan_id.clone());
+        state.plan_digest = Some(plan_digest.clone());
+        state.plan_revision = Some(crate::domain::cycle_plan::CYCLE_PLAN_REVISION);
+        control.write_atomic(
+            &state_path,
+            &format!("{}\n", serde_json::to_string_pretty(&state)?),
+        )?;
+    }
     let expected = control.head()?;
     control.commit(
         expected.as_deref(),
@@ -347,6 +374,81 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
         serde_json::to_value(&plan)?,
     )
     .with_project(control.project()?.project_id))
+}
+
+/// Revalidates the cycle's persisted plan binding at each lifecycle boundary.
+///
+/// Legacy cycles without a binding remain readable; once a plan is installed,
+/// changing or deleting it cannot silently change the lifecycle contract.
+///
+/// # Errors
+///
+/// Returns an error when the bound plan is missing, malformed, stale, or
+/// contradictory to the cycle.
+pub fn require_active_plan(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+) -> Result<(), HarnessError> {
+    let (Some(plan_id), Some(plan_digest), Some(plan_revision)) =
+        (&cycle.plan_id, &cycle.plan_digest, &cycle.plan_revision)
+    else {
+        return Ok(());
+    };
+    let raw = control.read(&format!("plans/{plan_id}.json"))?;
+    let plan: CyclePlan = serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+        reason: format!("active cycle plan {plan_id} is malformed: {source}"),
+        code: ErrorCode::PolicyInvalidCycle,
+    })?;
+    plan.validate()?;
+    if plan.cycle_id != cycle.cycle_id.to_string()
+        || plan.digest()? != *plan_digest
+        || *plan_revision != crate::domain::cycle_plan::CYCLE_PLAN_REVISION
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {} has a stale or contradictory active plan",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    Ok(())
+}
+
+/// Requires a card state to carry the active cycle plan binding.
+///
+/// # Errors
+///
+/// Returns an error when the active plan or card state is missing, malformed,
+/// stale, or contradictory.
+pub fn require_card_plan_binding(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    card_id: &crate::domain::ids::CardId,
+) -> Result<(), HarnessError> {
+    require_active_plan(control, cycle)?;
+    let (Some(plan_id), Some(plan_digest), Some(plan_revision)) =
+        (&cycle.plan_id, &cycle.plan_digest, &cycle.plan_revision)
+    else {
+        return Ok(());
+    };
+    let state: crate::commands::card::CardStateRecord = serde_json::from_str(&control.read(
+        &crate::commands::card::CardStateRecord::relative_path(card_id),
+    )?)
+    .map_err(|source| HarnessError::Control {
+        reason: format!("card {card_id} state is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    if state.plan_id.as_deref() != Some(plan_id)
+        || state.plan_digest.as_ref() != Some(plan_digest)
+        || state.plan_revision != Some(*plan_revision)
+    {
+        return Err(HarnessError::Control {
+            reason: format!("card {card_id} is not bound to cycle plan {plan_id}"),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    Ok(())
 }
 
 /// How long each replay frame is shown before the next replaces it.
@@ -380,7 +482,7 @@ pub fn execute_replay(
     let cycle_id: CycleId = args.cycle_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
-    let cycle = load(&control, &cycle_id)?;
+    let cycle = load_cycle(&control, &cycle_id)?;
     let events = EventStore::new(&control);
     let status = derived_status(&events, &cycle_id)?;
     let history = events.for_cycle(&cycle_id)?;
@@ -516,7 +618,14 @@ fn timeline_text(
 }
 
 /// Reads a cycle record, or reports that it does not exist.
-fn load(control: &ControlRepository, cycle_id: &CycleId) -> Result<CycleRecord, HarnessError> {
+///
+/// # Errors
+///
+/// Returns an error when the record is missing or cannot be decoded.
+pub fn load_cycle(
+    control: &ControlRepository,
+    cycle_id: &CycleId,
+) -> Result<CycleRecord, HarnessError> {
     let relative = CycleRecord::relative_path(cycle_id);
     if !control.path(&relative).exists() {
         return Err(HarnessError::Control {
@@ -614,6 +723,9 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 harness_version: env!("CARGO_PKG_VERSION").to_owned(),
                 project_revision: Digest::of_canonical(&config)?,
                 release_invariants: args.release_invariants.clone(),
+                plan_id: None,
+                plan_digest: None,
+                plan_revision: None,
                 card_ids: Vec::new(),
                 atomic_groups: Vec::new(),
                 created_by: args.common.actor.clone(),
@@ -652,7 +764,7 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let cycle = load(&control, &cycle_id)?;
+        let cycle = load_cycle(&control, &cycle_id)?;
         cycle.status.check_transition(CycleStatus::Active)?;
         let baseline = resolve_baseline(&control)?;
         return Ok(CommandOutcome::new(
@@ -674,7 +786,7 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
         clock,
         |control, events, expected, steps| {
             steps.at("control-write")?;
-            let mut cycle = load(control, &cycle_id)?;
+            let mut cycle = load_cycle(control, &cycle_id)?;
             let previous = cycle.status;
             previous.check_transition(CycleStatus::Active)?;
 
@@ -733,7 +845,7 @@ fn run_seal(args: &SealArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let cycle = load(&control, &cycle_id)?;
+        let cycle = load_cycle(&control, &cycle_id)?;
         cycle.status.check_transition(CycleStatus::Sealed)?;
         let baseline = cycle
             .baseline_sha
@@ -761,7 +873,7 @@ fn run_seal(args: &SealArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
         clock,
         |control, events, expected, steps| {
             steps.at("control-write")?;
-            let mut cycle = load(control, &cycle_id)?;
+            let mut cycle = load_cycle(control, &cycle_id)?;
             let previous = cycle.status;
             previous.check_transition(CycleStatus::Sealed)?;
             let baseline = cycle
@@ -903,7 +1015,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     let cycle_id: CycleId = args.cycle_id.parse()?;
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
-    let cycle = load(&control, &cycle_id)?;
+    let cycle = load_cycle(&control, &cycle_id)?;
     let events = EventStore::new(&control);
     let derived = derived_status(&events, &cycle_id)?;
     let history = events.for_cycle(&cycle_id)?;
@@ -1132,7 +1244,7 @@ fn run_declare_group(
         clock,
         |control, events, expected, steps| {
             steps.at("control-write")?;
-            let mut cycle = load(control, &cycle_id)?;
+            let mut cycle = load_cycle(control, &cycle_id)?;
             if cycle
                 .atomic_groups
                 .iter()
@@ -1204,7 +1316,7 @@ fn preview_declare_group(
     card_ids: &[crate::domain::ids::CardId],
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
-    let mut cycle = load(&control, cycle_id)?;
+    let mut cycle = load_cycle(&control, cycle_id)?;
     cycle.atomic_groups.push(AtomicGroup {
         name: args.name.clone(),
         card_ids: card_ids.to_vec(),
@@ -1231,7 +1343,7 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
-        let cycle = load(&control, &cycle_id)?;
+        let cycle = load_cycle(&control, &cycle_id)?;
         cycle.status.check_transition(CycleStatus::Abandoned)?;
         return Ok(CommandOutcome::new(
             "cycle.abandon",
@@ -1246,7 +1358,7 @@ fn run_abandon(args: &AbandonArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         clock,
         |control, events, expected, steps| {
             steps.at("control-write")?;
-            let mut cycle = load(control, &cycle_id)?;
+            let mut cycle = load_cycle(control, &cycle_id)?;
             let previous = cycle.status;
             previous.check_transition(CycleStatus::Abandoned)?;
 

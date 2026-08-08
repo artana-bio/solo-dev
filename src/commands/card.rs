@@ -60,6 +60,12 @@ pub struct CardStateRecord {
     pub current_digest: Digest,
     /// The canonicalization algorithm the digest was computed under.
     pub canonical_algorithm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
 }
 
 impl CardStateRecord {
@@ -1048,6 +1054,7 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             }
             let draft = stored_draft(control, &card_id)?;
             let cycle = cycle_accepting_cards(control, &draft)?;
+            crate::commands::cycle::require_active_plan(control, &cycle)?;
             require_cycle_baseline(&cycle, &draft)?;
             let config = control.project()?;
 
@@ -1150,6 +1157,9 @@ fn write_revision(
                 current_revision: record.revision,
                 current_digest: digest.clone(),
                 canonical_algorithm: CardRecord::canonical_algorithm().to_owned(),
+                plan_id: None,
+                plan_digest: None,
+                plan_revision: None,
             })?
         ),
     )

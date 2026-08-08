@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorCode, HarnessError};
 
 pub const CYCLE_PLAN_SCHEMA: &str = "harness.cycle-plan/v1";
+pub const CYCLE_PLAN_REVISION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +44,14 @@ pub struct CyclePlan {
 }
 
 impl CyclePlan {
+    /// The stable digest used to bind this plan into lifecycle records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonical serialization fails.
+    pub fn digest(&self) -> Result<crate::domain::digest::Digest, HarnessError> {
+        crate::domain::digest::Digest::of_canonical(self)
+    }
     /// Deterministically validates the complete plan before distribution.
     ///
     /// # Errors

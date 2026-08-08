@@ -79,6 +79,10 @@ pub struct CommonArgs {
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
     pub actor: String,
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
 }
 
 /// Arguments accepted by `work start`.
@@ -561,6 +565,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
+            crate::commands::cycle::require_card_plan_binding(control, &cycle, &card_id)?;
             let (base, branch, path) =
                 preflight_start(control, &config, &card_id, &record, &state)?;
             let scope = GitScope::work_tree(&config.repository);
@@ -585,6 +591,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                 card_id: card_id.clone(),
                 card_revision: state.current_revision,
                 actor_id: args.common.actor.clone(),
+                actor_principal_id: args.common.actor_principal_id.clone(),
+                actor_session_id: args.common.actor_session_id.clone(),
                 branch: branch.clone(),
                 worktree_path: path.clone(),
                 base_sha: base.clone(),

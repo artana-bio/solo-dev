@@ -82,6 +82,10 @@ pub struct CommonArgs {
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
     pub actor: String,
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
 }
 
 /// Arguments accepted by `handoff create`.
@@ -1072,6 +1076,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 worktree_clean: true,
                 declaration: declaration.clone(),
                 actor_id: args.common.actor.clone(),
+                actor_principal_id: lease.actor_principal_id.clone(),
+                actor_session_id: lease.actor_session_id.clone(),
                 created_at: clock.now(),
                 status: HandoffStatus::Active,
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),

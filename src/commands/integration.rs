@@ -481,6 +481,7 @@ fn assess(
     let scope = GitScope::work_tree(&control.project()?.repository);
     let mut assessed = Vec::new();
     for card_id in &cycle.card_ids {
+        crate::commands::cycle::require_card_plan_binding(control, cycle, card_id)?;
         let Ok((record, state)) = load_card(control, card_id) else {
             // Declared but never activated: it has claimed nothing and cannot
             // be integrated, and that is not an error in this report.
@@ -3270,25 +3271,41 @@ fn store_verification(
     }
 
     let landing_sha = record.landing_sha.clone().unwrap_or_default();
+    let mut proofs = Vec::new();
+    for card_id in &cycle.card_ids {
+        let (card, _) = load_card(control, card_id)?;
+        if let Some(map) = card.proof_map {
+            for entry in map.entries {
+                let (Some(id), Some(oracle)) = (entry.id, entry.gate_oracle) else {
+                    continue;
+                };
+                proofs.push((id, entry.invariant, oracle));
+            }
+        }
+    }
     let invariant_checks = cycle
         .release_invariants
         .iter()
         .map(|invariant| {
-            // An invariant is machine-checked only when its stable binding is the
-            // gate identifier and a passed receipt for that exact landing SHA is
-            // persisted. Everything else remains explicitly unproven.
-            let matching: Vec<String> = receipts
+            let proof = proofs
                 .iter()
-                .filter(|receipt| {
-                    receipt.passed
-                        && receipt.gate_id == *invariant
-                        && receipt.evaluated_sha == landing_sha
+                .find(|(id, text, _)| id == invariant || text == invariant);
+            let matching: Vec<String> = proof
+                .map(|(_, _, oracle)| {
+                    receipts
+                        .iter()
+                        .filter(|receipt| {
+                            receipt.passed
+                                && receipt.gate_id == *oracle
+                                && receipt.evaluated_sha == landing_sha
+                        })
+                        .map(|receipt| receipt.receipt_id.to_string())
+                        .collect()
                 })
-                .map(|receipt| receipt.receipt_id.to_string())
-                .collect();
-            let checked = !matching.is_empty();
+                .unwrap_or_default();
+            let checked = proof.is_some() && !matching.is_empty();
             InvariantCheck {
-                proof_entry_id: checked.then(|| invariant.clone()),
+                proof_entry_id: proof.map(|(id, _, _)| id.clone()),
                 invariant: invariant.clone(),
                 machine_checked: checked,
                 observed_receipt_ids: matching,
