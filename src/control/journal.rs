@@ -119,6 +119,13 @@ pub struct OperationRecord {
     /// decision was made on.
     #[serde(default)]
     pub touched_outside_control: bool,
+    /// Whether the command has crossed into any durable mutation phase.
+    ///
+    /// This is distinct from `touched_outside_control`: a transaction may
+    /// have written a lease, event, or control record without touching Git.
+    /// Once true, a later policy error must retain the recovery journal.
+    #[serde(default)]
+    pub mutation_started: bool,
 }
 
 impl OperationRecord {
@@ -194,6 +201,7 @@ impl<'a> Journal<'a> {
             steps: Vec::new(),
             expected_control_head,
             touched_outside_control: false,
+            mutation_started: false,
             started_at: clock.now(),
             finished_at: None,
             failure: None,

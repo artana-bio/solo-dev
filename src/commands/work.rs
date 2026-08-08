@@ -14,7 +14,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{CardStateRecord, load_card, require_convergence_budget, store_card_state},
-        transaction::{Steps, pure_recheck, with_transaction},
+        transaction::{Steps, with_transaction},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
     domain::{
@@ -596,18 +596,18 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             let (record, state) = load_card(control, &card_id)?;
             let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
             let (base, branch, path) =
-                pure_recheck(preflight_start(control, &config, &card_id, &record, &state))?;
-            crate::commands::cycle::require_plan_assignment(
+                steps.recheck(preflight_start(control, &config, &card_id, &record, &state))?;
+            steps.recheck(crate::commands::cycle::require_plan_assignment(
                 control,
                 &cycle,
                 &card_id,
                 &args.common.actor,
                 args.common.actor_principal_id.as_deref(),
                 args.common.actor_session_id.as_deref(),
-            )
-            .map_err(HarnessError::no_persist)?;
-            crate::commands::cycle::require_work_admission(control, &cycle, &card_id)
-                .map_err(HarnessError::no_persist)?;
+            ))?;
+            steps.recheck(crate::commands::cycle::require_work_admission(
+                control, &cycle, &card_id,
+            ))?;
             let scope = GitScope::work_tree(&config.repository);
 
             let lease_id = next_lease_id(control)?;
@@ -714,6 +714,7 @@ fn run_start_batch(
             args.common.actor_principal_id.as_deref(),
             args.common.actor_session_id.as_deref(),
         )?;
+        preflight_start(&control, &config, card_id, &record, &state)?;
         members.push((record, state));
     }
     crate::commands::cycle::require_joint_work_admission(&control, &cycle, &card_ids)?;
@@ -749,22 +750,22 @@ fn run_start_batch(
             let mut fresh_members = Vec::with_capacity(card_ids.len());
             for card_id in &card_ids {
                 let (record, state) = load_card(control, card_id)?;
-                crate::commands::cycle::require_plan_assignment(
+                steps.recheck(crate::commands::cycle::require_plan_assignment(
                     control,
                     &cycle,
                     card_id,
                     &args.common.actor,
                     args.common.actor_principal_id.as_deref(),
                     args.common.actor_session_id.as_deref(),
-                )
-                .map_err(HarnessError::no_persist)?;
+                ))?;
                 fresh_members.push((record, state));
             }
-            crate::commands::cycle::require_joint_work_admission(control, &cycle, &card_ids)
-                .map_err(HarnessError::no_persist)?;
+            steps.recheck(crate::commands::cycle::require_joint_work_admission(
+                control, &cycle, &card_ids,
+            ))?;
             let mut leases = Vec::with_capacity(fresh_members.len());
             for (record, state) in fresh_members {
-                pure_recheck(preflight_start(
+                steps.recheck(preflight_start(
                     control,
                     &config,
                     &record.card_id,
@@ -826,7 +827,7 @@ fn allocate_member(
     steps: &mut Steps<'_>,
     clock: &dyn Clock,
 ) -> Result<crate::domain::lease::LeaseRecord, HarnessError> {
-    let (base, branch, path) = pure_recheck(preflight_start(
+    let (base, branch, path) = steps.recheck(preflight_start(
         control,
         config,
         &record.card_id,
@@ -1208,17 +1209,17 @@ fn resume_to_active(
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
             let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
-            crate::commands::cycle::require_plan_assignment(
+            steps.recheck(crate::commands::cycle::require_plan_assignment(
                 control,
                 &cycle,
                 card_id,
                 &args.common.actor,
                 args.common.actor_principal_id.as_deref(),
                 args.common.actor_session_id.as_deref(),
-            )
-            .map_err(HarnessError::no_persist)?;
-            crate::commands::cycle::require_work_admission(control, &cycle, card_id)
-                .map_err(HarnessError::no_persist)?;
+            ))?;
+            steps.recheck(crate::commands::cycle::require_work_admission(
+                control, &cycle, card_id,
+            ))?;
             // 72-3: the same narrow case the dry run checks, for the same
             // reason — see the note there. `resume_to_active` handles every
             // source state `resumes_to_active` admits, and only `ready` is
@@ -1230,20 +1231,22 @@ fn resume_to_active(
             // transaction commits on is read at commit time, not assumed
             // from before it began.
             if state.state == CardState::Ready {
-                pure_recheck(require_convergence_budget(control, &config, &record))?;
+                steps.recheck(require_convergence_budget(control, &config, &record))?;
             }
-            pure_recheck(verify_locator(control, &lease, &config.project_id))?;
+            steps.recheck(verify_locator(control, &lease, &config.project_id))?;
             // Section 11.2 routes `ready` to `active` through `leased`, which
             // is the same path `work start` takes. Stepping through it rather
             // than widening the state machine keeps one definition of what a
             // legal transition is.
             let mut state = state;
             if state.state == CardState::Ready {
-                pure_recheck(state.state.check_transition(CardState::Leased))?;
+                steps.recheck(state.state.check_transition(CardState::Leased))?;
+                steps.mutation_started()?;
                 store_card_state(control, &record, &state, CardState::Leased)?;
                 state.state = CardState::Leased;
             }
-            pure_recheck(state.state.check_transition(CardState::Active))?;
+            steps.recheck(state.state.check_transition(CardState::Active))?;
+            steps.mutation_started()?;
             store_card_state(control, &record, &state, CardState::Active)?;
 
             events.append(

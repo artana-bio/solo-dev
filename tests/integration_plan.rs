@@ -1744,6 +1744,130 @@ fn resume_mode_conflicts_match_dry_run_without_journal_side_effects() {
 }
 
 #[test]
+fn joint_batch_preflight_refusal_has_no_first_member_effect_or_journal() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-TOCTOU-002", "joint_integration");
+    let collision = workspace.worktrees.join("F-002");
+    fs::create_dir_all(&collision).unwrap();
+    let journal_count = |workspace: &Workspace| {
+        fs::read_dir(workspace.control.join("journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    };
+    let before_journals = journal_count(&workspace);
+    let output = workspace.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-PRECONDITION-WORKTREE-EXISTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(collision.to_str().unwrap())
+    );
+    assert!(!workspace.worktrees.join("F-001").exists());
+    assert_eq!(journal_count(&workspace), before_journals);
+}
+
+#[test]
+fn joint_batch_late_member_collision_retains_partial_recovery_journal() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-TOCTOU-LATE", "joint_integration");
+    let collision = workspace.worktrees.join("F-002");
+    let hook = workspace.repository.join(".git/hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntop=$(git rev-parse --show-toplevel)\ncase \"$top\" in\n  */F-001) mkdir -p '{}' ;;\nesac\nexit 0\n",
+            collision.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&hook, permissions).unwrap();
+
+    let before_journals = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    let output = workspace.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-PRECONDITION-WORKTREE-EXISTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(collision.to_str().unwrap())
+    );
+    assert!(workspace.worktrees.join("F-001").exists());
+    assert!(collision.exists());
+    let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(journals.len(), before_journals + 1);
+    let journal = journals
+        .iter()
+        .find(|record| record["command"] == "work.start-batch")
+        .expect("late collision must retain the batch journal");
+    assert_eq!(journal["state"], "failed_partial");
+    assert_eq!(journal["mutation_started"], true);
+    let status = Workspace::run(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        !status["data"]["unresolved_operations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let recovery = Workspace::run(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(recovery.status.success());
+    let recovery: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();
+    assert_eq!(recovery["data"]["recovery_required"], true);
+}
+
+#[test]
 fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[

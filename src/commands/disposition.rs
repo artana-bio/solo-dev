@@ -114,7 +114,7 @@ use crate::{
             FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
         },
         card::{load_card, store_card_state},
-        transaction::{pure_recheck, with_transaction},
+        transaction::with_transaction,
     },
     config::{ConvergencePolicy, FieldError, ProjectConfig},
     control::{
@@ -608,7 +608,7 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let (record, state) = load_card(control, &card_id)?;
             let config = control.project()?;
-            let policy_digest = pure_recheck(require_renewable(
+            let policy_digest = steps.recheck(require_renewable(
                 control,
                 &config,
                 &record,
@@ -623,6 +623,7 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             // material-scope-revision fact uses in `card.rs`'s `run_revise`.
             // A candidate SHA would not do: an escalated card may not have
             // reached `handed_off` at all yet.
+            steps.mutation_started()?;
             let event = events.append(
                 &config.project_id,
                 EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)
