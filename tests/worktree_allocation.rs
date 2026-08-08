@@ -19,6 +19,7 @@ fn with_ready_card() -> Workspace {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/a.rs"]);
+    workspace.bind_fixture_plan("PLAN-WORKTREE-001", "parallel");
     workspace
 }
 
@@ -442,6 +443,7 @@ fn a_card_revised_while_allocated_can_be_resumed() {
     let before = support::capture(&worktree, &["rev-parse", "HEAD"]);
 
     workspace.revise_card("F-001", &["src/**", "docs/**"], "widen the write scope");
+    workspace.bind_fixture_plan("PLAN-WORKTREE-REV-001", "parallel");
     assert_eq!(
         workspace.card_json(&["status", "--card-id", "F-001"])["data"]["state"],
         "ready"

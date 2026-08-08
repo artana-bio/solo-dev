@@ -161,7 +161,9 @@ change-harness cycle plan --plan-id PLAN-001 --file plan.json
 ```
 
 A normal cycle with no bound plan is refused before integration. The only
-planless compatibility path is an explicit, pre-existing migration record:
+planless compatibility path is an explicit, pre-existing migration record. It
+is refused for cycles created by the current CLI, which carry durable
+`plan_required_v1` creation provenance:
 `cycle migrate-legacy --provenance legacy_cycle_plan_v1`.
 
 ---
@@ -175,6 +177,15 @@ change-harness work start --card-id F-001 --actor implementer-a
 It prints a worktree path. **Work there, not in your checkout.** Commit normally with `git` — that is not an escape, it is the point.
 
 > **If you `card revise` while holding a lease**, the card drops back to `ready` and `handoff create` will refuse. The fix is `work resume --card-id F-001 --actor implementer-a`, which returns it to `active`. `work start` will not do it — it refuses because the lease is still held.
+
+For a `joint_integration` plan, individual starts are refused. Allocate the
+complete joint set atomically:
+
+```bash
+change-harness work start-batch \
+  --card-id F-001 --card-id F-002 \
+  --actor-principal-id principal-a --actor-session-id session-a
+```
 
 ---
 

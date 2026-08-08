@@ -672,6 +672,7 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.bind_fixture_plan_with_assignment("PLAN-ASCII-001", "parallel", AUTHOR);
 
     workspace.work(&["start", "--card-id", "F-001", "--actor", AUTHOR]);
     let worktree = workspace.worktrees.join("F-001");

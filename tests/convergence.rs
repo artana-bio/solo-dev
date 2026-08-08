@@ -2901,7 +2901,15 @@ fn an_unrelated_card_in_the_same_cycle_still_starts_work() {
     // coexist without an ownership-overlap refusal, must be completely
     // unaffected by F-001's escalation.
     workspace.activate_card("F-002", &["docs/f002/**"]);
-    let output = workspace.work_raw(&["start", "--card-id", "F-002"]);
+    let output = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
     assert!(
         output.status.success(),
         "an unrelated card in the same cycle must still be able to start work: {}",
@@ -2933,7 +2941,15 @@ fn blocking_and_checkpointing_an_escalated_card_are_still_permitted() {
     // must be able to continue work they already own even once escalated,
     // since #72-2 already refuses the delivery and review attempts
     // themselves.
-    let resume = workspace.work_raw(&["resume", "--card-id", "F-001"]);
+    let resume = workspace.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
     assert!(
         resume.status.success(),
         "resuming already-owned work must stay permitted on an escalated card: {}{}",

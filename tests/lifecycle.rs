@@ -292,9 +292,19 @@ fn stateful_dry_runs_do_not_change_state() {
     ]);
     work.cycle(&["activate", "--cycle-id", "C-001"]);
     work.activate_card("F-001", &["src/F-001/**"]);
+    work.bind_fixture_plan("plan-dry-run", "parallel");
 
     assert_dry_run_unchanged(&work, "work start", || {
-        work.work_raw(&["start", "--card-id", "F-001", "--dry-run"])
+        work.work_raw(&[
+            "start",
+            "--card-id",
+            "F-001",
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+            "--dry-run",
+        ])
     });
     assert!(
         !work.worktrees.join("F-001").exists(),
@@ -324,7 +334,16 @@ fn stateful_dry_runs_do_not_change_state() {
     });
     work.work(&["block", "--card-id", "F-001", "--reason", "waiting"]);
     assert_dry_run_unchanged(&work, "work resume", || {
-        work.work_raw(&["resume", "--card-id", "F-001", "--dry-run"])
+        work.work_raw(&[
+            "resume",
+            "--card-id",
+            "F-001",
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+            "--dry-run",
+        ])
     });
     work.work(&["resume", "--card-id", "F-001"]);
     work.activate_card("F-002", &["src/F-002/**"]);

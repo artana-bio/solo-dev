@@ -1102,7 +1102,14 @@ fn build_record(
         plan_id: cycle.plan_id.clone(),
         plan_digest: cycle.plan_digest.clone(),
         plan_revision: cycle.plan_revision,
-        plan_migration_provenance: plan.legacy_migration_provenance,
+        // Carry the cycle's already-recorded compatibility provenance onto
+        // every integration record.  Otherwise a legacy cycle could prepare
+        // successfully but be refused at acceptance because the record lost
+        // the authoritative migration binding.
+        plan_migration_provenance: cycle
+            .plan_migration_provenance
+            .clone()
+            .or(plan.legacy_migration_provenance),
         status: IntegrationStatus::Prepared,
         mode: plan.mode,
         baseline_sha,

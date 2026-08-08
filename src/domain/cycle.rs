@@ -193,6 +193,10 @@ pub struct CycleRecord {
     /// New cycles never receive this implicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_migration_provenance: Option<String>,
+    /// Creation-time plan-policy provenance. Missing only on pre-upgrade
+    /// persisted cycles that may undergo explicit legacy migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_plan_policy: Option<String>,
     /// Cards declared against this cycle.
     pub card_ids: Vec<CardId>,
     /// Groups of cards that land together.
@@ -365,6 +369,7 @@ mod tests {
             plan_digest: None,
             plan_revision: None,
             plan_migration_provenance: None,
+            creation_plan_policy: None,
             card_ids: vec![],
             atomic_groups: vec![],
             created_by: "alvaro".to_owned(),

@@ -134,6 +134,7 @@ fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, de
     )
     .unwrap();
     if cycle["plan_id"].is_null() && cycle["plan_migration_provenance"].is_null() {
+        workspace.mark_cycle_pre_upgrade("C-001");
         workspace.cycle(&[
             "migrate-legacy",
             "--cycle-id",
@@ -473,6 +474,7 @@ fn sealed_cycle_prepare_defaults_to_final_authorization() {
 #[test]
 fn sealed_cycle_legacy_bypass_requires_exact_migration_provenance() {
     let workspace = cycle_with(1);
+    workspace.mark_cycle_pre_upgrade("C-001");
     workspace.cycle(&[
         "migrate-legacy",
         "--cycle-id",
@@ -661,6 +663,7 @@ fn final_prepare_text_mode_says_delivers_no_cards_only_for_the_all_abandoned_cas
     let all_abandoned = cycle_with(2);
     all_abandoned.card(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
     all_abandoned.card(&["abandon", "--card-id", "F-002", "--reason", "superseded"]);
+    all_abandoned.mark_cycle_pre_upgrade("C-001");
     all_abandoned.cycle(&[
         "migrate-legacy",
         "--cycle-id",
@@ -741,8 +744,59 @@ fn dependencies_are_merged_before_their_dependents() {
     // F-002 depends on F-001, so it must merge second despite sorting first
     // among the ready set only by identifier.
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
-    workspace.approve_card("F-002", "src/F-002/a.rs");
     workspace.approve_card("F-001", "src/F-001/a.rs");
+    let first = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--card-id",
+        "F-001",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[
+            step,
+            "--integration-id",
+            &first,
+            "--actor-id",
+            "coordinator",
+        ]);
+    }
+    workspace.integration(&[
+        "verify",
+        "--integration-id",
+        &first,
+        "--actor-id",
+        "verifier",
+    ]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &first,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &first,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    workspace.integration(&[
+        "promote",
+        "--integration-id",
+        &first,
+        "--actor-id",
+        "promoter",
+    ]);
+    workspace.archive(&["create", "--integration-id", &first]);
+    workspace.archive(&["close", "--integration-id", &first]);
+    workspace.approve_card("F-002", "src/F-002/a.rs");
 
     let envelope = workspace.integration_json(&[
         "prepare",
@@ -750,8 +804,10 @@ fn dependencies_are_merged_before_their_dependents() {
         "C-001",
         "--actor-id",
         "coordinator",
+        "--card-id",
+        "F-002",
     ]);
-    assert_eq!(merge_order(&envelope), ["F-001", "F-002"]);
+    assert_eq!(merge_order(&envelope), ["F-002"]);
 }
 
 #[test]
@@ -767,6 +823,14 @@ fn a_dependency_that_is_neither_selected_nor_landed_is_refused() {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.approve_card("F-002", "src/F-002/a.rs");
     // F-001 is approved too, but deliberately left out of the selection.
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -1254,6 +1318,174 @@ fn planless_cycle_refuses_normal_integration_before_legacy_migration() {
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
     assert!(String::from_utf8_lossy(&output.stdout).contains("no distribution plan"));
+}
+
+#[test]
+fn new_cycles_cannot_claim_legacy_migration_but_pre_upgrade_cycles_can_once() {
+    let fresh = cycle_with(0);
+    let forged = fresh.cycle_raw(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(forged.status.code(), Some(5));
+    assert_eq!(error_code(&forged), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(
+        fresh
+            .events()
+            .iter()
+            .filter(|event| event["event_type"] == "cycle.legacy-migrated")
+            .count(),
+        0
+    );
+
+    let legacy = cycle_with(0);
+    legacy.mark_cycle_pre_upgrade("C-001");
+    legacy.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    let repeat = legacy.cycle_raw(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(repeat.status.code(), Some(5));
+    assert_eq!(error_code(&repeat), "CH-POLICY-INVALID-CYCLE");
+}
+
+#[test]
+fn new_planless_cycle_refuses_work_start_without_journal_or_lease_side_effects() {
+    let workspace = cycle_with(1);
+    let before = workspace.control_head();
+    let output = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), before);
+    assert!(
+        workspace
+            .events()
+            .iter()
+            .all(|event| event["event_type"] != "work.started")
+    );
+    assert!(!workspace.worktrees.join("F-001").exists());
+    assert!(
+        workspace
+            .control
+            .join("leases")
+            .read_dir()
+            .map_or(true, |mut entries| entries.next().is_none())
+    );
+}
+
+#[test]
+fn dependency_and_distribution_admission_is_enforced_before_work_mutation() {
+    let dependent = Workspace::initialized();
+    dependent.cycle(&["create", "--cycle-id", "C-001", "--objective", "dependency"]);
+    dependent.cycle(&["activate", "--cycle-id", "C-001"]);
+    dependent.activate_card("F-001", &["src/F-001/**"]);
+    dependent.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
+    dependent.bind_fixture_plan("PLAN-DEPENDENCY", "parallel");
+    let before = dependent.control_head();
+    let refused = dependent.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(dependent.control_head(), before);
+
+    let sequential = cycle_with(2);
+    sequential.bind_fixture_plan("PLAN-SEQUENTIAL", "sequential");
+    let later = sequential.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(later.status.code(), Some(5));
+    assert_eq!(error_code(&later), "CH-POLICY-INVALID-TRANSITION");
+    sequential.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    let overlapping = sequential.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(overlapping.status.code(), Some(5));
+
+    let parallel = cycle_with(2);
+    parallel.bind_fixture_plan("PLAN-PARALLEL", "parallel");
+    for card in ["F-001", "F-002"] {
+        parallel.work(&[
+            "start",
+            "--card-id",
+            card,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+    }
+
+    let joint = cycle_with(2);
+    joint.bind_fixture_plan("PLAN-JOINT", "joint_integration");
+    let individual = joint.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(individual.status.code(), Some(5));
+    assert_eq!(error_code(&individual), "CH-POLICY-INVALID-CYCLE");
+    joint.work(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
 }
 
 #[test]

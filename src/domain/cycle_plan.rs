@@ -8,6 +8,8 @@ use crate::error::{ErrorCode, HarnessError};
 
 pub const CYCLE_PLAN_SCHEMA: &str = "harness.cycle-plan/v1";
 pub const CYCLE_PLAN_REVISION: u32 = 1;
+/// Creation-time policy marker written on every new cycle.
+pub const CYCLE_PLAN_POLICY_REQUIRED: &str = "plan_required_v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]

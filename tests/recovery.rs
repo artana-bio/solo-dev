@@ -305,6 +305,7 @@ fn an_interrupted_allocation_leaves_no_ambiguous_work_and_is_retryable() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.bind_fixture_plan("PLAN-RECOVERY-001", "parallel");
 
     let args: Vec<String> = vec![
         "work".into(),
@@ -313,6 +314,10 @@ fn an_interrupted_allocation_leaves_no_ambiguous_work_and_is_retryable() {
         workspace.control.display().to_string(),
         "--card-id".into(),
         "F-001".into(),
+        "--actor-principal-id".into(),
+        "implementer-principal".into(),
+        "--actor-session-id".into(),
+        "implementer-session".into(),
     ];
     assert!(!run_failing_at("worktree-added", &args).status.success());
 
@@ -326,7 +331,10 @@ fn an_interrupted_allocation_leaves_no_ambiguous_work_and_is_retryable() {
         "--output".into(),
         "json".into(),
     ]);
-    assert_eq!(report["data"]["recovery_required"], true);
+    assert_eq!(
+        report["data"]["recovery_required"], true,
+        "recovery report: {report}"
+    );
     assert!(
         workspace.candidate_branch_exists("card/F-001"),
         "recovery must not delete work whose disposition is ambiguous"
@@ -418,6 +426,7 @@ fn resume_does_not_mark_an_operation_it_cannot_resume_as_complete() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.bind_fixture_plan("PLAN-RECOVERY-002", "parallel");
 
     let args: Vec<String> = vec![
         "work".into(),
@@ -426,6 +435,10 @@ fn resume_does_not_mark_an_operation_it_cannot_resume_as_complete() {
         workspace.control.display().to_string(),
         "--card-id".into(),
         "F-001".into(),
+        "--actor-principal-id".into(),
+        "implementer-principal".into(),
+        "--actor-session-id".into(),
+        "implementer-session".into(),
     ];
     assert!(!run_failing_at("worktree-added", &args).status.success());
 
@@ -483,6 +496,7 @@ fn an_allocation_that_created_a_worktree_is_reported_as_needing_recovery() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.bind_fixture_plan("PLAN-RECOVERY-003", "parallel");
 
     let args: Vec<String> = vec![
         "work".into(),
@@ -491,6 +505,10 @@ fn an_allocation_that_created_a_worktree_is_reported_as_needing_recovery() {
         workspace.control.display().to_string(),
         "--card-id".into(),
         "F-001".into(),
+        "--actor-principal-id".into(),
+        "implementer-principal".into(),
+        "--actor-session-id".into(),
+        "implementer-session".into(),
     ];
     assert!(!run_failing_at("worktree-locked", &args).status.success());
 

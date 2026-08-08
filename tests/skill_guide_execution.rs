@@ -176,6 +176,7 @@ fn fixture_ready_for_the_narrow_claim() -> Workspace {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates("F-001", &["src/thing.rs"], &["gate.fmt"]);
+    workspace.bind_fixture_plan_with_assignment("PLAN-SKILL-001", "parallel", "implementer-a");
     workspace.work(&["start", "--card-id", "F-001", "--actor", "implementer-a"]);
 
     let worktree = workspace.worktrees.join("F-001");
@@ -345,6 +346,7 @@ fn a_correctly_matched_reserve_and_run_pair_is_accepted() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates("F-900", &["src/other.rs"], &["gate.check"]);
+    workspace.bind_fixture_plan_with_assignment("PLAN-SKILL-002", "parallel", "solo-operator");
     workspace.work(&["start", "--card-id", "F-900", "--actor", "solo-operator"]);
 
     let worktree = workspace.worktrees.join("F-900");

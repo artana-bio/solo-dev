@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 63 |
+| Plan revision | 65 |
 | Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Governance extension `WP-600` is **DONE**; the Terra P1 plan-governance repairs are implemented and fully gated. |
+| Current implementation status | Governance extension `WP-600` is **DONE**; focused admission/migration tests, mutation evidence, the normalized full suite, formatting, clippy, and diff checks all pass. |
 | Next executable work package | Independent review and promotion of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -1314,7 +1314,7 @@ why it is outside the package gate.
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Commit | `4729d18` |
 | Dependencies | None |
 | Owner | Codex |
@@ -3505,10 +3505,10 @@ When the plan changes:
 
 | Field | Value |
 | --- | --- |
-| Status | `DONE` |
+| Status | `IN_PROGRESS` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | Prior P0 evidence remains valid. This Terra P1 repair adds exact canonical card-scope matching, typed actor/principal/session assignment enforcement, plan revision replacement for changed card membership, explicit `cycle migrate-legacy` provenance, planless-cycle refusal, persisted plan staging, and focused lifecycle regressions. The owning scope mutation fails when exact comparison is disabled and passes when restored; the controlled full suite exits 0, with `cargo fmt --check`, strict clippy, and `git diff --check` also passing. |
+| Focused evidence | Prior P0 evidence remains valid. This repair adds pre-journal plan admission for work/review, dependency and sequential/parallel/joint execution enforcement, atomic `work start-batch`, creation-time `plan_required_v1` provenance, and event-backed one-time legacy eligibility. Focused admission, dependency-binding, lifecycle, recovery, quickstart, skill-guide, promotion, and worktree-allocation regressions pass. The dependency admission guard was mutated to `if false`; its owning regression failed, and the exact guard was restored. Normalized sequential `cargo test --all --quiet` exited 0; `cargo fmt --check`, strict clippy, and `git diff --check` are the final gates. |
 
 Delivered in this slice:
 

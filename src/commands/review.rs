@@ -435,6 +435,8 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         let control = ControlRepository::open(&args.common.control)?;
         let config = control.project()?;
         let (record, state) = load_card(&control, &card_id)?;
+        let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+        crate::commands::cycle::require_active_plan(&control, &cycle)?;
         latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
             reason: format!("card {card_id} has no handoff to review"),
             code: ErrorCode::PreconditionNotFound,
@@ -460,7 +462,7 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
-            crate::commands::cycle::require_card_plan_binding(control, &cycle, &card_id)?;
+            crate::commands::cycle::require_active_plan(control, &cycle)?;
             // 72-2: the first check that can refuse, before anything is
             // written — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;

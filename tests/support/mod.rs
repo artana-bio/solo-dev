@@ -316,23 +316,111 @@ impl Workspace {
             .collect()
     }
 
+    /// Reproduces a control repository created before plan-required cycle
+    /// provenance existed. This is deliberately an explicit fixture mutation,
+    /// not a production migration path.
+    pub fn mark_cycle_pre_upgrade(&self, cycle_id: &str) {
+        let cycle_path = self.control.join(format!("cycles/{cycle_id}.json"));
+        let mut cycle: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cycle_path).unwrap()).unwrap();
+        cycle
+            .as_object_mut()
+            .unwrap()
+            .remove("creation_plan_policy");
+        fs::write(
+            &cycle_path,
+            format!("{}\n", serde_json::to_string_pretty(&cycle).unwrap()),
+        )
+        .unwrap();
+        let events_dir = self.control.join("events");
+        for entry in fs::read_dir(events_dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let mut event: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if event["cycle_id"].as_str() == Some(cycle_id)
+                && event["event_type"] == "cycle.created"
+            {
+                event["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("creation_plan_policy");
+                fs::write(
+                    &path,
+                    format!("{}\n", serde_json::to_string_pretty(&event).unwrap()),
+                )
+                .unwrap();
+            }
+        }
+        git(&self.control, &["add", "-A"]);
+        git(
+            &self.control,
+            &["commit", "-q", "-m", "fixture: pre-upgrade cycle"],
+        );
+    }
+
     /// Runs a `work` subcommand in JSON mode without asserting success.
     pub fn work_raw(&self, args: &[&str]) -> Output {
+        let mut normalized = args.to_vec();
+        if matches!(args.first(), Some(&("start" | "resume")))
+            && let Some(card_id) = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+        {
+            let card_path = self.control.join(format!("cards/{card_id}/r1.json"));
+            if card_path.exists() {
+                let card: serde_json::Value =
+                    serde_json::from_slice(&fs::read(card_path).unwrap()).unwrap();
+                let cycle_id = card["cycle_id"].as_str().unwrap();
+                let cycle_path = self.control.join(format!("cycles/{cycle_id}.json"));
+                let cycle: serde_json::Value =
+                    serde_json::from_slice(&fs::read(cycle_path).unwrap()).unwrap();
+                if cycle["plan_id"].is_string() {
+                    self.ensure_default_cycle_plan_for(cycle_id);
+                    if !normalized.contains(&"--actor-principal-id") {
+                        normalized.extend(["--actor-principal-id", "implementer-principal"]);
+                    }
+                    if !normalized.contains(&"--actor-session-id") {
+                        normalized.extend(["--actor-session-id", "implementer-session"]);
+                    }
+                }
+            }
+        }
         let mut full = vec![
             "work".to_owned(),
-            args[0].to_owned(),
+            normalized[0].to_owned(),
             "--output".to_owned(),
             "json".to_owned(),
             "--control".to_owned(),
             self.control.display().to_string(),
         ];
-        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        full.extend(normalized[1..].iter().map(|arg| (*arg).to_owned()));
         Self::run(&full)
     }
 
     /// Runs a `work` subcommand, asserting success.
     pub fn work(&self, args: &[&str]) -> Output {
-        let output = self.work_raw(args);
+        let mut normalized = args.to_vec();
+        if matches!(args.first(), Some(&("start" | "resume"))) {
+            let card_id = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+                .expect("work fixture must name a card");
+            let card: serde_json::Value = serde_json::from_slice(
+                &fs::read(self.control.join(format!("cards/{card_id}/r1.json"))).unwrap(),
+            )
+            .unwrap();
+            self.ensure_default_cycle_plan_for(card["cycle_id"].as_str().unwrap());
+            if !args.contains(&"--actor-principal-id") {
+                normalized.extend(["--actor-principal-id", "implementer-principal"]);
+            }
+            if !args.contains(&"--actor-session-id") {
+                normalized.extend(["--actor-session-id", "implementer-session"]);
+            }
+        }
+        let output = self.work_raw(&normalized);
         assert!(
             output.status.success(),
             "work {args:?} failed: {}{}",
@@ -890,6 +978,19 @@ impl Workspace {
                     .filter_map(serde_json::Value::as_str)
                     .collect::<std::collections::BTreeSet<_>>();
                 planned_ids == cycle_ids
+                    && planned_cards.iter().all(|planned| {
+                        let Some(card_id) = planned["card_id"].as_str() else {
+                            return false;
+                        };
+                        let card_path = self.control.join(format!("cards/{card_id}/r1.json"));
+                        let Ok(raw) = fs::read(card_path) else {
+                            return false;
+                        };
+                        let Ok(card) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                            return false;
+                        };
+                        planned["card_revision"] == card["revision"]
+                    })
             });
         if current_plan_covers_cards {
             return;
@@ -961,6 +1062,75 @@ impl Workspace {
             &path.display().to_string(),
         ]);
         fs::remove_file(path).expect("the disposable plan input should be removable");
+    }
+
+    /// Binds a complete fixture plan with one explicit execution class.
+    pub fn bind_fixture_plan(&self, plan_id: &str, distribution: &str) {
+        self.bind_fixture_plan_with_assignment(plan_id, distribution, "operator");
+    }
+
+    /// Binds a complete fixture plan for a caller-declared implementer.
+    pub fn bind_fixture_plan_with_assignment(
+        &self,
+        plan_id: &str,
+        distribution: &str,
+        assignment: &str,
+    ) {
+        let cycle = self.cycle_json(&["status", "--cycle-id", "C-001"]);
+        let card_ids = cycle["data"]["card_ids"].as_array().unwrap();
+        let cards = card_ids
+            .iter()
+            .map(|id| {
+                let card_id = id.as_str().unwrap();
+                let card: serde_json::Value = serde_json::from_slice(
+                    &fs::read(self.control.join(format!("cards/{card_id}/r1.json"))).unwrap(),
+                )
+                .unwrap();
+                let proof_entries = card["proof_map"]["entries"]
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| vec!["fixture-proof".to_owned()]);
+                serde_json::json!({
+                    "card_id": card_id,
+                    "card_revision": card["revision"],
+                    "scope": card["write_scope"]["include"],
+                    "scope_exclude": card["write_scope"]["exclude"],
+                    "depends_on": card["depends_on"],
+                    "proof_entries": proof_entries,
+                    "mutation_plan": ["fixture mutation"],
+                    "risk": card["risk"],
+                    "reviewer_requirements": ["independent"],
+                    "assignment": assignment,
+                    "assignment_principal_id": "implementer-principal",
+                    "assignment_session_id": "implementer-session",
+                    "distribution": distribution,
+                    "acceptance_behaviors": card["acceptance"]["behaviors"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = serde_json::json!({
+            "schema": "harness.cycle-plan/v1",
+            "plan_id": plan_id,
+            "cycle_id": "C-001",
+            "objective": "fixture distribution",
+            "cards": cards,
+        });
+        let path = self.root.join(format!("{plan_id}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        self.cycle(&[
+            "plan",
+            "--plan-id",
+            plan_id,
+            "--file",
+            &path.display().to_string(),
+        ]);
+        fs::remove_file(path).unwrap();
     }
 
     /// Revises a card, moving its digest.
