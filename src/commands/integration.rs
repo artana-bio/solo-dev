@@ -969,6 +969,18 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         return preview_prepare(args, &cycle_id, &requested);
     }
 
+    // Plan policy failures must be reported before opening a journaled
+    // integration mutation. This is especially important for a missing plan
+    // or a split atomic group: neither case created any external state and
+    // should not strand an operation that requires recovery.
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        require_cycle_convergence_budget(&control, &config, &cycle_id)?;
+        let cycle = load_cycle(&control, &cycle_id)?;
+        let _ = build_plan(&control, &cycle, &requested, args)?;
+    }
+
     with_transaction(
         &args.control,
         "integration.prepare",
@@ -1090,12 +1102,7 @@ fn build_record(
         plan_id: cycle.plan_id.clone(),
         plan_digest: cycle.plan_digest.clone(),
         plan_revision: cycle.plan_revision,
-        plan_migration_provenance: plan.legacy_migration_provenance.or_else(|| {
-            cycle
-                .plan_id
-                .is_none()
-                .then_some(LEGACY_PLAN_MIGRATION_PROVENANCE.to_owned())
-        }),
+        plan_migration_provenance: plan.legacy_migration_provenance,
         status: IntegrationStatus::Prepared,
         mode: plan.mode,
         baseline_sha,
@@ -1229,6 +1236,12 @@ fn resolve_final_mode(
                 code: ErrorCode::UsageConflictingOptions,
             });
         }
+        if cycle.plan_migration_provenance.as_deref() != Some(provenance.as_str()) {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance must already be recorded on the cycle by `cycle migrate-legacy`; prepare cannot mint it".to_owned(),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
         return Ok((false, Some(provenance.clone())));
     }
     Ok((true, None))
@@ -1255,6 +1268,9 @@ fn build_plan(
     requested: &[CardId],
     args: &PrepareArgs,
 ) -> Result<Plan, HarnessError> {
+    if !cycle.card_ids.is_empty() {
+        crate::commands::cycle::require_active_plan(control, cycle)?;
+    }
     // One outstanding integration per cycle. Section 11.3 has no state for two
     // concurrent plans, and two plans built against the same protected commit
     // would each believe they were the one about to land.
@@ -1324,6 +1340,7 @@ fn build_plan(
     } else {
         resolve_mode(args.mode, selected.len())?
     };
+    require_execution_classification(control, cycle, &selected, mode)?;
     let members = plan_members(control, cycle, &selected)?;
 
     let deferred = if requested.is_empty() {
@@ -1350,6 +1367,60 @@ fn build_plan(
         abandoned_card_ids,
         deferred,
     })
+}
+
+/// Binds the requested integration shape to the plan's declared execution
+/// classification. A plan is not merely a fingerprint for the card set.
+fn require_execution_classification(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    selected: &[&Candidacy],
+    mode: IntegrationMode,
+) -> Result<(), HarnessError> {
+    let Some(plan_id) = cycle.plan_id.as_deref() else {
+        return Ok(());
+    };
+    let plan: crate::domain::cycle_plan::CyclePlan = serde_json::from_str(
+        &control.read(&format!("plans/{plan_id}.json"))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("cycle plan {plan_id} is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    for candidate in selected {
+        let planned = plan
+            .cards
+            .iter()
+            .find(|planned| planned.card_id == candidate.record.card_id.to_string())
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "cycle plan {plan_id} has no execution classification for {}",
+                    candidate.record.card_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            })?;
+        let invalid = match planned.distribution {
+            crate::domain::cycle_plan::Distribution::JointIntegration => {
+                mode != IntegrationMode::Batch
+            }
+            crate::domain::cycle_plan::Distribution::Sequential => {
+                selected.len() > 1 && mode != IntegrationMode::Batch
+            }
+            crate::domain::cycle_plan::Distribution::Parallel => false,
+        };
+        if invalid {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "plan {plan_id} classifies card {} as {:?}, which does not permit integration mode `{}`",
+                    candidate.record.card_id,
+                    planned.distribution,
+                    mode.name()
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Attaches one advisory per card a plan left out.
@@ -4585,6 +4656,16 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 
     if args.dry_run {
         return preview_promote(args, &integration_id);
+    }
+
+    // Validate the transition before opening an operation journal. A normal
+    // policy refusal (for example, attempting to move an archived integration)
+    // must not become an unresolved recovery obligation for the next command.
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        let record = load_integration(&control, &integration_id)?;
+        check_promotion(&control, &config, &record, &args.actor_id)?;
     }
 
     with_transaction(

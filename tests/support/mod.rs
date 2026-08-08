@@ -571,6 +571,15 @@ impl Workspace {
 
     /// Runs an `integration` subcommand and parses its JSON envelope.
     pub fn integration_json(&self, args: &[&str]) -> serde_json::Value {
+        if args.first() == Some(&"prepare") {
+            // Keep legacy fixture setup explicit while preserving raw-command
+            // tests that assert a planless cycle is refused.
+            let cycle_id = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--cycle-id").then_some(pair[1]))
+                .unwrap_or("C-001");
+            self.ensure_default_cycle_plan_for(cycle_id);
+        }
         serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
     }
 
@@ -785,7 +794,18 @@ impl Workspace {
     /// feature actor — the whole pre-integration path, which every integration
     /// test needs and none of them is testing.
     pub fn approve_card(&self, card_id: &str, file: &str) {
-        self.work(&["start", "--card-id", card_id]);
+        // The fixture may add cards after an earlier plan was pinned. Publish
+        // an explicit revised complete plan before lifecycle work starts.
+        self.ensure_default_cycle_plan_for("C-001");
+        self.work(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
 
         let worktree = self.worktrees.join(card_id);
         let path = worktree.join(file);
@@ -833,6 +853,114 @@ impl Workspace {
             "--actor",
             "reviewer-session",
         ]);
+        self.ensure_default_cycle_plan_for("C-001");
+    }
+
+    /// Gives legacy lifecycle fixtures an explicit, real plan before they
+    /// enter integration. This is test plumbing, not a production bypass:
+    /// the command under test still refuses a cycle that has no plan.
+    #[allow(clippy::too_many_lines)]
+    fn ensure_default_cycle_plan_for(&self, cycle_id: &str) {
+        let cycle_record: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(self.control.join(format!("cycles/{cycle_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        if cycle_record["plan_migration_provenance"].is_string() {
+            return;
+        }
+        let cycle = self.cycle_json(&["status", "--cycle-id", cycle_id]);
+        let card_ids = cycle["data"]["card_ids"]
+            .as_array()
+            .expect("cycle status exposes card membership");
+        let current_plan_covers_cards = cycle_record["plan_id"]
+            .as_str()
+            .and_then(|plan_id| {
+                let path = self.control.join(format!("plans/{plan_id}.json"));
+                fs::read_to_string(path).ok()
+            })
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .and_then(|plan| plan["cards"].as_array().cloned())
+            .is_some_and(|planned_cards| {
+                let planned_ids = planned_cards
+                    .iter()
+                    .filter_map(|card| card["card_id"].as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let cycle_ids = card_ids
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                planned_ids == cycle_ids
+            });
+        if current_plan_covers_cards {
+            return;
+        }
+        let plan_id = (1..10_000)
+            .map(|revision| format!("PLAN-TEST-{revision:03}"))
+            .find(|candidate| {
+                !self
+                    .control
+                    .join(format!("plans/{candidate}.json"))
+                    .exists()
+            })
+            .expect("a fixture plan id should be available");
+        let cards = card_ids
+            .iter()
+            .map(|id| {
+                let card_id = id.as_str().unwrap();
+                let card: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(self.control.join(format!("cards/{card_id}/r1.json")))
+                        .unwrap(),
+                )
+                .unwrap();
+                let proof_entries = card["proof_map"]["entries"]
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| vec!["fixture-proof".to_owned()]);
+                serde_json::json!({
+                    "card_id": card_id,
+                    "card_revision": card["revision"],
+                    "scope": card["write_scope"]["include"],
+                    "scope_exclude": card["write_scope"]["exclude"],
+                    "depends_on": card["depends_on"],
+                    "proof_entries": proof_entries,
+                    "mutation_plan": ["fixture mutation"],
+                    "risk": card["risk"],
+                    "reviewer_requirements": ["independent"],
+                    "assignment": "operator",
+                    "assignment_principal_id": "implementer-principal",
+                    "assignment_session_id": "implementer-session",
+                    "distribution": "parallel",
+                    "acceptance_behaviors": card["acceptance"]["behaviors"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = serde_json::json!({
+            "schema": "harness.cycle-plan/v1",
+            "plan_id": &plan_id,
+            "cycle_id": cycle_id,
+            "objective": "fixture distribution",
+            "cards": cards,
+        });
+        let path = self.root.join(format!("{plan_id}.json"));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&plan).unwrap()),
+        )
+        .unwrap();
+        self.cycle(&[
+            "plan",
+            "--plan-id",
+            &plan_id,
+            "--file",
+            &path.display().to_string(),
+        ]);
+        fs::remove_file(path).expect("the disposable plan input should be removable");
     }
 
     /// Revises a card, moving its digest.

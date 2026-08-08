@@ -23,12 +23,23 @@ pub struct PlannedCard {
     pub card_id: String,
     pub card_revision: u32,
     pub scope: Vec<String>,
+    /// The authoritative card's excluded scope. An omitted field is the
+    /// empty exclusion set for compatibility with the first plan spelling.
+    #[serde(default)]
+    pub scope_exclude: Vec<String>,
     pub depends_on: Vec<String>,
     pub proof_entries: Vec<String>,
     pub mutation_plan: Vec<String>,
     pub risk: String,
     pub reviewer_requirements: Vec<String>,
+    /// Declared actor label for the implementer assignment.
     pub assignment: Option<String>,
+    /// Optional only while reading an explicitly migrated historical plan;
+    /// newly authored plans must carry both principal and session boundaries.
+    #[serde(default)]
+    pub assignment_principal_id: Option<String>,
+    #[serde(default)]
+    pub assignment_session_id: Option<String>,
     pub distribution: Distribution,
     pub acceptance_behaviors: Vec<String>,
 }
@@ -76,8 +87,26 @@ impl CyclePlan {
             return Err(invalid("cycle plan contains duplicate card ids"));
         }
         for card in &self.cards {
-            if card.assignment.as_deref().is_none_or(str::is_empty) {
+            if card
+                .assignment
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
                 return Err(invalid(&format!("card {} is unassigned", card.card_id)));
+            }
+            if card
+                .assignment_principal_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+                || card
+                    .assignment_session_id
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err(invalid(&format!(
+                    "card {} has incomplete typed assignment provenance",
+                    card.card_id
+                )));
             }
             if card.proof_entries.is_empty() || card.mutation_plan.is_empty() {
                 return Err(invalid(&format!(
@@ -169,12 +198,15 @@ mod tests {
             card_id: id.to_owned(),
             card_revision: 1,
             scope: vec![scope.to_owned()],
+            scope_exclude: vec![],
             depends_on: vec![],
             proof_entries: vec!["P-001".to_owned()],
             mutation_plan: vec!["remove guard".to_owned()],
             risk: "low".to_owned(),
             reviewer_requirements: vec!["independent".to_owned()],
             assignment: Some("agent-a".to_owned()),
+            assignment_principal_id: Some("principal-a".to_owned()),
+            assignment_session_id: Some("session-a".to_owned()),
             distribution: Distribution::Parallel,
             acceptance_behaviors: vec!["behavior".to_owned()],
         }
@@ -206,5 +238,28 @@ mod tests {
             cards: vec![first, second],
         };
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn plan_rejects_unassigned_or_partially_typed_assignment() {
+        let cases = [
+            (None, Some("principal-a"), Some("session-a")),
+            (Some("agent-a"), None, Some("session-a")),
+            (Some("agent-a"), Some("principal-a"), None),
+        ];
+        for (actor, principal, session) in cases {
+            let mut planned = card("F-001", "src/a.rs");
+            planned.assignment = actor.map(str::to_owned);
+            planned.assignment_principal_id = principal.map(str::to_owned);
+            planned.assignment_session_id = session.map(str::to_owned);
+            let plan = CyclePlan {
+                schema: CYCLE_PLAN_SCHEMA.to_owned(),
+                plan_id: "PLAN-001".to_owned(),
+                cycle_id: "C-001".to_owned(),
+                objective: "objective".to_owned(),
+                cards: vec![planned],
+            };
+            assert!(plan.validate().is_err());
+        }
     }
 }

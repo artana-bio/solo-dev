@@ -346,7 +346,15 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
 
     // #30: a read-only dashboard selects the narrow gate but cannot authorize
     // it. Exact duplicate reservations have one durable winner.
-    workspace.work(&["start", "--card-id", "F-002"]);
+    workspace.work(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
     let head_before_dashboard = workspace.control_head();
     let preflight = workspace.gate_json(&["preflight", "--card-id", "F-002"]);
     assert_eq!(preflight["data"]["next_permitted_stage"], "narrow");
@@ -427,7 +435,15 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
 
     // #32: declared mutations are reserved once, run in an isolated source,
     // restored after each witness, and never leak into the candidate worktree.
-    workspace.work(&["start", "--card-id", "F-003"]);
+    workspace.work(&[
+        "start",
+        "--card-id",
+        "F-003",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
     let campaign = workspace.root.join("campaign.json");
     fs::write(&campaign, r#"{"schema":"harness.declared-mutation-campaign/v1","mutations":[{"id":"M-001","path":"README.md","expected_utf8":"hello\n","replacement_utf8":"mutant-one\n"},{"id":"M-002","path":"README.md","expected_utf8":"hello\n","replacement_utf8":"mutant-two\n"}]}"#).unwrap();
     let mutation_winner = workspace.gate_json(&[
@@ -520,7 +536,15 @@ fn validation_economy_composition_is_fail_fast_exact_and_never_authorizes_from_a
     // while independent work is eligible; it becomes a true wait when that
     // alternative is blocked, and starts only after a terminal lane settlement.
     for card in ["F-004", "F-005", "F-006", "F-007"] {
-        workspace.work(&["start", "--card-id", card]);
+        workspace.work(&[
+            "start",
+            "--card-id",
+            card,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
     }
     let profile = cpu_profile(&workspace);
     let reserve_cpu = |card: &str, gate: &str| {

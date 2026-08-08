@@ -463,6 +463,15 @@ fn preview_start(args: &StartArgs, card_id: &CardId) -> Result<CommandOutcome, H
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
     // `preflight_start` is by definition every check that can refuse, and it
     // resolves the base commit rather than echoing what the card asked for.
     // This preview reimplemented a subset: it checked the state transition and
@@ -557,6 +566,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         return preview_start(args, &card_id);
     }
 
+    preflight_start_request(args, &card_id)?;
+
     with_transaction(
         &args.common.control,
         "work.start",
@@ -566,7 +577,14 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
             let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
-            crate::commands::cycle::require_card_plan_binding(control, &cycle, &card_id)?;
+            crate::commands::cycle::require_plan_assignment(
+                control,
+                &cycle,
+                &card_id,
+                &args.common.actor,
+                args.common.actor_principal_id.as_deref(),
+                args.common.actor_session_id.as_deref(),
+            )?;
             let (base, branch, path) =
                 preflight_start(control, &config, &card_id, &record, &state)?;
             let scope = GitScope::work_tree(&config.repository);
@@ -640,6 +658,24 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             .with_project(config.project_id.clone()))
         },
     )
+}
+
+/// Performs caller-facing start checks before a journaled mutation begins.
+fn preflight_start_request(args: &StartArgs, card_id: &CardId) -> Result<(), HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (record, state) = load_card(&control, card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
+    preflight_start(&control, &config, card_id, &record, &state)?;
+    Ok(())
 }
 
 /// Loads the card, its state, and its held lease, or explains what is missing.
@@ -840,6 +876,15 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
         let (record, state, lease) = allocation(&control, &card_id)?;
+        let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+        crate::commands::cycle::require_plan_assignment(
+            &control,
+            &cycle,
+            &card_id,
+            &args.common.actor,
+            args.common.actor_principal_id.as_deref(),
+            args.common.actor_session_id.as_deref(),
+        )?;
         let config = control.project()?;
         // 72-3: checked only for `ready`, the one source state
         // `resumes_to_active` admits that is functionally equivalent to
@@ -871,7 +916,16 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     }
 
     let control = ControlRepository::open(&args.common.control)?;
-    let (_record, state, _lease) = allocation(&control, &card_id)?;
+    let (record, state, _lease) = allocation(&control, &card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        &card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
 
     if resumes_to_active(state.state) {
         return resume_to_active(args, &card_id, clock);
@@ -917,6 +971,15 @@ fn resume_to_active(
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
+            crate::commands::cycle::require_plan_assignment(
+                control,
+                &cycle,
+                card_id,
+                &args.common.actor,
+                args.common.actor_principal_id.as_deref(),
+                args.common.actor_session_id.as_deref(),
+            )?;
             // 72-3: the same narrow case the dry run checks, for the same
             // reason — see the note there. `resume_to_active` handles every
             // source state `resumes_to_active` admits, and only `ready` is

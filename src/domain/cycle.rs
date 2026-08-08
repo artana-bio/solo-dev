@@ -189,6 +189,10 @@ pub struct CycleRecord {
     pub plan_digest: Option<Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_revision: Option<u32>,
+    /// Explicit provenance for a pre-plan cycle admitted through migration.
+    /// New cycles never receive this implicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_migration_provenance: Option<String>,
     /// Cards declared against this cycle.
     pub card_ids: Vec<CardId>,
     /// Groups of cards that land together.
@@ -360,6 +364,7 @@ mod tests {
             plan_id: None,
             plan_digest: None,
             plan_revision: None,
+            plan_migration_provenance: None,
             card_ids: vec![],
             atomic_groups: vec![],
             created_by: "alvaro".to_owned(),

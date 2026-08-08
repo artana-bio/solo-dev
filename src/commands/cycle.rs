@@ -16,7 +16,7 @@ use crate::{
     domain::{
         clock::Clock,
         cycle::{AtomicGroup, CYCLE_SCHEMA, CycleRecord, CycleStatus, status_from_events},
-        cycle_plan::{CYCLE_PLAN_SCHEMA, CyclePlan},
+        cycle_plan::{CYCLE_PLAN_REVISION, CYCLE_PLAN_SCHEMA, CyclePlan},
         digest::Digest,
         ids::CycleId,
     },
@@ -40,6 +40,8 @@ pub enum CycleCommand {
     DeclareGroup(DeclareGroupArgs),
     /// Validate and persist the complete cycle distribution manifest.
     Plan(PlanArgs),
+    /// Explicitly mark a pre-plan cycle for compatibility migration.
+    MigrateLegacy(LegacyArgs),
     /// Report a cycle's derived status.
     Status(StatusArgs),
     /// List every cycle in authoritative identifier order.
@@ -68,6 +70,7 @@ impl CycleCommand {
             Self::Seal(..) => "cycle.seal",
             Self::DeclareGroup(..) => "cycle.declare-group",
             Self::Plan(..) => "cycle.plan",
+            Self::MigrateLegacy(..) => "cycle.migrate-legacy",
             Self::Status(..) => "cycle.status",
             Self::List(..) => "cycle.list",
             Self::Replay(..) => "cycle.replay",
@@ -161,6 +164,18 @@ pub struct PlanArgs {
     pub file: PathBuf,
 }
 
+/// Arguments accepted by `cycle migrate-legacy`.
+#[derive(Debug, Args)]
+pub struct LegacyArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[arg(long)]
+    pub cycle_id: String,
+    /// Must be the exact typed compatibility marker.
+    #[arg(long)]
+    pub provenance: String,
+}
+
 /// Arguments accepted by `cycle status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -219,6 +234,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
         CycleCommand::Seal(args) => run_seal(args, clock),
         CycleCommand::DeclareGroup(args) => run_declare_group(args, clock),
         CycleCommand::Plan(args) => run_plan(args),
+        CycleCommand::MigrateLegacy(args) => run_migrate_legacy(args, clock),
         CycleCommand::Status(args) => run_status(args),
         CycleCommand::List(args) => run_list(args),
         // The process entry point routes `cycle replay` through
@@ -291,6 +307,27 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
             ),
             code: ErrorCode::PolicyInvalidCycle,
         })?;
+        let mut authoritative_include = card.write_scope.include.clone();
+        authoritative_include.sort();
+        authoritative_include.dedup();
+        let mut planned_include = planned_card.scope.clone();
+        planned_include.sort();
+        planned_include.dedup();
+        let mut authoritative_exclude = card.write_scope.exclude.clone();
+        authoritative_exclude.sort();
+        authoritative_exclude.dedup();
+        let mut planned_exclude = planned_card.scope_exclude.clone();
+        planned_exclude.sort();
+        planned_exclude.dedup();
+        if authoritative_include != planned_include || authoritative_exclude != planned_exclude {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "cycle plan {} scope for {} does not exactly match the authoritative card write_scope",
+                    plan.plan_id, planned_card.card_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
         let planned_dependencies: std::collections::BTreeSet<_> =
             planned_card.depends_on.iter().cloned().collect();
         let card_dependencies: std::collections::BTreeSet<_> =
@@ -376,6 +413,64 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
     .with_project(control.project()?.project_id))
 }
 
+/// Explicitly records compatibility provenance for a pre-plan cycle.
+/// Normal cycle creation and integration preparation never mint this marker.
+fn run_migrate_legacy(
+    args: &LegacyArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    if args.provenance != crate::domain::integration::LEGACY_PLAN_MIGRATION_PROVENANCE {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "unsupported legacy migration provenance `{}`; expected `{}`",
+                args.provenance,
+                crate::domain::integration::LEGACY_PLAN_MIGRATION_PROVENANCE
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+    with_transaction(
+        &args.common.control,
+        "cycle.migrate-legacy",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let mut cycle = load_cycle(control, &cycle_id)?;
+            if cycle.plan_id.is_some()
+                || cycle.plan_digest.is_some()
+                || cycle.plan_revision.is_some()
+                || cycle.plan_migration_provenance.is_some()
+            {
+                return Err(HarnessError::Control {
+                    reason: format!("cycle {cycle_id} already has plan or migration provenance"),
+                    code: ErrorCode::PolicyInvalidCycle,
+                });
+            }
+            cycle.plan_migration_provenance = Some(args.provenance.clone());
+            store(control, &cycle)?;
+            let config = control.project()?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("cycle.legacy-migrated", &args.common.actor)
+                    .cycle(cycle_id.clone())
+                    .meta("provenance", serde_json::json!(args.provenance)),
+                clock,
+            )?;
+            control.commit(expected, &format!("cycle: migrate legacy {cycle_id}"))?;
+            Ok(CommandOutcome::new(
+                "cycle.migrate-legacy",
+                format!("Recorded explicit legacy migration provenance for cycle {cycle_id}"),
+                serde_json::json!({
+                    "cycle_id": cycle_id.to_string(),
+                    "provenance": args.provenance,
+                }),
+            )
+            .with_project(config.project_id))
+        },
+    )
+}
+
 /// Revalidates the cycle's persisted plan binding at each lifecycle boundary.
 ///
 /// Legacy cycles without a binding remain readable; once a plan is installed,
@@ -392,7 +487,18 @@ pub fn require_active_plan(
     let (Some(plan_id), Some(plan_digest), Some(plan_revision)) =
         (&cycle.plan_id, &cycle.plan_digest, &cycle.plan_revision)
     else {
-        return Ok(());
+        if cycle.plan_migration_provenance.as_deref()
+            == Some(crate::domain::integration::LEGACY_PLAN_MIGRATION_PROVENANCE)
+        {
+            return Ok(());
+        }
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {} has no distribution plan; bind a cycle plan before lifecycle work or explicitly migrate a pre-existing legacy cycle",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
     };
     let raw = control.read(&format!("plans/{plan_id}.json"))?;
     let plan: CyclePlan = serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
@@ -402,7 +508,7 @@ pub fn require_active_plan(
     plan.validate()?;
     if plan.cycle_id != cycle.cycle_id.to_string()
         || plan.digest()? != *plan_digest
-        || *plan_revision != crate::domain::cycle_plan::CYCLE_PLAN_REVISION
+        || *plan_revision != CYCLE_PLAN_REVISION
     {
         return Err(HarnessError::Control {
             reason: format!(
@@ -426,6 +532,12 @@ pub fn require_card_plan_binding(
     cycle: &CycleRecord,
     card_id: &crate::domain::ids::CardId,
 ) -> Result<(), HarnessError> {
+    if cycle.plan_id.is_none() && cycle.plan_digest.is_none() && cycle.plan_revision.is_none() {
+        // Cards may be authored and reviewed before the complete cycle
+        // distribution manifest is bound. `integration prepare` is the hard
+        // lifecycle boundary and calls `require_active_plan` directly.
+        return Ok(());
+    }
     require_active_plan(control, cycle)?;
     let (Some(plan_id), Some(plan_digest), Some(plan_revision)) =
         (&cycle.plan_id, &cycle.plan_digest, &cycle.plan_revision)
@@ -446,6 +558,78 @@ pub fn require_card_plan_binding(
         return Err(HarnessError::Control {
             reason: format!("card {card_id} is not bound to cycle plan {plan_id}"),
             code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    Ok(())
+}
+
+/// Checks the plan facts that must remain equal to the authoritative card.
+///
+/// # Errors
+///
+/// Returns a policy error when the cycle plan is absent, stale, incomplete, or
+/// assigns the card to a different actor, principal, or session.
+pub fn require_plan_assignment(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    card_id: &crate::domain::ids::CardId,
+    actor_id: &str,
+    principal_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), HarnessError> {
+    // Work allocation predates cycle manifests and remains readable while a
+    // coordinator is assembling the complete card set. The first operation
+    // that can advance the cycle toward integration (`integration prepare`)
+    // requires the binding; once present, every start/renewal is checked here.
+    if cycle.plan_id.is_none() && cycle.plan_digest.is_none() && cycle.plan_revision.is_none() {
+        return Ok(());
+    }
+    require_card_plan_binding(control, cycle, card_id)?;
+    let (Some(plan_id), Some(plan_digest), Some(plan_revision)) =
+        (&cycle.plan_id, &cycle.plan_digest, &cycle.plan_revision)
+    else {
+        // A migrated historical cycle has no typed assignment to enforce.
+        return Ok(());
+    };
+    let plan: CyclePlan = serde_json::from_str(&control.read(&format!("plans/{plan_id}.json"))?)
+        .map_err(|source| HarnessError::Control {
+            reason: format!("cycle plan {plan_id} is malformed: {source}"),
+            code: ErrorCode::InternalControlCorrupt,
+        })?;
+    if plan.digest()? != *plan_digest || *plan_revision != CYCLE_PLAN_REVISION {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {cycle_id} has a stale assignment plan",
+                cycle_id = cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    let planned = plan
+        .cards
+        .iter()
+        .find(|planned| planned.card_id == card_id.to_string())
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!("cycle plan {plan_id} has no assignment for card {card_id}"),
+            code: ErrorCode::PolicyInvalidCycle,
+        })?;
+    let principal = principal_id.filter(|value| !value.trim().is_empty());
+    let session = session_id.filter(|value| !value.trim().is_empty());
+    if planned.assignment.as_deref() != Some(actor_id)
+        || planned.assignment_principal_id.as_deref() != principal
+        || planned.assignment_session_id.as_deref() != session
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "card {card_id} is assigned by cycle plan {plan_id} to actor/principal/session {:?}/{:?}/{:?}, not the declared caller {:?}/{:?}/{:?}",
+                planned.assignment,
+                planned.assignment_principal_id,
+                planned.assignment_session_id,
+                actor_id,
+                principal,
+                session
+            ),
+            code: ErrorCode::PolicyOwnershipOverlap,
         });
     }
     Ok(())
@@ -726,6 +910,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 plan_id: None,
                 plan_digest: None,
                 plan_revision: None,
+                plan_migration_provenance: None,
                 card_ids: Vec::new(),
                 atomic_groups: Vec::new(),
                 created_by: args.common.actor.clone(),

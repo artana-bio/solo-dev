@@ -1054,7 +1054,6 @@ fn run_activate(args: &ActivateArgs, clock: &dyn Clock) -> Result<CommandOutcome
             }
             let draft = stored_draft(control, &card_id)?;
             let cycle = cycle_accepting_cards(control, &draft)?;
-            crate::commands::cycle::require_active_plan(control, &cycle)?;
             require_cycle_baseline(&cycle, &draft)?;
             let config = control.project()?;
 

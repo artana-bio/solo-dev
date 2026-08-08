@@ -124,6 +124,46 @@ change-harness card activate --card-id F-001
 
 An activated card is immutable. To change it: `card revise --card-id F-001 --draft draft.yaml --reason "..."` — which supersedes the revision and **invalidates any handoff, review, or receipt bound to the old one.**
 
+## Bind the cycle distribution plan
+
+Before work starts or integration is prepared, persist one plan covering every
+card in the cycle. Its scope must exactly match each card's canonical
+`write_scope`, and each assignment must include the declared actor, principal,
+and session:
+
+```json
+{
+  "schema": "harness.cycle-plan/v1",
+  "plan_id": "PLAN-001",
+  "cycle_id": "C-001",
+  "objective": "add a farewell function",
+  "cards": [{
+    "card_id": "F-001",
+    "card_revision": 1,
+    "scope": ["src/farewell.py"],
+    "scope_exclude": [],
+    "depends_on": [],
+    "proof_entries": ["proof-farewell"],
+    "mutation_plan": ["remove the farewell assertion"],
+    "risk": "low",
+    "reviewer_requirements": ["independent"],
+    "assignment": "implementer-a",
+    "assignment_principal_id": "principal-a",
+    "assignment_session_id": "session-a",
+    "distribution": "parallel",
+    "acceptance_behaviors": ["the farewell function returns the greeting"]
+  }]
+}
+```
+
+```bash
+change-harness cycle plan --plan-id PLAN-001 --file plan.json
+```
+
+A normal cycle with no bound plan is refused before integration. The only
+planless compatibility path is an explicit, pre-existing migration record:
+`cycle migrate-legacy --provenance legacy_cycle_plan_v1`.
+
 ---
 
 ## 5. Do the work in the allocated worktree

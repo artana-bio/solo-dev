@@ -129,7 +129,28 @@ fn an_invalidated_approval_is_reported_as_stale_rather_than_absent() {
 /// That card's reviewer verified it by hand across eleven scenarios;
 /// `artana-bio/solo-dev#15` item 2 is the gap that left behind.
 fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, decision: &str) {
-    workspace.work(&["start", "--card-id", card_id]);
+    let cycle: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(workspace.control.join("cycles/C-001.json")).unwrap(),
+    )
+    .unwrap();
+    if cycle["plan_id"].is_null() && cycle["plan_migration_provenance"].is_null() {
+        workspace.cycle(&[
+            "migrate-legacy",
+            "--cycle-id",
+            "C-001",
+            "--provenance",
+            "legacy_cycle_plan_v1",
+        ]);
+    }
+    workspace.work(&[
+        "start",
+        "--card-id",
+        card_id,
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
 
     let worktree = workspace.worktrees.join(card_id);
     let path = worktree.join(format!("src/{card_id}/a.rs"));
@@ -452,6 +473,13 @@ fn sealed_cycle_prepare_defaults_to_final_authorization() {
 #[test]
 fn sealed_cycle_legacy_bypass_requires_exact_migration_provenance() {
     let workspace = cycle_with(1);
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
     workspace.cycle(&["seal", "--cycle-id", "C-001"]);
 
@@ -633,6 +661,13 @@ fn final_prepare_text_mode_says_delivers_no_cards_only_for_the_all_abandoned_cas
     let all_abandoned = cycle_with(2);
     all_abandoned.card(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
     all_abandoned.card(&["abandon", "--card-id", "F-002", "--reason", "superseded"]);
+    all_abandoned.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     all_abandoned.cycle(&["seal", "--cycle-id", "C-001"]);
 
     let all_abandoned_output = Workspace::run(&[
@@ -959,7 +994,7 @@ fn inspect_reproduces_the_recorded_plan() {
 }
 
 #[test]
-fn preparing_an_empty_cycle_is_refused() {
+fn preparing_a_planless_cycle_is_refused() {
     let workspace = cycle_with(1);
     let output = workspace.integration_raw(&[
         "prepare",
@@ -968,8 +1003,8 @@ fn preparing_an_empty_cycle_is_refused() {
         "--actor-id",
         "coordinator",
     ]);
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
 }
 
 #[test]
@@ -1151,7 +1186,9 @@ fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
     "mutation_plan": ["remove guard"],
     "risk": "low",
     "reviewer_requirements": ["independent"],
-    "assignment": "implementer",
+    "assignment": "operator",
+    "assignment_principal_id": "implementer-principal",
+    "assignment_session_id": "implementer-session",
     "distribution": "parallel",
     "acceptance_behaviors": ["it works"]
   }]
@@ -1159,6 +1196,7 @@ fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
 "#,
     )
     .unwrap();
+
     workspace.cycle(&[
         "plan",
         "--plan-id",
@@ -1200,5 +1238,96 @@ fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
         String::from_utf8_lossy(&refused.stdout).contains("stale or contradictory active plan"),
         "tampered plan refusal must name the plan binding: {}",
         String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
+#[test]
+fn planless_cycle_refuses_normal_integration_before_legacy_migration() {
+    let workspace = cycle_with(1);
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no distribution plan"));
+}
+
+#[test]
+fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    let invalid_path = workspace.root.join("invalid-plan.json");
+    fs::write(
+        &invalid_path,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-001","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/**"],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    let refused = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &invalid_path.display().to_string(),
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("does not exactly match"));
+
+    let valid = workspace.root.join("valid-plan.json");
+    fs::write(
+        &valid,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-001","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    workspace.cycle(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &valid.display().to_string(),
+    ]);
+
+    let wrong = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "operator",
+        "--actor-principal-id",
+        "other-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(wrong.status.code(), Some(5));
+    assert_eq!(error_code(&wrong), "CH-POLICY-OWNERSHIP-OVERLAP");
+    let valid_start = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "operator",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert!(
+        valid_start.status.success(),
+        "valid planned start failed: {}{}",
+        String::from_utf8_lossy(&valid_start.stdout),
+        String::from_utf8_lossy(&valid_start.stderr)
     );
 }

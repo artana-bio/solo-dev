@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 61 |
+| Plan revision | 63 |
 | Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Governance extension `WP-600` is **DONE**; the second Terra-high repair findings are closed and final gates pass. |
+| Current implementation status | Governance extension `WP-600` is **DONE**; the Terra P1 plan-governance repairs are implemented and fully gated. |
 | Next executable work package | Independent review and promotion of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -3508,7 +3508,7 @@ When the plan changes:
 | Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | Terra-high repair regressions cover default sealed-cycle final authorization, exact legacy migration provenance, typed approval principal/session, blank and reused attestor boundaries, mutation-session binding, dry-run/record parity, and downstream plan tamper refusal. The 683-test library suite and all integration binaries pass sequentially; `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
+| Focused evidence | Prior P0 evidence remains valid. This Terra P1 repair adds exact canonical card-scope matching, typed actor/principal/session assignment enforcement, plan revision replacement for changed card membership, explicit `cycle migrate-legacy` provenance, planless-cycle refusal, persisted plan staging, and focused lifecycle regressions. The owning scope mutation fails when exact comparison is disabled and passes when restored; the controlled full suite exits 0, with `cargo fmt --check`, strict clippy, and `git diff --check` also passing. |
 
 Delivered in this slice:
 
