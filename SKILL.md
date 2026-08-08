@@ -184,6 +184,216 @@ and card review use `--actor`; integration commands use `--actor-id`;
 integration review uses `--reviewer-actor-id`; acceptance uses
 `--acceptance-owner`.
 
+## Multi-agent orchestration
+
+Change Harness governs the assignment, worktree, evidence, and state
+transitions. It does not launch an AI model. The coordinator uses the agent
+host's **create new task/session** operation, then gives that task the bounded
+packet below. Do not substitute a shared conversation, an informal request to
+"take a look," or a branch name for an assignment.
+
+The operating flow is:
+
+```text
+User request
+  -> Coordinator proposes a cycle and independently reviewable cards
+  -> Owner approves scope when the original request did not already authorize it
+  -> Coordinator activates each card and allocates one worktree
+  -> One implementer task receives one card and its allocated worktree
+  -> Implementer commits, proves the behavior, and creates an exact-SHA handoff
+  -> One fresh reviewer task receives authoritative review state and repository objects only
+  -> Reviewer records findings, an undeclared mutation, and a verdict
+  -> Coordinator integrates only exact candidates whose Harness state is approved
+```
+
+### Convert a user request into cards
+
+The coordinator translates intent into governance before starting agents:
+
+1. Restate the observable outcome and explicit non-goals.
+2. Inspect repository guidance and fresh project, cycle, and ownership state.
+3. Split work by independently reviewable outcome, not by file count or by how
+   many agents are available.
+4. For every card, declare exact write scope, contract reads and changes,
+   dependencies, exclusive resources, risk, named gates, acceptance behaviors,
+   regression behaviors, and rollback strategy.
+5. Keep coupled changes in one card when neither half can be tested or reviewed
+   honestly on its own. Use separate cards when each outcome has its own proof
+   and neither requires overlapping ownership.
+6. If the user's request did not already authorize implementation, show the
+   proposed cycle and cards before activation. Approval of the product request
+   is not permission to silently widen its scope.
+
+One implementation assignment means **one activated card, one lease, one
+allocated worktree, and one feature actor**. An agent may complete several
+cards over time, but each card gets a separate task and handoff. Cards may run
+in parallel only after the Harness accepts their ownership, dependency, and
+exclusive-resource boundaries. The coordinator owns fan-out and fan-in; an
+implementer does not recruit another agent or split its own card silently.
+
+### Start an implementer task
+
+Read the authoritative card, allocate its worktree, and use the returned path
+as the new task's working directory:
+
+```bash
+change-harness card status --card-id F-001
+change-harness work start --card-id F-001 --actor implementer-a
+change-harness work status --card-id F-001
+```
+
+The implementation packet contains only what the task needs to deliver the
+card:
+
+- project and control-repository locator;
+- cycle ID and exact baseline SHA;
+- activated card ID, revision, digest, and complete card body;
+- lease ID, allocated worktree path, and feature actor ID;
+- repository guidance files the task must read;
+- named gates and any approved focused test commands;
+- the reporting contract below; and
+- explicit confirmation that this packet is the complete assigned context.
+
+Do not paste the coordinator's private reasoning, unrelated card discussions,
+or a broad conversation transcript. Repository files may be read when the card
+or repository guidance requires them; another agent's conversation is never a
+repository dependency.
+
+Copy and fill this prompt when creating the implementer task:
+
+```text
+Role: Implementer for card <card-id> as actor <feature-actor-id>.
+
+Authority:
+- Control repository: <absolute-control-path>
+- Cycle: <cycle-id>; baseline: <exact-baseline-sha>
+- Card: <card-id> revision <revision>; digest: <card-digest>
+- Lease: <lease-id>
+- Worktree: <absolute-allocated-worktree-path>
+
+Complete assigned context:
+- Activated card: <attach or paste the complete authoritative card>
+- Required repository guidance: <exact file list>
+- Named gates and focused checks: <exact names or commands>
+
+Rules:
+1. Work only in the allocated worktree and only within the card's write scope.
+2. Do not edit the control repository, authority, protected branch, or another card.
+3. Do not widen scope or delegate part of this card. Ask the coordinator when a
+   missing decision would change behavior, scope, contracts, risk, or dependencies.
+4. Make bounded assumptions only when they stay inside the card; report them.
+5. Add or update focused tests, run an intended-oracle mutation, commit all work,
+   run the named gates, verify scope, and create the exact-SHA handoff.
+
+Reporting:
+- Progress: current phase, completed evidence, next action, and any risk discovered.
+- Clarification: one decision needed, why it blocks, and the smallest safe options.
+- Blocked: Harness state or refusal code, evidence, and required recovery or decision.
+- Complete: candidate SHA, handoff ID, changed files, checks and mutation results,
+  assumptions, limitations, residual risks, and checks not run.
+
+This packet is the complete assigned context. Do not infer authority from prior chat.
+```
+
+### Progress, clarification, and completion
+
+The implementer reports after orientation, after a material proof or failure,
+before any scope-changing decision, and at handoff. Progress is informational;
+it never changes Harness state by itself.
+
+If missing information does not change the card boundary, the implementer may
+make a conservative assumption and record it. If it changes behavior, scope,
+contracts, dependencies, risk, acceptance, or rollback, the implementer stops
+that path and asks one focused question. When no in-scope work can continue,
+record the block:
+
+```bash
+change-harness work block --card-id F-001 --actor implementer-a --reason "Product decision required"
+```
+
+The coordinator answers in the implementer task, revises the card when its
+immutable contract must change, and never uses an informal message to override
+the activated card. At completion, verify the report from Harness and Git
+state; do not accept "done" in chat as a handoff.
+
+### Start a genuinely fresh reviewer task
+
+For every review attempt, create a new task/session that is **not forked,
+cloned, resumed, or summarized from the implementer task**. Do not attach the
+implementer's conversation, private or hidden reasoning, scratch notes,
+working summary, or the coordinator's desired verdict. If the agent host
+cannot prevent inherited implementation context, the review is not
+independent: do not record it as approval.
+
+The fresh task receives the control-repository locator, card ID, reviewer actor
+ID, required repository guidance, and the prompt below. The reviewer runs
+`review begin` inside the fresh task so the authoritative packet — activated
+cycle and card, exact baseline and candidate SHAs, complete diff, contract
+changes, receipts, and handoff decisions, assumptions, and limitations — comes
+from current Harness state rather than a coordinator's summary:
+
+```bash
+change-harness review begin --card-id F-001 --actor reviewer-b
+change-harness review example
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+```
+
+Copy and fill this prompt when creating the reviewer task:
+
+```text
+Role: Independent reviewer for card <card-id> as actor <reviewer-actor-id>.
+
+Start from authority:
+- Control repository: <absolute-control-path>
+- Card: <card-id>
+- Required repository guidance: <exact file list>
+- Run `review begin` yourself and use the exact packet and Git objects it names.
+
+Independence rules:
+1. This is a new task with no inherited implementation conversation.
+2. Do not request or inspect the implementer's conversation, private or hidden
+   reasoning, scratch notes, or working summary.
+3. Do not edit the candidate branch or repair the implementation yourself.
+4. Do not assume approval is desired. Findings and evidence come first.
+
+Review requirements:
+1. Inspect the complete base-to-candidate diff and the relevant repository code.
+2. Evaluate every acceptance behavior, regression, contract change, and the
+   review criteria in the authoritative packet.
+3. Check whether tests can pass while the required behavior is wrong.
+4. Run at least one narrow mutation the implementer did not declare and record
+   the changed mechanism, command, intended oracle, and observed result.
+5. Record `approved`, `changes_requested`, or `blocked` through the Harness.
+   Locate every finding and disposition every prior authoritative finding.
+
+Return: decision, findings first, mutation result, gate-adequacy conclusion,
+verdict/review ID, residual risks, and limits of what you verified.
+```
+
+For a re-review, the fresh reviewer task also receives the authoritative prior
+findings because it must disposition them. It still receives no implementation
+conversation. Requested changes return to the original implementer through the
+review record; the reviewer and coordinator do not patch the candidate.
+
+### Coordinator integration boundary
+
+Before integration, the coordinator independently reads `card status`,
+`handoff inspect`, and `integration ready`. Integrate only when the Harness
+reports the exact candidate approved. A reviewer message, an implementer
+summary, or a green command copied from another task is not sufficient.
+
+The coordinator may fan out independent cards, but fans them in only through
+Harness state:
+
+- `changes_requested`: return the structured findings to that card's original
+  implementer task, then require a new commit, handoff, and fresh review;
+- `blocked`: resolve the named authority, environment, or product decision
+  without editing the candidate on the reviewer's behalf;
+- `approved`: confirm the approval still binds the current card digest,
+  candidate SHA, dependencies, and receipts before integration; and
+- mixed outcomes across cards: integrate only an authorized complete set;
+  never hide an unfinished dependency by omitting it silently.
+
 ## Exit codes and refusals
 
 | Code | Meaning |

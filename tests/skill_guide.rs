@@ -51,6 +51,7 @@ const COVERED_SECTIONS: &[&str] = &[
     "## Convergence budgets and escalation",
     "## What the Harness guarantees",
     "## Lifecycle",
+    "## Multi-agent orchestration",
     "## Orient first",
     "## Repository adoption",
 ];
