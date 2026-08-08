@@ -20,6 +20,7 @@ pub enum Distribution {
 #[serde(deny_unknown_fields)]
 pub struct PlannedCard {
     pub card_id: String,
+    pub card_revision: u32,
     pub scope: Vec<String>,
     pub depends_on: Vec<String>,
     pub proof_entries: Vec<String>,
@@ -157,6 +158,7 @@ mod tests {
     fn card(id: &str, scope: &str) -> PlannedCard {
         PlannedCard {
             card_id: id.to_owned(),
+            card_revision: 1,
             scope: vec![scope.to_owned()],
             depends_on: vec![],
             proof_entries: vec!["P-001".to_owned()],

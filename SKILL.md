@@ -797,7 +797,10 @@ disposition and a sealed cycle's final acceptance; see "Who may record a
 disposition" for the document shape and the route to install or change one
 afterwards.
 
-New projects record an `installed_default` final-authorization mode. Existing
-documents without that marker retain the compatibility refusal until migrated.
+New projects always record an explicit final-authorization mode. Supplying
+`--final-authorizer-actor-id` installs `installed_default`; omitting it records
+`migration_required`, and the sealed-cycle acceptance path refuses until an
+authorizer policy is installed. Existing documents without that marker retain
+the same compatibility refusal until migrated.
 Run `audit probes` for the disposable negative assurance contract and use
 `audit report` for the typed evidence/claim projection.

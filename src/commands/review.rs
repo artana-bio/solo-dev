@@ -888,6 +888,7 @@ fn preview_record(
     let config = control.project()?;
     require_review_return_reason(config.convergence_policy.as_ref(), verdict)?;
     let (record, state) = load_card(&control, card_id)?;
+    require_typed_reviewer_contract(&record, verdict)?;
     require_convergence_budget(&control, &config, &record)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
@@ -901,6 +902,11 @@ fn preview_record(
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
+    refuse_shared_reviewer_boundary(
+        &verdict.reviewer_actor_id,
+        verdict.reviewer_provenance.as_ref(),
+        &handoff.actor_id,
+    )?;
     check_review_conduct(&record.review_policy, verdict.review_conduct)?;
     verdict.gate_adequacy.validate_mutation_evidence()?;
     Ok(CommandOutcome::new(
@@ -915,6 +921,56 @@ fn preview_record(
             "decision": verdict.decision.name(),
         }),
     ))
+}
+
+fn require_typed_reviewer_contract(
+    record: &crate::domain::card::CardRecord,
+    verdict: &Verdict,
+) -> Result<(), HarnessError> {
+    if verdict.human_reviewer && verdict.reviewer_kind != Some(ReviewerKind::Human) {
+        return Err(HarnessError::Control {
+            reason: "legacy human_reviewer is migration input only; declare typed human identity and attestation".to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        });
+    }
+    if record.risk.requires_human_review() && verdict.reviewer_kind != Some(ReviewerKind::Human) {
+        return Err(HarnessError::Control {
+            reason: "high-risk approvals require a declared reviewer_kind: human and independent attestation; legacy human_reviewer is not sufficient"
+                .to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        });
+    }
+    Ok(())
+}
+
+fn refuse_shared_reviewer_boundary(
+    reviewer_actor_id: &str,
+    provenance: Option<&ReviewerProvenance>,
+    feature_actor_id: &str,
+) -> Result<(), HarnessError> {
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    let reviewer = actors::ActorIdentity {
+        actor_kind: "reviewer",
+        actor_id: reviewer_actor_id,
+        principal_id: provenance.principal_id.as_deref(),
+        session_id: None,
+    };
+    let feature = actors::ActorIdentity {
+        actor_kind: "implementer",
+        actor_id: feature_actor_id,
+        principal_id: Some(feature_actor_id),
+        session_id: provenance.session_id.as_deref(),
+    };
+    if reviewer.same_boundary(&feature) {
+        return Err(HarnessError::Control {
+            reason: "reviewer and implementer share the declared principal/session boundary"
+                .to_owned(),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
 }
 
 /// The card state a decision moves the card to.
@@ -1101,6 +1157,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             // policy and the verdict the caller already supplied.
             require_review_return_reason(config.convergence_policy.as_ref(), &verdict)?;
             let (record, state) = load_card(control, &card_id)?;
+            require_typed_reviewer_contract(&record, &verdict)?;
             // 72-2: the first check able to refuse once the card record
             // exists — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
@@ -1144,6 +1201,11 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 HandoffScope::Bindings
             };
             require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;
+            refuse_shared_reviewer_boundary(
+                &verdict.reviewer_actor_id,
+                verdict.reviewer_provenance.as_ref(),
+                &handoff.actor_id,
+            )?;
 
             let next_state = state_for(verdict.decision);
             state.state.check_transition(next_state)?;
@@ -1310,6 +1372,28 @@ fn validate_mutation_receipts(
                 }
             })?;
         receipt.validate()?;
+        let expected_revision = format!("{}-r{}", review.card_id, review.card_revision);
+        if receipt.card_revision != expected_revision {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation receipt {receipt_id} is not bound to card revision {expected_revision}"
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+        if let Some(principal_id) = review
+            .reviewer_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.principal_id.as_deref())
+            && receipt.reviewer_principal_id.as_deref() != Some(principal_id)
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation receipt {receipt_id} is not bound to the reviewer's declared principal"
+                ),
+                code: ErrorCode::PolicySameActor,
+            });
+        }
         if let Some(session_id) = review
             .reviewer_provenance
             .as_ref()

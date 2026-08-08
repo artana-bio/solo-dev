@@ -776,7 +776,7 @@ impl ReviewRecord {
         }
         Err(HarnessError::Control {
             reason: format!(
-                "card risk `{}` requires a human reviewer under Section 15.3 and this review declared none; set `human_reviewer: true` on the verdict. Declared, not proven: see D-013",
+                "card risk `{}` requires a typed human reviewer with independent attestation; legacy human_reviewer is migration input only",
                 risk.name()
             ),
             code: ErrorCode::PolicyRiskReview,

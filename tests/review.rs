@@ -1064,6 +1064,18 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     ]);
     workspace.review(&["begin", "--card-id", "F-001"]);
 
+    let legacy_human = "reviewer_actor_id: reviewer-session-a\nhuman_reviewer: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: legacy self-certification\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let legacy_output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, legacy_human),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&legacy_output), "CH-POLICY-RISK-REVIEW");
+
     let output = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -1088,7 +1100,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     // Declaring it is the way through. Like every other identity in this
     // harness it is a claim, not a proof — D-013 — so this must be recorded on
     // the review rather than checked.
-    let human = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\nhuman_reviewer: true\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let human = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation-1\n  attestor_actor_id: independent-attestor\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: I independently attest this is a human review\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture review has no executable mutation\n  approved_by: independent-attestor\n";
     let envelope = workspace.review_json(&[
         "record",
         "--card-id",
@@ -1100,8 +1112,8 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(
-        envelope["data"]["review"]["human_reviewer"], true,
-        "the claim must be on the record, so an auditor can see who made it"
+        envelope["data"]["review"]["reviewer_kind"], "human",
+        "the typed claim must be on the record, so an auditor can see who made it"
     );
 }
 

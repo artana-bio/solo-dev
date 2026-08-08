@@ -33,7 +33,7 @@ struct CardSpec<'a> {
 
 fn activate(workspace: &Workspace, card_id: &str, spec: CardSpec<'_>) {
     let proof = if spec.proof_map {
-        "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains true\n      precondition: focused fixture exists\n      assertion: check observes behavior\n      mutation: bypass makes check fail\n  claim_boundary: only this named behavior\n"
+        "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains true\n      precondition: focused fixture exists\n      assertion: check observes behavior\n      mutation: bypass makes check fail\n      gate_oracle: gate.unit\n  claim_boundary: only this named behavior\n"
     } else {
         ""
     };

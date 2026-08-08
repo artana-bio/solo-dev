@@ -152,6 +152,11 @@ pub struct MergeArgs {
     /// Who is performing the merge.
     #[arg(long)]
     pub actor_id: String,
+    /// Declared verifier principal/session boundary; identity is not host-attested.
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
     /// A registered gate to run after each candidate is merged. Repeatable.
     ///
     /// These are cheap intermediate checks, not combined verification: their
@@ -3238,6 +3243,7 @@ fn verify_landing(
 /// Identifiers are allocated only once the runs are done, so a verification
 /// that never completed does not consume a block of them and leave a gap that
 /// reads like deleted evidence.
+#[allow(clippy::too_many_arguments)]
 fn store_verification(
     control: &ControlRepository,
     record: &IntegrationRecord,
@@ -3245,6 +3251,8 @@ fn store_verification(
     receipts: &mut [Receipt],
     worktree_clean_after: bool,
     actor_id: &str,
+    actor_principal_id: Option<&str>,
+    actor_session_id: Option<&str>,
     clock: &dyn Clock,
 ) -> Result<VerificationRecord, HarnessError> {
     let mut receipt_ids = Vec::new();
@@ -3304,6 +3312,8 @@ fn store_verification(
         interactions: member_interactions(control, record)?,
         worktree_clean_after,
         verified_by: actor_id.to_owned(),
+        verified_principal_id: actor_principal_id.map(str::to_owned),
+        verified_session_id: actor_session_id.map(str::to_owned),
         verified_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
     })
@@ -3396,6 +3406,8 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                 &mut receipts,
                 worktree_clean_after,
                 &args.actor_id,
+                args.actor_principal_id.as_deref(),
+                args.actor_session_id.as_deref(),
                 clock,
             )?;
             let receipt_ids = verification.receipt_ids.clone();
@@ -3534,6 +3546,11 @@ pub struct ReviewArgs {
     /// Who is reviewing. Must differ from whoever verified it.
     #[arg(long)]
     pub reviewer_actor_id: String,
+    /// Declared reviewer principal/session boundary; identity is not host-attested.
+    #[arg(long)]
+    pub reviewer_principal_id: Option<String>,
+    #[arg(long)]
+    pub reviewer_session_id: Option<String>,
     /// A risk accepted by approving this integration. Repeatable.
     #[arg(long = "residual-risk")]
     pub residual_risks: Vec<String>,
@@ -3667,6 +3684,8 @@ fn require_invariants_addressed(
 fn refuse_verifier_reviewing(
     verification: &VerificationRecord,
     reviewer_actor_id: &str,
+    reviewer_principal_id: Option<&str>,
+    reviewer_session_id: Option<&str>,
 ) -> Result<(), HarnessError> {
     actors::refuse_unusable("integration reviewer", reviewer_actor_id)?;
     actors::refuse_unusable("verifier", &verification.verified_by)?;
@@ -3675,6 +3694,25 @@ fn refuse_verifier_reviewing(
             reason: format!(
                 "{reviewer_actor_id} verified this integration and cannot also review it"
             ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    let reviewer = actors::ActorIdentity {
+        actor_kind: "integration_reviewer",
+        actor_id: reviewer_actor_id,
+        principal_id: reviewer_principal_id,
+        session_id: reviewer_session_id,
+    };
+    let verifier = actors::ActorIdentity {
+        actor_kind: "integration_verifier",
+        actor_id: &verification.verified_by,
+        principal_id: verification.verified_principal_id.as_deref(),
+        session_id: verification.verified_session_id.as_deref(),
+    };
+    if reviewer.same_boundary(&verifier) {
+        return Err(HarnessError::Control {
+            reason: "integration reviewer shares the verifier principal/session boundary"
+                .to_owned(),
             code: ErrorCode::PolicySameActor,
         });
     }
@@ -3701,6 +3739,7 @@ fn refuse_member_implementer_reviewing(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_integration_review(
     args: &ReviewArgs,
     clock: &dyn Clock,
@@ -3718,6 +3757,13 @@ fn run_integration_review(
             .status
             .check_transition(IntegrationStatus::Reviewed)?;
         let verification = load_verification(&control, &integration_id)?;
+        refuse_verifier_reviewing(
+            &verification,
+            &args.reviewer_actor_id,
+            args.reviewer_principal_id.as_deref(),
+            args.reviewer_session_id.as_deref(),
+        )?;
+        refuse_member_implementer_reviewing(&control, &record, &args.reviewer_actor_id)?;
         require_invariants_addressed(&verification, &args.invariants_held)?;
         return Ok(CommandOutcome::new(
             "integration.review",
@@ -3750,7 +3796,12 @@ fn run_integration_review(
                 .check_transition(IntegrationStatus::Reviewed)?;
             let verification = load_verification(control, &integration_id)?;
 
-            refuse_verifier_reviewing(&verification, &args.reviewer_actor_id)?;
+            refuse_verifier_reviewing(
+                &verification,
+                &args.reviewer_actor_id,
+                args.reviewer_principal_id.as_deref(),
+                args.reviewer_session_id.as_deref(),
+            )?;
             refuse_member_implementer_reviewing(control, &record, &args.reviewer_actor_id)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 

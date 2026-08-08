@@ -614,8 +614,14 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
                 exception_triggers: vec![],
             }
         }),
-        final_authorization_mode: (!args.final_authorizer_actor_ids.is_empty())
-            .then(|| "installed_default".to_owned()),
+        final_authorization_mode: Some(
+            if args.final_authorizer_actor_ids.is_empty() {
+                "migration_required"
+            } else {
+                "installed_default"
+            }
+            .to_owned(),
+        ),
         convergence_policy,
     })
 }

@@ -454,8 +454,7 @@ pub(crate) fn validate_final_authorization_for_promotion(
     // has no v2 final-authorization policy. An explicit v2 policy cannot be
     // bypassed by rewriting a final record to look historical.
     if acceptance.schema == ACCEPTANCE_SCHEMA {
-        if config.final_authorization_policy.is_none() && config.final_authorization_mode.is_none()
-        {
+        if config.final_authorization_policy.is_none() {
             return Ok(());
         }
         return Err(HarnessError::ControlWithRecovery {

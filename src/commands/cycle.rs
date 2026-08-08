@@ -235,6 +235,7 @@ pub fn execute(command: &CycleCommand, clock: &dyn Clock) -> Result<CommandOutco
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let raw = fs::read_to_string(&args.file).map_err(|source| HarnessError::WorkspaceAccess {
@@ -277,6 +278,52 @@ fn run_plan(args: &PlanArgs) -> Result<CommandOutcome, HarnessError> {
             ),
             code: ErrorCode::PolicyInvalidCycle,
         });
+    }
+    for planned_card in &plan.cards {
+        let card_id: crate::domain::ids::CardId = planned_card.card_id.parse()?;
+        let card: crate::domain::card::CardRecord = serde_json::from_str(&control.read(
+            &crate::domain::card::CardRecord::relative_path(&card_id, planned_card.card_revision),
+        )?)
+        .map_err(|_| HarnessError::Control {
+            reason: format!(
+                "plan {} does not bind an existing card revision for {}",
+                plan.plan_id, planned_card.card_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        })?;
+        let planned_dependencies: std::collections::BTreeSet<_> =
+            planned_card.depends_on.iter().cloned().collect();
+        let card_dependencies: std::collections::BTreeSet<_> =
+            card.depends_on.iter().map(ToString::to_string).collect();
+        let proof_ids: std::collections::BTreeSet<_> = card
+            .proof_map
+            .as_ref()
+            .map(|map| {
+                map.entries
+                    .iter()
+                    .filter_map(|entry| entry.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let planned_proofs: std::collections::BTreeSet<_> =
+            planned_card.proof_entries.iter().cloned().collect();
+        if card.revision != planned_card.card_revision
+            || card.risk.name() != planned_card.risk
+            || card_dependencies != planned_dependencies
+            || (!proof_ids.is_empty() && !proof_ids.is_subset(&planned_proofs))
+            || card.named_gates.feature.is_empty()
+            || planned_card.reviewer_requirements.is_empty()
+            || planned_card.proof_entries.is_empty()
+            || planned_card.mutation_plan.is_empty()
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "cycle plan {} has contradictory lifecycle requirements for {}",
+                    plan.plan_id, planned_card.card_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
     }
     let relative = format!("plans/{}.json", plan.plan_id);
     if control.path(&relative).exists() {

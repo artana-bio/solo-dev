@@ -19,6 +19,7 @@ use crate::{
 
 /// Schema identifier for a gate definition.
 pub const GATE_SCHEMA: &str = "harness.gate/v1";
+pub const GATE_SCHEMA_V2: &str = "harness.gate/v2";
 
 /// Directory holding gate definitions, relative to the control repository.
 pub const GATE_DIR: &str = "gates";
@@ -126,6 +127,8 @@ pub struct GateDefinition {
     /// What the gate semantically establishes; distinct from its command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<String>,
     /// Required when a new gate intentionally duplicates another gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_justification: Option<String>,
@@ -177,7 +180,7 @@ impl GateDefinition {
             code: ErrorCode::ConfigInvalidGate,
         };
 
-        if self.schema != GATE_SCHEMA {
+        if self.schema != GATE_SCHEMA && self.schema != GATE_SCHEMA_V2 {
             return Err(reject(format!(
                 "expected schema `{GATE_SCHEMA}`, found `{}`",
                 self.schema
@@ -276,6 +279,9 @@ impl GateDefinition {
     /// Returns a gate configuration error when either field is absent.
     pub fn validate_contract(&self) -> Result<(), HarnessError> {
         self.validate()?;
+        if self.schema == GATE_SCHEMA && self.purpose.is_none() && self.semantics.is_none() {
+            return Ok(());
+        }
         if self
             .purpose
             .as_deref()
@@ -328,6 +334,7 @@ mod tests {
             gate_id: "gate.unit".to_owned(),
             purpose: Some("focused regression".to_owned()),
             semantics: Some("must fail on the declared mutation".to_owned()),
+            migration: None,
             reuse_justification: None,
             revision: 1,
             argv: vec!["cargo".to_owned(), "test".to_owned()],

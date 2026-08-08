@@ -762,6 +762,12 @@ pub struct VerificationRecord {
     pub worktree_clean_after: bool,
     /// Who ran it. Declared, not proven; see D-013.
     pub verified_by: String,
+    /// Declared verifier principal; not host-attested.
+    #[serde(default)]
+    pub verified_principal_id: Option<String>,
+    /// Declared verifier session; not host-attested.
+    #[serde(default)]
+    pub verified_session_id: Option<String>,
     /// When it completed.
     pub verified_at: Timestamp,
     /// The canonicalization algorithm its digest was computed under.

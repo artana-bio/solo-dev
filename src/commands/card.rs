@@ -780,6 +780,9 @@ fn require_declared_proof(
             code: ErrorCode::PolicyInvalidCard,
         });
     }
+    if let Some(proof_map) = &record.proof_map {
+        proof_map.validate_strict()?;
+    }
     Ok(())
 }
 

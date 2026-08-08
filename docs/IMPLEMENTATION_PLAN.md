@@ -5,14 +5,14 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 59 |
+| Plan revision | 60 |
 | Plan date | 2026-08-02 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-026` |
 | Current release stage | Single-repository MVP |
-| Current implementation status | Governance extension `WP-600` is **DONE**. All eight P0/P1 outcomes have persisted contracts, refusal paths, CLI/report surfaces, focused tests, and controlled full-suite evidence. |
+| Current implementation status | Governance extension `WP-600` is **DONE**. Terra-high repairs are committed and all focused/full quality gates pass. |
 | Next executable work package | Independent review and promotion of this candidate. |
 | Final acceptance owner | Alvaro Alvarez |
 
@@ -2743,7 +2743,7 @@ Delivered notes:
 
 | D-059 | Require a class on every generated declaration rather than defaulting one | Accepted | A default would have to be either transient — silently forbidding a file somebody committed on purpose — or per-card, silently granting a card ownership of something integration should produce. Both restore the ambiguity the classification exists to remove, and neither failure is visible at the point it is made. Requiring the class costs one line per declaration and makes the ownership decision explicit where it belongs, in the card under review. |
 
-### WP-600 — Workspace manifest
+### WP-600-MR — Workspace manifest
 
 | Field | Value |
 | --- | --- |
@@ -2771,7 +2771,7 @@ Acceptance:
 | Field | Value |
 | --- | --- |
 | Status | `DEFERRED` |
-| Dependencies | `WP-600` |
+| Dependencies | `WP-600-MR` |
 | Target release | Multi-repository release |
 
 Deliverables:
@@ -3505,10 +3505,10 @@ When the plan changes:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | `cargo test domain::review:: --quiet`; `cargo test domain::mutation::tests --quiet`; `cargo test domain::cycle_plan::tests --quiet`; `cargo fmt --check` |
+| Focused evidence | `cargo test --test review --test integration_plan --test gate_registry --test card_model --test progressive_preflight --quiet`; deliberate human-identity mutation was rejected; `cargo test --test promotion historical_v1_final_acceptance_remains_promotable_without_a_new_policy --quiet`; full suite 682 unit tests plus all integration binaries passed. |
 
 Delivered in this slice:
 
@@ -3529,7 +3529,7 @@ Delivered in this slice:
 - `audit report` emits `harness.claim-report/v1` classifications and preserves
   discrepancies instead of dropping unsupported claims.
 
-Requirement audit: (1) typed reviewer kind, provenance, independent human
+Requirement audit: complete. (1) typed reviewer kind, provenance, independent human
 attestation, and compatibility fields are enforced in review recording; (2)
 mutation receipts are persisted transactionally and bind card revision,
 candidate, reviewer/session, digests, oracle, failure, and restoration, with
@@ -3545,8 +3545,8 @@ declared from enforced; (8) `audit report` reads persisted integrations and
 verification receipts, binds claims to exact SHAs and policy digests, and
 preserves missing/contradictory evidence.
 
-Acceptance evidence: `cargo test --quiet` (controlled environment),
-`cargo fmt --check`, strict clippy, `git diff --check`, focused assurance,
-mutation-receipt, gate, archive, and promotion tests. The denied-network probe
+Acceptance evidence: `env -u NO_COLOR TERM=xterm cargo test --quiet`,
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+and `git diff --check` all pass. The denied-network probe
 is intentionally classified `not_tested` because the runner does not enforce
 host network isolation; this is an explicit limitation, not a security claim.

@@ -628,6 +628,7 @@ fn example_definition() -> GateDefinition {
         gate_id: "gate.example".to_owned(),
         purpose: Some("example validation".to_owned()),
         semantics: Some("exit zero means the example contract holds".to_owned()),
+        migration: None,
         reuse_justification: None,
         revision: 1,
         argv: vec!["true".to_owned()],
@@ -753,7 +754,7 @@ pub fn all_gates(control: &ControlRepository) -> Result<Vec<GateDefinition>, Har
 
 fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    if gate.purpose.is_some() || gate.semantics.is_some() {
+    if gate.schema != GATE_SCHEMA || gate.purpose.is_some() || gate.semantics.is_some() {
         gate.validate_contract()?;
     } else {
         gate.validate()?;
@@ -785,7 +786,7 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
     // v1 registry documents may omit the additive purpose/oracle fields. A
     // new document that starts either field must provide both; `gate validate`
     // is strict, while registration preserves the documented migration path.
-    if gate.purpose.is_some() || gate.semantics.is_some() {
+    if gate.schema != GATE_SCHEMA || gate.purpose.is_some() || gate.semantics.is_some() {
         gate.validate_contract()?;
     } else {
         gate.validate()?;

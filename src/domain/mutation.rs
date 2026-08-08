@@ -52,6 +52,8 @@ pub struct MutationReceipt {
     pub card_revision: String,
     pub candidate_sha: String,
     pub reviewer_actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_principal_id: Option<String>,
     pub reviewer_session_id: Option<String>,
     pub mutation_digest: Digest,
     pub patch_digest: Digest,
@@ -61,6 +63,8 @@ pub struct MutationReceipt {
     pub observed_result: String,
     pub failed_at_oracle: bool,
     pub restoration_proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restoration_sha: Option<String>,
     pub created_at: Timestamp,
     pub exemption: Option<MutationExemption>,
 }
@@ -112,6 +116,30 @@ impl MutationReceipt {
                 "the mutation did not reach a failing oracle",
             ));
         }
+        if self
+            .reviewer_principal_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+            || self
+                .reviewer_session_id
+                .as_deref()
+                .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(invalid(
+                "reviewer_identity",
+                "reviewer principal and session bindings must not be blank",
+            ));
+        }
+        if self
+            .restoration_sha
+            .as_deref()
+            .is_some_and(|sha| sha.trim().is_empty())
+        {
+            return Err(invalid(
+                "restoration_sha",
+                "restoration SHA must not be blank",
+            ));
+        }
         if self.exemption.is_some() {
             return Err(invalid(
                 "exemption",
@@ -156,6 +184,7 @@ mod tests {
             card_revision: "F-001-r1".to_owned(),
             candidate_sha: "a".repeat(40),
             reviewer_actor_id: "reviewer".to_owned(),
+            reviewer_principal_id: Some("principal".to_owned()),
             reviewer_session_id: Some("session".to_owned()),
             mutation_digest: Digest::of_bytes(b"mutation"),
             patch_digest: Digest::of_bytes(b"patch"),
@@ -165,6 +194,7 @@ mod tests {
             observed_result: "exit 101".to_owned(),
             failed_at_oracle: true,
             restoration_proof: "clean restore".to_owned(),
+            restoration_sha: Some("a".repeat(40)),
             created_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
             exemption: None,
         }

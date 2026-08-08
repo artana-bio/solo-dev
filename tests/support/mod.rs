@@ -112,7 +112,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\nmigration: legacy_v1\n"
         );
         let path = self.root.join(format!("{gate_id}.yaml"));
         fs::write(&path, body).unwrap();
@@ -393,7 +393,7 @@ impl Workspace {
         let proof_map = if risk == "low" {
             String::new()
         } else {
-            "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n".to_owned()
+            "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n      gate_oracle: gate.review\n  claim_boundary: only this fixture\n".to_owned()
         };
         let review_gates = if risk == "low" { "[]" } else { "[gate.review]" };
         let body = format!(
@@ -818,7 +818,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n",
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n      gate_oracle: gate.review\n  claim_boundary: only this fixture\n",
             base = self.cycle_baseline(),
         );
         let path = self.root.join(format!("{card_id}-revised.yaml"));
