@@ -1587,6 +1587,162 @@ fn mixed_execution_modes_enforce_symmetric_overlap_without_side_effects() {
     assert_eq!(joint_after_parallel.control_head(), before);
 }
 
+#[allow(clippy::needless_borrow, clippy::too_many_lines)]
+#[test]
+fn resume_mode_conflicts_match_dry_run_without_journal_side_effects() {
+    let journal_count = |workspace: &Workspace| {
+        fs::read_dir(workspace.control.join("journal")).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count()
+        })
+    };
+    let identity = [
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ];
+
+    let blocked_sequential = cycle_with(2);
+    blocked_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-RESUME-SEQ-PAR-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    blocked_sequential.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    blocked_sequential.work(&["block", "--card-id", "F-001", "--reason", "review feedback"]);
+    blocked_sequential.work(&[
+        "start",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let before_head = blocked_sequential.control_head();
+    let before_journals = journal_count(&blocked_sequential);
+    let dry = blocked_sequential.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+        "--dry-run",
+    ]);
+    assert_eq!(dry.status.code(), Some(5));
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["error"]["code"], "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(blocked_sequential.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_sequential), before_journals);
+    let real = blocked_sequential.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    assert_eq!(real.status.code(), Some(5));
+    let real_json: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(real_json["error"]["code"], dry_json["error"]["code"]);
+    assert_eq!(real_json["error"]["message"], dry_json["error"]["message"]);
+    assert_eq!(blocked_sequential.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_sequential), before_journals);
+
+    let blocked_parallel = cycle_with(2);
+    blocked_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-RESUME-PAR-SEQ-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    blocked_parallel.work(&[
+        "start",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    blocked_parallel.work(&["block", "--card-id", "F-002", "--reason", "review feedback"]);
+    blocked_parallel.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let before_head = blocked_parallel.control_head();
+    let before_journals = journal_count(&blocked_parallel);
+    let dry = blocked_parallel.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+        "--dry-run",
+    ]);
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry.status.code(), Some(5));
+    assert_eq!(dry_json["error"]["code"], "CH-POLICY-OWNERSHIP-OVERLAP");
+    let real = blocked_parallel.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let real_json: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(real.status.code(), Some(5));
+    assert_eq!(real_json["error"]["code"], dry_json["error"]["code"]);
+    assert_eq!(real_json["error"]["message"], dry_json["error"]["message"]);
+    assert_eq!(blocked_parallel.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_parallel), before_journals);
+
+    let valid = cycle_with(1);
+    valid.bind_fixture_plan("PLAN-RESUME-VALID-001", "sequential");
+    valid.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    valid.work(&["block", "--card-id", "F-001", "--reason", "review feedback"]);
+    let resumed = valid.work(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    assert!(resumed.status.success());
+}
+
 #[test]
 fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
     let workspace = Workspace::initialized();

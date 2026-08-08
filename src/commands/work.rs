@@ -604,8 +604,10 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                 &args.common.actor,
                 args.common.actor_principal_id.as_deref(),
                 args.common.actor_session_id.as_deref(),
-            )?;
-            crate::commands::cycle::require_work_admission(control, &cycle, &card_id)?;
+            )
+            .map_err(HarnessError::no_persist)?;
+            crate::commands::cycle::require_work_admission(control, &cycle, &card_id)
+                .map_err(HarnessError::no_persist)?;
             let scope = GitScope::work_tree(&config.repository);
 
             let lease_id = next_lease_id(control)?;
@@ -754,10 +756,12 @@ fn run_start_batch(
                     &args.common.actor,
                     args.common.actor_principal_id.as_deref(),
                     args.common.actor_session_id.as_deref(),
-                )?;
+                )
+                .map_err(HarnessError::no_persist)?;
                 fresh_members.push((record, state));
             }
-            crate::commands::cycle::require_joint_work_admission(control, &cycle, &card_ids)?;
+            crate::commands::cycle::require_joint_work_admission(control, &cycle, &card_ids)
+                .map_err(HarnessError::no_persist)?;
             let mut leases = Vec::with_capacity(fresh_members.len());
             for (record, state) in fresh_members {
                 preflight_start(control, &config, &record.card_id, &record, &state)?;
@@ -1096,6 +1100,9 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             args.common.actor_principal_id.as_deref(),
             args.common.actor_session_id.as_deref(),
         )?;
+        if resumes_to_active(state.state) {
+            crate::commands::cycle::require_work_admission(&control, &cycle, &card_id)?;
+        }
         // 72-3: checked only for `ready`, the one source state
         // `resumes_to_active` admits that is functionally equivalent to
         // `work start` rather than to continuing already-owned work — see
@@ -1140,6 +1147,9 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         args.common.actor_principal_id.as_deref(),
         args.common.actor_session_id.as_deref(),
     )?;
+    if resumes_to_active(state.state) {
+        crate::commands::cycle::require_work_admission(&control, &cycle, &card_id)?;
+    }
 
     if resumes_to_active(state.state) {
         return resume_to_active(args, &card_id, clock);
@@ -1193,8 +1203,10 @@ fn resume_to_active(
                 &args.common.actor,
                 args.common.actor_principal_id.as_deref(),
                 args.common.actor_session_id.as_deref(),
-            )?;
-            crate::commands::cycle::require_work_admission(control, &cycle, card_id)?;
+            )
+            .map_err(HarnessError::no_persist)?;
+            crate::commands::cycle::require_work_admission(control, &cycle, card_id)
+                .map_err(HarnessError::no_persist)?;
             // 72-3: the same narrow case the dry run checks, for the same
             // reason — see the note there. `resume_to_active` handles every
             // source state `resumes_to_active` admits, and only `ready` is

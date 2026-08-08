@@ -142,6 +142,10 @@ where
             journal.finish(&mut operation, OperationState::Completed, None, clock)?;
             Ok(outcome.with_operation(operation.operation_id.clone()))
         }
+        Err(HarnessError::NoPersist(error)) => {
+            journal.discard(&operation)?;
+            Err(*error)
+        }
         Err(error) => {
             let error = if error.code() == ErrorCode::PolicySensitiveValue {
                 match control.restore_tracked_paths(&before_control) {

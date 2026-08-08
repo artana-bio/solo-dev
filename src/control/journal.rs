@@ -238,6 +238,23 @@ impl<'a> Journal<'a> {
         self.write(record)
     }
 
+    /// Removes a provisional journal when a pure policy refusal is detected
+    /// after transaction setup but before any governed mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a control-I/O error when the provisional journal cannot be
+    /// removed.
+    pub fn discard(&self, record: &OperationRecord) -> Result<(), HarnessError> {
+        let path = self
+            .control
+            .path(&OperationRecord::relative_path(&record.operation_id));
+        if path.exists() {
+            fs::remove_file(&path).map_err(|source| HarnessError::ControlIo { path, source })?;
+        }
+        Ok(())
+    }
+
     /// Writes one record atomically.
     ///
     /// # Errors
