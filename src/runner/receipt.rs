@@ -51,6 +51,8 @@ pub enum TestResultStatus {
     Reported,
     /// No structured report was declared for this gate.
     NotReported,
+    /// A declared report was present but could not be accepted as evidence.
+    Invalid,
 }
 
 impl TestResultStatus {
@@ -59,8 +61,27 @@ impl TestResultStatus {
         match self {
             Self::Reported => "reported",
             Self::NotReported => "not_reported",
+            Self::Invalid => "invalid",
         }
     }
+}
+
+/// Redacted reason why a declared structured result was rejected.
+///
+/// This is intentionally a closed set. Receipt consumers need a stable reason
+/// without receiving parser text, report paths, or report contents.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredResultErrorCode {
+    Missing,
+    Malformed,
+    UnsafePath,
+    Stale,
+    Inconsistent,
+    Duplicate,
+    Oversized,
+    DepthExceeded,
+    ReadError,
 }
 
 /// Redacted test-result counts attached to one exact gate attempt.
@@ -73,6 +94,8 @@ pub struct TestResultSummary {
     pub errors: u64,
     pub skipped: u64,
     pub status: TestResultStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<StructuredResultErrorCode>,
 }
 
 impl TestResultSummary {
@@ -86,6 +109,21 @@ impl TestResultSummary {
             errors: 0,
             skipped: 0,
             status: TestResultStatus::NotReported,
+            error_code: None,
+        }
+    }
+
+    /// Creates the failed, redacted value for rejected structured evidence.
+    #[must_use]
+    pub const fn invalid(error_code: StructuredResultErrorCode) -> Self {
+        Self {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            errors: 0,
+            skipped: 0,
+            status: TestResultStatus::Invalid,
+            error_code: Some(error_code),
         }
     }
 
@@ -114,7 +152,25 @@ impl TestResultSummary {
         {
             return Err("not_reported test results must have zero counts");
         }
-        Ok(())
+        match self.status {
+            TestResultStatus::Reported if self.error_code.is_some() => {
+                Err("reported test results cannot carry an error code")
+            }
+            TestResultStatus::NotReported if self.error_code.is_some() => {
+                Err("not_reported test results cannot carry an error code")
+            }
+            TestResultStatus::Invalid
+                if self.error_code.is_none()
+                    || self.total != 0
+                    || self.passed != 0
+                    || self.failed != 0
+                    || self.errors != 0
+                    || self.skipped != 0 =>
+            {
+                Err("invalid test results must carry an error code and zero counts")
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -969,6 +1025,22 @@ mod tests {
         assert!(record.is_current_for(&"a".repeat(40), &gate));
         assert!(!record.is_current_for(&"b".repeat(40), &gate));
         assert!(!record.is_current_for(&"a".repeat(40), &Digest::of_bytes(b"other gate")));
+    }
+
+    #[test]
+    fn legacy_receipt_without_optional_test_results_keeps_canonical_digest() {
+        let current = receipt(1, true);
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy.as_object_mut().unwrap().remove("test_results");
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let decoded: Receipt = serde_json::from_slice(&legacy_bytes).unwrap();
+
+        assert!(decoded.test_results.is_none());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        assert_eq!(
+            Digest::of_canonical(&decoded).unwrap(),
+            Digest::of_canonical(&legacy).unwrap()
+        );
     }
 
     #[test]

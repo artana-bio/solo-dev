@@ -76,7 +76,12 @@ impl AttemptOutcome {
     /// platforms, so both conditions are checked.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.termination == Termination::Completed && self.exit_code == Some(0)
+        self.termination == Termination::Completed
+            && self.exit_code == Some(0)
+            && self
+                .test_results
+                .as_ref()
+                .is_none_or(|results| results.status != receipt::TestResultStatus::Invalid)
     }
 }
 
@@ -144,7 +149,7 @@ pub fn run_attempt_with_validation_cache(
     validation_cache: Option<&Path>,
 ) -> Result<AttemptOutcome, HarnessError> {
     let working_directory = resolve_working_directory(gate, worktree)?;
-    let report_before = junit::capture_before(gate, &working_directory, worktree, attempt)?;
+    let report_before = junit::capture_before(gate, &working_directory, worktree, attempt);
     let (stdout_path, stderr_path) = attempt_log_paths(log_root, &gate.gate_id, attempt);
     if let Some(parent) = stdout_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| HarnessError::ControlIo {
@@ -255,7 +260,7 @@ pub fn run_attempt_with_validation_cache(
     let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
     let termination = classify(timed_out, status.as_ref(), exit_code);
     let artifact_digests = digest_artifacts(gate, &working_directory);
-    let test_results = junit::collect(gate, &working_directory, worktree, &report_before, attempt)?;
+    let test_results = junit::collect(gate, &working_directory, worktree, &report_before, attempt);
     let _ = started_at;
 
     Ok(AttemptOutcome {

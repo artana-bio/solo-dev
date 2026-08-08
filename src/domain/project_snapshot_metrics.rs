@@ -194,6 +194,12 @@ pub(super) fn test_metrics(receipts: &[Receipt]) -> Result<TestResultSummary, Ha
         if test_results.status == TestResultStatus::NotReported {
             continue;
         }
+        if test_results.status == TestResultStatus::Invalid {
+            // Invalid structured evidence is visible in the snapshot and
+            // prevents a mixture of valid counts from looking authoritative.
+            summary = test_results.clone();
+            break;
+        }
         summary.status = TestResultStatus::Reported;
         summary.total = summary
             .total

@@ -642,7 +642,7 @@ termination
 stdout_digest
 stderr_digest
 artifact_digests{}
-test_results            (optional typed summary: total, passed, failed, errors, skipped, status)
+test_results            (optional typed summary: total, passed, failed, errors, skipped, status, error_code)
 log_location
 attempt
 ```
@@ -656,8 +656,14 @@ verification run against a landing commit. See D-046.
 `test_results` is omitted on legacy receipts and is optional for compatibility;
 new receipts carry `status: not_reported` when their trusted gate declares no
 JUnit report. When reports are declared, the runner records only validated
-counts on the exact receipt. Snapshot aggregation uses validated subject-bound
-receipts and never parses gate output.
+counts on the exact receipt. Unsafe, stale, malformed, inconsistent, duplicate,
+oversized, depth-limited, missing, or unreadable declared evidence records
+`status: invalid` with one closed-set `error_code` and zero counts; the failed
+attempt remains auditable. Snapshot aggregation uses validated subject-bound
+receipts and never parses gate output. Legacy receipts omit the optional field,
+and empty gate declarations remain absent from canonical gate bytes and digests.
+The report reader caps each XML payload at 16 MiB and XML nesting at 128
+elements, independently, before parsing counts.
 
 ### 10.7 Handoff
 

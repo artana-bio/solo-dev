@@ -54,6 +54,18 @@ fn snapshot_json(workspace: &Workspace) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn receipts(workspace: &Workspace) -> Vec<Value> {
+    let mut paths: Vec<_> = fs::read_dir(workspace.control.join("receipts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+        .collect()
+}
+
 fn junit_gate_definition(gate_id: &str, script: &str, reports: &str, max_attempts: u32) -> String {
     let argv = serde_json::to_string(&["sh", "-c", script]).unwrap();
     format!(
@@ -245,8 +257,35 @@ fn malformed_and_inconsistent_declared_reports_fail_closed() {
             "{name} must refuse invalid evidence"
         );
         let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("JUnit report validation failed"), "{text}");
+        assert!(!text.contains(xml), "raw XML must not be surfaced: {text}");
+        let receipt = receipts(&workspace).pop().expect("invalid attempt receipt");
+        assert_eq!(receipt["passed"], false);
+        assert_eq!(receipt["test_results"]["status"], "invalid");
+        assert_eq!(
+            receipt["test_results"]["error_code"],
+            if name == "gate.malformed" {
+                "malformed"
+            } else {
+                "inconsistent"
+            }
+        );
+        let status = workspace.gate_json(&["status", "--card-id", "F-001"]);
+        assert_eq!(
+            status["data"]["receipts"][0]["test_results"]["status"],
+            "invalid"
+        );
     }
+}
+
+#[test]
+fn missing_declared_report_is_audited_as_invalid() {
+    let workspace = junit_workspace("gate.missing", "true", "[report.xml]", 1);
+    let output = reserved_run_raw(&workspace, "F-001", "gate.missing");
+    assert!(!output.status.success());
+    let receipt = receipts(&workspace).pop().expect("missing report receipt");
+    assert_eq!(receipt["passed"], false);
+    assert_eq!(receipt["test_results"]["status"], "invalid");
+    assert_eq!(receipt["test_results"]["error_code"], "missing");
 }
 
 #[test]
@@ -292,12 +331,25 @@ fn symlinked_declared_report_is_refused() {
 
     let output = reserved_run_raw(&workspace, "F-001", "gate.symlink");
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("traverses a symlink"),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let receipt = receipts(&workspace).pop().expect("symlink attempt receipt");
+    assert_eq!(receipt["passed"], false);
+    assert_eq!(receipt["test_results"]["status"], "invalid");
+    assert_eq!(receipt["test_results"]["error_code"], "unsafe_path");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_parent_component_is_refused() {
+    let script = format!(
+        "mkdir real-reports; printf '%s' '{VALID_JUNIT}' > real-reports/report.xml; ln -s real-reports reports"
     );
+    let workspace = junit_workspace("gate.parent-symlink", &script, "[reports/report.xml]", 1);
+    let output = reserved_run_raw(&workspace, "F-001", "gate.parent-symlink");
+    assert!(!output.status.success());
+    let receipt = receipts(&workspace).pop().expect("parent symlink receipt");
+    assert_eq!(receipt["passed"], false);
+    assert_eq!(receipt["test_results"]["status"], "invalid");
+    assert_eq!(receipt["test_results"]["error_code"], "unsafe_path");
 }
 
 #[test]
@@ -331,6 +383,43 @@ fn retry_attempts_are_aggregated_without_reusing_the_first_report() {
     let snapshot = snapshot_json(&workspace);
     assert_eq!(snapshot["data"]["test_metrics"]["status"], "reported");
     assert_eq!(snapshot["data"]["test_metrics"]["total"], 8);
+    assert_eq!(snapshot["data"]["gate_metrics"]["attempts"], 2);
+}
+
+#[test]
+fn invalid_structured_evidence_stays_auditable_across_retries() {
+    let workspace = junit_workspace(
+        "gate.invalid-retry",
+        "printf '%s' '<testsuite>' > report.xml",
+        "[report.xml]",
+        2,
+    );
+    let output = reserved_run_raw(&workspace, "F-001", "gate.invalid-retry");
+    assert!(!output.status.success());
+
+    let receipt_path = fs::read_dir(workspace.control.join("receipts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .unwrap();
+    let mut retry: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    retry["receipt_id"] = "R-000002".into();
+    retry["attempt"] = 2.into();
+    fs::write(
+        workspace.control.join("receipts/R-000002.json"),
+        serde_json::to_vec_pretty(&retry).unwrap(),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "--all"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "test: invalid retry receipt"],
+    );
+
+    let snapshot = snapshot_json(&workspace);
+    assert_eq!(snapshot["data"]["test_metrics"]["status"], "invalid");
+    assert_eq!(snapshot["data"]["test_metrics"]["error_code"], "malformed");
     assert_eq!(snapshot["data"]["gate_metrics"]["attempts"], 2);
 }
 

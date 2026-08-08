@@ -234,6 +234,69 @@ fn a_combined_gate_failure_blocks_acceptance() {
 }
 
 #[test]
+fn invalid_integration_junit_is_recorded_as_a_failed_receipt() {
+    let workspace = Workspace::initialized();
+    let gate_path = workspace.gate_definition(
+        "gate.junit.integration",
+        "schema: harness.gate/v1\ngate_id: gate.junit.integration\nrevision: 1\nargv: [sh, -c, \"printf '%s' '<testsuite>' > report.xml\"]\nworking_directory: .\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\njunit_reports: [report.xml]\n",
+    );
+    workspace.gate(&["register", "--definition", &gate_path]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Integration JUnit metrics",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gate_sets(
+        "F-001",
+        &["src/F-001/**"],
+        &["gate.unit"],
+        &["gate.junit.integration"],
+    );
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let integration_id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[
+            step,
+            "--integration-id",
+            &integration_id,
+            "--actor-id",
+            "coordinator",
+        ]);
+    }
+
+    let output = workspace.integration_raw(&[
+        "verify",
+        "--integration-id",
+        &integration_id,
+        "--actor-id",
+        "verifier",
+    ]);
+    assert_eq!(output.status.code(), Some(7));
+    let receipt = receipts(&workspace)
+        .into_iter()
+        .find(|receipt| {
+            receipt["integration_id"] == integration_id
+                && receipt["gate_id"] == "gate.junit.integration"
+        })
+        .expect("integration invalid JUnit receipt");
+    assert_eq!(receipt["passed"], false);
+    assert_eq!(receipt["test_results"]["status"], "invalid");
+    assert_eq!(receipt["test_results"]["error_code"], "malformed");
+}
+
+#[test]
 fn a_failed_verification_is_still_recorded() {
     let workspace = Workspace::initialized();
     workspace.cycle(&[
