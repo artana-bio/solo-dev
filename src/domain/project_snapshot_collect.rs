@@ -22,7 +22,7 @@ use crate::{
         clock::Clock,
         cycle::{CYCLE_DIR, CycleRecord},
         digest::Digest,
-        handoff::{HANDOFF_DIR, HandoffRecord},
+        handoff::{HANDOFF_DIR, HandoffRecord, HandoffStatus},
         integration::{INTEGRATION_DIR, IntegrationRecord},
         lease::{LEASE_DIR, LeaseRecord},
         review::{REVIEW_DIR, ReviewRecord},
@@ -76,7 +76,7 @@ pub(super) fn collect_at_head(
         integrations: &raw_integrations,
         leases: &raw_leases,
     };
-    let receipts = validate_records(&config, &records, &mut diagnostics)?;
+    let receipts = validate_records(control, control_head, &config, &records, &mut diagnostics)?;
     let cycles = into_records(raw_cycles);
     let events = into_records(raw_events);
     let cards = into_records(cards);
@@ -159,6 +159,13 @@ pub(super) fn collect_at_head(
 struct Captured<T> {
     relative_path: String,
     record: T,
+    /// Digest of the canonical JSON object as captured from the control blob.
+    ///
+    /// This is intentionally separate from a typed record's re-serialized
+    /// digest: deserialization can supply defaults for fields that were absent
+    /// in a historical record, and those defaults must not rewrite its
+    /// identity during a read-only snapshot.
+    canonical_digest: Digest,
 }
 
 struct SnapshotRecords<'a> {
@@ -178,6 +185,14 @@ fn read_json_at<T: DeserializeOwned>(
     head: &str,
     relative: &str,
 ) -> Result<T, HarnessError> {
+    Ok(read_captured_json_at(control, head, relative)?.record)
+}
+
+fn read_captured_json_at<T: DeserializeOwned>(
+    control: &ControlRepository,
+    head: &str,
+    relative: &str,
+) -> Result<Captured<T>, HarnessError> {
     let object = format!("{head}:{relative}");
     let output = crate::git::command::run(&control.scope(), ["show", object.as_str()])?;
     if !output.success() {
@@ -185,8 +200,17 @@ fn read_json_at<T: DeserializeOwned>(
             "required control record is missing from the captured commit",
         ));
     }
-    serde_json::from_slice(&output.stdout_bytes)
-        .map_err(|_| control_corrupt("a control record in the captured commit is malformed"))
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout_bytes)
+        .map_err(|_| control_corrupt("a control record in the captured commit is malformed"))?;
+    let canonical_digest = Digest::of_canonical(&value)
+        .map_err(|_| control_corrupt("a control record in the captured commit is malformed"))?;
+    let record = serde_json::from_value(value)
+        .map_err(|_| control_corrupt("a control record in the captured commit is malformed"))?;
+    Ok(Captured {
+        relative_path: relative.to_owned(),
+        record,
+        canonical_digest,
+    })
 }
 
 fn read_json_files<T: DeserializeOwned>(
@@ -197,12 +221,7 @@ fn read_json_files<T: DeserializeOwned>(
     list_files(control, head, prefix)?
         .iter()
         .filter(|name| is_json(name))
-        .map(|relative_path| {
-            Ok(Captured {
-                relative_path: relative_path.clone(),
-                record: read_json_at(control, head, relative_path)?,
-            })
-        })
+        .map(|relative_path| read_captured_json_at(control, head, relative_path))
         .collect()
 }
 
@@ -231,15 +250,9 @@ fn read_cards(control: &ControlRepository, head: &str) -> Result<CardRecords, Ha
             continue;
         }
         if relative.ends_with("/state.json") {
-            states.push(Captured {
-                relative_path: relative.clone(),
-                record: read_json_at(control, head, &relative)?,
-            });
+            states.push(read_captured_json_at(control, head, &relative)?);
         } else if relative.contains("/r") {
-            cards.push(Captured {
-                relative_path: relative.clone(),
-                record: read_json_at(control, head, &relative)?,
-            });
+            cards.push(read_captured_json_at(control, head, &relative)?);
         }
     }
     Ok((cards, states))
@@ -261,6 +274,8 @@ fn is_json(relative: &str) -> bool {
 }
 
 fn validate_records(
+    control: &ControlRepository,
+    control_head: &str,
     config: &ProjectConfig,
     records: &SnapshotRecords<'_>,
     diagnostics: &mut Vec<String>,
@@ -315,7 +330,7 @@ fn validate_records(
     )?;
 
     let receipts = validate_receipts(config, records)?;
-    validate_subjects(config, records, diagnostics)?;
+    validate_subjects(control, control_head, config, records, diagnostics)?;
     Ok(receipts)
 }
 
@@ -451,6 +466,8 @@ fn validate_integration_subject(
 }
 
 fn validate_subjects(
+    control: &ControlRepository,
+    control_head: &str,
     config: &ProjectConfig,
     records: &SnapshotRecords<'_>,
     diagnostics: &mut Vec<String>,
@@ -466,7 +483,7 @@ fn validate_subjects(
     validate_card_cycle_refs(records)?;
     validate_card_states(records)?;
     validate_events(config, records)?;
-    validate_reviews(records)?;
+    validate_reviews(control, control_head, records)?;
     validate_handoffs(records)?;
     validate_integrations(records)?;
     validate_leases(records)?;
@@ -573,7 +590,11 @@ fn validate_events(
     Ok(())
 }
 
-fn validate_reviews(records: &SnapshotRecords<'_>) -> Result<(), HarnessError> {
+fn validate_reviews(
+    control: &ControlRepository,
+    control_head: &str,
+    records: &SnapshotRecords<'_>,
+) -> Result<(), HarnessError> {
     for review in records.reviews {
         let review = &review.record;
         if !records.cards.iter().any(|card| {
@@ -594,12 +615,69 @@ fn validate_reviews(records: &SnapshotRecords<'_>) -> Result<(), HarnessError> {
         if handoff.record.card_id != review.card_id
             || handoff.record.cycle_id != review.cycle_id
             || handoff.record.card_digest != review.card_digest
-            || handoff.record.digest().ok().as_ref() != Some(&review.handoff_digest)
+            || !handoff_binding_matches(control, control_head, handoff, &review.handoff_digest)?
         {
             return Err(control_corrupt("review_handoff_binding_invalid"));
         }
     }
     Ok(())
+}
+
+/// Allows a review to keep naming the exact handoff it saw when that handoff
+/// was later revoked through the normal delivery-side transition.
+///
+/// The current blob must either carry the review digest, or be a revoked
+/// version whose exact prior blob at a commit reachable from `control_head`
+/// carries it. The historical record must deserialize and match the current
+/// record in every field after normalizing only `active` to the current
+/// `revoked` status. This keeps revocation queryable without turning a changed
+/// handoff into a trusted review binding.
+fn handoff_binding_matches(
+    control: &ControlRepository,
+    control_head: &str,
+    handoff: &Captured<HandoffRecord>,
+    review_digest: &Digest,
+) -> Result<bool, HarnessError> {
+    if handoff.canonical_digest == *review_digest {
+        return Ok(true);
+    }
+    if handoff.record.status != HandoffStatus::Revoked {
+        return Ok(false);
+    }
+
+    let output = crate::git::command::run(
+        &control.scope(),
+        [
+            "log",
+            "--format=%H",
+            control_head,
+            "--",
+            handoff.relative_path.as_str(),
+        ],
+    )?;
+    if !output.success() {
+        return Err(control_corrupt(
+            "could not inspect the captured handoff history",
+        ));
+    }
+
+    for historical_head in output.trimmed_stdout().lines() {
+        if historical_head == control_head {
+            continue;
+        }
+        let historical: Captured<HandoffRecord> =
+            read_captured_json_at(control, historical_head, &handoff.relative_path)?;
+        if historical.canonical_digest != *review_digest {
+            continue;
+        }
+        if historical.record.status != HandoffStatus::Active {
+            return Ok(false);
+        }
+        let mut current = handoff.record.clone();
+        current.status = HandoffStatus::Active;
+        return Ok(current == historical.record);
+    }
+    Ok(false)
 }
 
 fn validate_handoffs(records: &SnapshotRecords<'_>) -> Result<(), HarnessError> {

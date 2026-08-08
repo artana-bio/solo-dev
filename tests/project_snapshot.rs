@@ -21,6 +21,7 @@ use change_harness::{
     control::repository::ControlRepository,
     domain::{
         clock::{FixedClock, SystemClock},
+        digest::Digest,
         project_snapshot::ProjectSnapshot,
     },
     error::ErrorCode,
@@ -137,6 +138,34 @@ fn approved_workspace() -> Workspace {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace
+}
+
+fn legacy_revoked_handoff_workspace() -> Workspace {
+    let workspace = approved_workspace();
+    let handoff_path = first_json_path(&workspace.control.join("handoffs"));
+    let review_path = first_json_path(&workspace.control.join("reviews"));
+    let mut handoff: Value =
+        serde_json::from_str(&fs::read_to_string(&handoff_path).unwrap()).expect("handoff JSON");
+    let mut review: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).expect("review JSON");
+
+    // Reproduce a handoff written before dependency_bindings existed. The
+    // review's historical digest was computed over that exact object, not
+    // over the typed record after serde supplied an empty default.
+    handoff
+        .as_object_mut()
+        .unwrap()
+        .remove("dependency_bindings");
+    review["handoff_digest"] =
+        serde_json::to_value(Digest::of_canonical(&handoff).unwrap()).unwrap();
+    fs::write(&handoff_path, serde_json::to_vec_pretty(&handoff).unwrap()).unwrap();
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    commit_control(&workspace);
+
+    handoff["status"] = "revoked".into();
+    fs::write(&handoff_path, serde_json::to_vec_pretty(&handoff).unwrap()).unwrap();
+    commit_control(&workspace);
     workspace
 }
 
@@ -398,6 +427,30 @@ fn stale_captured_head_is_rejected_instead_of_returning_a_mixed_snapshot() {
     let clock = FixedClock::at_unix_seconds(1_785_196_800).unwrap();
     let error = ProjectSnapshot::collect_at_head(&control, &captured, &clock).unwrap_err();
     assert_eq!(error.code(), ErrorCode::ConflictControlHeadMoved);
+}
+
+#[test]
+fn legacy_handoff_digest_uses_the_captured_blob_and_still_rejects_tampering() {
+    let workspace = legacy_revoked_handoff_workspace();
+
+    // The legacy field omission is compatible: the snapshot must validate the
+    // review against the canonical object actually stored in control Git.
+    let snapshot = snapshot_json(&workspace);
+    assert_eq!(snapshot["data"]["project_id"], "example");
+
+    // A real handoff mutation must still break the binding. This prevents the
+    // compatibility path from degrading into "trust the review" behavior.
+    let handoff_path = first_json_path(&workspace.control.join("handoffs"));
+    let mut handoff: Value = serde_json::from_str(&fs::read_to_string(&handoff_path).unwrap())
+        .expect("legacy handoff JSON");
+    handoff["branch"] = "tampered-branch".into();
+    fs::write(&handoff_path, serde_json::to_vec_pretty(&handoff).unwrap()).unwrap();
+    commit_control(&workspace);
+
+    snapshot_refusal(
+        &workspace,
+        "project snapshot durable-record integrity: review_handoff_binding_invalid",
+    );
 }
 
 #[test]
