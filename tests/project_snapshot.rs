@@ -5,6 +5,7 @@ mod support;
 
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -12,8 +13,16 @@ use std::{
 use serde_json::Value;
 
 use change_harness::{
+    cli::output::OutputFormat,
+    commands::{
+        project::SnapshotArgs,
+        project_snapshot::{self, WatchTermination},
+    },
     control::repository::ControlRepository,
-    domain::{clock::FixedClock, project_snapshot::ProjectSnapshot},
+    domain::{
+        clock::{FixedClock, SystemClock},
+        project_snapshot::ProjectSnapshot,
+    },
     error::ErrorCode,
 };
 use support::Workspace;
@@ -43,6 +52,15 @@ fn control_status(control: &Path) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_head(repository: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn receipt_path(workspace: &Workspace) -> PathBuf {
@@ -120,6 +138,173 @@ fn approved_workspace() -> Workspace {
     workspace.activate_card("F-001", &["src/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
     workspace
+}
+
+#[test]
+fn watch_json_is_refused_with_a_stable_usage_error() {
+    let workspace = Workspace::initialized();
+    let before_head = workspace.control_head();
+    let output = Workspace::run(&[
+        "project".into(),
+        "snapshot".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--watch".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("error envelope");
+    assert_eq!(envelope["error"]["code"], "CH-USAGE-CONFLICTING-OPTIONS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be combined")
+    );
+    assert!(!envelope["error"]["recovery"].as_str().unwrap().is_empty());
+    assert_eq!(workspace.control_head(), before_head);
+}
+
+#[test]
+fn watch_interval_is_bounded_before_the_command_reads_state() {
+    let workspace = Workspace::initialized();
+    let before_head = workspace.control_head();
+    let output = Workspace::run(&[
+        "project".into(),
+        "snapshot".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--watch".into(),
+        "--interval-ms".into(),
+        "99".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("error envelope");
+    assert_eq!(envelope["error"]["code"], "CH-USAGE-INVALID-ARGUMENTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("between 100 and 3600000")
+    );
+    assert_eq!(workspace.control_head(), before_head);
+}
+
+#[test]
+fn watch_non_tty_emits_one_plain_frame_without_mutation() {
+    let workspace = Workspace::initialized();
+    let before_control = workspace.control_head();
+    let before_repository = git_head(&workspace.repository);
+    let before_authority = git_head(&workspace.authority);
+    let output = Workspace::run(&[
+        "project".into(),
+        "snapshot".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--watch".into(),
+        "--interval-ms".into(),
+        "100".into(),
+    ]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.matches("Project example snapshot").count(), 1);
+    assert!(!text.contains('\x1b'));
+    assert_eq!(workspace.control_head(), before_control);
+    assert_eq!(git_head(&workspace.repository), before_repository);
+    assert_eq!(git_head(&workspace.authority), before_authority);
+    assert!(control_status(&workspace.control).is_empty());
+}
+
+struct BrokenPipeWriter;
+
+impl Write for BrokenPipeWriter {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn watch_stops_cleanly_when_the_output_pipe_closes() {
+    let workspace = Workspace::initialized();
+    let args = SnapshotArgs {
+        control: workspace.control.clone(),
+        watch: true,
+        interval_ms: Some(100),
+    };
+    let result = project_snapshot::run_watch(
+        &args,
+        OutputFormat::Text,
+        &SystemClock,
+        &mut BrokenPipeWriter,
+        true,
+    );
+
+    assert_eq!(result.unwrap(), WatchTermination::OutputClosed);
+}
+
+struct ControlChangingWriter<'a> {
+    workspace: &'a Workspace,
+    bytes: Vec<u8>,
+    changed: bool,
+}
+
+impl Write for ControlChangingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        let header_count = self
+            .bytes
+            .windows(b"Project example snapshot".len())
+            .filter(|window| *window == b"Project example snapshot")
+            .count();
+        if !self.changed && header_count >= 1 {
+            self.workspace
+                .register_gate_revision("gate.unit", 2, &["true"]);
+            self.changed = true;
+        }
+        if header_count >= 2 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stop test"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn watch_recollects_the_control_head_between_frames() {
+    let workspace = Workspace::initialized();
+    let before_head = workspace.control_head();
+    let args = SnapshotArgs {
+        control: workspace.control.clone(),
+        watch: true,
+        interval_ms: Some(100),
+    };
+    let mut writer = ControlChangingWriter {
+        workspace: &workspace,
+        bytes: Vec::new(),
+        changed: false,
+    };
+
+    let result =
+        project_snapshot::run_watch(&args, OutputFormat::Text, &SystemClock, &mut writer, true);
+
+    assert_eq!(result.unwrap(), WatchTermination::OutputClosed);
+    assert_ne!(workspace.control_head(), before_head);
+    let text = String::from_utf8(writer.bytes).unwrap();
+    assert_eq!(text.matches("Project example snapshot").count(), 2);
+    assert!(text.contains("control head:"));
 }
 
 #[test]
