@@ -890,7 +890,6 @@ fn preview_record(
     let config = control.project()?;
     require_review_return_reason(config.convergence_policy.as_ref(), verdict)?;
     let (record, state) = load_card(&control, card_id)?;
-    require_typed_reviewer_contract(&record, verdict)?;
     require_convergence_budget(&control, &config, &record)?;
     let handoff = latest_handoff(&control, card_id)?.ok_or_else(|| HarnessError::Control {
         reason: format!("card {card_id} has no handoff"),
@@ -913,6 +912,7 @@ fn preview_record(
     )?;
     check_review_conduct(&record.review_policy, verdict.review_conduct)?;
     verdict.gate_adequacy.validate_mutation_evidence()?;
+    require_typed_reviewer_contract(&record, verdict)?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(
@@ -943,6 +943,48 @@ fn require_typed_reviewer_contract(
                 .to_owned(),
             code: ErrorCode::PolicyRiskReview,
         });
+    }
+    if verdict.decision == Decision::Approved {
+        let Some(kind) = verdict.reviewer_kind else {
+            return Err(HarnessError::Control {
+                reason: "every new approval requires a declared typed reviewer_kind and nonblank reviewer provenance including session_id".to_owned(),
+                code: if record.risk.requires_human_review() {
+                    ErrorCode::PolicyRiskReview
+                } else {
+                    ErrorCode::PolicyIncompleteReview
+                },
+            });
+        };
+        let Some(provenance) = verdict.reviewer_provenance.as_ref() else {
+            return Err(HarnessError::Control {
+                reason:
+                    "every new approval requires typed reviewer provenance including session_id"
+                        .to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        };
+        if provenance
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            || provenance
+                .principal_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason:
+                    "approved reviewer provenance requires nonblank principal_id and session_id"
+                        .to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        }
+        if kind == ReviewerKind::Agent && verdict.human_attestation.is_some() {
+            return Err(HarnessError::Control {
+                reason: "an agent approval cannot carry human-attestation evidence".to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        }
     }
     Ok(())
 }
@@ -1163,7 +1205,6 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             // policy and the verdict the caller already supplied.
             require_review_return_reason(config.convergence_policy.as_ref(), &verdict)?;
             let (record, state) = load_card(control, &card_id)?;
-            require_typed_reviewer_contract(&record, &verdict)?;
             // 72-2: the first check able to refuse once the card record
             // exists — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
@@ -1259,6 +1300,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             if let Some(superseded) = previous.as_ref() {
                 review.check_supersedes(superseded)?;
             }
+            require_typed_reviewer_contract(&record, &verdict)?;
             validate_mutation_receipts(control, &review)?;
             let digest = review.digest()?;
 

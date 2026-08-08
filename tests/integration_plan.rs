@@ -433,6 +433,52 @@ fn final_prepare_accounts_for_every_sealed_member_and_records_the_seal_binding()
 }
 
 #[test]
+fn sealed_cycle_prepare_defaults_to_final_authorization() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(envelope["data"]["final_for_cycle"], true);
+    assert!(envelope["data"]["sealed_cycle_digest"].is_string());
+}
+
+#[test]
+fn sealed_cycle_legacy_bypass_requires_exact_migration_provenance() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let refused = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--legacy-migration-provenance",
+        "untrusted",
+    ]);
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+
+    let migrated = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--legacy-migration-provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(migrated["data"]["final_for_cycle"], false);
+}
+
+#[test]
 fn final_prepare_keeps_an_explicitly_abandoned_member_auditable() {
     let workspace = cycle_with(2);
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -1083,4 +1129,76 @@ fn a_promoted_integration_cannot_be_abandoned() {
     ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}
+
+#[test]
+fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
+    let workspace = cycle_with(1);
+    let plan_path = workspace.root.join("PLAN-001.json");
+    fs::write(
+        &plan_path,
+        r#"{
+  "schema": "harness.cycle-plan/v1",
+  "plan_id": "PLAN-001",
+  "cycle_id": "C-001",
+  "objective": "first slice",
+  "cards": [{
+    "card_id": "F-001",
+    "card_revision": 1,
+    "scope": ["src/F-001/**"],
+    "depends_on": [],
+    "proof_entries": ["P-001"],
+    "mutation_plan": ["remove guard"],
+    "risk": "low",
+    "reviewer_requirements": ["independent"],
+    "assignment": "implementer",
+    "distribution": "parallel",
+    "acceptance_behaviors": ["it works"]
+  }]
+}
+"#,
+    )
+    .unwrap();
+    workspace.cycle(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &plan_path.display().to_string(),
+    ]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let integration_id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let pinned = workspace.control.join("plans/PLAN-001.json");
+    let mut replacement: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&pinned).unwrap()).unwrap();
+    replacement["objective"] = serde_json::json!("tampered objective");
+    fs::write(
+        &pinned,
+        format!("{}\n", serde_json::to_string_pretty(&replacement).unwrap()),
+    )
+    .unwrap();
+
+    let refused = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &integration_id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("stale or contradictory active plan"),
+        "tampered plan refusal must name the plan binding: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
 }

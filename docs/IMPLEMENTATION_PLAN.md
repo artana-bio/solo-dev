@@ -3508,7 +3508,7 @@ When the plan changes:
 | Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
-| Focused evidence | Typed-review, executable-mutation, principal/session, cycle-plan, proof/oracle, gate-migration, final-authorization, and evidence-report regressions pass. The sequential full suite, `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
+| Focused evidence | Terra-high repair regressions cover default sealed-cycle final authorization, exact legacy migration provenance, typed approval principal/session, blank attestors, mutation-session binding, and downstream plan tamper refusal. The 683-test library suite and all integration binaries pass sequentially; `cargo fmt --check`, strict clippy, and `git diff --check` pass. |
 
 Delivered in this slice:
 
@@ -3531,17 +3531,20 @@ Delivered in this slice:
 
 Requirement audit: complete against the second Terra-high review. (1) typed reviewer kind, provenance, independent human
 attestation, and compatibility fields are enforced in review recording; every
-new approval requires executable mutation evidence or a typed policy-valid
-exemption; (2) mutation receipts are persisted transactionally and bind card revision,
+new approval requires nonblank typed principal/session provenance plus
+executable mutation evidence or a typed policy-valid exemption; (2) mutation
+receipts are persisted transactionally and bind card revision,
 candidate, reviewer/session, digests, oracle, failure, and restoration, with
 typed exemptions only; (3) invariant checks carry stable proof IDs, receipt
 IDs, exact landing SHA, and derived `machine_checked`/`not_tested` states; (4)
-new initialized projects use an explicit final-authorization mode: an installed
-default when an authorizer is supplied and migration-required refusal otherwise;
-legacy projects retain the refusal/migration path; (5) principal and
+sealed-cycle preparation is final-authorized by default, with an exact typed
+legacy migration marker as the only compatibility bypass; new initialized
+projects use an explicit final-authorization mode and migration-required
+refusal until a policy is installed; (5) principal and
 session boundaries are used for review and integration separation and review
 begin fails before mutation without a handoff; (6) cycle plans are versioned,
-validated against complete cycle membership, and persisted by CLI; (7)
+validated against complete cycle membership, pinned through integration, and
+revalidated at acceptance/promotion; (7)
 `audit probes` covers all named negative probes with honest synthetic/not-tested
 classification where host enforcement is unavailable, and network output
 distinguishes declared from enforced; (8) `audit report` reads persisted integrations and

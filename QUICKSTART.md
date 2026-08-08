@@ -234,7 +234,7 @@ If a gate run is interrupted, `project recover` prints the literal `gate settle 
 
 ## Two things not to rely on yet
 
-**Final-authorization policy ([#177](https://github.com/artana-bio/solo-dev/issues/177)).** It is silently inert unless the integration was prepared with `--final`, and `integration prepare` has no `--final` by default. You can install a policy, see it accepted, and be unprotected. Either standardise on `integration prepare --final` or treat that control as not-yet-there.
+**Final-authorization policy ([#177](https://github.com/artana-bio/solo-dev/issues/177)).** A sealed cycle now prepares as the final integration by default, so acceptance requires the configured final-authorizer policy. The only non-final sealed-cycle compatibility path requires the exact `--legacy-migration-provenance legacy_cycle_plan_v1` marker; it is not a general bypass. New projects without an authorizer remain explicitly `migration_required` and refuse sealed-cycle acceptance until the policy is installed.
 
 **`--dry-run` as a safety check ([#189](https://github.com/artana-bio/solo-dev/issues/189)).** It skips seven checks the real command applies, so it can report success for something that will be refused.
 

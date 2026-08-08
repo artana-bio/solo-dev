@@ -44,7 +44,8 @@ use crate::{
         integration::{
             ClaimClassification, INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember,
             IntegrationMode, IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck,
-            VERIFICATION_SCHEMA, VerificationRecord, interactions, topological_order,
+            LEGACY_PLAN_MIGRATION_PROVENANCE, VERIFICATION_SCHEMA, VerificationRecord,
+            interactions, topological_order,
         },
         review::ReviewRecord,
     },
@@ -201,6 +202,10 @@ pub struct PrepareArgs {
     /// Prepare the complete, auditable integration for a sealed cycle.
     #[arg(long = "final")]
     pub final_for_cycle: bool,
+    /// Explicitly preserve the pre-plan, non-final behavior for a legacy
+    /// sealed cycle. This is a migration marker, not a general bypass.
+    #[arg(long)]
+    pub legacy_migration_provenance: Option<String>,
     /// Validate and report the plan without recording it.
     #[arg(long)]
     pub dry_run: bool,
@@ -1082,6 +1087,15 @@ fn build_record(
         schema: INTEGRATION_SCHEMA.to_owned(),
         integration_id,
         cycle_id: cycle.cycle_id.clone(),
+        plan_id: cycle.plan_id.clone(),
+        plan_digest: cycle.plan_digest.clone(),
+        plan_revision: cycle.plan_revision,
+        plan_migration_provenance: plan.legacy_migration_provenance.or_else(|| {
+            cycle
+                .plan_id
+                .is_none()
+                .then_some(LEGACY_PLAN_MIGRATION_PROVENANCE.to_owned())
+        }),
         status: IntegrationStatus::Prepared,
         mode: plan.mode,
         baseline_sha,
@@ -1108,6 +1122,7 @@ struct Plan {
     atomic_groups: Vec<String>,
     mode: IntegrationMode,
     final_for_cycle: bool,
+    legacy_migration_provenance: Option<String>,
     sealed_cycle_digest: Option<Digest>,
     abandoned_card_ids: Vec<CardId>,
     /// Cards the cycle holds that this plan left out, and why.
@@ -1182,6 +1197,43 @@ fn final_cycle_binding(
     Ok((true, Some(Digest::of_canonical(cycle)?), abandoned_card_ids))
 }
 
+/// Resolves the sealed-cycle default and the only supported compatibility
+/// bypass. New sealed cycles always use final authorization unless the caller
+/// supplies the exact typed migration provenance.
+fn resolve_final_mode(
+    cycle: &CycleRecord,
+    args: &PrepareArgs,
+) -> Result<(bool, Option<String>), HarnessError> {
+    if cycle.status != CycleStatus::Sealed {
+        if args.legacy_migration_provenance.is_some() {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance is valid only for sealed-cycle compatibility"
+                    .to_owned(),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        return Ok((args.final_for_cycle, None));
+    }
+    if let Some(provenance) = &args.legacy_migration_provenance {
+        if provenance != LEGACY_PLAN_MIGRATION_PROVENANCE {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "unsupported legacy migration provenance `{provenance}`; expected `{LEGACY_PLAN_MIGRATION_PROVENANCE}`"
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        if args.final_for_cycle {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance cannot be combined with `--final`".to_owned(),
+                code: ErrorCode::UsageConflictingOptions,
+            });
+        }
+        return Ok((false, Some(provenance.clone())));
+    }
+    Ok((true, None))
+}
+
 /// Recovery guidance for `integration prepare --final` when a sealed cycle
 /// never had a card, distinct from every other empty-selection outcome.
 ///
@@ -1221,10 +1273,17 @@ fn build_plan(
         });
     }
 
+    let (final_for_cycle, legacy_migration_provenance) = resolve_final_mode(cycle, args)?;
+    if final_for_cycle && !requested.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "the default sealed-cycle final integration selects the complete cycle and cannot be combined with `--card-id`".to_owned(),
+            code: ErrorCode::UsageConflictingOptions,
+        });
+    }
     let assessed = assess(control, cycle)?;
     let selected = select(&assessed, requested)?;
     let (final_for_cycle, sealed_cycle_digest, abandoned_card_ids) =
-        final_cycle_binding(cycle, &assessed, &selected, args.final_for_cycle)?;
+        final_cycle_binding(cycle, &assessed, &selected, final_for_cycle)?;
     // An empty selection is refused unless `--final` can account for it by
     // abandonment. `abandoned_card_ids` is non-empty here if and only if the
     // sealed cycle held cards and every one of them was abandoned — see
@@ -1236,7 +1295,7 @@ fn build_plan(
     // does not apply and `--final` is refused the same as an ordinary
     // empty selection, with guidance specific to the sealed-and-empty case.
     if selected.is_empty() && abandoned_card_ids.is_empty() {
-        if args.final_for_cycle {
+        if final_for_cycle {
             return Err(HarnessError::ControlWithRecovery {
                 reason: format!(
                     "cycle {} was sealed with no cards: `--final` has nothing to integrate and nothing was abandoned",
@@ -1254,7 +1313,7 @@ fn build_plan(
 
     check_dependencies(&selected, &assessed)?;
     let atomic_groups = check_atomic_groups(cycle, &selected)?;
-    let mode = if args.final_for_cycle {
+    let mode = if final_for_cycle {
         if matches!(args.mode, Some(ModeArg::Individual)) {
             return Err(HarnessError::Control {
                 reason: "`--final` always prepares a batch integration and cannot use `--mode individual`".to_owned(),
@@ -1286,6 +1345,7 @@ fn build_plan(
         atomic_groups,
         mode,
         final_for_cycle,
+        legacy_migration_provenance,
         sealed_cycle_digest,
         abandoned_card_ids,
         deferred,
@@ -1470,6 +1530,56 @@ pub fn load_integration(
     serde_json::from_str(&control.read(&relative)?).map_err(|source| HarnessError::Control {
         reason: format!("integration {integration_id} is malformed: {source}"),
         code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+/// Revalidates the plan pinned by an integration at every authorization
+/// boundary. Historical unplanned records are accepted only when they carry
+/// the explicit typed migration provenance written by the new prepare path.
+///
+/// # Errors
+///
+/// Returns a policy error when the plan is missing, stale, or contradictory.
+pub fn require_plan_binding(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    let cycle = load_cycle(control, &record.cycle_id)?;
+    let fully_bound =
+        record.plan_id.is_some() && record.plan_digest.is_some() && record.plan_revision.is_some();
+    if fully_bound {
+        crate::commands::cycle::require_active_plan(control, &cycle)?;
+        if record.plan_id != cycle.plan_id
+            || record.plan_digest != cycle.plan_digest
+            || record.plan_revision != cycle.plan_revision
+            || record.plan_migration_provenance.is_some()
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration {} no longer matches its pinned cycle plan",
+                    record.integration_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        return Ok(());
+    }
+    if record.plan_id.is_none()
+        && record.plan_digest.is_none()
+        && record.plan_revision.is_none()
+        && record.plan_migration_provenance.as_deref() == Some(LEGACY_PLAN_MIGRATION_PROVENANCE)
+        && cycle.plan_id.is_none()
+        && cycle.plan_digest.is_none()
+        && cycle.plan_revision.is_none()
+    {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "integration {} has no complete cycle-plan binding or explicit legacy migration provenance",
+            record.integration_id
+        ),
+        code: ErrorCode::PolicyInvalidCycle,
     })
 }
 
@@ -4049,6 +4159,7 @@ fn check_promotion(
     record: &IntegrationRecord,
     actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
+    require_plan_binding(control, record)?;
     // #89: refused before anything else in this function, including the
     // convergence budget below. A rewritten control record makes every
     // later check's *inputs* untrustworthy — `require_cycle_convergence_

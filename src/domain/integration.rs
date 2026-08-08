@@ -28,6 +28,8 @@ pub const INTEGRATION_SCHEMA: &str = "harness.integration/v1";
 
 /// Directory holding integration records, relative to the control repository.
 pub const INTEGRATION_DIR: &str = "integrations";
+/// Explicit provenance retained on integrations created from pre-plan cycles.
+pub const LEGACY_PLAN_MIGRATION_PROVENANCE: &str = "legacy_cycle_plan_v1";
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
@@ -243,6 +245,16 @@ pub struct IntegrationRecord {
     pub integration_id: IntegrationId,
     /// The cycle it integrates.
     pub cycle_id: CycleId,
+    /// The cycle plan this integration was prepared from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
+    /// Explicit compatibility provenance for integrations predating cycle plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_migration_provenance: Option<String>,
     /// Where it is in its lifecycle.
     pub status: IntegrationStatus,
     /// Whether it lands one card or several.

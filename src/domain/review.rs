@@ -776,7 +776,7 @@ impl ReviewRecord {
         }
         Err(HarnessError::Control {
             reason: format!(
-                "card risk `{}` requires a typed human reviewer with independent attestation; legacy human_reviewer is migration input only",
+                "card risk `{}` requires a declared typed human reviewer with independent attestation; legacy human_reviewer is migration input only",
                 risk.name()
             ),
             code: ErrorCode::PolicyRiskReview,
@@ -939,6 +939,15 @@ pub fn validate_reviewer_identity(
                 code: ErrorCode::PolicyRiskReview,
             })?;
             if evidence.evidence_id.trim().is_empty()
+                || evidence.attestor_actor_id.trim().is_empty()
+                || evidence
+                    .attestor_principal_id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty())
+                || evidence
+                    .attestor_session_id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty())
                 || evidence.statement.trim().is_empty()
                 || !evidence.independently_created
             {

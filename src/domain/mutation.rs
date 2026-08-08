@@ -123,11 +123,11 @@ impl MutationReceipt {
             || self
                 .reviewer_session_id
                 .as_deref()
-                .is_some_and(|id| id.trim().is_empty())
+                .is_none_or(|id| id.trim().is_empty())
         {
             return Err(invalid(
                 "reviewer_identity",
-                "reviewer principal and session bindings must not be blank",
+                "new mutation receipts require a nonblank reviewer session; principal bindings must not be blank",
             ));
         }
         if self
@@ -205,6 +205,13 @@ mod tests {
         assert!(receipt().validate().is_ok());
         let mut invalid = receipt();
         invalid.failed_at_oracle = false;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn executable_receipt_requires_a_reviewer_session() {
+        let mut invalid = receipt();
+        invalid.reviewer_session_id = None;
         assert!(invalid.validate().is_err());
     }
 }

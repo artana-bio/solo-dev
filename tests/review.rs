@@ -1186,3 +1186,24 @@ fn every_new_low_risk_approval_needs_typed_mutation_evidence() {
     ]);
     assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
 }
+
+#[test]
+fn human_approval_rejects_blank_attestor_identity() {
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("blank-attestor.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation-blank\n  attestor_actor_id: ' '\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: independent attestation\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: fixture\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-attestor\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-RISK-REVIEW");
+}

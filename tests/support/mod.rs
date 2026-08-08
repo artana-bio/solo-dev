@@ -499,17 +499,20 @@ impl Workspace {
             && let Some(path) = args.get(index + 1)
         {
             let verdict_path = PathBuf::from(path);
-            if let Ok(body) = fs::read_to_string(&verdict_path)
+            if let Ok(mut body) = fs::read_to_string(&verdict_path)
                 && body.contains("decision: approved")
-                && !body.contains("mutation_exemption:")
             {
-                fs::write(
-                    &verdict_path,
-                    format!(
-                        "{body}mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
-                    ),
-                )
-                .unwrap();
+                if !body.contains("reviewer_kind:") {
+                    body.push_str(
+                        "reviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: reviewer-session\n  principal_id: reviewer-principal\n",
+                    );
+                }
+                if !body.contains("mutation_exemption:") {
+                    body.push_str(
+                        "mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
+                    );
+                }
+                fs::write(&verdict_path, body).unwrap();
             }
         }
         let output = self.review_raw(args);

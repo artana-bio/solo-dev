@@ -15,7 +15,8 @@ use crate::{
         card::{load_card, store_card_state},
         integration::{
             load_cycle, load_integration, load_verification, member_implementers,
-            require_cycle_convergence_budget, require_no_pending_exception, status_gate_refusal,
+            require_cycle_convergence_budget, require_no_pending_exception, require_plan_binding,
+            status_gate_refusal,
         },
         transaction::with_transaction,
     },
@@ -334,6 +335,7 @@ fn preview_record(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_plan_binding(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — acceptance
     // is the single gate that authorizes moving the protected branch (see
     // this module's own doc comment), so it is squarely on the path this
@@ -629,6 +631,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            require_plan_binding(control, &record)?;
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
