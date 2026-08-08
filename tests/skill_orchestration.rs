@@ -107,6 +107,12 @@ fn orchestration_stops_repeated_attempts_and_convenes_a_diagnostic_group() {
     assert_contains_all(
         body,
         &[
+            "harness.bottleneck-projection/v1",
+            "data.bottlenecks",
+            "convene_bottleneck_group",
+            "record_authorized_disposition",
+            "legacy_unassessed",
+            "cannot determine whether two\nnatural-language hypotheses are materially similar",
             "two materially similar attempts fail",
             "repeat the same hypothesis without new evidence",
             "Formal convergence-budget exhaustion also triggers this protocol",

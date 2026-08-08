@@ -6,6 +6,7 @@
 
 pub mod actors;
 pub mod allocation;
+pub mod bottleneck;
 pub mod convergence;
 pub mod credential_shape;
 pub mod paths;

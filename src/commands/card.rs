@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
-    commands::{gate::require_registered, transaction::with_transaction},
+    commands::{bottleneck, gate::require_registered, transaction::with_transaction},
     config::{ProjectConfig, ValidationPolicy},
     control::{
         event_store::{EventDraft, EventStore},
@@ -623,46 +623,6 @@ pub fn require_convergence_budget(
         ),
         code: ErrorCode::PolicyConvergenceEscalated,
     })
-}
-
-/// Assesses a card's convergence budget for `card status`, without refusing.
-///
-/// 72-3: `card status` is the operator's window into why a card stopped, so
-/// unlike [`require_convergence_budget`] this never turns an `Escalated`
-/// budget into a refusal — it hands the [`CardConvergence`] back as data.
-/// Mirrors that function's own projection and assessment exactly: same
-/// policy, same cycle events, same [`assess_card`] call, so the JSON `card
-/// status` publishes and the JSON the block above decides from can never
-/// disagree about whether a card is escalated. Kept as its own small function
-/// rather than a shared call site because `require_convergence_budget` is
-/// frozen by #72-2's contract; this only reads what it already reads.
-///
-/// A malformed, duplicate, foreign, or unbound convergence fact still fails
-/// here exactly as it does there: that is control-repository corruption, a
-/// different problem than an exhausted budget, and there is no projection
-/// left to assess.
-///
-/// # Errors
-///
-/// Propagates a control-read or projection failure unchanged.
-fn card_convergence(
-    control: &ControlRepository,
-    config: &ProjectConfig,
-    record: &CardRecord,
-) -> Result<CardConvergence, HarnessError> {
-    let policy = config.convergence_policy.as_ref();
-    let cycle_events = EventStore::new(control).for_cycle(&record.cycle_id)?;
-    let view =
-        project(policy, &config.project_id, &record.cycle_id, &cycle_events).map_err(|error| {
-            HarnessError::Control {
-                reason: format!(
-                    "convergence projection for cycle {} is unusable: {error}",
-                    record.cycle_id
-                ),
-                code: ErrorCode::InternalControlCorrupt,
-            }
-        })?;
-    Ok(assess_card(policy, &view, &record.card_id, record.risk))
 }
 
 /// Moves a card to a new state, keeping its revision and digest.
@@ -1521,7 +1481,9 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
     // `require_convergence_budget` decides from, so the JSON this command
     // publishes and the JSON that decides a block elsewhere can never
     // disagree.
-    let convergence = card_convergence(&control, &config, &record)?;
+    let assessment = bottleneck::for_card(&control, &config, &record)?;
+    let convergence = assessment.convergence;
+    let bottleneck = assessment.bottleneck;
 
     let mut text = format!(
         "Card {card_id}\ntitle: {}\ncycle: {}\nstate: {}\nrevision: {}\ndigest: {recomputed}\nrisk: {}",
@@ -1561,6 +1523,20 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             next_permitted_action_wire_name(*next_permitted_action)
         );
     }
+    let _ = write!(text, "\nbottleneck: {}", bottleneck.status.name());
+    for signal in &bottleneck.signals {
+        let _ = write!(text, "\n  {}: {}", signal.kind.name(), signal.detail);
+    }
+    if let Some(action) = bottleneck.recommended_action {
+        let _ = write!(text, "\n  recommended action: {}", action.name());
+    }
+    if let Some(action) = bottleneck.authority_action {
+        let _ = write!(
+            text,
+            "\n  authority action: {}",
+            next_permitted_action_wire_name(action)
+        );
+    }
 
     let mut outcome = CommandOutcome::new(
         "card.status",
@@ -1577,6 +1553,7 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
             "risk": record.risk.name(),
             "title": record.title,
             "convergence": convergence,
+            "bottleneck": bottleneck,
         }),
     )
     .with_project(config.project_id.clone());
@@ -1585,6 +1562,15 @@ fn run_status(args: &StatusArgs) -> Result<CommandOutcome, HarnessError> {
         outcome = outcome.with_warning(format!(
             "recomputed digest {recomputed} does not match the recorded {}; the immutable revision was altered outside the harness",
             state.current_digest
+        ));
+    }
+    if bottleneck.requires_visibility() {
+        let action = bottleneck
+            .recommended_action
+            .map_or("inspect_bottleneck", |action| action.name());
+        outcome = outcome.with_warning(format!(
+            "card {card_id} has bottleneck status {}; recommended action: {action}",
+            bottleneck.status.name()
         ));
     }
     Ok(outcome)

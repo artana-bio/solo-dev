@@ -12,7 +12,7 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
-        gate::stranded_execution_permits, integration::ResumeOutcome,
+        bottleneck, gate::stranded_execution_permits, integration::ResumeOutcome,
         transaction::with_transaction, work::silent_leases,
     },
     config::{
@@ -50,7 +50,7 @@ use crate::{
         command::{GitScope, run, run_ok},
         inspect,
     },
-    policy::convergence::ATTEMPT_RECORDED_EVENT,
+    policy::{bottleneck::BottleneckStatus, convergence::ATTEMPT_RECORDED_EVENT},
     runner::receipt::{LOG_DIR, RECEIPT_DIR},
 };
 
@@ -1081,9 +1081,10 @@ fn run_status(args: &StatusArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     // was.
     let now = clock.now();
     let silent = silent_leases(&control, now)?;
+    let bottlenecks = bottleneck::for_project(&control, &config)?;
 
     let mut text = format!(
-        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}\nstranded validation reservations: {}\nsilent leases: {}",
+        "Project {}\ncontrol repository: {}\ncontrol head: {}\ncontrol commits: {}\nlock: {}\nunresolved operations: {}\nstranded validation reservations: {}\nsilent leases: {}\nbottleneck cards: {}",
         config.project_id,
         control.root().display(),
         head.as_deref().unwrap_or("unborn"),
@@ -1098,7 +1099,8 @@ fn run_status(args: &StatusArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         },
         unresolved.len(),
         stranded.len(),
-        silent.len()
+        silent.len(),
+        bottlenecks.len()
     );
     let disagreement = locator_disagreement(&control);
     let authority = authority_health(&config);
@@ -1151,6 +1153,35 @@ fn run_status(args: &StatusArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             now.unix_seconds() - lease.last_activity_at().unix_seconds()
         );
     }
+    for entry in &bottlenecks {
+        let action = entry
+            .bottleneck
+            .recommended_action
+            .map_or("inspect_bottleneck", |action| action.name());
+        let _ = write!(
+            text,
+            "\n  card {}: {} (recommended action: {action})",
+            entry.card_id,
+            entry.bottleneck.status.name()
+        );
+    }
+
+    let bottleneck_warning = (!bottlenecks.is_empty()).then(|| {
+        let action = if bottlenecks.iter().any(|entry| {
+            matches!(
+                entry.bottleneck.status,
+                BottleneckStatus::AttentionRequired | BottleneckStatus::StopRequired
+            )
+        }) {
+            "convene_bottleneck_group"
+        } else {
+            "consider_card_split"
+        };
+        format!(
+            "{} card(s) have deterministic bottleneck signals; recommended action: {action}",
+            bottlenecks.len()
+        )
+    });
 
     let mut outcome = CommandOutcome::new(
         "project.status",
@@ -1175,10 +1206,15 @@ fn run_status(args: &StatusArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             "unresolved_operations": unresolved,
             "stranded_reservations": stranded,
             "silent_leases": silent_leases_json(&silent, now),
+            "bottleneck_count": bottlenecks.len(),
+            "bottlenecks": bottlenecks,
             "locator_disagreement": disagreement,
         }),
     );
     if let Some(warning) = disagreement {
+        outcome = outcome.with_warning(warning);
+    }
+    if let Some(warning) = bottleneck_warning {
         outcome = outcome.with_warning(warning);
     }
     Ok(outcome.with_project(config.project_id.clone()))
