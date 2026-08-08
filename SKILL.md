@@ -224,6 +224,28 @@ The coordinator translates intent into governance before starting agents:
    proposed cycle and cards before activation. Approval of the product request
    is not permission to silently widen its scope.
 
+### Plan before executing
+
+Planning and execution are separate phases. Before starting an implementer
+task, the coordinator proposes the complete card set currently known for the
+cycle; it does not let agents create cards opportunistically while coding.
+Each proposed card must have the fields above and an explicit execution
+relationship: no dependency, depends on another card, or shares an exclusive
+resource. If implementation reveals work outside an activated card, stop at
+the boundary and propose a new card (or a revised card requiring approval)
+before doing that work.
+
+Execute the approved set according to those relationships:
+
+- use serial execution when a declared dependency or exclusive resource
+  requires it;
+- use parallel execution only for cards with accepted disjoint ownership,
+  dependencies, and resources.
+
+An unrelated card need not wait for another card to finish. "Serial" describes
+the order of card execution, not the creation of the plan; "parallel"
+describes independent card tasks, not shared ownership of one card.
+
 One implementation assignment means **one activated card, one lease, one
 allocated worktree, and one feature actor**. An agent may complete several
 cards over time, but each card gets a separate task and handoff. Cards may run
