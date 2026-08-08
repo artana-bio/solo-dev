@@ -10,6 +10,7 @@ pub const CONTROL_ENV: &str = "CHANGE_HARNESS_CONTROL";
 
 pub mod acceptance;
 pub mod archive;
+pub(crate) mod assurance_probe_fixture;
 pub(crate) mod assurance_probe_result;
 pub(crate) mod assurance_probe_scenarios;
 pub mod assurance_probes;

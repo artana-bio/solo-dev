@@ -18,7 +18,10 @@ use crate::{
     runner,
 };
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Subcommand)]
 pub enum MutationCommand {
@@ -147,108 +150,125 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                 source,
             })?;
             let worktree = scratch.path().join("candidate");
-            run(
-                &GitScope::work_tree(&config.repository),
-                [
-                    "worktree",
-                    "add",
-                    "--detach",
-                    worktree.to_string_lossy().as_ref(),
-                    receipt.candidate_sha.as_str(),
-                ],
-            )?
-            .require_success()?;
-            let oracle = crate::commands::gate::load_gate(control, &receipt.gate_oracle)?;
-            let baseline_oracle = runner::run_attempt(
-                &oracle,
-                &worktree,
-                scratch.path().join("logs-before").as_path(),
-                1,
-                clock,
-            )?;
-            if !baseline_oracle.passed() {
-                return Err(HarnessError::Control {
-                    reason: "mutation oracle must pass on the exact candidate before mutation"
-                        .to_owned(),
-                    code: ErrorCode::PolicyIncompleteReview,
-                });
-            }
-            let mut mutation = std::process::Command::new(&receipt.command[0]);
-            mutation.args(&receipt.command[1..]).current_dir(&worktree);
-            let mutation_output = mutation.output().map_err(|source| HarnessError::Control {
-                reason: format!("mutation command could not start: {source}"),
-                code: ErrorCode::PolicyIncompleteReview,
-            })?;
-            let oracle_outcome = runner::run_attempt(
-                &oracle,
-                &worktree,
-                scratch.path().join("logs").as_path(),
-                1,
-                clock,
-            )?;
-            if receipt.failed_at_oracle == oracle_outcome.passed() {
-                return Err(HarnessError::Control {
-                    reason: format!(
-                        "mutation oracle result contradicted failed_at_oracle: mutation exit {:?}, oracle passed {}",
-                        mutation_output.status.code(),
-                        oracle_outcome.passed()
-                    ),
-                    code: ErrorCode::PolicyIncompleteReview,
-                });
-            }
-            let mut observed_patch =
-                run(&GitScope::work_tree(&worktree), ["diff", "--binary"])?.stdout;
-            if observed_patch.trim().is_empty() {
-                let status =
-                    run(&GitScope::work_tree(&worktree), ["status", "--porcelain"])?.stdout;
-                if !status.trim().is_empty() {
-                    observed_patch = status;
+            let candidate_sha = receipt.candidate_sha.clone();
+            steps.outside_control("mutation-worktree-add")?;
+            let attempt = (|| {
+                run(
+                    &GitScope::work_tree(&config.repository),
+                    [
+                        "worktree",
+                        "add",
+                        "--detach",
+                        worktree.to_string_lossy().as_ref(),
+                        receipt.candidate_sha.as_str(),
+                    ],
+                )?
+                .require_success()?;
+                steps.at("mutation-worktree-added")?;
+                let oracle = crate::commands::gate::load_gate(control, &receipt.gate_oracle)?;
+                let baseline_oracle = runner::run_attempt(
+                    &oracle,
+                    &worktree,
+                    scratch.path().join("logs-before").as_path(),
+                    1,
+                    clock,
+                )?;
+                if !baseline_oracle.passed() {
+                    return Err(HarnessError::Control {
+                        reason: "mutation oracle must pass on the exact candidate before mutation"
+                            .to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
                 }
-            }
-            if observed_patch.trim().is_empty() {
-                return Err(HarnessError::Control {
-                    reason: "mutation command produced no tracked tree change".to_owned(),
-                    code: ErrorCode::PolicyIncompleteReview,
-                });
-            }
-            run(
-                &GitScope::work_tree(&worktree),
-                ["reset", "--hard", receipt.candidate_sha.as_str()],
-            )?
-            .require_success()?;
-            run(&GitScope::work_tree(&worktree), ["clean", "-fdx"])?.require_success()?;
-            if !run(&GitScope::work_tree(&worktree), ["status", "--porcelain"])?
-                .trimmed_stdout()
-                .is_empty()
-            {
-                return Err(HarnessError::Control {
-                    reason: "mutation restoration proof failed: disposable worktree is dirty"
-                        .to_owned(),
-                    code: ErrorCode::PolicyIncompleteReview,
-                });
-            }
-            let restored = inspect::resolve_commit(&GitScope::work_tree(&worktree), "HEAD")?;
-            let mut receipt = receipt;
-            receipt.mutation_digest = Digest::of_bytes(observed_patch.as_bytes());
-            receipt.patch_digest = receipt.mutation_digest.clone();
-            receipt.observed_result = format!(
-                "mutation_exit={:?}; oracle_exit={:?}; oracle_passed={}",
-                mutation_output.status.code(),
-                oracle_outcome.exit_code,
-                oracle_outcome.passed()
+                let mut mutation = std::process::Command::new(&receipt.command[0]);
+                mutation.args(&receipt.command[1..]).current_dir(&worktree);
+                let mutation_output =
+                    mutation.output().map_err(|source| HarnessError::Control {
+                        reason: format!("mutation command could not start: {source}"),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    })?;
+                if !mutation_output.status.success() {
+                    return Err(HarnessError::Control {
+                        reason: format!(
+                            "mutation command failed with exit {:?}",
+                            mutation_output.status.code()
+                        ),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
+                }
+                let oracle_outcome = runner::run_attempt(
+                    &oracle,
+                    &worktree,
+                    scratch.path().join("logs").as_path(),
+                    1,
+                    clock,
+                )?;
+                if receipt.failed_at_oracle == oracle_outcome.passed() {
+                    return Err(HarnessError::Control {
+                        reason: format!(
+                            "mutation oracle result contradicted failed_at_oracle: mutation exit {:?}, oracle passed {}",
+                            mutation_output.status.code(),
+                            oracle_outcome.passed()
+                        ),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
+                }
+                let mut observed_patch =
+                    run(&GitScope::work_tree(&worktree), ["diff", "--binary"])?.stdout;
+                if observed_patch.trim().is_empty() {
+                    let status =
+                        run(&GitScope::work_tree(&worktree), ["status", "--porcelain"])?.stdout;
+                    if !status.trim().is_empty() {
+                        observed_patch = status;
+                    }
+                }
+                if observed_patch.trim().is_empty() {
+                    return Err(HarnessError::Control {
+                        reason: "mutation command produced no tracked tree change".to_owned(),
+                        code: ErrorCode::PolicyIncompleteReview,
+                    });
+                }
+                let mut receipt = receipt;
+                receipt.mutation_digest = Digest::of_bytes(observed_patch.as_bytes());
+                receipt.patch_digest = receipt.mutation_digest.clone();
+                receipt.observed_result = format!(
+                    "mutation_exit={:?}; oracle_exit={:?}; oracle_passed={}",
+                    mutation_output.status.code(),
+                    oracle_outcome.exit_code,
+                    oracle_outcome.passed()
+                );
+                receipt.validate()?;
+                Ok(receipt)
+            })();
+            let cleanup = cleanup_disposable_worktree(
+                &config.repository,
+                &worktree,
+                &candidate_sha,
+                scratch.path(),
             );
-            receipt.restoration_sha = Some(restored);
-            receipt.validate()?;
-            run(
-                &GitScope::work_tree(&config.repository),
-                [
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree.to_string_lossy().as_ref(),
-                ],
-            )?
-            .require_success()?;
+            let receipt = match (attempt, cleanup) {
+                (Ok(mut receipt), Ok(restoration_sha)) => {
+                    receipt.restoration_sha = Some(restoration_sha);
+                    receipt.validate()?;
+                    receipt
+                }
+                (Err(error), Ok(_)) => return Err(error),
+                (attempt, Err(cleanup_error)) => {
+                    let retained = scratch.keep();
+                    let original = attempt.err().map_or_else(
+                        || "mutation succeeded but cleanup failed".to_owned(),
+                        |error| error.to_string(),
+                    );
+                    return Err(HarnessError::ControlWithRecovery {
+                        reason: format!(
+                            "{original}; disposable mutation cleanup failed: {cleanup_error}; evidence retained at {}",
+                            retained.display()
+                        ),
+                        code: ErrorCode::RecoveryIncomplete,
+                        recovery: "Run project recover after inspecting the retained disposable mutation evidence.",
+                    });
+                }
+            };
             control.write_atomic(
                 &relative,
                 &format!("{}\n", serde_json::to_string_pretty(&receipt)?),
@@ -265,6 +285,72 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
             .with_project(config.project_id))
         },
     )
+}
+
+/// Restores a disposable mutation worktree without destructive Git shortcuts.
+///
+/// All entries other than Git's worktree metadata are first moved into a
+/// quarantine directory inside the temporary allocation. The candidate tree
+/// is then restored with bounded `git restore` and a non-forcing detached
+/// checkout, after which ordinary `git worktree remove` can deregister it.
+fn cleanup_disposable_worktree(
+    repository: &Path,
+    worktree: &Path,
+    candidate_sha: &str,
+    scratch: &Path,
+) -> Result<String, HarnessError> {
+    let quarantine = scratch.join("quarantine");
+    fs::create_dir_all(&quarantine).map_err(|source| HarnessError::ControlIo {
+        path: quarantine.clone(),
+        source,
+    })?;
+    for entry in fs::read_dir(worktree).map_err(|source| HarnessError::ControlIo {
+        path: worktree.to_owned(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| HarnessError::ControlIo {
+            path: worktree.to_owned(),
+            source,
+        })?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let destination = quarantine.join(entry.file_name());
+        fs::rename(entry.path(), &destination).map_err(|source| HarnessError::ControlIo {
+            path: entry.path(),
+            source,
+        })?;
+    }
+    let scope = GitScope::work_tree(worktree);
+    run(
+        &scope,
+        [
+            "restore",
+            "--source",
+            candidate_sha,
+            "--staged",
+            "--worktree",
+            "--",
+            ".",
+        ],
+    )?
+    .require_success()?;
+    run(&scope, ["checkout", "--detach", candidate_sha])?.require_success()?;
+    if !run(&scope, ["status", "--porcelain"])?
+        .trimmed_stdout()
+        .is_empty()
+    {
+        return Err(HarnessError::Control {
+            reason: "disposable mutation cleanup left the worktree dirty".to_owned(),
+            code: ErrorCode::RecoveryIncomplete,
+        });
+    }
+    run(
+        &GitScope::work_tree(repository),
+        ["worktree", "remove", worktree.to_string_lossy().as_ref()],
+    )?
+    .require_success()?;
+    Ok(candidate_sha.to_owned())
 }
 
 fn inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
