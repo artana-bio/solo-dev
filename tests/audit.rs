@@ -430,6 +430,50 @@ fn audit_report_surfaces_a_review_mutation_receipt_deleted_after_approval() {
     let _ = integration_id;
 }
 
+#[test]
+fn audit_report_surfaces_a_review_exemption_policy_discrepancy() {
+    let (workspace, _) = completed_with_id();
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    git(&workspace.control, &["add", "-A"]);
+    git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove exemption policy"],
+    );
+
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        !report.status.success(),
+        "audit must fail on lost exemption policy"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY");
+    let discrepancies = &envelope["error"]["details"]["discrepancies"];
+    assert!(
+        discrepancies
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["claim"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mutation")),
+        "audit must identify exemption evidence: {discrepancies}"
+    );
+}
+
 fn report_error_details(workspace: &Workspace) -> serde_json::Value {
     let report = Workspace::run(&[
         "audit".into(),

@@ -370,6 +370,15 @@ change-harness review begin  --control $CONTROL --card-id F-001 --actor reviewer
 change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
 ```
 
+An approval may use a mutation exemption only when the project has an
+explicitly registered policy. New projects fail closed when
+`--mutation-exemption-policy` is omitted; each policy rule names the allowed
+code and exact declared approver actor, principal, and session. Free-form
+exemption codes and approvers are refused, and approved reviews pin the
+policy digest and resolved authorization facts. Existing projects install a
+typed policy explicitly with `project set-mutation-exemption-policy`; older
+free-form approvals are not migrated silently.
+
 **7. See what is waiting.** `integration ready` answers "what is approved and
 integrable" from control state, and says why each card that is not ready is
 not. An actor arriving with no context does not have to remember.

@@ -509,6 +509,8 @@ pub struct ReviewRecord {
     pub mutation_receipt_bindings: Vec<crate::domain::mutation::MutationReceiptBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_exemption: Option<crate::domain::mutation::MutationExemption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_exemption_binding: Option<crate::domain::mutation::MutationExemptionBinding>,
     /// Who produced the candidate.
     pub feature_actor_id: String,
     /// The conclusion.
@@ -1225,6 +1227,7 @@ mod tests {
             mutation_receipt_ids: vec![],
             mutation_receipt_bindings: vec![],
             mutation_exemption: None,
+            mutation_exemption_binding: None,
             feature_actor_id: "implementer-session-1".to_owned(),
             decision,
             findings,

@@ -25,7 +25,9 @@ use crate::{
         digest::CANONICAL_ALGORITHM,
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
-        mutation::{MutationExemption, MutationReceipt, MutationReceiptBinding},
+        mutation::{
+            MutationExemption, MutationExemptionBinding, MutationReceipt, MutationReceiptBinding,
+        },
         review::{
             Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
             MutationAuthorship, MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct,
@@ -953,6 +955,7 @@ fn build_review_record(
         mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
         mutation_receipt_bindings: vec![],
         mutation_exemption: verdict.mutation_exemption.clone(),
+        mutation_exemption_binding: None,
         feature_actor_id: handoff.actor_id.clone(),
         decision: verdict.decision,
         findings: verdict.findings.clone(),
@@ -1509,10 +1512,13 @@ pub fn validate_approved_review_evidence(
     }
     let mut checked = review.clone();
     validate_mutation_receipts(control, &mut checked)?;
-    if checked.mutation_receipt_bindings != review.mutation_receipt_bindings {
+    validate_mutation_exemption(control, &mut checked)?;
+    if checked.mutation_receipt_bindings != review.mutation_receipt_bindings
+        || checked.mutation_exemption_binding != review.mutation_exemption_binding
+    {
         return Err(HarnessError::Control {
             reason: format!(
-                "approved review {} has unpinned mutation receipt bindings",
+                "approved review {} has unpinned mutation evidence bindings",
                 review.review_id
             ),
             code: ErrorCode::GateEvidenceStale,
@@ -1521,11 +1527,86 @@ pub fn validate_approved_review_evidence(
     Ok(())
 }
 
+fn validate_mutation_exemption(
+    control: &ControlRepository,
+    review: &mut ReviewRecord,
+) -> Result<(), HarnessError> {
+    let Some(exemption) = review.mutation_exemption.as_ref() else {
+        if review.mutation_exemption_binding.is_some() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} carries mutation-exemption authorization without an exemption",
+                    review.review_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+        return Ok(());
+    };
+    exemption.validate(&review.reviewer_actor_id)?;
+    if review.decision != Decision::Approved {
+        return Ok(());
+    }
+    let config = control.project()?;
+    let policy = config.mutation_exemption_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "approved mutation exemption has no registered project exemption policy; install one explicitly before approving".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        }
+    })?;
+    let rule = policy
+        .rule_for(&exemption.code, &exemption.approved_by)
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "mutation exemption code `{}` is not authorized for approver `{}` by the registered project policy",
+                exemption.code, exemption.approved_by
+            ),
+            code: ErrorCode::PolicyIncompleteReview,
+        })?;
+    if review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.principal_id.as_deref())
+        == Some(rule.approver_principal_id.as_str())
+        || review
+            .reviewer_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.session_id.as_deref())
+            == Some(rule.approver_session_id.as_str())
+    {
+        return Err(HarnessError::Control {
+            reason: "mutation exemption approver must be independent from the reviewer principal and session".to_owned(),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    let binding = MutationExemptionBinding {
+        policy_digest: policy.digest()?,
+        code: rule.code.clone(),
+        approved_by: rule.approved_by.clone(),
+        approver_principal_id: rule.approver_principal_id.clone(),
+        approver_session_id: rule.approver_session_id.clone(),
+    };
+    if let Some(existing) = &review.mutation_exemption_binding {
+        if existing != &binding {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation exemption authorization for review {} is stale or bound to a different project policy",
+                    review.review_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+    } else {
+        review.mutation_exemption_binding = Some(binding);
+    }
+    Ok(())
+}
+
 fn validate_mutation_receipts(
     control: &ControlRepository,
     review: &mut ReviewRecord,
 ) -> Result<(), HarnessError> {
-    if let Some(exemption) = &review.mutation_exemption {
+    if review.mutation_exemption.is_some() {
         if !review.mutation_receipt_ids.is_empty() {
             return Err(HarnessError::Control {
                 reason: "a review cannot combine executable mutation receipts with an exemption"
@@ -1533,8 +1614,8 @@ fn validate_mutation_receipts(
                 code: ErrorCode::PolicyIncompleteReview,
             });
         }
-        exemption.validate(&review.reviewer_actor_id)?;
         review.mutation_receipt_bindings.clear();
+        validate_mutation_exemption(control, review)?;
         return Ok(());
     }
     if review.decision == Decision::Approved && review.mutation_receipt_ids.is_empty() {

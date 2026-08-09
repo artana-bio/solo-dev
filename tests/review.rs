@@ -59,6 +59,9 @@ fn handed_off() -> (Workspace, String) {
 /// Writes a verdict file and returns its path.
 fn verdict(workspace: &Workspace, body: &str) -> String {
     let path = workspace.root.join("verdict.yaml");
+    // This helper is intentionally limited to the fixture's explicitly
+    // installed, registered exemption. Raw production-path tests bypass it
+    // when exercising missing or unauthorized evidence.
     let body = if body.contains("decision: approved") && !body.contains("mutation_exemption:") {
         format!(
             "{body}mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
@@ -349,6 +352,10 @@ fn a_declared_exemption_is_recorded_and_visible() {
     assert_eq!(
         evidence["reason"], "fixture verdict for unrelated review behavior; no mutation performed",
         "the exemption's own reason must be visible in the recorded review, not merely a boolean"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["mutation_exemption_binding"]["code"], "fixture-no-mutation",
+        "the approval must pin the resolved exemption policy facts"
     );
 
     // And still visible on a later read, not only in the write's own reply.
@@ -1164,6 +1171,39 @@ fn a_low_risk_card_needs_no_human_declaration() {
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(envelope["data"]["review"]["human_reviewer"], false);
+}
+
+#[test]
+fn an_arbitrary_mutation_exemption_is_refused_by_the_production_path() {
+    for (code, approved_by) in [
+        ("made-up-bypass", "unrelated-string"),
+        ("fixture-no-mutation", "unrelated-string"),
+        ("fixture-no-mutation", "reviewer-session-a"),
+    ] {
+        let (workspace, _) = handed_off();
+        let path = workspace.root.join("arbitrary-exemption.yaml");
+        fs::write(
+            &path,
+            format!(
+                "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: review-session\n  principal_id: reviewer-principal\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: prose only\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: {code}\n  reason: made-up reason\n  approved_by: {approved_by}\n"
+            ),
+        )
+        .unwrap();
+        let output = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path.display().to_string(),
+            "--actor",
+            "reviewer-session-a",
+        ]);
+        assert!(
+            !output.status.success(),
+            "arbitrary exemption must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    }
 }
 
 #[test]

@@ -578,6 +578,19 @@ change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal
 change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
+Mutation exemptions are not free-form review evidence. A project must
+explicitly install a versioned mutation-exemption policy; omitting it on a
+new project fails closed. The policy names each allowed code and exact declared
+approver actor, principal, and session. Approved reviews pin the policy digest
+and resolved authorization facts, which are rechecked during integration,
+acceptance, promotion, and audit.
+
+Install the policy during `project init` with
+`--mutation-exemption-policy /abs/path/policy.json`, or migrate an existing
+project explicitly with `project set-mutation-exemption-policy --policy
+/abs/path/policy.json`. Existing free-form exemptions are never silently
+blessed.
+
 The reviewer must run at least one mutation the implementer did **not**
 declare. Re-running the declared mutation only re-checks a report you already
 have; a mutation the implementer never tried is the only kind that can find

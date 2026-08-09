@@ -218,6 +218,103 @@ fn an_approved_review_with_changed_mutation_receipt_digest_is_not_ready() {
     assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
 }
 
+#[test]
+fn an_approved_exemption_without_its_project_policy_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove exemption policy"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "missing exemption policy must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-INCOMPLETE-REVIEW");
+}
+
+#[test]
+fn an_existing_project_must_install_exemption_policy_through_the_typed_command() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "remove exemption policy for migration",
+        ],
+    );
+
+    let policy = workspace.root.join("mutation-exemption-policy.json");
+    let installed = Workspace::run(&[
+        "project".into(),
+        "set-mutation-exemption-policy".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--policy".into(),
+        policy.display().to_string(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "typed policy migration must succeed: {}",
+        String::from_utf8_lossy(&installed.stdout)
+    );
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        ready.status.success(),
+        "restored policy should restore readiness"
+    );
+}
+
+#[test]
+fn an_approved_exemption_with_a_replaced_policy_digest_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "code": "new-policy-code",
+            "approved_by": "new-approver",
+            "approver_principal_id": "new-principal",
+            "approver_session_id": "new-session"
+        }));
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "replace exemption policy"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "policy digest drift must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+}
+
 /// The card identifiers in an integration's merge order.
 fn merge_order(envelope: &serde_json::Value) -> Vec<String> {
     envelope["data"]["members"]

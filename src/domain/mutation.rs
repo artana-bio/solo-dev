@@ -19,6 +19,18 @@ pub struct MutationExemption {
     pub approved_by: String,
 }
 
+/// Immutable project-policy facts resolved when an exemption-backed approval
+/// is recorded.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MutationExemptionBinding {
+    pub policy_digest: Digest,
+    pub code: String,
+    pub approved_by: String,
+    pub approver_principal_id: String,
+    pub approver_session_id: String,
+}
+
 impl MutationExemption {
     /// # Errors
     ///

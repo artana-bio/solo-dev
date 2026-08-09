@@ -18,8 +18,8 @@ use crate::{
     config::{
         CONVERGENCE_POLICY_V1, CardConvergenceLimits, ConvergencePolicy, CycleConvergenceLimits,
         DEFAULT_AUTHORITY_REMOTE, ExceptionTrigger, FINAL_AUTHORIZATION_POLICY_V1, FieldError,
-        FinalAuthorizationPolicy, HostPolicy, PROJECT_SCHEMA, ProjectConfig, RiskConvergenceLimits,
-        ValidationPolicy,
+        FinalAuthorizationPolicy, HostPolicy, MutationExemptionPolicy, PROJECT_SCHEMA,
+        ProjectConfig, RiskConvergenceLimits, ValidationPolicy,
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
@@ -70,6 +70,8 @@ pub enum ProjectCommand {
     /// Install a final-authorization policy on an already-initialized
     /// project, making its declared `exception_triggers` reachable.
     SetFinalAuthorizationPolicy(SetFinalAuthorizationPolicyArgs),
+    /// Install or replace the explicitly registered mutation-exemption policy.
+    SetMutationExemptionPolicy(SetMutationExemptionPolicyArgs),
     /// Print a complete, valid convergence-policy example.
     ///
     /// Built by constructing a real `ConvergencePolicy` and serializing it,
@@ -102,6 +104,7 @@ impl ProjectCommand {
             Self::Recover(..) => "project.recover",
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
             Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
+            Self::SetMutationExemptionPolicy(..) => "project.set-mutation-exemption-policy",
             Self::Example(..) => "project.example",
             Self::ExampleFinalAuthorization(..) => "project.example-final-authorization",
         }
@@ -145,6 +148,10 @@ pub struct InitArgs {
     /// project reports `legacy_unassessed`, never a budget nobody declared.
     #[arg(long)]
     pub convergence_policy: Option<PathBuf>,
+    /// Path to a JSON mutation-exemption policy to install at creation.
+    /// Absent means approvals may not use mutation exemptions.
+    #[arg(long)]
+    pub mutation_exemption_policy: Option<PathBuf>,
 }
 
 /// Arguments accepted by `project validate`.
@@ -217,6 +224,19 @@ pub struct SetFinalAuthorizationPolicyArgs {
     pub dry_run: bool,
 }
 
+/// Arguments accepted by `project set-mutation-exemption-policy`.
+#[derive(Debug, Args)]
+pub struct SetMutationExemptionPolicyArgs {
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub policy: PathBuf,
+    #[arg(long, default_value = "operator")]
+    pub actor: String,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments accepted by `project example`.
 ///
 /// Deliberately empty, and deliberately not [`SetConvergencePolicyArgs`]:
@@ -250,6 +270,9 @@ pub fn execute(
         ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
         ProjectCommand::SetFinalAuthorizationPolicy(args) => {
             run_set_final_authorization_policy(args, clock)
+        }
+        ProjectCommand::SetMutationExemptionPolicy(args) => {
+            run_set_mutation_exemption_policy(args, clock)
         }
         ProjectCommand::Example(..) => run_example(),
         ProjectCommand::ExampleFinalAuthorization(..) => run_example_final_authorization(),
@@ -309,6 +332,23 @@ fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessE
             recovery,
         }
     })?;
+    policy.validate().map_err(FieldError::into_error)?;
+    Ok(policy)
+}
+
+fn read_mutation_exemption_policy(path: &PathBuf) -> Result<MutationExemptionPolicy, HarnessError> {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+        reason: format!(
+            "cannot read mutation exemption policy {}: {source}",
+            path.display()
+        ),
+        code: ErrorCode::ConfigMalformed,
+    })?;
+    let policy: MutationExemptionPolicy =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("mutation exemption policy is malformed: {source}"),
+            code: ErrorCode::ConfigMalformed,
+        })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
 }
@@ -593,6 +633,11 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
         .as_ref()
         .map(read_convergence_policy)
         .transpose()?;
+    let mutation_exemption_policy = args
+        .mutation_exemption_policy
+        .as_ref()
+        .map(read_mutation_exemption_policy)
+        .transpose()?;
 
     Ok(ProjectConfig {
         schema: PROJECT_SCHEMA.to_owned(),
@@ -622,6 +667,7 @@ fn config_from_args(args: &InitArgs) -> Result<ProjectConfig, HarnessError> {
             }
             .to_owned(),
         ),
+        mutation_exemption_policy,
         convergence_policy,
     })
 }
@@ -2072,6 +2118,81 @@ fn run_set_final_authorization_policy(
                     "project_id": config.project_id.to_string(),
                     "policy_digest": new_digest.as_str(),
                     "previous_policy_digest": existing_digest.as_ref().map(Digest::to_string),
+                    "changed": true,
+                }),
+            )
+            .with_project(config.project_id.clone()))
+        },
+    )
+}
+
+fn run_set_mutation_exemption_policy(
+    args: &SetMutationExemptionPolicyArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let new_policy = read_mutation_exemption_policy(&args.policy)?;
+    let new_digest = new_policy.digest()?;
+    if args.dry_run {
+        return Ok(CommandOutcome::new(
+            "project.set-mutation-exemption-policy",
+            format!(
+                "Dry run: would install mutation exemption policy digest {new_digest}; nothing was changed"
+            ),
+            serde_json::json!({
+                "dry_run": true,
+                "policy_digest": new_digest.as_str(),
+                "planned_mutations": ["write project/project.json", "commit control state"],
+            }),
+        ));
+    }
+
+    with_transaction(
+        &args.control,
+        "project.set-mutation-exemption-policy",
+        clock,
+        move |control, events, expected, steps| {
+            let mut config = control.project()?;
+            let previous = config
+                .mutation_exemption_policy
+                .as_ref()
+                .map(MutationExemptionPolicy::digest)
+                .transpose()?;
+            if previous.as_ref() == Some(&new_digest) {
+                return Ok(CommandOutcome::new(
+                    "project.set-mutation-exemption-policy",
+                    "mutation exemption policy is already installed",
+                    serde_json::json!({
+                        "project_id": config.project_id.to_string(),
+                        "policy_digest": new_digest.as_str(),
+                        "changed": false,
+                    }),
+                )
+                .with_project(config.project_id.clone()));
+            }
+            steps.at("control-write")?;
+            config.mutation_exemption_policy = Some(new_policy);
+            control.write_atomic(PROJECT_FILE, &format!("{}\n", config.to_json()?))?;
+            events.append(
+                &config.project_id,
+                EventDraft::new("project.mutation_exemption_policy_installed", &args.actor)
+                    .meta("policy_digest", serde_json::json!(new_digest.as_str()))
+                    .meta(
+                        "previous_policy_digest",
+                        serde_json::json!(previous.as_ref().map(Digest::to_string)),
+                    ),
+                clock,
+            )?;
+            control.commit(
+                expected,
+                &format!("project: set mutation exemption policy {new_digest}"),
+            )?;
+            Ok(CommandOutcome::new(
+                "project.set-mutation-exemption-policy",
+                format!("Installed mutation exemption policy digest {new_digest}"),
+                serde_json::json!({
+                    "project_id": config.project_id.to_string(),
+                    "policy_digest": new_digest.as_str(),
+                    "previous_policy_digest": previous.as_ref().map(Digest::to_string),
                     "changed": true,
                 }),
             )

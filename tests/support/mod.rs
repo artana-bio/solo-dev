@@ -75,6 +75,21 @@ impl Workspace {
     /// Creates the repositories and runs `project init`.
     pub fn initialized() -> Self {
         let workspace = Self::new();
+        let exemption_policy = workspace.root.join("mutation-exemption-policy.json");
+        fs::write(
+            &exemption_policy,
+            r#"{
+  "version": "harness.mutation-exemption-policy/v1",
+  "rules": [
+    {"code":"fixture-no-mutation","approved_by":"independent-attestor","approver_principal_id":"attestor-principal","approver_session_id":"attestor-session"},
+    {"code":"fixture","approved_by":"independent-attestor","approver_principal_id":"attestor-principal","approver_session_id":"attestor-session"},
+    {"code":"fixture","approved_by":"independent-approver","approver_principal_id":"approver-principal","approver_session_id":"approver-session"},
+    {"code":"reference_fixture","approved_by":"reference","approver_principal_id":"reference-principal","approver_session_id":"reference-session"},
+    {"code":"example_fixture","approved_by":"example-generator","approver_principal_id":"example-principal","approver_session_id":"example-session"}
+  ]
+}"#,
+        )
+        .unwrap();
         let output = Self::run(&[
             "project".into(),
             "init".into(),
@@ -88,6 +103,8 @@ impl Workspace {
             workspace.authority.display().to_string(),
             "--worktree-root".into(),
             workspace.worktrees.display().to_string(),
+            "--mutation-exemption-policy".into(),
+            exemption_policy.display().to_string(),
         ]);
         assert!(
             output.status.success(),
@@ -599,11 +616,6 @@ impl Workspace {
                 if !body.contains("reviewer_kind:") {
                     body.push_str(
                         "reviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: reviewer-session\n  principal_id: reviewer-principal\n",
-                    );
-                }
-                if !body.contains("mutation_exemption:") {
-                    body.push_str(
-                        "mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
                     );
                 }
                 fs::write(&verdict_path, body).unwrap();
