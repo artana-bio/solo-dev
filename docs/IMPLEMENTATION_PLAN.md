@@ -2853,7 +2853,7 @@ Final acceptance evidence, recorded 2026-08-08 on integrated candidate
 - `tests/project_snapshot_docs.rs` passed all three documentation-contract
   regressions;
 - Terra High approved the exact compatibility candidate after independent
-  mutations of branch, candidate SHA, card ID, receipt evidence, and actor
+  mutations of branch, candidate SHA, card ID, receipt evidence, and handoff
   declaration all failed closed;
 - live JSON, text, and non-TTY watch sampling succeeded against control head
   `755a00372a588b7db0cc8f1a464bcde29b6582bd`; control, candidate, and authority
