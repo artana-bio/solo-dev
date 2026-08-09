@@ -27,7 +27,9 @@ use crate::{
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
         handoff::latest_handoff,
-        review::{current_approval, dependency_standings, reviews_for},
+        review::{
+            current_approval, dependency_standings, reviews_for, validate_approved_review_evidence,
+        },
         transaction::{Steps, with_transaction},
         work::held_lease,
     },
@@ -3821,6 +3823,7 @@ pub fn member_implementers(
                 code: ErrorCode::PolicyNotIntegrable,
             });
         }
+        validate_approved_review_evidence(control, review)?;
         found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
     }
     Ok(found)

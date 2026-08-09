@@ -59,6 +59,115 @@ fn ready_ids(envelope: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+fn corrupt_approved_mutation_binding(
+    workspace: &Workspace,
+    receipt_id: &str,
+    receipt: Option<serde_json::Value>,
+) {
+    let reviews = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let review_id = reviews["data"]["reviews"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["review_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let review_path = workspace.control.join(format!("reviews/{review_id}.json"));
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_ids"] = serde_json::json!([receipt_id]);
+    review["mutation_exemption"] = serde_json::Value::Null;
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    if let Some(receipt) = receipt {
+        let receipt_path = workspace
+            .control
+            .join(format!("mutation-receipts/{receipt_id}.json"));
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "corrupt approved mutation evidence"],
+    );
+}
+
+fn validish_receipt(receipt_id: &str, candidate_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "harness.mutation-receipt/v1",
+        "receipt_id": receipt_id,
+        "card_revision": "F-001-r1",
+        "candidate_sha": candidate_sha,
+        "reviewer_actor_id": "reviewer-session",
+        "reviewer_principal_id": "reviewer-principal",
+        "reviewer_session_id": "reviewer-session",
+        "mutation_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "patch_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "command": ["true"],
+        "gate_oracle": "gate.unit",
+        "expected_failure": "oracle fails",
+        "observed_result": "oracle failed",
+        "failed_at_oracle": true,
+        "restoration_proof": "restored",
+        "restoration_sha": candidate_sha,
+        "created_at": "2026-08-08T00:00:00Z",
+        "exemption": null
+    })
+}
+
+#[test]
+fn an_approved_review_with_deleted_mutation_receipt_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let candidate = support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]);
+    corrupt_approved_mutation_binding(
+        &workspace,
+        "MR-DELETED-AFTER-APPROVAL",
+        Some(validish_receipt("MR-DELETED-AFTER-APPROVAL", &candidate)),
+    );
+    let receipt_path = workspace
+        .control
+        .join("mutation-receipts/MR-DELETED-AFTER-APPROVAL.json");
+    fs::remove_file(receipt_path).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "delete mutation receipt"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(!ready.status.success(), "lost receipt must block readiness");
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+}
+
+#[test]
+fn an_approved_review_with_corrupt_or_rebound_mutation_receipt_is_not_ready() {
+    for (label, receipt) in [
+        ("corrupt", Some(serde_json::json!({"not": "a receipt"}))),
+        (
+            "rebound",
+            Some(validish_receipt(
+                "MR-REBOUND-AFTER-APPROVAL",
+                &"0".repeat(40),
+            )),
+        ),
+    ] {
+        let workspace = cycle_with(1);
+        workspace.approve_card("F-001", "src/F-001/a.rs");
+        let receipt_id = format!("MR-{}-AFTER-APPROVAL", label.to_ascii_uppercase());
+        corrupt_approved_mutation_binding(&workspace, &receipt_id, receipt);
+        let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+        assert!(
+            !ready.status.success(),
+            "{label} mutation receipt must block readiness"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+        assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+    }
+}
+
 /// The card identifiers in an integration's merge order.
 fn merge_order(envelope: &serde_json::Value) -> Vec<String> {
     envelope["data"]["members"]

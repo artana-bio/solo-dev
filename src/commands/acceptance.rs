@@ -343,7 +343,7 @@ fn preview_record(
     // real command would refuse for an escalated cycle. See
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
-    require_reviewed(&record)?;
+    require_reviewed(&control, &record)?;
     require_no_pending_exception(&control, &config, &record)?;
     refuse_existing_acceptance(&control, integration_id)?;
     let authorizer = authorizer(args)?;
@@ -641,7 +641,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
-            require_reviewed(&record)?;
+            require_reviewed(control, &record)?;
             require_no_pending_exception(control, &config, &record)?;
             refuse_existing_acceptance(control, &integration_id)?;
 
@@ -721,8 +721,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 /// status, where `integration verify` would be wrong advice since
 /// verification already happened; that and every other non-`Reviewed`
 /// status keep the plain code default rather than guessing.
-fn require_reviewed(record: &IntegrationRecord) -> Result<(), HarnessError> {
+fn require_reviewed(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
     if record.status == IntegrationStatus::Reviewed {
+        member_implementers(control, record)?;
         return Ok(());
     }
     let reason = format!(

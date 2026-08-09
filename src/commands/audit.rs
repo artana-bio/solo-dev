@@ -23,7 +23,7 @@ use crate::{
             load_compatibility_request, read_integration_compatibility_request, receipts_for,
             receipts_for_integration_verification,
         },
-        review::reviews_for,
+        review::{reviews_for, validate_approved_review_evidence},
     },
     control::{event_store::EventStore, repository::ControlRepository},
     domain::{
@@ -566,6 +566,13 @@ fn check_reviews(
 ) -> Result<usize, HarnessError> {
     let reviews = reviews_for(control, card_id)?;
     for review in &reviews {
+        if let Err(error) = validate_approved_review_evidence(control, review) {
+            found.push(Discrepancy {
+                subject: format!("review {}", review.review_id),
+                claim: "approved review mutation receipt evidence".to_owned(),
+                found: error.to_string(),
+            });
+        }
         if !commit_exists(&config.repository, &review.candidate_sha) {
             found.push(Discrepancy {
                 subject: format!("review {}", review.review_id),

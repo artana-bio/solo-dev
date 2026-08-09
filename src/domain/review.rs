@@ -505,6 +505,8 @@ pub struct ReviewRecord {
     /// First-class executable mutation receipts supporting this review.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutation_receipt_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation_receipt_bindings: Vec<crate::domain::mutation::MutationReceiptBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_exemption: Option<crate::domain::mutation::MutationExemption>,
     /// Who produced the candidate.
@@ -1221,6 +1223,7 @@ mod tests {
             reviewer_provenance: None,
             human_attestation: None,
             mutation_receipt_ids: vec![],
+            mutation_receipt_bindings: vec![],
             mutation_exemption: None,
             feature_actor_id: "implementer-session-1".to_owned(),
             decision,

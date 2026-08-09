@@ -25,7 +25,7 @@ use crate::{
         digest::CANONICAL_ALGORITHM,
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
-        mutation::{MutationExemption, MutationReceipt},
+        mutation::{MutationExemption, MutationReceipt, MutationReceiptBinding},
         review::{
             Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
             MutationAuthorship, MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct,
@@ -364,6 +364,7 @@ pub fn current_approval(
         let standings =
             dependency_standings(control, scope, depends_on, &review.dependency_bindings)?;
         if review.is_current_for(candidate_sha, card_digest, &standings) {
+            validate_approved_review_evidence(control, &review)?;
             return Ok(Some(review));
         }
     }
@@ -387,7 +388,11 @@ pub fn standing_approval(
     control: &ControlRepository,
     card_id: &CardId,
 ) -> Result<Option<ReviewRecord>, HarnessError> {
-    Ok(ReviewRecord::standing_approval(&reviews_for(control, card_id)?).cloned())
+    let approval = ReviewRecord::standing_approval(&reviews_for(control, card_id)?).cloned();
+    if let Some(review) = &approval {
+        validate_approved_review_evidence(control, review)?;
+    }
+    Ok(approval)
 }
 
 /// Where each declared dependency stands against one record's bindings.
@@ -946,6 +951,7 @@ fn build_review_record(
         reviewer_provenance: verdict.reviewer_provenance.clone(),
         human_attestation: verdict.human_attestation.clone(),
         mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
+        mutation_receipt_bindings: vec![],
         mutation_exemption: verdict.mutation_exemption.clone(),
         feature_actor_id: handoff.actor_id.clone(),
         decision: verdict.decision,
@@ -964,7 +970,7 @@ fn validate_review_candidate(
     control: &ControlRepository,
     record: &crate::domain::card::CardRecord,
     verdict: &Verdict,
-    review: &ReviewRecord,
+    review: &mut ReviewRecord,
     previous: Option<&ReviewRecord>,
 ) -> Result<(), HarnessError> {
     review.validate()?;
@@ -1021,7 +1027,7 @@ fn preview_record(
     state.state.check_transition(next_state)?;
     let previous = reviews_for(&control, card_id)?.into_iter().next_back();
     let review_id = next_review_id(&control)?;
-    let review = build_review_record(
+    let mut review = build_review_record(
         &record,
         &state,
         &handoff,
@@ -1030,7 +1036,7 @@ fn preview_record(
         previous.as_ref(),
         clock,
     )?;
-    validate_review_candidate(&control, &record, verdict, &review, previous.as_ref())?;
+    validate_review_candidate(&control, &record, verdict, &mut review, previous.as_ref())?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(
@@ -1389,7 +1395,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 
             let previous = reviews_for(control, &card_id)?.into_iter().next_back();
             let review_id = next_review_id(control)?;
-            let review = build_review_record(
+            let mut review = build_review_record(
                 &record,
                 &state,
                 &handoff,
@@ -1398,7 +1404,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 previous.as_ref(),
                 clock,
             )?;
-            validate_review_candidate(control, &record, &verdict, &review, previous.as_ref())?;
+            validate_review_candidate(control, &record, &verdict, &mut review, previous.as_ref())?;
             let digest = review.digest()?;
 
             control.write_atomic(
@@ -1488,9 +1494,36 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     )
 }
 
-fn validate_mutation_receipts(
+/// Revalidates executable mutation evidence for an approved review consumer.
+///
+/// # Errors
+///
+/// Returns a stable policy or stale-evidence error when a receipt is missing,
+/// malformed, replaced, or no longer matches the approval binding.
+pub fn validate_approved_review_evidence(
     control: &ControlRepository,
     review: &ReviewRecord,
+) -> Result<(), HarnessError> {
+    if review.decision != Decision::Approved {
+        return Ok(());
+    }
+    let mut checked = review.clone();
+    validate_mutation_receipts(control, &mut checked)?;
+    if checked.mutation_receipt_bindings != review.mutation_receipt_bindings {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "approved review {} has unpinned mutation receipt bindings",
+                review.review_id
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(())
+}
+
+fn validate_mutation_receipts(
+    control: &ControlRepository,
+    review: &mut ReviewRecord,
 ) -> Result<(), HarnessError> {
     if let Some(exemption) = &review.mutation_exemption {
         if !review.mutation_receipt_ids.is_empty() {
@@ -1501,6 +1534,7 @@ fn validate_mutation_receipts(
             });
         }
         exemption.validate(&review.reviewer_actor_id)?;
+        review.mutation_receipt_bindings.clear();
         return Ok(());
     }
     if review.decision == Decision::Approved && review.mutation_receipt_ids.is_empty() {
@@ -1509,61 +1543,105 @@ fn validate_mutation_receipts(
             code: ErrorCode::PolicyIncompleteReview,
         });
     }
+    let mut actual_bindings = Vec::new();
     for receipt_id in &review.mutation_receipt_ids {
-        let relative = MutationReceipt::relative_path(receipt_id);
-        let receipt: MutationReceipt =
-            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
-                HarnessError::Control {
-                    reason: format!("mutation receipt {receipt_id} is malformed: {source}"),
-                    code: ErrorCode::InternalControlCorrupt,
-                }
-            })?;
-        receipt.validate()?;
-        let expected_revision = format!("{}-r{}", review.card_id, review.card_revision);
-        if receipt.card_revision != expected_revision {
-            return Err(HarnessError::Control {
-                reason: format!(
-                    "mutation receipt {receipt_id} is not bound to card revision {expected_revision}"
-                ),
-                code: ErrorCode::GateEvidenceStale,
-            });
-        }
-        if let Some(principal_id) = review
-            .reviewer_provenance
-            .as_ref()
-            .and_then(|provenance| provenance.principal_id.as_deref())
-            && receipt.reviewer_principal_id.as_deref() != Some(principal_id)
-        {
-            return Err(HarnessError::Control {
-                reason: format!(
-                    "mutation receipt {receipt_id} is not bound to the reviewer's declared principal"
-                ),
-                code: ErrorCode::PolicySameActor,
-            });
-        }
-        if let Some(session_id) = review
-            .reviewer_provenance
-            .as_ref()
-            .and_then(|provenance| provenance.session_id.as_deref())
-            && receipt.reviewer_session_id.as_deref() != Some(session_id)
-        {
-            return Err(HarnessError::Control {
-                reason: format!(
-                    "mutation receipt {receipt_id} is not bound to the reviewer's declared session"
-                ),
-                code: ErrorCode::PolicySameActor,
-            });
-        }
-        if receipt.candidate_sha != review.candidate_sha
-            || !actors::same(&receipt.reviewer_actor_id, &review.reviewer_actor_id)
-        {
-            return Err(HarnessError::Control {
-                reason: format!(
-                    "mutation receipt {receipt_id} is not bound to this candidate and reviewer"
-                ),
-                code: ErrorCode::GateEvidenceStale,
-            });
-        }
+        let receipt = load_mutation_receipt(control, receipt_id)?;
+        validate_receipt_binding(review, receipt_id, &receipt)?;
+        let binding = MutationReceiptBinding::from_receipt(&receipt)?;
+        actual_bindings.push(binding);
+    }
+    if review.mutation_receipt_bindings.is_empty() {
+        review.mutation_receipt_bindings = actual_bindings;
+    } else if review.mutation_receipt_bindings != actual_bindings {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt bindings for review {} no longer match persisted receipts",
+                review.review_id
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(())
+}
+
+fn load_mutation_receipt(
+    control: &ControlRepository,
+    receipt_id: &str,
+) -> Result<MutationReceipt, HarnessError> {
+    let relative = MutationReceipt::relative_path(receipt_id);
+    let raw = control
+        .read(&relative)
+        .map_err(|source| HarnessError::Control {
+            reason: format!("mutation receipt {receipt_id} is missing or unreadable: {source}"),
+            code: ErrorCode::GateEvidenceStale,
+        })?;
+    let receipt: MutationReceipt =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("mutation receipt {receipt_id} is malformed: {source}"),
+            code: ErrorCode::GateEvidenceStale,
+        })?;
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn validate_receipt_binding(
+    review: &ReviewRecord,
+    receipt_id: &str,
+    receipt: &MutationReceipt,
+) -> Result<(), HarnessError> {
+    let expected_revision = format!("{}-r{}", review.card_id, review.card_revision);
+    if receipt.card_revision != expected_revision {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to card revision {expected_revision}"
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    if receipt.reviewer_actor_id != review.reviewer_actor_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to reviewer actor {}",
+                review.reviewer_actor_id
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if let Some(principal_id) = review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.principal_id.as_deref())
+        && receipt.reviewer_principal_id.as_deref() != Some(principal_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to the reviewer's declared principal"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if let Some(session_id) = review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.session_id.as_deref())
+        && receipt.reviewer_session_id.as_deref() != Some(session_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to the reviewer's declared session"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if receipt.candidate_sha != review.candidate_sha
+        || !actors::same(&receipt.reviewer_actor_id, &review.reviewer_actor_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to this candidate and reviewer"
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
     }
     Ok(())
 }

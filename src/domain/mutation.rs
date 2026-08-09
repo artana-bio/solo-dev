@@ -69,6 +69,39 @@ pub struct MutationReceipt {
     pub exemption: Option<MutationExemption>,
 }
 
+/// Immutable receipt facts pinned into a review approval.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MutationReceiptBinding {
+    pub receipt_id: String,
+    pub receipt_digest: Digest,
+    pub card_revision: String,
+    pub candidate_sha: String,
+    pub reviewer_actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_principal_id: Option<String>,
+    pub reviewer_session_id: Option<String>,
+    pub gate_oracle: String,
+}
+
+impl MutationReceiptBinding {
+    /// # Errors
+    ///
+    /// Returns an error if the receipt cannot be canonically digested.
+    pub fn from_receipt(receipt: &MutationReceipt) -> Result<Self, HarnessError> {
+        Ok(Self {
+            receipt_id: receipt.receipt_id.clone(),
+            receipt_digest: Digest::of_canonical(receipt)?,
+            card_revision: receipt.card_revision.clone(),
+            candidate_sha: receipt.candidate_sha.clone(),
+            reviewer_actor_id: receipt.reviewer_actor_id.clone(),
+            reviewer_principal_id: receipt.reviewer_principal_id.clone(),
+            reviewer_session_id: receipt.reviewer_session_id.clone(),
+            gate_oracle: receipt.gate_oracle.clone(),
+        })
+    }
+}
+
 impl MutationReceipt {
     /// # Errors
     ///

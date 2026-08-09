@@ -378,6 +378,58 @@ fn audit_report_surfaces_missing_verification_receipt_and_cannot_claim_machine_c
     );
 }
 
+#[test]
+fn audit_report_surfaces_a_review_mutation_receipt_deleted_after_approval() {
+    let (workspace, integration_id) = completed_with_id();
+    let reviews_dir = workspace.control.join("reviews");
+    let review_path = fs::read_dir(&reviews_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name().unwrap().to_string_lossy().contains("RV-"))
+        .expect("approved review record");
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_ids"] = serde_json::json!(["MR-AUDIT-DELETED"]);
+    review["mutation_exemption"] = serde_json::Value::Null;
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    git(&workspace.control, &["add", "-A"]);
+    git(
+        &workspace.control,
+        &["commit", "-q", "-m", "delete review mutation evidence"],
+    );
+
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        !report.status.success(),
+        "audit must fail on lost review evidence"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY");
+    let details = &envelope["error"]["details"];
+    assert!(
+        details["discrepancies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["claim"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mutation")),
+        "review mutation evidence discrepancy must be explicit: {details}"
+    );
+    assert_eq!(details["cycle_id"], "C-001");
+    let _ = integration_id;
+}
+
 fn report_error_details(workspace: &Workspace) -> serde_json::Value {
     let report = Workspace::run(&[
         "audit".into(),
