@@ -10,6 +10,16 @@ use support::Workspace;
 
 fn active_cycle() -> Workspace {
     let workspace = Workspace::initialized();
+    create_active_cycle(workspace)
+}
+
+fn active_cycle_with_exemption_policy() -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
+    create_active_cycle(workspace)
+}
+
+fn create_active_cycle(workspace: Workspace) -> Workspace {
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -33,7 +43,7 @@ struct CardSpec<'a> {
 
 fn activate(workspace: &Workspace, card_id: &str, spec: CardSpec<'_>) {
     let proof = if spec.proof_map {
-        "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains true\n      precondition: focused fixture exists\n      assertion: check observes behavior\n      mutation: bypass makes check fail\n  claim_boundary: only this named behavior\n"
+        "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains true\n      precondition: focused fixture exists\n      assertion: check observes behavior\n      mutation: bypass makes check fail\n      gate_oracle: gate.unit\n  claim_boundary: only this named behavior\n"
     } else {
         ""
     };
@@ -98,7 +108,7 @@ fn handoff_and_approve(workspace: &Workspace, card_id: &str) {
     let verdict = workspace.root.join(format!("{card_id}-verdict.yaml"));
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct proof\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct proof\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
     )
     .unwrap();
     workspace.review(&[
@@ -343,7 +353,9 @@ fn progressive_execution_allows_only_the_next_gate_and_reserves_final_for_integr
 
 #[test]
 fn an_approved_card_cannot_schedule_final_integration_until_handoff_evidence_is_current() {
-    let workspace = active_cycle();
+    // This is the only test in this binary whose verdict carries a typed
+    // exemption, so it opts into the policy before the cycle freezes config.
+    let workspace = active_cycle_with_exemption_policy();
     workspace.register_gate("gate.review", &["true"]);
     activate(
         &workspace,

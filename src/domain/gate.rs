@@ -19,6 +19,7 @@ use crate::{
 
 /// Schema identifier for a gate definition.
 pub const GATE_SCHEMA: &str = "harness.gate/v1";
+pub const GATE_SCHEMA_V2: &str = "harness.gate/v2";
 
 /// Directory holding gate definitions, relative to the control repository.
 pub const GATE_DIR: &str = "gates";
@@ -123,6 +124,17 @@ pub struct GateDefinition {
     pub schema: String,
     /// Names the gate. Cards reference this, never a command.
     pub gate_id: String,
+    /// Why this gate exists in the lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// What the gate semantically establishes; distinct from its command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<String>,
+    /// Required when a new gate intentionally duplicates another gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_justification: Option<String>,
     /// Starts at 1 and increases by exactly one.
     pub revision: u32,
     /// The executable and its arguments. Never a shell string.
@@ -176,7 +188,7 @@ impl GateDefinition {
             code: ErrorCode::ConfigInvalidGate,
         };
 
-        if self.schema != GATE_SCHEMA {
+        if self.schema != GATE_SCHEMA && self.schema != GATE_SCHEMA_V2 {
             return Err(reject(format!(
                 "expected schema `{GATE_SCHEMA}`, found `{}`",
                 self.schema
@@ -267,6 +279,41 @@ impl GateDefinition {
 
         Ok(())
     }
+
+    /// Validates the public executable-gate contract.  The optional fields
+    /// remain readable for legacy v1 records, but every newly registered gate
+    /// must state its purpose and semantic oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a gate configuration error when either field is absent.
+    pub fn validate_contract(&self) -> Result<(), HarnessError> {
+        self.validate()?;
+        if self.schema == GATE_SCHEMA && self.purpose.is_none() && self.semantics.is_none() {
+            return Ok(());
+        }
+        if self
+            .purpose
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason: format!("gate `{}` must declare a purpose", self.gate_id),
+                code: ErrorCode::ConfigInvalidGate,
+            });
+        }
+        if self
+            .semantics
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason: format!("gate `{}` must declare semantics", self.gate_id),
+                code: ErrorCode::ConfigInvalidGate,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn validate_junit_reports(gate_id: &str, reports: &[String]) -> Result<(), String> {
@@ -331,6 +378,10 @@ mod tests {
         GateDefinition {
             schema: GATE_SCHEMA.to_owned(),
             gate_id: "gate.unit".to_owned(),
+            purpose: Some("focused regression".to_owned()),
+            semantics: Some("must fail on the declared mutation".to_owned()),
+            migration: None,
+            reuse_justification: None,
             revision: 1,
             argv: vec!["cargo".to_owned(), "test".to_owned()],
             working_directory: ".".to_owned(),

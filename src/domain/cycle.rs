@@ -182,6 +182,21 @@ pub struct CycleRecord {
     pub project_revision: Digest,
     /// Conditions the cycle must satisfy to be accepted.
     pub release_invariants: Vec<String>,
+    /// The active distribution plan bound to this cycle, when migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
+    /// Explicit provenance for a pre-plan cycle admitted through migration.
+    /// New cycles never receive this implicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_migration_provenance: Option<String>,
+    /// Creation-time plan-policy provenance. Missing only on pre-upgrade
+    /// persisted cycles that may undergo explicit legacy migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_plan_policy: Option<String>,
     /// Cards declared against this cycle.
     pub card_ids: Vec<CardId>,
     /// Groups of cards that land together.
@@ -350,6 +365,11 @@ mod tests {
             harness_version: "0.1.0".to_owned(),
             project_revision: Digest::of_bytes(b"project"),
             release_invariants: vec![],
+            plan_id: None,
+            plan_digest: None,
+            plan_revision: None,
+            plan_migration_provenance: None,
+            creation_plan_policy: None,
             card_ids: vec![],
             atomic_groups: vec![],
             created_by: "alvaro".to_owned(),

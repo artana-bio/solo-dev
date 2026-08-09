@@ -60,6 +60,12 @@ pub struct CardStateRecord {
     pub current_digest: Digest,
     /// The canonicalization algorithm the digest was computed under.
     pub canonical_algorithm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
 }
 
 impl CardStateRecord {
@@ -357,10 +363,12 @@ fn example_card_draft() -> CardDraft {
         proof_map: Some(ProofMap {
             schema: PROOF_MAP_SCHEMA.to_owned(),
             entries: vec![ProofMapEntry {
+                id: Some("proof-1".to_owned()),
                 invariant: "The declared behavior stays true.".to_owned(),
                 precondition: "A focused fixture exercises exactly this behavior.".to_owned(),
                 assertion: "The check observes the behavior directly.".to_owned(),
                 mutation: "A discriminating change that must make the assertion fail.".to_owned(),
+                gate_oracle: Some("gate.example".to_owned()),
             }],
             claim_boundary: "Only the behavior named above; nothing wider is claimed.".to_owned(),
         }),
@@ -733,7 +741,22 @@ fn cycle_accepting_cards(
             code: ErrorCode::PolicyInvalidTransition,
         });
     }
+    require_unpinned_cycle(&cycle, "activate a card")?;
     Ok(cycle)
+}
+
+/// A pinned plan is the immutable membership contract for one cycle.
+fn require_unpinned_cycle(cycle: &CycleRecord, action: &str) -> Result<(), HarnessError> {
+    if cycle.plan_id.is_some() || cycle.plan_digest.is_some() || cycle.plan_revision.is_some() {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "cycle {} has a pinned plan and cannot {action}; create a new cycle for changed membership",
+                cycle.cycle_id
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    Ok(())
 }
 
 /// Requires a card to reason from the exact baseline frozen for its cycle.
@@ -777,6 +800,9 @@ fn require_declared_proof(
             ),
             code: ErrorCode::PolicyInvalidCard,
         });
+    }
+    if let Some(proof_map) = &record.proof_map {
+        proof_map.validate_strict()?;
     }
     Ok(())
 }
@@ -1145,6 +1171,9 @@ fn write_revision(
                 current_revision: record.revision,
                 current_digest: digest.clone(),
                 canonical_algorithm: CardRecord::canonical_algorithm().to_owned(),
+                plan_id: None,
+                plan_digest: None,
+                plan_revision: None,
             })?
         ),
     )
@@ -1287,6 +1316,13 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 code: ErrorCode::InternalControlCorrupt,
             })?;
 
+            let cycle: CycleRecord = serde_json::from_str(
+                &control.read(&CycleRecord::relative_path(&previous.cycle_id))?,
+            )
+            .map_err(|source| HarnessError::Control {
+                reason: format!("cycle {} is malformed: {source}", previous.cycle_id),
+                code: ErrorCode::InternalControlCorrupt,
+            })?;
             let config = control.project()?;
             // 72-3: the first check able to refuse once the card record and
             // project config both exist — a revision returns the card to
@@ -1300,12 +1336,6 @@ fn run_revise(args: &ReviseArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             require_declared_proof(&config.validation_policy, &record)?;
             // A revision may widen the write scope, so allocation is re-checked
             // rather than assumed to still hold from activation.
-            let cycle: CycleRecord =
-                serde_json::from_str(&control.read(&CycleRecord::relative_path(&record.cycle_id))?)
-                    .map_err(|source| HarnessError::Control {
-                        reason: format!("cycle {} is malformed: {source}", record.cycle_id),
-                        code: ErrorCode::InternalControlCorrupt,
-                    })?;
             check_allocation(control, &cycle, &record)?;
             let digest = record.digest()?;
             // A revision returns the card to `ready`: its definition changed, so

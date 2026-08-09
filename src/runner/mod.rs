@@ -517,6 +517,10 @@ mod tests {
         GateDefinition {
             schema: GATE_SCHEMA.to_owned(),
             gate_id: "gate.test".to_owned(),
+            purpose: Some("runner test".to_owned()),
+            semantics: Some("process exit status is the oracle".to_owned()),
+            migration: None,
+            reuse_justification: None,
             revision: 1,
             argv: argv.iter().map(|value| (*value).to_owned()).collect(),
             working_directory: ".".to_owned(),

@@ -47,6 +47,9 @@ pub enum Risk {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProofMapEntry {
+    /// Stable identifier used by gate and verification receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// The behavior that must continue to hold.
     pub invariant: String,
     /// The setup required to exercise that behavior.
@@ -55,6 +58,9 @@ pub struct ProofMapEntry {
     pub assertion: String,
     /// A discriminating change that must make the assertion fail.
     pub mutation: String,
+    /// Gate or command oracle that must observe this invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_oracle: Option<String>,
 }
 
 /// A bounded, reviewable declaration of the proof a card needs.
@@ -113,6 +119,44 @@ impl ProofMap {
                         "proof_map.entries[{index}].{field} must not be empty"
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the receipt-bindable form used by new cards.
+    ///
+    /// # Errors
+    ///
+    /// Returns a card-policy error when an entry lacks a stable ID/oracle or
+    /// when IDs are duplicated.
+    pub fn validate_strict(&self) -> Result<(), HarnessError> {
+        self.validate()?;
+        if self.entries.iter().any(|entry| {
+            entry.id.as_deref().is_none_or(|id| id.trim().is_empty())
+                || entry
+                    .gate_oracle
+                    .as_deref()
+                    .is_none_or(|oracle| oracle.trim().is_empty())
+        }) {
+            return Err(HarnessError::Control {
+                reason: "proof entries require stable ids and gate_oracle bindings".to_owned(),
+                code: ErrorCode::PolicyInvalidCard,
+            });
+        }
+        let mut ids = BTreeSet::new();
+        for entry in &self.entries {
+            let Some(id) = entry.id.as_ref() else {
+                return Err(HarnessError::Control {
+                    reason: "proof entries require stable ids".to_owned(),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
+            };
+            if !ids.insert(id) {
+                return Err(HarnessError::Control {
+                    reason: "proof entry ids must be unique".to_owned(),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
             }
         }
         Ok(())
@@ -1050,10 +1094,12 @@ risk: low
         let complete = ProofMap {
             schema: PROOF_MAP_SCHEMA.to_owned(),
             entries: vec![ProofMapEntry {
+                id: Some("proof-1".to_owned()),
                 invariant: "the intended behavior remains true".to_owned(),
                 precondition: "a focused fixture is installed".to_owned(),
                 assertion: "the check sees the behavior".to_owned(),
                 mutation: "bypass the check".to_owned(),
+                gate_oracle: Some("gate.unit".to_owned()),
             }],
             claim_boundary: "only the focused behavior".to_owned(),
         };

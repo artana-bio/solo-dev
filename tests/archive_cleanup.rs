@@ -24,6 +24,9 @@ fn promoted(count: usize) -> (Workspace, String) {
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
 
@@ -317,7 +320,10 @@ fn a_close_dry_run_leaves_the_lease_held() {
         "a dry run must not release the lease: {record}"
     );
     assert_eq!(record["released_at"], serde_json::Value::Null);
-    assert_eq!(held_lease_id(&workspace, "F-001").as_deref(), Some(&*lease_id));
+    assert_eq!(
+        held_lease_id(&workspace, "F-001").as_deref(),
+        Some(&*lease_id)
+    );
 }
 
 #[test]

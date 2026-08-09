@@ -333,9 +333,9 @@ changes, receipts, and handoff decisions, assumptions, and limitations — comes
 from current Harness state rather than a coordinator's summary:
 
 ```bash
-change-harness review begin --card-id F-001 --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 change-harness review example
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
 Copy and fill this prompt when creating the reviewer task:
@@ -580,9 +580,22 @@ guide's prose: the shape carries fields no sentence here names, including
 
 ```bash
 change-harness review example
-change-harness review begin --card-id F-001 --actor reviewer-b
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
+
+Mutation exemptions are not free-form review evidence. A project must
+explicitly install a versioned mutation-exemption policy; omitting it on a
+new project fails closed. The policy names each allowed code and exact declared
+approver actor, principal, and session. Approved reviews pin the policy digest
+and resolved authorization facts, which are rechecked during integration,
+acceptance, promotion, and audit.
+
+Install the policy during `project init` with
+`--mutation-exemption-policy /abs/path/policy.json`, or migrate an existing
+project explicitly with `project set-mutation-exemption-policy --policy
+/abs/path/policy.json`. Existing free-form exemptions are never silently
+blessed.
 
 The reviewer must run at least one mutation the implementer did **not**
 declare. Re-running the declared mutation only re-checks a report you already
@@ -802,3 +815,11 @@ policy at the same time — the same set of actor ids that later authorizes a
 disposition and a sealed cycle's final acceptance; see "Who may record a
 disposition" for the document shape and the route to install or change one
 afterwards.
+
+New projects always record an explicit final-authorization mode. Supplying
+`--final-authorizer-actor-id` installs `installed_default`; omitting it records
+`migration_required`, and the sealed-cycle acceptance path refuses until an
+authorizer policy is installed. Existing documents without that marker retain
+the same compatibility refusal until migrated.
+Run `audit probes` for the disposable negative assurance contract and use
+`audit report` for the typed evidence/claim projection.

@@ -50,6 +50,12 @@ Three repositories, deliberately separate: **your code**, the **control** reposi
 export CHANGE_HARNESS_CONTROL=/abs/path/to/myapp-control
 ```
 
+New projects always record an explicit final-authorization mode. Without
+`--final-authorizer-actor-id`, initialization records `migration_required` and
+sealed-cycle acceptance refuses until a policy is installed. Supplying one or
+more `--final-authorizer-actor-id` values installs the documented default
+policy and enforces it on the sealed-cycle path.
+
 ---
 
 ## 2. Register **two** gates — not one
@@ -118,6 +124,48 @@ change-harness card activate --card-id F-001
 
 An activated card is immutable. To change it: `card revise --card-id F-001 --draft draft.yaml --reason "..."` — which supersedes the revision and **invalidates any handoff, review, or receipt bound to the old one.**
 
+## Bind the cycle distribution plan
+
+Before work starts or integration is prepared, persist one plan covering every
+card in the cycle. Its scope must exactly match each card's canonical
+`write_scope`, and each assignment must include the declared actor, principal,
+and session:
+
+```json
+{
+  "schema": "harness.cycle-plan/v1",
+  "plan_id": "PLAN-001",
+  "cycle_id": "C-001",
+  "objective": "add a farewell function",
+  "cards": [{
+    "card_id": "F-001",
+    "card_revision": 1,
+    "scope": ["src/farewell.py"],
+    "scope_exclude": [],
+    "depends_on": [],
+    "proof_entries": ["proof-farewell"],
+    "mutation_plan": ["remove the farewell assertion"],
+    "risk": "low",
+    "reviewer_requirements": ["independent"],
+    "assignment": "implementer-a",
+    "assignment_principal_id": "principal-a",
+    "assignment_session_id": "session-a",
+    "distribution": "parallel",
+    "acceptance_behaviors": ["the farewell function returns the greeting"]
+  }]
+}
+```
+
+```bash
+change-harness cycle plan --plan-id PLAN-001 --file plan.json
+```
+
+A normal cycle with no bound plan is refused before integration. The only
+planless compatibility path is an explicit, pre-existing migration record. It
+is refused for cycles created by the current CLI, which carry durable
+`plan_required_v1` creation provenance:
+`cycle migrate-legacy --provenance legacy_cycle_plan_v1`.
+
 ---
 
 ## 5. Do the work in the allocated worktree
@@ -129,6 +177,15 @@ change-harness work start --card-id F-001 --actor implementer-a
 It prints a worktree path. **Work there, not in your checkout.** Commit normally with `git` — that is not an escape, it is the point.
 
 > **If you `card revise` while holding a lease**, the card drops back to `ready` and `handoff create` will refuse. The fix is `work resume --card-id F-001 --actor implementer-a`, which returns it to `active`. `work start` will not do it — it refuses because the lease is still held.
+
+For a `joint_integration` plan, individual starts are refused. Allocate the
+complete joint set atomically:
+
+```bash
+change-harness work start-batch \
+  --card-id F-001 --card-id F-002 \
+  --actor-principal-id principal-a --actor-session-id session-a
+```
 
 ---
 
@@ -165,7 +222,7 @@ change-harness handoff create --card-id F-001 --declaration decl.yaml --actor im
 ## 8. Review — a different actor
 
 ```bash
-change-harness review begin --card-id F-001 --actor reviewer-b
+change-harness review begin --card-id F-001 --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 change-harness review example > verdict.yaml
 ```
 
@@ -187,7 +244,7 @@ gate_adequacy:
 ```
 
 ```bash
-change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b
+change-harness review record --card-id F-001 --verdict verdict.yaml --actor reviewer-b --actor-principal-id reviewer-b --actor-session-id review-session
 ```
 
 `--actor` must match `reviewer_actor_id`, and it must differ from the implementer.
@@ -228,9 +285,9 @@ If a gate run is interrupted, `project recover` prints the literal `gate settle 
 
 ## Two things not to rely on yet
 
-**Final-authorization policy ([#177](https://github.com/artana-bio/solo-dev/issues/177)).** It is silently inert unless the integration was prepared with `--final`, and `integration prepare` has no `--final` by default. You can install a policy, see it accepted, and be unprotected. Either standardise on `integration prepare --final` or treat that control as not-yet-there.
+**Final-authorization policy ([#177](https://github.com/artana-bio/solo-dev/issues/177)).** A sealed cycle now prepares as the final integration by default, so acceptance requires the configured final-authorizer policy. The only non-final sealed-cycle compatibility path requires the exact `--legacy-migration-provenance legacy_cycle_plan_v1` marker; it is not a general bypass. New projects without an authorizer remain explicitly `migration_required` and refuse sealed-cycle acceptance until the policy is installed.
 
-**`--dry-run` as a safety check ([#189](https://github.com/artana-bio/solo-dev/issues/189)).** It skips seven checks the real command applies, so it can report success for something that will be refused.
+**`--dry-run` as a safety check ([#189](https://github.com/artana-bio/solo-dev/issues/189)).** Review recording now runs the same candidate, attestation, mutation-evidence, and receipt validation sequence as the real command and persists nothing. Other dry-run commands may still have command-specific limitations; use the real command's structured result for authority.
 
 ---
 
@@ -243,5 +300,10 @@ $ git log --oneline -2
 ```
 
 And in the control repository: the card's frozen contract, the receipt proving `gate.unit` ran against that exact commit in a clean tree, the handoff binding the reviewed SHA, the reviewer's identity, and the mutation they used to prove the test could fail.
+
+Run `change-harness audit probes --output json` for the required negative
+assurance checks. Record executable mutation evidence with `mutation create`,
+then use `audit report --cycle-id <cycle-id> --output json`; unsupported claims
+remain explicitly `not_tested`.
 
 That last one is the difference between "a test passed" and "a test could have caught this."

@@ -75,6 +75,11 @@ pub struct LeaseRecord {
     pub card_revision: u32,
     /// Who holds it. Declared, not proven; see D-013.
     pub actor_id: String,
+    /// Declared implementer principal/session; not host-attested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_session_id: Option<String>,
     /// The branch created for the work.
     pub branch: String,
     /// The worktree allocated for the work.
@@ -230,6 +235,8 @@ mod tests {
             card_id: "F-001".parse().unwrap(),
             card_revision: 1,
             actor_id: "alvaro".to_owned(),
+            actor_principal_id: None,
+            actor_session_id: None,
             branch: "card/F-001".to_owned(),
             worktree_path: PathBuf::from("/work/F-001"),
             base_sha: "a".repeat(40),

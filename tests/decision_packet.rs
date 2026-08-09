@@ -16,6 +16,8 @@ fn final_cycle() -> Workspace {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     for card in ["F-002", "F-001"] {
         workspace.activate_card(card, &[&format!("src/{card}/**")]);
+    }
+    for card in ["F-002", "F-001"] {
         workspace.approve_card(card, &format!("src/{card}/a.rs"));
     }
     workspace.cycle(&["seal", "--cycle-id", "C-001"]);

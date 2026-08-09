@@ -937,6 +937,7 @@ fn fixture_ready_for_a_reserve_and_run(card_id: &str, gate_id: &str, actor: &str
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates(card_id, &["src/thing.rs"], &[gate_id]);
+    workspace.bind_fixture_plan_with_assignment("PLAN-QUICKSTART-001", "parallel", actor);
     workspace.work(&["start", "--card-id", card_id, "--actor", actor]);
 
     let worktree = workspace.worktrees.join(card_id);
@@ -1098,6 +1099,7 @@ fn a_correctly_matched_step_6_style_reserve_and_run_pair_is_accepted() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates("F-900", &["src/other.rs"], &["gate.check"]);
+    workspace.bind_fixture_plan_with_assignment("PLAN-QUICKSTART-002", "parallel", "solo-operator");
     workspace.work(&["start", "--card-id", "F-900", "--actor", "solo-operator"]);
 
     let worktree = workspace.worktrees.join("F-900");

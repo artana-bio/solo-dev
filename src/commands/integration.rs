@@ -27,7 +27,9 @@ use crate::{
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
         handoff::latest_handoff,
-        review::{current_approval, dependency_standings, reviews_for},
+        review::{
+            current_approval, dependency_standings, reviews_for, validate_approved_review_evidence,
+        },
         transaction::{Steps, with_transaction},
         work::held_lease,
     },
@@ -42,9 +44,10 @@ use crate::{
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, IntegrationId},
         integration::{
-            INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember, IntegrationMode,
-            IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck, VERIFICATION_SCHEMA,
-            VerificationRecord, interactions, topological_order,
+            ClaimClassification, INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember,
+            IntegrationMode, IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck,
+            LEGACY_PLAN_MIGRATION_PROVENANCE, VERIFICATION_SCHEMA, VerificationRecord,
+            interactions, topological_order,
         },
         review::ReviewRecord,
     },
@@ -153,6 +156,11 @@ pub struct MergeArgs {
     /// Who is performing the merge.
     #[arg(long)]
     pub actor_id: String,
+    /// Declared verifier principal/session boundary; identity is not host-attested.
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
     /// A registered gate to run after each candidate is merged. Repeatable.
     ///
     /// These are cheap intermediate checks, not combined verification: their
@@ -197,6 +205,10 @@ pub struct PrepareArgs {
     /// Prepare the complete, auditable integration for a sealed cycle.
     #[arg(long = "final")]
     pub final_for_cycle: bool,
+    /// Explicitly preserve the pre-plan, non-final behavior for a legacy
+    /// sealed cycle. This is a migration marker, not a general bypass.
+    #[arg(long)]
+    pub legacy_migration_provenance: Option<String>,
     /// Validate and report the plan without recording it.
     #[arg(long)]
     pub dry_run: bool,
@@ -477,6 +489,7 @@ fn assess(
     let scope = GitScope::work_tree(&control.project()?.repository);
     let mut assessed = Vec::new();
     for card_id in &cycle.card_ids {
+        crate::commands::cycle::require_card_plan_binding(control, cycle, card_id)?;
         let Ok((record, state)) = load_card(control, card_id) else {
             // Declared but never activated: it has claimed nothing and cannot
             // be integrated, and that is not an error in this report.
@@ -959,6 +972,18 @@ fn run_prepare(args: &PrepareArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         return preview_prepare(args, &cycle_id, &requested);
     }
 
+    // Plan policy failures must be reported before opening a journaled
+    // integration mutation. This is especially important for a missing plan
+    // or a split atomic group: neither case created any external state and
+    // should not strand an operation that requires recovery.
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        require_cycle_convergence_budget(&control, &config, &cycle_id)?;
+        let cycle = load_cycle(&control, &cycle_id)?;
+        let _ = build_plan(&control, &cycle, &requested, args)?;
+    }
+
     with_transaction(
         &args.control,
         "integration.prepare",
@@ -1077,6 +1102,17 @@ fn build_record(
         schema: INTEGRATION_SCHEMA.to_owned(),
         integration_id,
         cycle_id: cycle.cycle_id.clone(),
+        plan_id: cycle.plan_id.clone(),
+        plan_digest: cycle.plan_digest.clone(),
+        plan_revision: cycle.plan_revision,
+        // Carry the cycle's already-recorded compatibility provenance onto
+        // every integration record.  Otherwise a legacy cycle could prepare
+        // successfully but be refused at acceptance because the record lost
+        // the authoritative migration binding.
+        plan_migration_provenance: cycle
+            .plan_migration_provenance
+            .clone()
+            .or(plan.legacy_migration_provenance),
         status: IntegrationStatus::Prepared,
         mode: plan.mode,
         baseline_sha,
@@ -1103,6 +1139,7 @@ struct Plan {
     atomic_groups: Vec<String>,
     mode: IntegrationMode,
     final_for_cycle: bool,
+    legacy_migration_provenance: Option<String>,
     sealed_cycle_digest: Option<Digest>,
     abandoned_card_ids: Vec<CardId>,
     /// Cards the cycle holds that this plan left out, and why.
@@ -1177,6 +1214,49 @@ fn final_cycle_binding(
     Ok((true, Some(Digest::of_canonical(cycle)?), abandoned_card_ids))
 }
 
+/// Resolves the sealed-cycle default and the only supported compatibility
+/// bypass. New sealed cycles always use final authorization unless the caller
+/// supplies the exact typed migration provenance.
+fn resolve_final_mode(
+    cycle: &CycleRecord,
+    args: &PrepareArgs,
+) -> Result<(bool, Option<String>), HarnessError> {
+    if cycle.status != CycleStatus::Sealed {
+        if args.legacy_migration_provenance.is_some() {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance is valid only for sealed-cycle compatibility"
+                    .to_owned(),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        return Ok((args.final_for_cycle, None));
+    }
+    if let Some(provenance) = &args.legacy_migration_provenance {
+        if provenance != LEGACY_PLAN_MIGRATION_PROVENANCE {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "unsupported legacy migration provenance `{provenance}`; expected `{LEGACY_PLAN_MIGRATION_PROVENANCE}`"
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        if args.final_for_cycle {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance cannot be combined with `--final`".to_owned(),
+                code: ErrorCode::UsageConflictingOptions,
+            });
+        }
+        if cycle.plan_migration_provenance.as_deref() != Some(provenance.as_str()) {
+            return Err(HarnessError::Control {
+                reason: "legacy migration provenance must already be recorded on the cycle by `cycle migrate-legacy`; prepare cannot mint it".to_owned(),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        return Ok((false, Some(provenance.clone())));
+    }
+    Ok((true, None))
+}
+
 /// Recovery guidance for `integration prepare --final` when a sealed cycle
 /// never had a card, distinct from every other empty-selection outcome.
 ///
@@ -1198,6 +1278,9 @@ fn build_plan(
     requested: &[CardId],
     args: &PrepareArgs,
 ) -> Result<Plan, HarnessError> {
+    if !cycle.card_ids.is_empty() {
+        crate::commands::cycle::require_active_plan(control, cycle)?;
+    }
     // One outstanding integration per cycle. Section 11.3 has no state for two
     // concurrent plans, and two plans built against the same protected commit
     // would each believe they were the one about to land.
@@ -1216,10 +1299,17 @@ fn build_plan(
         });
     }
 
+    let (final_for_cycle, legacy_migration_provenance) = resolve_final_mode(cycle, args)?;
+    if final_for_cycle && !requested.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "the default sealed-cycle final integration selects the complete cycle and cannot be combined with `--card-id`".to_owned(),
+            code: ErrorCode::UsageConflictingOptions,
+        });
+    }
     let assessed = assess(control, cycle)?;
     let selected = select(&assessed, requested)?;
     let (final_for_cycle, sealed_cycle_digest, abandoned_card_ids) =
-        final_cycle_binding(cycle, &assessed, &selected, args.final_for_cycle)?;
+        final_cycle_binding(cycle, &assessed, &selected, final_for_cycle)?;
     // An empty selection is refused unless `--final` can account for it by
     // abandonment. `abandoned_card_ids` is non-empty here if and only if the
     // sealed cycle held cards and every one of them was abandoned — see
@@ -1231,7 +1321,7 @@ fn build_plan(
     // does not apply and `--final` is refused the same as an ordinary
     // empty selection, with guidance specific to the sealed-and-empty case.
     if selected.is_empty() && abandoned_card_ids.is_empty() {
-        if args.final_for_cycle {
+        if final_for_cycle {
             return Err(HarnessError::ControlWithRecovery {
                 reason: format!(
                     "cycle {} was sealed with no cards: `--final` has nothing to integrate and nothing was abandoned",
@@ -1249,7 +1339,7 @@ fn build_plan(
 
     check_dependencies(&selected, &assessed)?;
     let atomic_groups = check_atomic_groups(cycle, &selected)?;
-    let mode = if args.final_for_cycle {
+    let mode = if final_for_cycle {
         if matches!(args.mode, Some(ModeArg::Individual)) {
             return Err(HarnessError::Control {
                 reason: "`--final` always prepares a batch integration and cannot use `--mode individual`".to_owned(),
@@ -1260,6 +1350,7 @@ fn build_plan(
     } else {
         resolve_mode(args.mode, selected.len())?
     };
+    require_execution_classification(control, cycle, &selected, mode)?;
     let members = plan_members(control, cycle, &selected)?;
 
     let deferred = if requested.is_empty() {
@@ -1281,10 +1372,89 @@ fn build_plan(
         atomic_groups,
         mode,
         final_for_cycle,
+        legacy_migration_provenance,
         sealed_cycle_digest,
         abandoned_card_ids,
         deferred,
     })
+}
+
+/// Binds the requested integration shape to the plan's declared execution
+/// classification. A plan is not merely a fingerprint for the card set.
+fn require_execution_classification(
+    control: &ControlRepository,
+    cycle: &CycleRecord,
+    selected: &[&Candidacy],
+    mode: IntegrationMode,
+) -> Result<(), HarnessError> {
+    let Some(plan_id) = cycle.plan_id.as_deref() else {
+        return Ok(());
+    };
+    let relative = crate::domain::cycle_plan::CyclePlan::relative_path(plan_id)?;
+    let plan: crate::domain::cycle_plan::CyclePlan =
+        serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+            HarnessError::Control {
+                reason: format!("cycle plan {plan_id} is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            }
+        })?;
+    let planned_joint: std::collections::BTreeSet<_> = plan
+        .cards
+        .iter()
+        .filter(|card| {
+            card.distribution == crate::domain::cycle_plan::Distribution::JointIntegration
+        })
+        .map(|card| card.card_id.as_str())
+        .collect();
+    let selected_ids: std::collections::BTreeSet<_> = selected
+        .iter()
+        .map(|candidate| candidate.record.card_id.as_str())
+        .collect();
+    if !planned_joint.is_disjoint(&selected_ids)
+        && (mode != IntegrationMode::Batch || selected_ids != planned_joint)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "plan {plan_id} requires joint-integration cards [{}] to be prepared together as one exact batch",
+                planned_joint.iter().copied().collect::<Vec<_>>().join(", ")
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    for candidate in selected {
+        let planned = plan
+            .cards
+            .iter()
+            .find(|planned| planned.card_id == candidate.record.card_id.to_string())
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "cycle plan {plan_id} has no execution classification for {}",
+                    candidate.record.card_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            })?;
+        let invalid = match planned.distribution {
+            crate::domain::cycle_plan::Distribution::JointIntegration => {
+                mode != IntegrationMode::Batch
+            }
+            crate::domain::cycle_plan::Distribution::Sequential => {
+                selected.len() > 1 && mode != IntegrationMode::Batch
+            }
+            crate::domain::cycle_plan::Distribution::Parallel => false,
+        };
+        if invalid {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "plan {plan_id} classifies card {} as {:?}, which does not permit integration mode `{}`",
+                    candidate.record.card_id,
+                    planned.distribution,
+                    mode.name()
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Attaches one advisory per card a plan left out.
@@ -1465,6 +1635,133 @@ pub fn load_integration(
     serde_json::from_str(&control.read(&relative)?).map_err(|source| HarnessError::Control {
         reason: format!("integration {integration_id} is malformed: {source}"),
         code: ErrorCode::InternalControlCorrupt,
+    })
+}
+
+/// One proof entry bound to the exact card revision carried by an integration.
+#[derive(Clone, Debug)]
+pub(crate) struct IntegrationProof {
+    pub id: String,
+    pub invariant: String,
+    pub oracle: String,
+}
+
+/// Loads the exact member revisions and constructs the only proof namespace an
+/// integration may use. IDs and invariant bindings are global within that
+/// namespace, so lookup can never silently select the first conflicting card.
+pub(crate) fn integration_proofs(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<IntegrationProof>, HarnessError> {
+    let mut proofs: Vec<IntegrationProof> = Vec::new();
+    for member in &record.members {
+        let relative = CardRecord::relative_path(&member.card_id, member.card_revision);
+        let card: CardRecord =
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!(
+                        "integration member {} revision {} is malformed: {source}",
+                        member.card_id, member.card_revision
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })?;
+        if card.digest()? != member.card_digest {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration {} member {} no longer matches its pinned card digest",
+                    record.integration_id, member.card_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+        let Some(map) = card.proof_map else {
+            continue;
+        };
+        map.validate_strict()?;
+        for entry in map.entries {
+            let id = entry.id.expect("strict proof validation requires an id");
+            let oracle = entry
+                .gate_oracle
+                .expect("strict proof validation requires an oracle");
+            if proofs.iter().any(|proof| proof.id == id) {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "proof entry id `{id}` is duplicated across members of integration {}",
+                        record.integration_id
+                    ),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
+            }
+            if proofs
+                .iter()
+                .any(|proof| proof.invariant == entry.invariant)
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "invariant `{}` has more than one proof binding in integration {}",
+                        entry.invariant, record.integration_id
+                    ),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
+            }
+            proofs.push(IntegrationProof {
+                id,
+                invariant: entry.invariant,
+                oracle,
+            });
+        }
+    }
+    Ok(proofs)
+}
+
+/// Revalidates the plan pinned by an integration at every authorization
+/// boundary. Historical unplanned records are accepted only when they carry
+/// the explicit typed migration provenance written by the new prepare path.
+///
+/// # Errors
+///
+/// Returns a policy error when the plan is missing, stale, or contradictory.
+pub fn require_plan_binding(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    let cycle = load_cycle(control, &record.cycle_id)?;
+    let fully_bound =
+        record.plan_id.is_some() && record.plan_digest.is_some() && record.plan_revision.is_some();
+    if fully_bound {
+        crate::commands::cycle::require_active_plan(control, &cycle)?;
+        if record.plan_id != cycle.plan_id
+            || record.plan_digest != cycle.plan_digest
+            || record.plan_revision != cycle.plan_revision
+            || record.plan_migration_provenance.is_some()
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration {} no longer matches its pinned cycle plan",
+                    record.integration_id
+                ),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        return Ok(());
+    }
+    if record.plan_id.is_none()
+        && record.plan_digest.is_none()
+        && record.plan_revision.is_none()
+        && record.plan_migration_provenance.as_deref() == Some(LEGACY_PLAN_MIGRATION_PROVENANCE)
+        && cycle.plan_id.is_none()
+        && cycle.plan_digest.is_none()
+        && cycle.plan_revision.is_none()
+    {
+        return Ok(());
+    }
+    Err(HarnessError::Control {
+        reason: format!(
+            "integration {} has no complete cycle-plan binding or explicit legacy migration provenance",
+            record.integration_id
+        ),
+        code: ErrorCode::PolicyInvalidCycle,
     })
 }
 
@@ -2939,6 +3236,8 @@ fn preview_land(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_plan_binding(&control, &record)?;
+    integration_proofs(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — see
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
@@ -3245,6 +3544,7 @@ fn verify_landing(
 /// Identifiers are allocated only once the runs are done, so a verification
 /// that never completed does not consume a block of them and leave a gap that
 /// reads like deleted evidence.
+#[allow(clippy::too_many_arguments)]
 fn store_verification(
     control: &ControlRepository,
     record: &IntegrationRecord,
@@ -3252,6 +3552,8 @@ fn store_verification(
     receipts: &mut [Receipt],
     worktree_clean_after: bool,
     actor_id: &str,
+    actor_principal_id: Option<&str>,
+    actor_session_id: Option<&str>,
     clock: &dyn Clock,
 ) -> Result<VerificationRecord, HarnessError> {
     let mut receipt_ids = Vec::new();
@@ -3268,28 +3570,69 @@ fn store_verification(
         receipt_ids.push(receipt.receipt_id.to_string());
     }
 
+    let landing_sha = record.landing_sha.clone().unwrap_or_default();
+    let proofs = integration_proofs(control, record)?;
+    let invariant_checks = cycle
+        .release_invariants
+        .iter()
+        .map(|invariant| {
+            let proof = proofs
+                .iter()
+                .find(|proof| proof.id == *invariant || proof.invariant == *invariant);
+            let matching: Vec<String> = proof
+                .map(|proof| {
+                    receipts
+                        .iter()
+                        .filter(|receipt| {
+                            receipt.passed
+                                && receipt.gate_id == proof.oracle
+                                && receipt.evaluated_sha == landing_sha
+                        })
+                        .map(|receipt| receipt.receipt_id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let checked = proof.is_some() && !matching.is_empty();
+            InvariantCheck {
+                proof_entry_id: proof.map(|proof| proof.id.clone()),
+                invariant: invariant.clone(),
+                machine_checked: checked,
+                observed_receipt_ids: matching,
+                classification: Some(if checked {
+                    ClaimClassification::MachineChecked
+                } else {
+                    ClaimClassification::NotTested
+                }),
+            }
+        })
+        .collect();
     Ok(VerificationRecord {
         schema: VERIFICATION_SCHEMA.to_owned(),
         integration_id: record.integration_id.clone(),
         cycle_id: record.cycle_id.clone(),
-        landing_sha: record.landing_sha.clone().unwrap_or_default(),
+        landing_sha,
         landing_tree: record.integration_tree.clone().unwrap_or_default(),
         receipt_ids,
         failed_gates,
-        invariants: cycle
-            .release_invariants
-            .iter()
-            .map(|invariant| InvariantCheck {
-                invariant: invariant.clone(),
-                machine_checked: false,
-            })
-            .collect(),
+        invariants: invariant_checks,
         interactions: member_interactions(control, record)?,
         worktree_clean_after,
         verified_by: actor_id.to_owned(),
+        verified_principal_id: actor_principal_id.map(str::to_owned),
+        verified_session_id: actor_session_id.map(str::to_owned),
         verified_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
     })
+}
+
+/// Requires verification to use the pinned member and proof catalog.
+fn require_verification_evidence_binding(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    require_plan_binding(control, record)?;
+    integration_proofs(control, record)?;
+    Ok(())
 }
 
 /// Reports what verification would run, running no gate.
@@ -3304,6 +3647,7 @@ fn preview_verify(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_verification_evidence_binding(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — see
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
@@ -3353,6 +3697,7 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            require_verification_evidence_binding(control, &record)?;
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
@@ -3379,6 +3724,8 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                 &mut receipts,
                 worktree_clean_after,
                 &args.actor_id,
+                args.actor_principal_id.as_deref(),
+                args.actor_session_id.as_deref(),
                 clock,
             )?;
             let receipt_ids = verification.receipt_ids.clone();
@@ -3517,6 +3864,11 @@ pub struct ReviewArgs {
     /// Who is reviewing. Must differ from whoever verified it.
     #[arg(long)]
     pub reviewer_actor_id: String,
+    /// Declared reviewer principal/session boundary; identity is not host-attested.
+    #[arg(long)]
+    pub reviewer_principal_id: Option<String>,
+    #[arg(long)]
+    pub reviewer_session_id: Option<String>,
     /// A risk accepted by approving this integration. Repeatable.
     #[arg(long = "residual-risk")]
     pub residual_risks: Vec<String>,
@@ -3582,6 +3934,7 @@ pub fn member_implementers(
                 code: ErrorCode::PolicyNotIntegrable,
             });
         }
+        validate_approved_review_evidence(control, review)?;
         found.push((member.card_id.to_string(), review.feature_actor_id.clone()));
     }
     Ok(found)
@@ -3650,6 +4003,8 @@ fn require_invariants_addressed(
 fn refuse_verifier_reviewing(
     verification: &VerificationRecord,
     reviewer_actor_id: &str,
+    reviewer_principal_id: Option<&str>,
+    reviewer_session_id: Option<&str>,
 ) -> Result<(), HarnessError> {
     actors::refuse_unusable("integration reviewer", reviewer_actor_id)?;
     actors::refuse_unusable("verifier", &verification.verified_by)?;
@@ -3661,9 +4016,49 @@ fn refuse_verifier_reviewing(
             code: ErrorCode::PolicySameActor,
         });
     }
+    let reviewer = actors::ActorIdentity {
+        actor_kind: "integration_reviewer",
+        actor_id: reviewer_actor_id,
+        principal_id: reviewer_principal_id,
+        session_id: reviewer_session_id,
+    };
+    let verifier = actors::ActorIdentity {
+        actor_kind: "integration_verifier",
+        actor_id: &verification.verified_by,
+        principal_id: verification.verified_principal_id.as_deref(),
+        session_id: verification.verified_session_id.as_deref(),
+    };
+    if reviewer.same_boundary(&verifier) {
+        return Err(HarnessError::Control {
+            reason: "integration reviewer shares the verifier principal/session boundary"
+                .to_owned(),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
     Ok(())
 }
 
+fn refuse_member_implementer_reviewing(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    reviewer_actor_id: &str,
+) -> Result<(), HarnessError> {
+    let implementers = member_implementers(control, record)?;
+    if implementers
+        .iter()
+        .any(|(_, actor)| actors::same(actor, reviewer_actor_id))
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "{reviewer_actor_id} implemented a member card and cannot review the integration"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_integration_review(
     args: &ReviewArgs,
     clock: &dyn Clock,
@@ -3681,6 +4076,13 @@ fn run_integration_review(
             .status
             .check_transition(IntegrationStatus::Reviewed)?;
         let verification = load_verification(&control, &integration_id)?;
+        refuse_verifier_reviewing(
+            &verification,
+            &args.reviewer_actor_id,
+            args.reviewer_principal_id.as_deref(),
+            args.reviewer_session_id.as_deref(),
+        )?;
+        refuse_member_implementer_reviewing(&control, &record, &args.reviewer_actor_id)?;
         require_invariants_addressed(&verification, &args.invariants_held)?;
         return Ok(CommandOutcome::new(
             "integration.review",
@@ -3713,7 +4115,13 @@ fn run_integration_review(
                 .check_transition(IntegrationStatus::Reviewed)?;
             let verification = load_verification(control, &integration_id)?;
 
-            refuse_verifier_reviewing(&verification, &args.reviewer_actor_id)?;
+            refuse_verifier_reviewing(
+                &verification,
+                &args.reviewer_actor_id,
+                args.reviewer_principal_id.as_deref(),
+                args.reviewer_session_id.as_deref(),
+            )?;
+            refuse_member_implementer_reviewing(control, &record, &args.reviewer_actor_id)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 
             record.status = IntegrationStatus::Reviewed;
@@ -3943,6 +4351,7 @@ fn check_promotion(
     record: &IntegrationRecord,
     actor_id: &str,
 ) -> Result<PromotionChecks, HarnessError> {
+    require_plan_binding(control, record)?;
     // #89: refused before anything else in this function, including the
     // convergence budget below. A rewritten control record makes every
     // later check's *inputs* untrustworthy — `require_cycle_convergence_
@@ -4010,6 +4419,7 @@ fn check_promotion(
             recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
+    integration_proofs(control, record)?;
     let verification = load_verification(control, &record.integration_id)?;
     if verification.landing_sha != landing_sha {
         return Err(HarnessError::Control {
@@ -4368,6 +4778,16 @@ fn run_promote(args: &PromoteArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
 
     if args.dry_run {
         return preview_promote(args, &integration_id);
+    }
+
+    // Validate the transition before opening an operation journal. A normal
+    // policy refusal (for example, attempting to move an archived integration)
+    // must not become an unresolved recovery obligation for the next command.
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let config = control.project()?;
+        let record = load_integration(&control, &integration_id)?;
+        check_promotion(&control, &config, &record, &args.actor_id)?;
     }
 
     with_transaction(

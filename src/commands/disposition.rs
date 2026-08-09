@@ -583,6 +583,23 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         return preview_renew(args, &card_id, dimension);
     }
 
+    // Match the dry-run admission before opening a journal. The transaction
+    // repeats it under the project lock and maps a race to the same
+    // non-persisting refusal.
+    {
+        let control = ControlRepository::open(&args.common.control)?;
+        let (record, _) = load_card(&control, &card_id)?;
+        let config = control.project()?;
+        require_renewable(
+            &control,
+            &config,
+            &record,
+            dimension,
+            &args.common.actor,
+            &args.rationale,
+        )?;
+    }
+
     with_transaction(
         &args.common.control,
         "disposition.renew",
@@ -591,14 +608,14 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let (record, state) = load_card(control, &card_id)?;
             let config = control.project()?;
-            let policy_digest = require_renewable(
+            let policy_digest = steps.recheck(require_renewable(
                 control,
                 &config,
                 &record,
                 dimension,
                 &args.common.actor,
                 &args.rationale,
-            )?;
+            ))?;
 
             // `head` binds to the current revision's own `base_sha` — the
             // only exact commit SHA a card is guaranteed to carry in any
@@ -606,6 +623,7 @@ fn run_renew(args: &RenewArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             // material-scope-revision fact uses in `card.rs`'s `run_revise`.
             // A candidate SHA would not do: an escalated card may not have
             // reached `handed_off` at all yet.
+            steps.mutation_started()?;
             let event = events.append(
                 &config.project_id,
                 EventDraft::new(DISPOSITION_RECORDED_EVENT, &args.common.actor)

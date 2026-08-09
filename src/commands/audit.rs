@@ -8,19 +8,22 @@
 //! commit a receipt refers to that no longer exists, is a *finding* — never a
 //! line quietly left out because it could not be resolved.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand};
 
 use crate::{
     cli::output::CommandOutcome,
-    commands::CONTROL_ENV,
+    commands::{CONTROL_ENV, audit_evidence::cross_check_verification},
     commands::{
         gate::{
             load_compatibility_request, read_integration_compatibility_request, receipts_for,
             receipts_for_integration_verification,
         },
-        review::reviews_for,
+        review::{reviews_for, validate_approved_review_evidence},
     },
     control::{event_store::EventStore, repository::ControlRepository},
     domain::{
@@ -28,6 +31,9 @@ use crate::{
         clock::Clock,
         cycle::CycleRecord,
         ids::{CardId, CycleId},
+        integration::{
+            ClaimClassification, INTEGRATION_DIR, IntegrationRecord, VerificationRecord,
+        },
     },
     error::{ErrorCode, HarnessError},
     git::{
@@ -47,6 +53,10 @@ pub enum AuditCommand {
     /// Verify that every control head a landing commit anchored is still an
     /// ancestor of the control record.
     Anchors(AnchorsArgs),
+    /// Emit a stable claim/evidence classification for a cycle.
+    Report(ReportArgs),
+    /// Execute the disposable negative assurance probes.
+    Probes,
 }
 
 impl AuditCommand {
@@ -60,6 +70,8 @@ impl AuditCommand {
         match self {
             Self::Cycle(..) => "audit.cycle",
             Self::Anchors(..) => "audit.anchors",
+            Self::Report(..) => "audit.report",
+            Self::Probes => "audit.probes",
         }
     }
 }
@@ -85,6 +97,15 @@ pub struct AnchorsArgs {
     /// Path to the control repository.
     #[arg(long, env = CONTROL_ENV)]
     pub control: std::path::PathBuf,
+}
+
+/// Arguments accepted by `audit report`.
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub cycle_id: String,
 }
 
 /// Something the record says that the objects do not bear out.
@@ -122,6 +143,8 @@ pub(crate) struct CycleEvidence {
     pub(crate) cards: Vec<CardEvidence>,
 }
 
+/// Recomputes verification claims from the pinned integration, cards, and
+/// receipts. Stored `machine_checked` is an assertion, never authority.
 /// Cross-checks a cycle's recorded evidence against the objects it names.
 ///
 /// # Errors
@@ -343,11 +366,171 @@ pub fn execute(command: &AuditCommand, _clock: &dyn Clock) -> Result<CommandOutc
     match command {
         AuditCommand::Cycle(args) => run_cycle(args),
         AuditCommand::Anchors(args) => run_anchors(args),
+        AuditCommand::Report(args) => run_report(args),
+        AuditCommand::Probes => run_probes(),
     }
 }
 
+fn run_probes() -> Result<CommandOutcome, HarnessError> {
+    let probes = crate::commands::assurance_probes::run_all()?;
+    let failed = probes
+        .iter()
+        .filter(|probe| {
+            probe.classification != "executed_passed" && probe.probe != "denied_network"
+        })
+        .count();
+    let all_required_probes_passed = failed == 0;
+    let report = serde_json::json!({
+        "schema": "harness.assurance-probes/v1",
+        "probes": probes,
+        "network_denial_enforced": false,
+        "network_denial_status": "declared_not_enforced",
+        "all_required_probes_passed": all_required_probes_passed,
+        "failed_probe_count": failed,
+    });
+    if !all_required_probes_passed {
+        return Err(HarnessError::ControlWithDetails {
+            reason: format!("{failed} required assurance probe(s) did not pass"),
+            code: ErrorCode::PolicyAuditDiscrepancy,
+            details: report,
+        });
+    }
+    Ok(CommandOutcome::new(
+        "audit.probes",
+        serde_json::to_string_pretty(&report)?,
+        report,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_report(args: &ReportArgs) -> Result<CommandOutcome, HarnessError> {
+    let cycle_id: CycleId = args.cycle_id.parse()?;
+    let control = ControlRepository::open(&args.control)?;
+    let config = control.project()?;
+    let cycle: CycleRecord = serde_json::from_str(
+        &control.read(&CycleRecord::relative_path(&cycle_id))?,
+    )
+    .map_err(|source| HarnessError::Control {
+        reason: format!("cycle {cycle_id} is malformed: {source}"),
+        code: ErrorCode::InternalControlCorrupt,
+    })?;
+    let evidence = cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
+    let mut discrepancies = evidence.discrepancies.clone();
+    let mut claims = Vec::new();
+    let integration_dir = control.path(INTEGRATION_DIR);
+    if integration_dir.exists() {
+        let mut entries: Vec<_> = fs::read_dir(&integration_dir)
+            .map_err(|source| HarnessError::ControlIo {
+                path: integration_dir.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let integration: IntegrationRecord =
+                serde_json::from_str(&fs::read_to_string(entry.path()).map_err(|source| {
+                    HarnessError::ControlIo {
+                        path: entry.path(),
+                        source,
+                    }
+                })?)
+                .map_err(|source| HarnessError::Control {
+                    reason: format!("integration record is malformed: {source}"),
+                    code: ErrorCode::InternalControlCorrupt,
+                })?;
+            if integration.cycle_id != cycle_id {
+                continue;
+            }
+            let verification_path = VerificationRecord::relative_path(&integration.integration_id);
+            if control.path(&verification_path).exists() {
+                let verification: VerificationRecord =
+                    serde_json::from_str(&control.read(&verification_path)?).map_err(|source| {
+                        HarnessError::Control {
+                            reason: format!("verification is malformed: {source}"),
+                            code: ErrorCode::InternalControlCorrupt,
+                        }
+                    })?;
+                let recomputed = cross_check_verification(
+                    &control,
+                    &config,
+                    &integration,
+                    &verification,
+                    &mut discrepancies,
+                )?;
+                for (proof_id, invariant, classification, receipt_ids) in recomputed {
+                    let claim_key = proof_id.as_deref().unwrap_or(&invariant);
+                    let claim_findings: Vec<_> = discrepancies
+                        .iter()
+                        .filter(|entry| {
+                            entry.subject.contains(claim_key) || entry.claim.contains(&invariant)
+                        })
+                        .collect();
+                    claims.push(serde_json::json!({
+                        "claim_id": format!("{cycle_id}-INV-{}", claim_key),
+                        "claim": invariant,
+                        "classification": classification,
+                        "landing_sha": verification.landing_sha,
+                        "receipt_ids": receipt_ids,
+                        "verification_receipt_ids": verification.receipt_ids,
+                        "policy": config.final_authorization_policy.as_ref().and_then(|p| p.digest().ok()).map_or_else(|| "legacy-or-installed-default".to_owned(), |d| d.to_string()),
+                        "missing_evidence": if classification == ClaimClassification::NotTested || classification == ClaimClassification::Failed { serde_json::json!(claim_findings) } else { serde_json::json!([]) },
+                    }));
+                }
+            }
+        }
+    }
+    if claims.is_empty() {
+        claims = cycle.release_invariants.iter().enumerate().map(|(index, claim)| serde_json::json!({
+            "claim_id": format!("{cycle_id}-INV-{:03}", index + 1), "claim": claim,
+            "classification": "not_tested", "baseline_sha": cycle.baseline_sha,
+            "receipt_ids": [], "policy": "no persisted verification", "missing_evidence": discrepancies,
+        })).collect();
+    }
+    let report = serde_json::json!({
+        "schema": "harness.claim-report/v1",
+        "cycle_id": cycle_id.to_string(),
+        "claims": claims,
+        "discrepancies": discrepancies,
+        "all_claims_supported": !claims.is_empty()
+            && claims.iter().all(|claim| {
+                !matches!(
+                    claim["classification"].as_str(),
+                    Some("not_tested" | "failed")
+                )
+            }),
+        "contradiction_count": discrepancies.len(),
+        "receipt_reuse_evidence": {
+            "classification": "not_tested",
+            "reason": "production integration receipts do not collect every fixed reuse dimension",
+            "unsupported_dimensions": ["toolchain", "inputs", "fixtures", "cache", "trust_mode"],
+        },
+        "classification_vocabulary": ["mechanically_enforced", "machine_checked", "reviewer_attested", "externally_observed", "not_tested", "failed"],
+    });
+    let contradiction_count = discrepancies.len();
+    let outcome = CommandOutcome::new(
+        "audit.report",
+        serde_json::to_string_pretty(&report)?,
+        report.clone(),
+    )
+    .with_project(config.project_id);
+    if contradiction_count > 0 {
+        return Err(HarnessError::ControlWithDetails {
+            reason: format!(
+                "audit report found {contradiction_count} contradictory evidence item(s)"
+            ),
+            code: ErrorCode::PolicyAuditDiscrepancy,
+            details: report,
+        });
+    }
+    Ok(outcome)
+}
+
 /// Checks that a commit named by the record still exists.
-fn commit_exists(repository: &std::path::Path, sha: &str) -> bool {
+pub(crate) fn commit_exists(repository: &std::path::Path, sha: &str) -> bool {
     inspect::resolve_commit(&GitScope::work_tree(repository), sha).is_ok()
 }
 
@@ -390,6 +573,13 @@ fn check_reviews(
 ) -> Result<usize, HarnessError> {
     let reviews = reviews_for(control, card_id)?;
     for review in &reviews {
+        if let Err(error) = validate_approved_review_evidence(control, review) {
+            found.push(Discrepancy {
+                subject: format!("review {}", review.review_id),
+                claim: "approved review mutation receipt evidence".to_owned(),
+                found: error.to_string(),
+            });
+        }
         if !commit_exists(&config.repository, &review.candidate_sha) {
             found.push(Discrepancy {
                 subject: format!("review {}", review.review_id),

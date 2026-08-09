@@ -416,9 +416,18 @@ gates could actually observe the acceptance behaviors — both because spike
 reviewers needed to say things a binary verdict cannot express.
 
 ```bash
-change-harness review begin  --control $CONTROL --card-id F-001
-change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example
+change-harness review begin  --control $CONTROL --card-id F-001 --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
+change-harness review record --control $CONTROL --card-id F-001 --verdict verdict.yaml --actor reviewer-example --actor-principal-id reviewer-example --actor-session-id review-session
 ```
+
+An approval may use a mutation exemption only when the project has an
+explicitly registered policy. New projects fail closed when
+`--mutation-exemption-policy` is omitted; each policy rule names the allowed
+code and exact declared approver actor, principal, and session. Free-form
+exemption codes and approvers are refused, and approved reviews pin the
+policy digest and resolved authorization facts. Existing projects install a
+typed policy explicitly with `project set-mutation-exemption-policy`; older
+free-form approvals are not migrated silently.
 
 **7. See what is waiting.** `integration ready` answers "what is approved and
 integrable" from control state, and says why each card that is not ready is
@@ -558,3 +567,7 @@ See:
   adversarial review, the three kinds of truth the harness does and does not
   provide, and the one experiment — with kill thresholds fixed in advance —
   that remains capable of falsifying the idea.
+
+Governance evidence is executable: `audit probes` runs stable negative probes,
+`mutation create` persists receipts for typed approvals, and `audit report`
+leaves claims without exact receipt coverage as `not_tested`.

@@ -328,6 +328,11 @@ pub struct HandoffRecord {
     pub declaration: ActorDeclaration,
     /// Who handed off. Declared, not proven; see D-013.
     pub actor_id: String,
+    /// Declared implementer principal/session copied from the work lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_session_id: Option<String>,
     /// When it was created.
     pub created_at: Timestamp,
     /// Whether it still stands.
@@ -517,6 +522,8 @@ mod tests {
             worktree_clean: true,
             declaration: declaration(),
             actor_id: "alvaro".to_owned(),
+            actor_principal_id: None,
+            actor_session_id: None,
             created_at: FixedClock::at_unix_seconds(1_785_196_800).unwrap().now(),
             status: HandoffStatus::Active,
             canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),

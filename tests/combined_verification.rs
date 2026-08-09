@@ -35,6 +35,9 @@ fn landed_with_invariants(count: usize, invariants: &[&str]) -> (Workspace, Stri
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
 
@@ -73,6 +76,29 @@ fn receipts(workspace: &Workspace) -> Vec<serde_json::Value> {
         .iter()
         .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).expect("a receipt"))
         .collect()
+}
+
+fn activate_card_with_proof(
+    workspace: &Workspace,
+    card_id: &str,
+    proof_id: &str,
+    invariant: &str,
+    oracle: &str,
+) {
+    let baseline = workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["baseline_sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let draft = workspace.root.join(format!("{card_id}-proof.yaml"));
+    fs::write(
+        &draft,
+        format!(
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Proof {card_id}\ngoal: Exercise proof scope\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {baseline}\nwrite_scope:\n  include: [src/{card_id}/**]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: {proof_id}\n      invariant: {invariant}\n      precondition: fixture exists\n      assertion: gate observes behavior\n      mutation: bypass makes gate fail\n      gate_oracle: {oracle}\n  claim_boundary: only this fixture\n"
+        ),
+    )
+    .unwrap();
+    workspace.card(&["create", "--draft", draft.to_str().unwrap()]);
+    workspace.card(&["activate", "--card-id", card_id]);
 }
 
 #[test]
@@ -197,6 +223,8 @@ fn a_combined_gate_failure_blocks_acceptance() {
             &["gate.unit"],
             &["gate.combined"],
         );
+    }
+    for card in ["F-001", "F-002"] {
         workspace.approve_card(card, &format!("src/{card}/a.rs"));
     }
     let id = workspace.integration_json(&[
@@ -420,6 +448,8 @@ fn the_interaction_checklist_names_members_whose_contracts_touch() {
         fs::write(&path, body).unwrap();
         workspace.card(&["create", "--draft", &path.display().to_string()]);
         workspace.card(&["activate", "--card-id", card]);
+    }
+    for card in ["F-001", "F-002"] {
         workspace.approve_card(card, &format!("src/{card}/a.rs"));
     }
 
@@ -464,6 +494,110 @@ fn cycle_invariants_are_carried_into_verification_unanswered() {
         invariants[0]["machine_checked"], false,
         "a free-text invariant is a reviewer's judgment, and must not claim otherwise"
     );
+}
+
+#[test]
+fn a_non_member_card_cannot_lend_its_proof_to_an_integration() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Proof scope",
+        "--release-invariant",
+        "borrowed-invariant",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    activate_card_with_proof(
+        &workspace,
+        "F-001",
+        "member-proof",
+        "member-invariant",
+        "gate.unit",
+    );
+    activate_card_with_proof(
+        &workspace,
+        "F-002",
+        "borrowed-proof",
+        "borrowed-invariant",
+        "gate.unit",
+    );
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--card-id",
+        "F-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+
+    let verified =
+        workspace.integration_json(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    assert_eq!(verified["data"]["invariants"][0]["machine_checked"], false);
+    assert!(verified["data"]["invariants"][0]["proof_entry_id"].is_null());
+}
+
+#[test]
+fn duplicate_proof_ids_across_integration_members_refuse_before_evidence_mutation() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Proof uniqueness",
+        "--release-invariant",
+        "shared-proof",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    activate_card_with_proof(
+        &workspace,
+        "F-001",
+        "shared-proof",
+        "first-invariant",
+        "gate.unit",
+    );
+    activate_card_with_proof(
+        &workspace,
+        "F-002",
+        "shared-proof",
+        "conflicting-invariant",
+        "gate.all",
+    );
+    for card in ["F-001", "F-002"] {
+        workspace.approve_card(card, &format!("src/{card}/a.rs"));
+    }
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    let head_before = workspace.control_head();
+    let receipts_before = receipts(&workspace).len();
+
+    let refusal =
+        workspace.integration_raw(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-INVALID-CARD");
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(receipts(&workspace).len(), receipts_before);
 }
 
 #[test]

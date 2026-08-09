@@ -25,6 +25,9 @@ fn reviewed(count: usize) -> (Workspace, String) {
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
 
@@ -387,6 +390,101 @@ fn an_old_unconfigured_project_refuses_new_final_authorization_without_mutation(
 }
 
 #[test]
+fn an_installed_final_policy_missing_from_control_refuses_without_inventing_an_owner() {
+    let (workspace, id) = reviewed_final();
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    project["final_authorization_mode"] = serde_json::json!("installed_default");
+    project
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy");
+    fs::write(
+        &project_path,
+        format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove installed final policy"],
+    );
+
+    let before = workspace.control_head();
+    let refusal = workspace.acceptance_raw(&["record", "--integration-id", &id]);
+    assert_eq!(refusal.status.code(), Some(2));
+    assert_eq!(error_code(&refusal), "CH-USAGE-INVALID-ARGUMENTS");
+    assert_eq!(workspace.control_head(), before);
+    assert!(
+        !workspace
+            .control
+            .join("acceptances/ACC-000001.json")
+            .exists(),
+        "refusal must not synthesize an owner or acceptance"
+    );
+
+    let missing_policy = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    assert_eq!(missing_policy.status.code(), Some(5));
+    assert_eq!(error_code(&missing_policy), "CH-POLICY-NOT-ACCEPTED");
+    assert_eq!(workspace.control_head(), before);
+}
+
+#[test]
+fn removal_of_an_installed_final_policy_refuses_promotion_before_authority_moves() {
+    let (workspace, id) = reviewed_final();
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--authorizer-actor-id",
+        "owner",
+    ]);
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    project["final_authorization_mode"] = serde_json::json!("installed_default");
+    project
+        .as_object_mut()
+        .unwrap()
+        .remove("final_authorization_policy");
+    fs::write(
+        &project_path,
+        format!("{}\n", serde_json::to_string_pretty(&project).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove installed final policy"],
+    );
+
+    let authority_before = support::capture(&workspace.authority, &["rev-parse", "main"]);
+    let control_before = workspace.control_head();
+    let refusal = workspace.integration_raw(&[
+        "promote",
+        "--integration-id",
+        &id,
+        "--actor-id",
+        "release-agent",
+    ]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-NOT-ACCEPTED");
+    assert_eq!(workspace.control_head(), control_before);
+    assert_eq!(
+        support::capture(&workspace.authority, &["rev-parse", "main"]),
+        authority_before,
+        "a missing installed policy must refuse before authority mutation"
+    );
+}
+
+#[test]
 fn project_init_requires_explicit_final_authorizers_to_write_a_v2_policy() {
     let unconfigured = Workspace::initialized();
     let raw: serde_json::Value = serde_json::from_slice(
@@ -672,72 +770,41 @@ fn a_non_ascii_implementer_is_refused_at_the_first_comparison() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
-
-    workspace.work(&["start", "--card-id", "F-001", "--actor", AUTHOR]);
-    let worktree = workspace.worktrees.join("F-001");
-    fs::create_dir_all(worktree.join("src/F-001")).unwrap();
-    fs::write(worktree.join("src/F-001/a.rs"), "// work\n").unwrap();
-    support::git(&worktree, &["add", "-A"]);
-    support::git(&worktree, &["commit", "-q", "-m", "feat: work"]);
-    workspace.gate(&[
-        "run",
-        "--card-id",
-        "F-001",
-        "--gate-id",
-        "gate.unit",
-        "--actor",
-        AUTHOR,
+    let before = workspace.control_head();
+    let plan = serde_json::json!({
+        "schema": "harness.cycle-plan/v1",
+        "plan_id": "PLAN-ASCII-001",
+        "cycle_id": "C-001",
+        "objective": "reject unusable identity",
+        "cards": [{
+            "card_id": "F-001",
+            "card_revision": 1,
+            "scope": ["src/F-001/**"],
+            "scope_exclude": [],
+            "depends_on": [],
+            "proof_entries": ["fixture-proof"],
+            "mutation_plan": ["fixture mutation"],
+            "risk": "low",
+            "reviewer_requirements": ["independent"],
+            "assignment": AUTHOR,
+            "assignment_principal_id": "implementer-principal",
+            "assignment_session_id": "implementer-session",
+            "distribution": "parallel",
+            "acceptance_behaviors": ["it works"]
+        }]
+    });
+    let path = workspace.root.join("PLAN-ASCII-001.json");
+    fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let refused = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "PLAN-ASCII-001",
+        "--file",
+        path.to_str().unwrap(),
     ]);
-
-    let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
-    let declaration = workspace.root.join("declaration.yaml");
-    fs::write(
-        &declaration,
-        format!(
-            "delivered_sha: {head}\nbehavior_delivered: adds a.rs\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
-        ),
-    )
-    .unwrap();
-    workspace.handoff(&[
-        "create",
-        "--card-id",
-        "F-001",
-        "--declaration",
-        &declaration.display().to_string(),
-        "--actor",
-        AUTHOR,
-    ]);
-    workspace.review(&["begin", "--card-id", "F-001", "--actor", "reviewer"]);
-
-    // The double-s spelling is the same name to a reader and was a different
-    // actor to the previous comparison. It never gets the chance to be either.
-    let verdict = workspace.root.join("verdict.yaml");
-    fs::write(
-        &verdict,
-        "reviewer_actor_id: STRASSE\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\n",
-    )
-    .unwrap();
-    // #120: `--actor` must agree with the verdict's `reviewer_actor_id`, or
-    // `require_actor_agreement` refuses before this test's own check ever
-    // runs. `STRASSE` is plain ASCII, so it must be named here too — the
-    // point under test is the *handoff* actor `STRAẞE`'s non-ASCII capital
-    // sharp S, which only `check_independence` (downstream of the agreement
-    // check) refuses.
-    let recorded = workspace.review_raw(&[
-        "record",
-        "--card-id",
-        "F-001",
-        "--verdict",
-        &verdict.display().to_string(),
-        "--actor",
-        "STRASSE",
-    ]);
-    assert_eq!(recorded.status.code(), Some(5));
-    assert_eq!(error_code(&recorded), "CH-POLICY-INCOMPLETE-REVIEW");
-    assert!(
-        String::from_utf8_lossy(&recorded.stdout).contains("ASCII"),
-        "the refusal must say why, or the author cannot act on it"
-    );
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), before);
 }
 
 #[test]

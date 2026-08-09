@@ -19,6 +19,31 @@ fn with_ready_card() -> Workspace {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/a.rs"]);
+    workspace.bind_fixture_plan("PLAN-WORKTREE-001", "parallel");
+    workspace
+}
+
+/// A genuine legacy cycle has no pinned plan, so revision and resume remain
+/// available without inventing a replacement plan that production forbids.
+fn legacy_ready_card() -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Revise allocated work before integration planning",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    workspace.activate_card("F-001", &["src/a.rs"]);
     workspace
 }
 
@@ -436,7 +461,7 @@ fn a_card_revised_while_allocated_can_be_resumed() {
     // was handled, `work start` refused because the lease existed and resume
     // refused because `ready` was not a state it covered, so the card could
     // never be handed off again.
-    let workspace = with_ready_card();
+    let workspace = legacy_ready_card();
     workspace.work(&["start", "--card-id", "F-001"]);
     let worktree = workspace.worktrees.join("F-001");
     let before = support::capture(&worktree, &["rev-parse", "HEAD"]);
@@ -467,7 +492,7 @@ fn a_card_revised_while_allocated_can_be_resumed() {
 fn resuming_a_revised_card_still_checks_the_locator() {
     // The regression that would matter: `ready` must not become a state where
     // resume skips the checks it performs everywhere else.
-    let workspace = with_ready_card();
+    let workspace = legacy_ready_card();
     workspace.work(&["start", "--card-id", "F-001"]);
     workspace.revise_card("F-001", &["src/**", "docs/**"], "widen the write scope");
 

@@ -28,6 +28,8 @@ pub const INTEGRATION_SCHEMA: &str = "harness.integration/v1";
 
 /// Directory holding integration records, relative to the control repository.
 pub const INTEGRATION_DIR: &str = "integrations";
+/// Explicit provenance retained on integrations created from pre-plan cycles.
+pub const LEGACY_PLAN_MIGRATION_PROVENANCE: &str = "legacy_cycle_plan_v1";
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
@@ -243,6 +245,16 @@ pub struct IntegrationRecord {
     pub integration_id: IntegrationId,
     /// The cycle it integrates.
     pub cycle_id: CycleId,
+    /// The cycle plan this integration was prepared from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
+    /// Explicit compatibility provenance for integrations predating cycle plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_migration_provenance: Option<String>,
     /// Where it is in its lifecycle.
     pub status: IntegrationStatus,
     /// Whether it lands one card or several.
@@ -708,11 +720,32 @@ pub struct Interaction {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InvariantCheck {
+    /// Stable proof-map entry identifier, when the cycle/card declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_entry_id: Option<String>,
     /// The invariant as the cycle stated it.
     pub invariant: String,
     /// Whether any gate could observe it. Always false for now; free-text
     /// invariants are a reviewer's judgment, not a machine's.
     pub machine_checked: bool,
+    /// Receipt ids that mechanically support this classification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_receipt_ids: Vec<String>,
+    /// Explicit claim classification; old records remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<ClaimClassification>,
+}
+
+/// Stable evidence classification used by verification and claim reports.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimClassification {
+    MechanicallyEnforced,
+    MachineChecked,
+    ReviewerAttested,
+    ExternallyObserved,
+    NotTested,
+    Failed,
 }
 
 /// The result of running every required gate against the landing commit.
@@ -741,6 +774,12 @@ pub struct VerificationRecord {
     pub worktree_clean_after: bool,
     /// Who ran it. Declared, not proven; see D-013.
     pub verified_by: String,
+    /// Declared verifier principal; not host-attested.
+    #[serde(default)]
+    pub verified_principal_id: Option<String>,
+    /// Declared verifier session; not host-attested.
+    #[serde(default)]
+    pub verified_session_id: Option<String>,
     /// When it completed.
     pub verified_at: Timestamp,
     /// The canonicalization algorithm its digest was computed under.

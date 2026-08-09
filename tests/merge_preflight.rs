@@ -25,6 +25,9 @@ fn integrable(count: usize) -> Workspace {
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
     workspace
@@ -38,6 +41,10 @@ fn integrable(count: usize) -> Workspace {
 /// protected branch moving under an approved candidate — which is exactly what
 /// `expected_main_sha` exists to detect.
 fn conflicting() -> Workspace {
+    conflicting_with_cards(1)
+}
+
+fn conflicting_with_cards(count: usize) -> Workspace {
     let workspace = Workspace::initialized();
     // A file the card and the branch will both edit must exist at the baseline.
     fs::write(
@@ -61,7 +68,13 @@ fn conflicting() -> Workspace {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["shared.txt"]);
+    if count == 2 {
+        workspace.activate_card("F-002", &["src/F-002/**"]);
+    }
     workspace.approve_card("F-001", "shared.txt");
+    if count == 2 {
+        workspace.approve_card("F-002", "src/F-002/a.rs");
+    }
 
     // Someone lands a change to the same file directly on the protected branch.
     fs::write(
@@ -156,10 +169,9 @@ fn a_candidate_conflicting_with_the_moved_branch_is_reported_as_textual() {
 
 #[test]
 fn the_sequence_stops_at_the_first_conflict_and_says_so() {
-    let workspace = conflicting();
-    // A second card that would merge cleanly, ordered after the conflict.
-    workspace.activate_card("F-002", &["src/F-002/**"]);
-    workspace.approve_card("F-002", "src/F-002/a.rs");
+    // A second card would merge cleanly, ordered after the conflict. Both are
+    // activated before the plan is pinned by work on the first card.
+    let workspace = conflicting_with_cards(2);
     let id = prepare(&workspace);
 
     let envelope = workspace.integration_json(&["preflight", "--integration-id", &id]);
@@ -562,6 +574,8 @@ fn scenario_28_a_semantic_conflict_cannot_be_resolved_in_place() {
             &["gate.unit"],
             &["gate.combined"],
         );
+    }
+    for card in ["F-001", "F-002"] {
         workspace.approve_card(card, &format!("src/{card}/a.rs"));
     }
     let id = prepare(&workspace);

@@ -36,6 +36,8 @@ use crate::{
 pub enum WorkCommand {
     /// Allocate a branch and worktree for a ready card.
     Start(StartArgs),
+    /// Atomically allocate every member of a joint-integration set.
+    StartBatch(BatchStartArgs),
     /// Report a card's allocation.
     Status(CardArgs),
     /// Record a progress note against the current lease.
@@ -60,6 +62,7 @@ impl WorkCommand {
     pub const fn path(&self) -> &'static str {
         match self {
             Self::Start(..) => "work.start",
+            Self::StartBatch(..) => "work.start-batch",
             Self::Status(..) => "work.status",
             Self::Checkpoint(..) => "work.checkpoint",
             Self::Resume(..) => "work.resume",
@@ -79,6 +82,10 @@ pub struct CommonArgs {
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
     pub actor: String,
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
 }
 
 /// Arguments accepted by `work start`.
@@ -90,6 +97,19 @@ pub struct StartArgs {
     #[arg(long)]
     pub card_id: String,
     /// Report planned mutations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments accepted by `work start-batch`.
+#[derive(Debug, Args)]
+pub struct BatchStartArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Joint card to allocate; repeat for every member.
+    #[arg(long = "card-id", required = true)]
+    pub card_ids: Vec<String>,
+    /// Validate the complete joint set without allocating anything.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -157,6 +177,7 @@ pub struct BlockArgs {
 pub fn execute(command: &WorkCommand, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     match command {
         WorkCommand::Start(args) => run_start(args, clock),
+        WorkCommand::StartBatch(args) => run_start_batch(args, clock),
         WorkCommand::Status(args) => run_status(args),
         WorkCommand::Checkpoint(args) => run_checkpoint(args, clock),
         WorkCommand::Resume(args) => run_resume(args, clock),
@@ -501,6 +522,7 @@ fn preview_start(args: &StartArgs, card_id: &CardId) -> Result<CommandOutcome, H
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
     // `preflight_start` is by definition every check that can refuse, and it
     // resolves the base commit rather than echoing what the card asked for.
     // This preview reimplemented a subset: it checked the state transition and
@@ -510,6 +532,15 @@ fn preview_start(args: &StartArgs, card_id: &CardId) -> Result<CommandOutcome, H
     // exists to preserve. It also never checked whether the branch or worktree
     // was already there.
     let (base, branch, path) = preflight_start(&control, &config, card_id, &record, &state)?;
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
+    crate::commands::cycle::require_work_admission(&control, &cycle, card_id)?;
     Ok(CommandOutcome::new(
         "work.start",
         format!(
@@ -595,6 +626,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         return preview_start(args, &card_id);
     }
 
+    preflight_start_request(args, &card_id)?;
+
     with_transaction(
         &args.common.control,
         "work.start",
@@ -603,8 +636,20 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
             let (base, branch, path) =
-                preflight_start(control, &config, &card_id, &record, &state)?;
+                steps.recheck(preflight_start(control, &config, &card_id, &record, &state))?;
+            steps.recheck(crate::commands::cycle::require_plan_assignment(
+                control,
+                &cycle,
+                &card_id,
+                &args.common.actor,
+                args.common.actor_principal_id.as_deref(),
+                args.common.actor_session_id.as_deref(),
+            ))?;
+            steps.recheck(crate::commands::cycle::require_work_admission(
+                control, &cycle, &card_id,
+            ))?;
             let scope = GitScope::work_tree(&config.repository);
 
             let lease_id = next_lease_id(control)?;
@@ -627,6 +672,8 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                 card_id: card_id.clone(),
                 card_revision: state.current_revision,
                 actor_id: args.common.actor.clone(),
+                actor_principal_id: args.common.actor_principal_id.clone(),
+                actor_session_id: args.common.actor_session_id.clone(),
                 branch: branch.clone(),
                 worktree_path: path.clone(),
                 base_sha: base.clone(),
@@ -674,6 +721,227 @@ fn run_start(args: &StartArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             .with_project(config.project_id.clone()))
         },
     )
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_start_batch(
+    args: &BatchStartArgs,
+    clock: &dyn Clock,
+) -> Result<CommandOutcome, HarnessError> {
+    let card_ids = parse_unique_card_ids(&args.card_ids)?;
+    if card_ids.len() < 2 {
+        return Err(HarnessError::Control {
+            reason: "joint work requires at least two card ids".to_owned(),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (first_record, _) = load_card(&control, &card_ids[0])?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &first_record.cycle_id)?;
+    let mut members = Vec::with_capacity(card_ids.len());
+    for card_id in &card_ids {
+        let (record, state) = load_card(&control, card_id)?;
+        if record.cycle_id != cycle.cycle_id {
+            return Err(HarnessError::Control {
+                reason: format!("joint work card {card_id} belongs to another cycle"),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        crate::commands::cycle::require_plan_assignment(
+            &control,
+            &cycle,
+            card_id,
+            &args.common.actor,
+            args.common.actor_principal_id.as_deref(),
+            args.common.actor_session_id.as_deref(),
+        )?;
+        preflight_start(&control, &config, card_id, &record, &state)?;
+        members.push((record, state));
+    }
+    crate::commands::cycle::require_joint_work_admission(&control, &cycle, &card_ids)?;
+    for (record, state) in &members {
+        preflight_start(&control, &config, &record.card_id, record, state)?;
+    }
+    if args.dry_run {
+        return Ok(CommandOutcome::new(
+            "work.start-batch",
+            format!(
+                "Dry run: would atomically allocate joint cards {}; nothing was changed",
+                card_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            serde_json::json!({
+                "dry_run": true,
+                "card_ids": card_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            }),
+        ));
+    }
+
+    with_transaction(
+        &args.common.control,
+        "work.start-batch",
+        clock,
+        |control, events, expected, steps| {
+            steps.at("control-write")?;
+            let config = control.project()?;
+            let cycle = crate::commands::cycle::load_cycle(control, &cycle.cycle_id)?;
+            let mut fresh_members = Vec::with_capacity(card_ids.len());
+            for card_id in &card_ids {
+                let (record, state) = load_card(control, card_id)?;
+                steps.recheck(crate::commands::cycle::require_plan_assignment(
+                    control,
+                    &cycle,
+                    card_id,
+                    &args.common.actor,
+                    args.common.actor_principal_id.as_deref(),
+                    args.common.actor_session_id.as_deref(),
+                ))?;
+                fresh_members.push((record, state));
+            }
+            steps.recheck(crate::commands::cycle::require_joint_work_admission(
+                control, &cycle, &card_ids,
+            ))?;
+            let mut leases = Vec::with_capacity(fresh_members.len());
+            for (record, state) in fresh_members {
+                steps.recheck(preflight_start(
+                    control,
+                    &config,
+                    &record.card_id,
+                    &record,
+                    &state,
+                ))?;
+                leases.push(allocate_member(
+                    control,
+                    events,
+                    &config,
+                    &record,
+                    &state,
+                    &args.common.actor,
+                    args.common.actor_principal_id.as_ref(),
+                    args.common.actor_session_id.as_ref(),
+                    steps,
+                    clock,
+                )?);
+            }
+            control.commit(expected, "work: atomically start joint cards")?;
+            Ok(CommandOutcome::new(
+                "work.start-batch",
+                format!("Atomically allocated joint cards {}", card_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")),
+                serde_json::json!({
+                    "card_ids": card_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "lease_ids": leases.iter().map(|lease| lease.lease_id.to_string()).collect::<Vec<_>>(),
+                    "state": CardState::Active.name(),
+                }),
+            ).with_project(config.project_id.clone()))
+        },
+    )
+}
+
+fn parse_unique_card_ids(values: &[String]) -> Result<Vec<CardId>, HarnessError> {
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        let id: CardId = value.parse()?;
+        if ids.contains(&id) {
+            return Err(HarnessError::Control {
+                reason: format!("duplicate joint card id {id}"),
+                code: ErrorCode::PolicyInvalidCycle,
+            });
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_member(
+    control: &ControlRepository,
+    events: &crate::control::event_store::EventStore<'_>,
+    config: &crate::config::ProjectConfig,
+    record: &CardRecord,
+    state: &CardStateRecord,
+    actor: &str,
+    principal: Option<&String>,
+    session: Option<&String>,
+    steps: &mut Steps<'_>,
+    clock: &dyn Clock,
+) -> Result<crate::domain::lease::LeaseRecord, HarnessError> {
+    let (base, branch, path) = steps.recheck(preflight_start(
+        control,
+        config,
+        &record.card_id,
+        record,
+        state,
+    ))?;
+    let scope = GitScope::work_tree(&config.repository);
+    let lease_id = next_lease_id(control)?;
+    allocate_worktree(&scope, &branch, &base, &path, &record.card_id, steps)?;
+    write_locator(
+        control,
+        config,
+        &path,
+        &record.card_id,
+        state.current_revision,
+        &lease_id,
+    )?;
+    verify_allocation(&scope, &path, &base)?;
+    let lease = LeaseRecord {
+        schema: LEASE_SCHEMA.to_owned(),
+        lease_id: lease_id.clone(),
+        card_id: record.card_id.clone(),
+        card_revision: state.current_revision,
+        actor_id: actor.to_owned(),
+        actor_principal_id: principal.cloned(),
+        actor_session_id: session.cloned(),
+        branch: branch.clone(),
+        worktree_path: path.clone(),
+        base_sha: base.clone(),
+        status: LeaseStatus::Held,
+        granted_at: clock.now(),
+        released_at: None,
+        progress: Vec::new(),
+    };
+    store_lease(control, &lease)?;
+    store_card_state(control, record, state, CardState::Active)?;
+    events.append(
+        &config.project_id,
+        EventDraft::new("work.started", actor)
+            .cycle(record.cycle_id.clone())
+            .card(
+                record.card_id.clone(),
+                state.current_revision,
+                state.current_digest.clone(),
+            )
+            .transition(Some(state.state.name()), CardState::Active.name())
+            .head(base)
+            .meta("lease_id", serde_json::json!(lease_id.to_string()))
+            .meta("branch", serde_json::json!(branch))
+            .meta("worktree_path", serde_json::json!(path)),
+        clock,
+    )?;
+    Ok(lease)
+}
+
+/// Performs caller-facing start checks before a journaled mutation begins.
+fn preflight_start_request(args: &StartArgs, card_id: &CardId) -> Result<(), HarnessError> {
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (record, state) = load_card(&control, card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+    preflight_start(&control, &config, card_id, &record, &state)?;
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
+    crate::commands::cycle::require_work_admission(&control, &cycle, card_id)?;
+    Ok(())
 }
 
 /// Loads the card, its state, and its held lease, or explains what is missing.
@@ -874,7 +1142,22 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
         let (record, state, lease) = allocation(&control, &card_id)?;
+        let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
         let config = control.project()?;
+        if state.state == CardState::Ready {
+            require_convergence_budget(&control, &config, &record)?;
+        }
+        crate::commands::cycle::require_plan_assignment(
+            &control,
+            &cycle,
+            &card_id,
+            &args.common.actor,
+            args.common.actor_principal_id.as_deref(),
+            args.common.actor_session_id.as_deref(),
+        )?;
+        if resumes_to_active(state.state) {
+            crate::commands::cycle::require_work_admission(&control, &cycle, &card_id)?;
+        }
         // 72-3: checked only for `ready`, the one source state
         // `resumes_to_active` admits that is functionally equivalent to
         // `work start` rather than to continuing already-owned work — see
@@ -905,7 +1188,23 @@ fn run_resume(args: &ResumeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     }
 
     let control = ControlRepository::open(&args.common.control)?;
-    let (_record, state, _lease) = allocation(&control, &card_id)?;
+    let (record, state, _lease) = allocation(&control, &card_id)?;
+    let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+    let config = control.project()?;
+    if state.state == CardState::Ready {
+        require_convergence_budget(&control, &config, &record)?;
+    }
+    crate::commands::cycle::require_plan_assignment(
+        &control,
+        &cycle,
+        &card_id,
+        &args.common.actor,
+        args.common.actor_principal_id.as_deref(),
+        args.common.actor_session_id.as_deref(),
+    )?;
+    if resumes_to_active(state.state) {
+        crate::commands::cycle::require_work_admission(&control, &cycle, &card_id)?;
+    }
 
     if resumes_to_active(state.state) {
         return resume_to_active(args, &card_id, clock);
@@ -951,6 +1250,18 @@ fn resume_to_active(
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state, lease) = allocation(control, card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
+            steps.recheck(crate::commands::cycle::require_plan_assignment(
+                control,
+                &cycle,
+                card_id,
+                &args.common.actor,
+                args.common.actor_principal_id.as_deref(),
+                args.common.actor_session_id.as_deref(),
+            ))?;
+            steps.recheck(crate::commands::cycle::require_work_admission(
+                control, &cycle, card_id,
+            ))?;
             // 72-3: the same narrow case the dry run checks, for the same
             // reason — see the note there. `resume_to_active` handles every
             // source state `resumes_to_active` admits, and only `ready` is
@@ -962,20 +1273,22 @@ fn resume_to_active(
             // transaction commits on is read at commit time, not assumed
             // from before it began.
             if state.state == CardState::Ready {
-                require_convergence_budget(control, &config, &record)?;
+                steps.recheck(require_convergence_budget(control, &config, &record))?;
             }
-            verify_locator(control, &lease, &config.project_id)?;
+            steps.recheck(verify_locator(control, &lease, &config.project_id))?;
             // Section 11.2 routes `ready` to `active` through `leased`, which
             // is the same path `work start` takes. Stepping through it rather
             // than widening the state machine keeps one definition of what a
             // legal transition is.
             let mut state = state;
             if state.state == CardState::Ready {
-                state.state.check_transition(CardState::Leased)?;
+                steps.recheck(state.state.check_transition(CardState::Leased))?;
+                steps.mutation_started()?;
                 store_card_state(control, &record, &state, CardState::Leased)?;
                 state.state = CardState::Leased;
             }
-            state.state.check_transition(CardState::Active)?;
+            steps.recheck(state.state.check_transition(CardState::Active))?;
+            steps.mutation_started()?;
             store_card_state(control, &record, &state, CardState::Active)?;
 
             events.append(

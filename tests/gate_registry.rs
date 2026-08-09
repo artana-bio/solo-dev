@@ -10,7 +10,7 @@ use support::Workspace;
 /// A gate definition body with the given fields.
 fn definition(gate_id: &str, revision: u32, argv: &str) -> String {
     format!(
-        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: {argv}\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+        "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: {argv}\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\nmigration: legacy_v1\n"
     )
 }
 

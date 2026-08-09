@@ -626,6 +626,10 @@ fn example_definition() -> GateDefinition {
     GateDefinition {
         schema: GATE_SCHEMA.to_owned(),
         gate_id: "gate.example".to_owned(),
+        purpose: Some("example validation".to_owned()),
+        semantics: Some("exit zero means the example contract holds".to_owned()),
+        migration: None,
+        reuse_justification: None,
         revision: 1,
         argv: vec!["true".to_owned()],
         working_directory: ".".to_owned(),
@@ -751,7 +755,7 @@ pub fn all_gates(control: &ControlRepository) -> Result<Vec<GateDefinition>, Har
 
 fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    gate.validate()?;
+    validate_authored_definition(&gate)?;
     Ok(CommandOutcome::new(
         "gate.validate",
         format!(
@@ -773,9 +777,10 @@ fn run_validate(args: &DefinitionArgs) -> Result<CommandOutcome, HarnessError> {
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let gate = read_definition(&args.definition)?;
-    gate.validate()?;
+    validate_authored_definition(&gate)?;
     let digest = gate.digest()?;
 
     if args.dry_run {
@@ -805,6 +810,30 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
             steps.at("control-write")?;
             let config = control.project()?;
             let previous = load_gate(control, &gate.gate_id).ok();
+            if previous.is_none() && gate.purpose.is_some() && gate.semantics.is_some() {
+                for existing in all_gates(control)? {
+                    if existing.gate_id != gate.gate_id
+                        && existing.argv == gate.argv
+                        && existing.working_directory == gate.working_directory
+                        && existing.timeout_seconds == gate.timeout_seconds
+                        && existing.environment == gate.environment
+                        && existing.network_policy == gate.network_policy
+                        && existing.retry_policy == gate.retry_policy
+                        && gate
+                            .reuse_justification
+                            .as_deref()
+                            .is_none_or(|value| value.trim().is_empty())
+                    {
+                        return Err(HarnessError::Control {
+                            reason: format!(
+                                "gate `{}` duplicates `{}`; provide an explicit reuse_justification",
+                                gate.gate_id, existing.gate_id
+                            ),
+                            code: ErrorCode::ConfigInvalidGate,
+                        });
+                    }
+                }
+            }
 
             if let Some(existing) = &previous {
                 // A revision must move forward by exactly one, so a receipt can
@@ -876,6 +905,24 @@ fn run_register(args: &RegisterArgs, clock: &dyn Clock) -> Result<CommandOutcome
             .with_project(config.project_id.clone()))
         },
     )
+}
+
+fn validate_authored_definition(gate: &GateDefinition) -> Result<(), HarnessError> {
+    gate.validate_contract()?;
+    if gate.schema == GATE_SCHEMA
+        && gate.purpose.is_none()
+        && gate.semantics.is_none()
+        && gate.migration.as_deref() != Some("legacy_v1")
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "newly authored gate `{}` is semantics-free; use gate/v2 semantics or explicitly mark legacy_v1 migration",
+                gate.gate_id
+            ),
+            code: ErrorCode::ConfigInvalidGate,
+        });
+    }
+    Ok(())
 }
 
 fn run_list(args: &CommonArgs) -> Result<CommandOutcome, HarnessError> {

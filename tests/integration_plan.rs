@@ -6,13 +6,30 @@
 
 mod support;
 
-use std::fs;
+use change_harness::{
+    control::lock::ProjectLock,
+    domain::{card::CardRecord, clock::SystemClock, ids::CardId},
+};
+use std::{fs, process::Command};
 
 use support::Workspace;
 
 /// A cycle with `count` cards, all activated against the cycle baseline.
 fn cycle_with(count: usize) -> Workspace {
     let workspace = Workspace::initialized();
+    activate_cycle_cards(workspace, count)
+}
+
+/// Same lifecycle fixture with exemption authorization frozen into the cycle
+/// from creation. Tests opt into this explicitly; the shared default remains
+/// fail-closed.
+fn cycle_with_exemption_policy(count: usize) -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
+    activate_cycle_cards(workspace, count)
+}
+
+fn activate_cycle_cards(workspace: Workspace, count: usize) -> Workspace {
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -34,6 +51,17 @@ fn error_code(output: &std::process::Output) -> String {
     envelope["error"]["code"].as_str().unwrap().to_owned()
 }
 
+fn journal_count(workspace: &Workspace) -> usize {
+    fs::read_dir(workspace.control.join("journal")).map_or(0, std::iter::Iterator::count)
+}
+
+fn journal_names(workspace: &Workspace) -> std::collections::BTreeSet<String> {
+    fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// The card identifiers listed as ready, in report order.
 fn ready_ids(envelope: &serde_json::Value) -> Vec<String> {
     envelope["data"]["ready"]
@@ -42,6 +70,262 @@ fn ready_ids(envelope: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|entry| entry["card_id"].as_str().unwrap().to_owned())
         .collect()
+}
+
+fn corrupt_approved_mutation_binding(
+    workspace: &Workspace,
+    receipt_id: &str,
+    receipt: Option<serde_json::Value>,
+) {
+    let reviews = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let review_id = reviews["data"]["reviews"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["review_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let review_path = workspace.control.join(format!("reviews/{review_id}.json"));
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_ids"] = serde_json::json!([receipt_id]);
+    review["mutation_exemption"] = serde_json::Value::Null;
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    if let Some(receipt) = receipt {
+        let receipt_path = workspace
+            .control
+            .join(format!("mutation-receipts/{receipt_id}.json"));
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "corrupt approved mutation evidence"],
+    );
+}
+
+fn validish_receipt(receipt_id: &str, candidate_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "harness.mutation-receipt/v1",
+        "receipt_id": receipt_id,
+        "card_revision": "F-001-r1",
+        "candidate_sha": candidate_sha,
+        "reviewer_actor_id": "reviewer-session",
+        "reviewer_principal_id": "reviewer-principal",
+        "reviewer_session_id": "reviewer-session",
+        "mutation_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "patch_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "command": ["true"],
+        "gate_oracle": "gate.unit",
+        "expected_failure": "oracle fails",
+        "observed_result": "oracle failed",
+        "failed_at_oracle": true,
+        "restoration_proof": "restored",
+        "restoration_sha": candidate_sha,
+        "created_at": "2026-08-08T00:00:00Z",
+        "exemption": null
+    })
+}
+
+#[test]
+fn an_approved_review_with_deleted_mutation_receipt_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let candidate = support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]);
+    corrupt_approved_mutation_binding(
+        &workspace,
+        "MR-DELETED-AFTER-APPROVAL",
+        Some(validish_receipt("MR-DELETED-AFTER-APPROVAL", &candidate)),
+    );
+    let receipt_path = workspace
+        .control
+        .join("mutation-receipts/MR-DELETED-AFTER-APPROVAL.json");
+    fs::remove_file(receipt_path).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "delete mutation receipt"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(!ready.status.success(), "lost receipt must block readiness");
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+}
+
+#[test]
+fn an_approved_review_with_corrupt_or_rebound_mutation_receipt_is_not_ready() {
+    for (label, receipt) in [
+        ("corrupt", Some(serde_json::json!({"not": "a receipt"}))),
+        (
+            "rebound",
+            Some(validish_receipt(
+                "MR-REBOUND-AFTER-APPROVAL",
+                &"0".repeat(40),
+            )),
+        ),
+    ] {
+        let workspace = cycle_with(1);
+        workspace.approve_card("F-001", "src/F-001/a.rs");
+        let receipt_id = format!("MR-{}-AFTER-APPROVAL", label.to_ascii_uppercase());
+        corrupt_approved_mutation_binding(&workspace, &receipt_id, receipt);
+        let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+        assert!(
+            !ready.status.success(),
+            "{label} mutation receipt must block readiness"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+        assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+    }
+}
+
+#[test]
+fn an_approved_review_with_changed_mutation_receipt_digest_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let candidate = support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]);
+    let receipt_id = "MR-DIGEST-CHANGED-AFTER-APPROVAL";
+    corrupt_approved_mutation_binding(
+        &workspace,
+        receipt_id,
+        Some(validish_receipt(receipt_id, &candidate)),
+    );
+
+    let reviews = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let review_id = reviews["data"]["reviews"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["review_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let review_path = workspace.control.join(format!("reviews/{review_id}.json"));
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_bindings"] = serde_json::json!([{
+        "receipt_id": receipt_id,
+        "receipt_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "card_revision": "F-001-r1",
+        "candidate_sha": candidate,
+        "reviewer_actor_id": "reviewer-session",
+        "reviewer_principal_id": "reviewer-principal",
+        "reviewer_session_id": "reviewer-session",
+        "gate_oracle": "gate.unit"
+    }]);
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "change mutation receipt digest"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "changed receipt digest must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+}
+
+#[test]
+fn an_approved_exemption_without_its_project_policy_is_not_ready() {
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove exemption policy"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "missing exemption policy must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-INCOMPLETE-REVIEW");
+}
+
+#[test]
+fn an_existing_project_must_install_exemption_policy_through_the_typed_command() {
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "remove exemption policy for migration",
+        ],
+    );
+
+    let policy = workspace.root.join("mutation-exemption-policy.json");
+    let installed = Workspace::run(&[
+        "project".into(),
+        "set-mutation-exemption-policy".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--policy".into(),
+        policy.display().to_string(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "typed policy migration must succeed: {}",
+        String::from_utf8_lossy(&installed.stdout)
+    );
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        ready.status.success(),
+        "restored policy should restore readiness"
+    );
+}
+
+#[test]
+fn an_approved_exemption_with_a_replaced_policy_digest_is_not_ready() {
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "code": "new-policy-code",
+            "approved_by": "new-approver",
+            "approver_principal_id": "new-principal",
+            "approver_session_id": "new-session"
+        }));
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "replace exemption policy"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "policy digest drift must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
 }
 
 /// The card identifiers in an integration's merge order.
@@ -129,7 +413,29 @@ fn an_invalidated_approval_is_reported_as_stale_rather_than_absent() {
 /// That card's reviewer verified it by hand across eleven scenarios;
 /// `artana-bio/solo-dev#15` item 2 is the gap that left behind.
 fn left_non_approved_by_a_stale_verdict(workspace: &Workspace, card_id: &str, decision: &str) {
-    workspace.work(&["start", "--card-id", card_id]);
+    let cycle: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(workspace.control.join("cycles/C-001.json")).unwrap(),
+    )
+    .unwrap();
+    if cycle["plan_id"].is_null() && cycle["plan_migration_provenance"].is_null() {
+        workspace.mark_cycle_pre_upgrade("C-001");
+        workspace.cycle(&[
+            "migrate-legacy",
+            "--cycle-id",
+            "C-001",
+            "--provenance",
+            "legacy_cycle_plan_v1",
+        ]);
+    }
+    workspace.work(&[
+        "start",
+        "--card-id",
+        card_id,
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
 
     let worktree = workspace.worktrees.join(card_id);
     let path = worktree.join(format!("src/{card_id}/a.rs"));
@@ -433,6 +739,60 @@ fn final_prepare_accounts_for_every_sealed_member_and_records_the_seal_binding()
 }
 
 #[test]
+fn sealed_cycle_prepare_defaults_to_final_authorization() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let envelope = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(envelope["data"]["final_for_cycle"], true);
+    assert!(envelope["data"]["sealed_cycle_digest"].is_string());
+}
+
+#[test]
+fn sealed_cycle_legacy_bypass_requires_exact_migration_provenance() {
+    let workspace = cycle_with(1);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    workspace.cycle(&["seal", "--cycle-id", "C-001"]);
+
+    let refused = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--legacy-migration-provenance",
+        "untrusted",
+    ]);
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+
+    let migrated = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--legacy-migration-provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(migrated["data"]["final_for_cycle"], false);
+}
+
+#[test]
 fn final_prepare_keeps_an_explicitly_abandoned_member_auditable() {
     let workspace = cycle_with(2);
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -587,6 +947,14 @@ fn final_prepare_text_mode_says_delivers_no_cards_only_for_the_all_abandoned_cas
     let all_abandoned = cycle_with(2);
     all_abandoned.card(&["abandon", "--card-id", "F-001", "--reason", "superseded"]);
     all_abandoned.card(&["abandon", "--card-id", "F-002", "--reason", "superseded"]);
+    all_abandoned.mark_cycle_pre_upgrade("C-001");
+    all_abandoned.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     all_abandoned.cycle(&["seal", "--cycle-id", "C-001"]);
 
     let all_abandoned_output = Workspace::run(&[
@@ -660,8 +1028,59 @@ fn dependencies_are_merged_before_their_dependents() {
     // F-002 depends on F-001, so it must merge second despite sorting first
     // among the ready set only by identifier.
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
-    workspace.approve_card("F-002", "src/F-002/a.rs");
     workspace.approve_card("F-001", "src/F-001/a.rs");
+    let first = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+        "--card-id",
+        "F-001",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[
+            step,
+            "--integration-id",
+            &first,
+            "--actor-id",
+            "coordinator",
+        ]);
+    }
+    workspace.integration(&[
+        "verify",
+        "--integration-id",
+        &first,
+        "--actor-id",
+        "verifier",
+    ]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &first,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &first,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    workspace.integration(&[
+        "promote",
+        "--integration-id",
+        &first,
+        "--actor-id",
+        "promoter",
+    ]);
+    workspace.archive(&["create", "--integration-id", &first]);
+    workspace.archive(&["close", "--integration-id", &first]);
+    workspace.approve_card("F-002", "src/F-002/a.rs");
 
     let envelope = workspace.integration_json(&[
         "prepare",
@@ -669,8 +1088,10 @@ fn dependencies_are_merged_before_their_dependents() {
         "C-001",
         "--actor-id",
         "coordinator",
+        "--card-id",
+        "F-002",
     ]);
-    assert_eq!(merge_order(&envelope), ["F-001", "F-002"]);
+    assert_eq!(merge_order(&envelope), ["F-002"]);
 }
 
 #[test]
@@ -686,6 +1107,14 @@ fn a_dependency_that_is_neither_selected_nor_landed_is_refused() {
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.approve_card("F-002", "src/F-002/a.rs");
     // F-001 is approved too, but deliberately left out of the selection.
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -868,6 +1297,146 @@ fn mode_individual_is_refused_for_a_multi_card_selection() {
 }
 
 #[test]
+fn a_pinned_plan_freezes_cycle_membership_without_control_mutation() {
+    let workspace = cycle_with(1);
+    let baseline = workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["baseline_sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let draft = workspace.root.join("F-002-after-plan.yaml");
+    fs::write(
+        &draft,
+        format!(
+            "card_id: F-002\ncycle_id: C-001\ntitle: Late card\ngoal: Must be refused\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {baseline}\nwrite_scope:\n  include: [src/F-002/**]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        ),
+    )
+    .unwrap();
+    workspace.card(&["create", "--draft", draft.to_str().unwrap()]);
+    workspace.bind_fixture_plan("PLAN-FROZEN-MEMBERSHIP-001", "parallel");
+
+    let cycle_path = workspace.control.join("cycles/C-001.json");
+    let plan_path = workspace
+        .control
+        .join("plans/PLAN-FROZEN-MEMBERSHIP-001.json");
+    let cycle_before = fs::read(&cycle_path).unwrap();
+    let plan_before = fs::read(&plan_path).unwrap();
+    let head_before = workspace.control_head();
+    let cleanliness_before = support::capture(&workspace.control, &["status", "--porcelain"]);
+
+    let refusal = workspace.card_raw(&["activate", "--card-id", "F-002"]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(fs::read(&cycle_path).unwrap(), cycle_before);
+    assert_eq!(fs::read(&plan_path).unwrap(), plan_before);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        cleanliness_before
+    );
+    assert!(
+        !workspace.control.join("cards/F-002/state.json").exists(),
+        "a refused activation must not create authoritative card state"
+    );
+}
+
+#[test]
+fn joint_integration_requires_the_exact_complete_planned_set_atomically() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-COMPLETE-001", "joint_integration");
+    workspace.work(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    for card in ["F-001", "F-002"] {
+        let worktree = workspace.worktrees.join(card);
+        let source = worktree.join(format!("src/{card}/a.rs"));
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, format!("// {card}\n")).unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", &format!("feat: {card}")]);
+        workspace.gate(&["run", "--card-id", card, "--gate-id", "gate.unit"]);
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = workspace
+            .root
+            .join(format!("{card}-joint-declaration.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: adds {card}\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            card,
+            "--declaration",
+            declaration.to_str().unwrap(),
+        ]);
+        workspace.review(&["begin", "--card-id", card]);
+        let receipt = workspace.create_fixture_mutation_receipt(
+            card,
+            "reviewer-session",
+            "reviewer-principal",
+            "reviewer-session",
+        );
+        let verdict = workspace.root.join(format!("{card}-joint-verdict.yaml"));
+        fs::write(
+            &verdict,
+            format!(
+                "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct joint lifecycle proof\n  mutation_evidence:\n    status: demonstrated\n    mutation: added fixture marker\n    failing_test: fixture oracle rejects marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"
+            ),
+        )
+        .unwrap();
+        workspace.review(&[
+            "record",
+            "--card-id",
+            card,
+            "--verdict",
+            verdict.to_str().unwrap(),
+            "--actor",
+            "reviewer-session",
+        ]);
+    }
+    let plan_path = workspace.control.join("plans/PLAN-JOINT-COMPLETE-001.json");
+    let plan_before = fs::read(&plan_path).unwrap();
+    let head_before = workspace.control_head();
+    let cleanliness_before = support::capture(&workspace.control, &["status", "--porcelain"]);
+
+    let refusal = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--card-id",
+        "F-001",
+        "--mode",
+        "batch",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(fs::read(&plan_path).unwrap(), plan_before);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        cleanliness_before
+    );
+    assert_eq!(
+        fs::read_dir(workspace.control.join("integrations")).map_or(0, std::iter::Iterator::count),
+        0,
+        "partial joint preparation must create no integration"
+    );
+}
+
+#[test]
 fn a_dry_run_reports_the_plan_and_changes_nothing() {
     let workspace = cycle_with(1);
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -913,7 +1482,7 @@ fn inspect_reproduces_the_recorded_plan() {
 }
 
 #[test]
-fn preparing_an_empty_cycle_is_refused() {
+fn preparing_a_planless_cycle_is_refused() {
     let workspace = cycle_with(1);
     let output = workspace.integration_raw(&[
         "prepare",
@@ -922,8 +1491,8 @@ fn preparing_an_empty_cycle_is_refused() {
         "--actor-id",
         "coordinator",
     ]);
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(error_code(&output), "CH-PRECONDITION-NOT-FOUND");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
 }
 
 #[test]
@@ -1083,4 +1652,999 @@ fn a_promoted_integration_cannot_be_abandoned() {
     ]);
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(error_code(&output), "CH-POLICY-INVALID-TRANSITION");
+}
+
+#[test]
+fn replacing_a_pinned_cycle_plan_blocks_downstream_authorization() {
+    let workspace = cycle_with(1);
+    let plan_path = workspace.root.join("PLAN-001.json");
+    fs::write(
+        &plan_path,
+        r#"{
+  "schema": "harness.cycle-plan/v1",
+  "plan_id": "PLAN-001",
+  "cycle_id": "C-001",
+  "objective": "first slice",
+  "cards": [{
+    "card_id": "F-001",
+    "card_revision": 1,
+    "scope": ["src/F-001/**"],
+    "depends_on": [],
+    "proof_entries": ["P-001"],
+    "mutation_plan": ["remove guard"],
+    "risk": "low",
+    "reviewer_requirements": ["independent"],
+    "assignment": "operator",
+    "assignment_principal_id": "implementer-principal",
+    "assignment_session_id": "implementer-session",
+    "distribution": "parallel",
+    "acceptance_behaviors": ["it works"]
+  }]
+}
+"#,
+    )
+    .unwrap();
+
+    workspace.cycle(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &plan_path.display().to_string(),
+    ]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let integration_id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let pinned = workspace.control.join("plans/PLAN-001.json");
+    let before_tampered_acceptance_head = workspace.control_head();
+    let before_tampered_acceptance_journals = journal_count(&workspace);
+    let mut replacement: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&pinned).unwrap()).unwrap();
+    replacement["objective"] = serde_json::json!("tampered objective");
+    fs::write(
+        &pinned,
+        format!("{}\n", serde_json::to_string_pretty(&replacement).unwrap()),
+    )
+    .unwrap();
+
+    let refused = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &integration_id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("stale or contradictory active plan"),
+        "tampered plan refusal must name the plan binding: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(workspace.control_head(), before_tampered_acceptance_head);
+    assert_eq!(
+        journal_count(&workspace),
+        before_tampered_acceptance_journals
+    );
+}
+
+#[test]
+fn planless_cycle_refuses_normal_integration_before_legacy_migration() {
+    let workspace = cycle_with(1);
+    let output = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no distribution plan"));
+}
+
+#[test]
+fn new_cycles_cannot_claim_legacy_migration_but_pre_upgrade_cycles_can_once() {
+    let fresh = cycle_with(0);
+    let forged = fresh.cycle_raw(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(forged.status.code(), Some(5));
+    assert_eq!(error_code(&forged), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(
+        fresh
+            .events()
+            .iter()
+            .filter(|event| event["event_type"] == "cycle.legacy-migrated")
+            .count(),
+        0
+    );
+
+    let legacy = cycle_with(0);
+    legacy.mark_cycle_pre_upgrade("C-001");
+    legacy.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    let repeat = legacy.cycle_raw(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
+    assert_eq!(repeat.status.code(), Some(5));
+    assert_eq!(error_code(&repeat), "CH-POLICY-INVALID-CYCLE");
+}
+
+#[test]
+fn new_planless_cycle_refuses_work_start_without_journal_or_lease_side_effects() {
+    let workspace = cycle_with(1);
+    let before = workspace.control_head();
+    let output = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), before);
+    assert!(
+        workspace
+            .events()
+            .iter()
+            .all(|event| event["event_type"] != "work.started")
+    );
+    assert!(!workspace.worktrees.join("F-001").exists());
+    assert!(
+        workspace
+            .control
+            .join("leases")
+            .read_dir()
+            .map_or(true, |mut entries| entries.next().is_none())
+    );
+}
+
+#[test]
+fn dependency_and_distribution_admission_is_enforced_before_work_mutation() {
+    let dependent = Workspace::initialized();
+    dependent.cycle(&["create", "--cycle-id", "C-001", "--objective", "dependency"]);
+    dependent.cycle(&["activate", "--cycle-id", "C-001"]);
+    dependent.activate_card("F-001", &["src/F-001/**"]);
+    dependent.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
+    dependent.bind_fixture_plan("PLAN-DEPENDENCY", "parallel");
+    let before = dependent.control_head();
+    let refused = dependent.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-TRANSITION");
+    assert_eq!(dependent.control_head(), before);
+
+    let sequential = cycle_with(2);
+    sequential.bind_fixture_plan("PLAN-SEQUENTIAL", "sequential");
+    let later = sequential.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(later.status.code(), Some(5));
+    assert_eq!(error_code(&later), "CH-POLICY-INVALID-TRANSITION");
+    sequential.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    let overlapping = sequential.work_raw(&[
+        "start",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(overlapping.status.code(), Some(5));
+
+    let parallel = cycle_with(2);
+    parallel.bind_fixture_plan("PLAN-PARALLEL", "parallel");
+    for card in ["F-001", "F-002"] {
+        parallel.work(&[
+            "start",
+            "--card-id",
+            card,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+    }
+
+    let joint = cycle_with(2);
+    joint.bind_fixture_plan("PLAN-JOINT", "joint_integration");
+    let individual = joint.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(individual.status.code(), Some(5));
+    assert_eq!(error_code(&individual), "CH-POLICY-INVALID-CYCLE");
+    joint.work(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+}
+
+#[test]
+fn mixed_execution_modes_enforce_symmetric_overlap_without_side_effects() {
+    let start = |workspace: &Workspace, card_id: &str| {
+        workspace.work(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+    };
+    let refuse_start = |workspace: &Workspace, card_id: &str| {
+        let before = workspace.control_head();
+        let output = workspace.work_raw(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(error_code(&output), "CH-POLICY-OWNERSHIP-OVERLAP");
+        assert_eq!(workspace.control_head(), before);
+    };
+
+    let sequential_then_parallel = cycle_with(2);
+    sequential_then_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-SEQ-PAR-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    start(&sequential_then_parallel, "F-001");
+    refuse_start(&sequential_then_parallel, "F-002");
+
+    let parallel_then_sequential = cycle_with(2);
+    parallel_then_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-PAR-SEQ-001",
+        &["parallel", "sequential"],
+        "operator",
+    );
+    start(&parallel_then_sequential, "F-001");
+    refuse_start(&parallel_then_sequential, "F-002");
+
+    let parallel = cycle_with(2);
+    parallel.bind_fixture_plan("PLAN-MIXED-PAR-PAR-001", "parallel");
+    start(&parallel, "F-001");
+    start(&parallel, "F-002");
+
+    let joint_after_sequential = cycle_with(3);
+    joint_after_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-SEQ-JOINT-001",
+        &["sequential", "joint_integration", "joint_integration"],
+        "operator",
+    );
+    start(&joint_after_sequential, "F-001");
+    let before = joint_after_sequential.control_head();
+    let refused = joint_after_sequential.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-002",
+        "--card-id",
+        "F-003",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(joint_after_sequential.control_head(), before);
+
+    let joint_after_parallel = cycle_with(3);
+    joint_after_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-MIXED-PAR-JOINT-001",
+        &["parallel", "joint_integration", "joint_integration"],
+        "operator",
+    );
+    start(&joint_after_parallel, "F-001");
+    let before = joint_after_parallel.control_head();
+    let refused = joint_after_parallel.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-002",
+        "--card-id",
+        "F-003",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(joint_after_parallel.control_head(), before);
+}
+
+#[allow(clippy::needless_borrow, clippy::too_many_lines)]
+#[test]
+fn resume_mode_conflicts_match_dry_run_without_journal_side_effects() {
+    let journal_count = |workspace: &Workspace| {
+        fs::read_dir(workspace.control.join("journal")).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count()
+        })
+    };
+    let identity = [
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ];
+
+    let blocked_sequential = cycle_with(2);
+    blocked_sequential.bind_fixture_plan_with_distributions(
+        "PLAN-RESUME-SEQ-PAR-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    blocked_sequential.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    blocked_sequential.work(&["block", "--card-id", "F-001", "--reason", "review feedback"]);
+    blocked_sequential.work(&[
+        "start",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let before_head = blocked_sequential.control_head();
+    let before_journals = journal_count(&blocked_sequential);
+    let dry = blocked_sequential.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+        "--dry-run",
+    ]);
+    assert_eq!(dry.status.code(), Some(5));
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["error"]["code"], "CH-POLICY-OWNERSHIP-OVERLAP");
+    assert_eq!(blocked_sequential.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_sequential), before_journals);
+    let real = blocked_sequential.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    assert_eq!(real.status.code(), Some(5));
+    let real_json: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(real_json["error"]["code"], dry_json["error"]["code"]);
+    assert_eq!(real_json["error"]["message"], dry_json["error"]["message"]);
+    assert_eq!(blocked_sequential.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_sequential), before_journals);
+
+    let blocked_parallel = cycle_with(2);
+    blocked_parallel.bind_fixture_plan_with_distributions(
+        "PLAN-RESUME-PAR-SEQ-001",
+        &["sequential", "parallel"],
+        "operator",
+    );
+    blocked_parallel.work(&[
+        "start",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    blocked_parallel.work(&["block", "--card-id", "F-002", "--reason", "review feedback"]);
+    blocked_parallel.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let before_head = blocked_parallel.control_head();
+    let before_journals = journal_count(&blocked_parallel);
+    let dry = blocked_parallel.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+        "--dry-run",
+    ]);
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry.status.code(), Some(5));
+    assert_eq!(dry_json["error"]["code"], "CH-POLICY-OWNERSHIP-OVERLAP");
+    let real = blocked_parallel.work_raw(&[
+        "resume",
+        "--card-id",
+        "F-002",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    let real_json: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    assert_eq!(real.status.code(), Some(5));
+    assert_eq!(real_json["error"]["code"], dry_json["error"]["code"]);
+    assert_eq!(real_json["error"]["message"], dry_json["error"]["message"]);
+    assert_eq!(blocked_parallel.control_head(), before_head);
+    assert_eq!(journal_count(&blocked_parallel), before_journals);
+
+    let valid = cycle_with(1);
+    valid.bind_fixture_plan("PLAN-RESUME-VALID-001", "sequential");
+    valid.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    valid.work(&["block", "--card-id", "F-001", "--reason", "review feedback"]);
+    let resumed = valid.work(&[
+        "resume",
+        "--card-id",
+        "F-001",
+        &identity[0],
+        &identity[1],
+        &identity[2],
+        &identity[3],
+    ]);
+    assert!(resumed.status.success());
+}
+
+#[test]
+fn joint_batch_preflight_refusal_has_no_first_member_effect_or_journal() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-TOCTOU-002", "joint_integration");
+    let collision = workspace.worktrees.join("F-002");
+    fs::create_dir_all(&collision).unwrap();
+    let journal_count = |workspace: &Workspace| {
+        fs::read_dir(workspace.control.join("journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    };
+    let before_journals = journal_count(&workspace);
+    let output = workspace.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-PRECONDITION-WORKTREE-EXISTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(collision.to_str().unwrap())
+    );
+    assert!(!workspace.worktrees.join("F-001").exists());
+    assert_eq!(journal_count(&workspace), before_journals);
+}
+
+#[test]
+fn joint_batch_late_member_collision_retains_partial_recovery_journal() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-TOCTOU-LATE", "joint_integration");
+    let collision = workspace.worktrees.join("F-002");
+    let hook = workspace.repository.join(".git/hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntop=$(git rev-parse --show-toplevel)\ncase \"$top\" in\n  */F-001) mkdir -p '{}' ;;\nesac\nexit 0\n",
+            collision.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&hook, permissions).unwrap();
+
+    let before_journals = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    let output = workspace.work_raw(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-PRECONDITION-WORKTREE-EXISTS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(collision.to_str().unwrap())
+    );
+    assert!(workspace.worktrees.join("F-001").exists());
+    assert!(collision.exists());
+    let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(journals.len(), before_journals + 1);
+    let journal = journals
+        .iter()
+        .find(|record| record["command"] == "work.start-batch")
+        .expect("late collision must retain the batch journal");
+    assert_eq!(journal["state"], "failed_partial");
+    assert_eq!(journal["mutation_started"], true);
+    let status = Workspace::run(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        !status["data"]["unresolved_operations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let recovery = Workspace::run(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(recovery.status.success());
+    let recovery: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();
+    assert_eq!(recovery["data"]["recovery_required"], true);
+}
+
+#[test]
+fn cycle_plan_requires_exact_scope_and_typed_assignment_at_work_start() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+
+    let invalid_path = workspace.root.join("invalid-plan.json");
+    fs::write(
+        &invalid_path,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-001","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/**"],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    let refused = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &invalid_path.display().to_string(),
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("does not exactly match"));
+
+    let valid = workspace.root.join("valid-plan.json");
+    fs::write(
+        &valid,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-001","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    workspace.cycle(&[
+        "plan",
+        "--plan-id",
+        "PLAN-001",
+        "--file",
+        &valid.display().to_string(),
+    ]);
+
+    let wrong = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "operator",
+        "--actor-principal-id",
+        "other-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert_eq!(wrong.status.code(), Some(5));
+    assert_eq!(error_code(&wrong), "CH-POLICY-OWNERSHIP-OVERLAP");
+    let valid_start = workspace.work_raw(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "operator",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    assert!(
+        valid_start.status.success(),
+        "valid planned start failed: {}{}",
+        String::from_utf8_lossy(&valid_start.stdout),
+        String::from_utf8_lossy(&valid_start.stderr)
+    );
+}
+
+#[test]
+fn cycle_plan_failure_boundaries_retain_partial_recovery_evidence() {
+    for boundary in [
+        "plan-written",
+        "cycle-plan-bound",
+        "card-plan-bound-F-001",
+        "plan-commit",
+    ] {
+        let workspace = Workspace::initialized();
+        workspace.cycle(&[
+            "create",
+            "--cycle-id",
+            "C-001",
+            "--objective",
+            "First slice",
+        ]);
+        workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+        workspace.activate_card("F-001", &["src/F-001/**"]);
+        let plan = workspace.root.join(format!("{boundary}.json"));
+        fs::write(
+            &plan,
+            r#"{"schema":"harness.cycle-plan/v1","plan_id":"PLAN-BOUNDARY","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+            .args([
+                "cycle",
+                "plan",
+                "--control",
+                &workspace.control.display().to_string(),
+                "--plan-id",
+                "PLAN-BOUNDARY",
+                "--file",
+                &plan.display().to_string(),
+                "--output",
+                "json",
+            ])
+            .env("CHANGE_HARNESS_FAIL_AT", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "failure boundary {boundary} unexpectedly passed"
+        );
+        let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+            .collect();
+        let journal = journals
+            .iter()
+            .find(|record| record["command"] == "cycle.plan")
+            .unwrap_or_else(|| panic!("missing cycle.plan journal at {boundary}"));
+        assert_eq!(journal["mutation_started"], true, "boundary {boundary}");
+        assert_eq!(journal["state"], "failed_partial", "boundary {boundary}");
+        let status = Workspace::run(&[
+            "project".into(),
+            "status".into(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--output".into(),
+            "json".into(),
+        ]);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert!(
+            !status["data"]["unresolved_operations"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "boundary {boundary}: {status}"
+        );
+    }
+}
+
+fn simple_plan_file(workspace: &Workspace, plan_id: &str) -> std::path::PathBuf {
+    let plan = workspace.root.join(format!("{plan_id}.json"));
+    fs::write(
+        &plan,
+        format!(
+            r#"{{"schema":"harness.cycle-plan/v1","plan_id":"{plan_id}","cycle_id":"C-001","objective":"slice","cards":[{{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}}]}}"#
+        ),
+    )
+    .unwrap();
+    plan
+}
+
+fn planned_single_card() -> (Workspace, std::path::PathBuf) {
+    let workspace = cycle_with(1);
+    let plan = simple_plan_file(&workspace, "PLAN-RACE");
+    (workspace, plan)
+}
+
+#[test]
+fn cycle_plan_identifier_cannot_escape_its_control_directory() {
+    let workspace = cycle_with(1);
+    let plan = workspace.root.join("escaping-plan.json");
+    fs::write(
+        &plan,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"../project/project","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    let project = workspace.control.join("project/project.json");
+    let project_before = fs::read(&project).unwrap();
+    let head_before = workspace.control_head();
+
+    let output = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "../project/project",
+        "--file",
+        &plan.display().to_string(),
+    ]);
+
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(fs::read(project).unwrap(), project_before);
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(
+        support::capture(
+            &workspace.control,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+        "",
+        "identifier refusal must not mutate control state"
+    );
+}
+
+#[test]
+fn cycle_plan_refuses_while_the_project_lock_is_held_without_journal_side_effects() {
+    let (workspace, plan) = planned_single_card();
+    let before_head = workspace.control_head();
+    let before_journals = journal_count(&workspace);
+    let before_journal_names = journal_names(&workspace);
+    let card_path = workspace.control.join(CardRecord::relative_path(
+        &"F-001".parse::<CardId>().unwrap(),
+        1,
+    ));
+    let before_card = fs::read(&card_path).unwrap();
+    let before_status = support::capture(&workspace.control, &["status", "--porcelain"]);
+    let lock = ProjectLock::acquire(&workspace.control, "test-held-lock", &SystemClock).unwrap();
+    let refused = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "PLAN-RACE",
+        "--file",
+        &plan.display().to_string(),
+    ]);
+    drop(lock);
+    assert_eq!(error_code(&refused), "CH-POLICY-LOCK-HELD");
+    assert_eq!(workspace.control_head(), before_head);
+    assert_eq!(journal_count(&workspace), before_journals);
+    assert_eq!(journal_names(&workspace), before_journal_names);
+    assert_eq!(fs::read(&card_path).unwrap(), before_card);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        before_status
+    );
+}
+
+#[test]
+fn cycle_plan_uses_captured_head_and_refuses_a_control_head_race() {
+    let (workspace, plan) = planned_single_card();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "cycle",
+            "plan",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--plan-id",
+            "PLAN-RACE",
+            "--file",
+            &plan.display().to_string(),
+            "--output",
+            "json",
+        ])
+        .env("CHANGE_HARNESS_PLAN_CAS_RACE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(error_code(&output), "CH-CONFLICT-CONTROL-HEAD-MOVED");
+    assert!(workspace.control.join("plans/PLAN-RACE.json").exists());
+    let competitor_tree = Command::new("git")
+        .args(["show", "HEAD:plans/PLAN-RACE.json"])
+        .current_dir(&workspace.control)
+        .output()
+        .unwrap();
+    assert!(
+        !competitor_tree.status.success(),
+        "the competing head must not contain this command's plan write"
+    );
+    let expected_tree = support::capture(&workspace.control, &["rev-parse", "HEAD^{tree}"]);
+    let parent_tree = support::capture(&workspace.control, &["rev-parse", "HEAD^1^{tree}"]);
+    assert_eq!(
+        expected_tree, parent_tree,
+        "competitor must preserve the original tree"
+    );
+    let journals: Vec<serde_json::Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    let journal = journals
+        .iter()
+        .find(|record| record["command"] == "cycle.plan")
+        .unwrap();
+    assert_eq!(journal["mutation_started"], true);
+    assert_eq!(journal["state"], "failed_partial");
+}
+
+#[test]
+fn cycle_plan_revalidates_stale_card_revision_and_membership_without_side_effects() {
+    for (plan_id, card_revision, cards) in [
+        (
+            "PLAN-STALE-CARD",
+            99,
+            "[{\"card_id\":\"F-001\",\"card_revision\":99,\"scope\":[\"src/F-001/**\"],\"depends_on\":[],\"proof_entries\":[\"fixture-proof\"],\"mutation_plan\":[\"fixture mutation\"],\"risk\":\"low\",\"reviewer_requirements\":[\"independent\"],\"assignment\":\"operator\",\"assignment_principal_id\":\"implementer-principal\",\"assignment_session_id\":\"implementer-session\",\"distribution\":\"parallel\",\"acceptance_behaviors\":[\"it works\"]}]",
+        ),
+        ("PLAN-MEMBERSHIP", 1, "[]"),
+    ] {
+        let workspace = cycle_with(1);
+        let plan = workspace.root.join(format!("{plan_id}.json"));
+        fs::write(
+            &plan,
+            format!(
+                r#"{{"schema":"harness.cycle-plan/v1","plan_id":"{plan_id}","cycle_id":"C-001","objective":"slice","cards":{cards}}}"#
+            ),
+        )
+        .unwrap();
+        let before_head = workspace.control_head();
+        let before_journals = journal_count(&workspace);
+        let refused = workspace.cycle_raw(&[
+            "plan",
+            "--plan-id",
+            plan_id,
+            "--file",
+            &plan.display().to_string(),
+        ]);
+        assert!(!refused.status.success());
+        assert_eq!(error_code(&refused), "CH-POLICY-INVALID-CYCLE");
+        assert_eq!(workspace.control_head(), before_head);
+        assert_eq!(
+            journal_count(&workspace),
+            before_journals,
+            "journal side effect for {plan_id}"
+        );
+        let _ = card_revision;
+    }
+}
+
+#[test]
+fn cycle_plan_locked_stale_recheck_discards_its_provisional_journal() {
+    let (workspace, plan) = planned_single_card();
+    let before_head = workspace.control_head();
+    let before_journals = journal_count(&workspace);
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args([
+            "cycle",
+            "plan",
+            "--output",
+            "json",
+            "--control",
+            &workspace.control.display().to_string(),
+            "--plan-id",
+            "PLAN-RACE",
+            "--file",
+            &plan.display().to_string(),
+        ])
+        .env("CHANGE_HARNESS_PLAN_STALE_RECHECK", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), before_head);
+    assert_eq!(journal_count(&workspace), before_journals);
+    assert!(!workspace.control.join("plans/PLAN-RACE.json").exists());
 }

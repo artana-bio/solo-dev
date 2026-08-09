@@ -83,6 +83,14 @@ fn dependent_built_on_its_dependency() -> (Workspace, String) {
     let workspace = Workspace::initialized();
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
 
@@ -179,6 +187,14 @@ fn a_dependency_rewrite_does_not_invalidate_a_dependent_that_does_not_incorporat
     let workspace = Workspace::initialized();
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
@@ -229,6 +245,14 @@ fn a_missing_handed_off_dependency_commit_is_not_bound() {
     let workspace = Workspace::initialized();
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
     let unavailable = head_of(&workspace, "F-001");
@@ -258,6 +282,14 @@ fn a_dependent_cannot_declare_an_unlanded_dependency_candidate_as_its_base() {
     let workspace = Workspace::initialized();
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.approve_card("F-001", "src/F-001/a.rs");
     let dependency_candidate = head_of(&workspace, "F-001");
@@ -349,6 +381,14 @@ fn a_dependent_may_be_handed_off_before_its_dependency_is_approved() {
     let workspace = Workspace::initialized();
     workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "slice"]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.mark_cycle_pre_upgrade("C-001");
+    workspace.cycle(&[
+        "migrate-legacy",
+        "--cycle-id",
+        "C-001",
+        "--provenance",
+        "legacy_cycle_plan_v1",
+    ]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
     workspace.activate_card_depending_on("F-002", &["src/F-002/**"], &["F-001"]);
     workspace.approve_card("F-002", "src/F-002/b.rs");

@@ -162,6 +162,8 @@ fn exact_permits_run_outside_the_global_lock_then_settle_once() {
         ("F-002", "src/b/**", "gate.b"),
     ] {
         w.activate_card_with_gates(card, &[scope], &[gate]);
+    }
+    for card in ["F-001", "F-002"] {
         w.work(&["start", "--card-id", card]);
     }
     let ra = reserve(&w, "F-001", "gate.a");

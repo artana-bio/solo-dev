@@ -60,7 +60,7 @@ rollback_strategy: revert the commit
 
 fn with_proof_map(draft: &str) -> String {
     format!(
-        "{draft}proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: intended behavior remains true\n      precondition: the focused fixture is installed\n      assertion: the named check observes the behavior\n      mutation: bypassing the behavior makes the check fail\n  claim_boundary: only the named focused behavior\n"
+        "{draft}proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: intended behavior remains true\n      precondition: the focused fixture is installed\n      assertion: the named check observes the behavior\n      mutation: bypassing the behavior makes the check fail\n      gate_oracle: gate.unit\n  claim_boundary: only the named focused behavior\n"
     )
 }
 

@@ -976,6 +976,23 @@ pub enum HarnessError {
         recovery: &'static str,
     },
 
+    /// A control-state failure carrying a structured report for automation.
+    #[error("control state: {reason}")]
+    ControlWithDetails {
+        /// What went wrong.
+        reason: String,
+        /// The stable code for this class of failure.
+        code: ErrorCode,
+        /// Structured evidence produced before the command failed closed.
+        details: serde_json::Value,
+    },
+
+    /// A pure policy refusal discovered after a transaction journal opened.
+    /// The transaction must discard its provisional journal rather than
+    /// turning a TOCTOU policy rejection into durable operation history.
+    #[error("{0}")]
+    NoPersist(#[source] Box<HarnessError>),
+
     /// A control-state file could not be read or written.
     #[error("cannot access control state at {path}: {source}")]
     ControlIo {
@@ -1037,7 +1054,9 @@ impl HarnessError {
             Self::ConflictingOptions(_) => ErrorCode::UsageConflictingOptions,
             Self::Config { code, .. }
             | Self::Control { code, .. }
-            | Self::ControlWithRecovery { code, .. } => *code,
+            | Self::ControlWithRecovery { code, .. }
+            | Self::ControlWithDetails { code, .. } => *code,
+            Self::NoPersist(error) => error.code(),
             Self::ControlIo { source, .. } => classify_io(source),
             Self::WorkspaceNotFound(_) => ErrorCode::PreconditionWorkspaceMissing,
             Self::WorkspaceAccess { .. } => ErrorCode::PreconditionWorkspaceAccess,
@@ -1068,6 +1087,8 @@ impl HarnessError {
             Self::Control { reason, .. } | Self::ControlWithRecovery { reason, .. } => {
                 serde_json::json!({ "reason": reason })
             }
+            Self::ControlWithDetails { details, .. } => details.clone(),
+            Self::NoPersist(error) => error.details(),
             Self::ControlIo { path, .. } => serde_json::json!({ "path": path }),
             Self::WorkspaceNotFound(path) | Self::WorkspaceAccess { path, .. } => {
                 serde_json::json!({ "path": path })
@@ -1090,6 +1111,13 @@ impl HarnessError {
             Self::ControlWithRecovery { recovery, .. } => recovery,
             _ => self.code().recovery(),
         }
+    }
+
+    /// Marks a pure policy refusal as non-persisting when it occurs inside a
+    /// transaction after the journal has opened.
+    #[must_use]
+    pub fn no_persist(error: Self) -> Self {
+        Self::NoPersist(Box::new(error))
     }
 }
 

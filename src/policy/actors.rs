@@ -33,6 +33,43 @@
 
 use crate::error::{ErrorCode, HarnessError};
 
+/// Declared actor/session boundary used by role-separation checks.
+/// Values are caller-declared; this type makes the comparison boundary
+/// explicit instead of falling back to display labels.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorIdentity<'a> {
+    pub actor_kind: &'a str,
+    pub actor_id: &'a str,
+    pub principal_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+
+impl<'a> ActorIdentity<'a> {
+    #[must_use]
+    pub const fn new(actor_kind: &'a str, actor_id: &'a str) -> Self {
+        Self {
+            actor_kind,
+            actor_id,
+            principal_id: None,
+            session_id: None,
+        }
+    }
+
+    /// Returns whether two declared roles share the same principal/session
+    /// boundary. Reuse of either a principal or a session is a collision;
+    /// differing sessions cannot make one principal independent.
+    #[must_use]
+    pub fn same_boundary(&self, other: &Self) -> bool {
+        matches!(
+            (self.session_id, other.session_id),
+            (Some(left), Some(right)) if same(left, right)
+        ) || matches!(
+            (self.principal_id, other.principal_id),
+            (Some(left), Some(right)) if same(left, right)
+        ) || same(self.actor_id, other.actor_id)
+    }
+}
+
 /// The comparable form of a declared actor identifier.
 ///
 /// Whitespace runs collapse to one space and ASCII letters fold to lowercase,

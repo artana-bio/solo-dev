@@ -33,6 +33,112 @@ pub const FINAL_AUTHORIZATION_POLICY_V1: &str = "harness.final-authorization-pol
 /// The first shipped, explicitly bounded convergence-budget policy.
 pub const CONVERGENCE_POLICY_V1: &str = "harness.convergence-policy/v1";
 
+/// The explicitly registered policy used to authorize mutation exemptions.
+pub const MUTATION_EXEMPTION_POLICY_V1: &str = "harness.mutation-exemption-policy/v1";
+
+/// One declared principal/session that may approve a named mutation exemption.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MutationExemptionRule {
+    pub code: String,
+    pub approved_by: String,
+    pub approver_principal_id: String,
+    pub approver_session_id: String,
+}
+
+/// Closed, versioned project policy for mutation exemptions.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MutationExemptionPolicy {
+    pub version: String,
+    pub rules: Vec<MutationExemptionRule>,
+}
+
+impl MutationExemptionPolicy {
+    /// Validates the policy's closed authorization table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error when the version, rules, or authorization facts
+    /// are missing, duplicated, or malformed.
+    pub fn validate(&self) -> Result<(), FieldError> {
+        if self.version != MUTATION_EXEMPTION_POLICY_V1 {
+            return Err(FieldError::new(
+                "mutation_exemption_policy.version",
+                format!("must name `{MUTATION_EXEMPTION_POLICY_V1}`"),
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        if self.rules.is_empty() {
+            return Err(FieldError::new(
+                "mutation_exemption_policy.rules",
+                "must authorize at least one explicit exemption code",
+                ErrorCode::ConfigInvalidValue,
+            ));
+        }
+        let mut authorizations: Vec<(&str, &str)> = Vec::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            for (field, value) in [
+                ("code", &rule.code),
+                ("approved_by", &rule.approved_by),
+                ("approver_principal_id", &rule.approver_principal_id),
+                ("approver_session_id", &rule.approver_session_id),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(FieldError::new(
+                        format!("mutation_exemption_policy.rules[{index}].{field}"),
+                        "must be nonblank",
+                        ErrorCode::ConfigInvalidValue,
+                    ));
+                }
+            }
+            for (field, value) in [
+                ("approved_by", &rule.approved_by),
+                ("approver_principal_id", &rule.approver_principal_id),
+                ("approver_session_id", &rule.approver_session_id),
+            ] {
+                actors::refuse_unusable("mutation exemption policy identity", value).map_err(
+                    |error| {
+                        FieldError::new(
+                            format!("mutation_exemption_policy.rules[{index}].{field}"),
+                            error.to_string(),
+                            ErrorCode::ConfigInvalidValue,
+                        )
+                    },
+                )?;
+            }
+            if authorizations.iter().any(|(code, approved_by)| {
+                *code == rule.code && actors::same(approved_by, &rule.approved_by)
+            }) {
+                return Err(FieldError::new(
+                    format!("mutation_exemption_policy.rules[{index}]"),
+                    "the code and approved_by pair must be unique",
+                    ErrorCode::ConfigInvalidValue,
+                ));
+            }
+            authorizations.push((&rule.code, &rule.approved_by));
+        }
+        Ok(())
+    }
+
+    /// Finds the exact declared authorization for an exemption code and actor.
+    #[must_use]
+    pub fn rule_for(&self, code: &str, approved_by: &str) -> Option<&MutationExemptionRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.code == code && actors::same(&rule.approved_by, approved_by))
+    }
+
+    /// Returns the canonical policy digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error if canonical serialization fails.
+    pub fn digest(&self) -> Result<Digest, HarnessError> {
+        Digest::of_canonical(self)
+    }
+}
+
 /// Limits for the attempts a single card may consume at one risk level.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -296,7 +402,7 @@ impl FinalAuthorizationPolicy {
     pub fn authorizes(&self, actor_id: &str) -> bool {
         self.authorizer_actor_ids
             .iter()
-            .any(|configured| configured == actor_id)
+            .any(|configured| actors::same(configured, actor_id))
     }
 
     #[must_use]
@@ -593,6 +699,15 @@ pub struct ProjectConfig {
     /// compatible v1 default while every v2 acceptance pins its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_authorization_policy: Option<FinalAuthorizationPolicy>,
+    /// `installed_default` is written by new project initialization and makes
+    /// the sealed-cycle path deterministic; `None` preserves old projects and
+    /// their explicit migration refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_authorization_mode: Option<String>,
+    /// Explicit mutation-exemption authorization. Omission is fail-closed for
+    /// new approvals; old project documents remain readable for migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_exemption_policy: Option<MutationExemptionPolicy>,
     /// Omission is deliberately not a default: old projects are reported as
     /// `legacy_unassessed` rather than silently receiving new budgets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,6 +780,9 @@ impl ProjectConfig {
             policy.validate().map_err(FieldError::into_error)?;
         }
         if let Some(policy) = &config.convergence_policy {
+            policy.validate().map_err(FieldError::into_error)?;
+        }
+        if let Some(policy) = &config.mutation_exemption_policy {
             policy.validate().map_err(FieldError::into_error)?;
         }
         Ok(config)

@@ -103,10 +103,12 @@ fn reference_card_draft() -> CardDraft {
         proof_map: Some(ProofMap {
             schema: PROOF_MAP_SCHEMA.to_owned(),
             entries: vec![ProofMapEntry {
+                id: Some("proof-1".to_owned()),
                 invariant: "reference invariant".to_owned(),
                 precondition: "reference precondition".to_owned(),
                 assertion: "reference assertion".to_owned(),
                 mutation: "reference mutation".to_owned(),
+                gate_oracle: Some("gate.reference".to_owned()),
             }],
             claim_boundary: "reference boundary".to_owned(),
         }),

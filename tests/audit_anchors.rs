@@ -54,6 +54,14 @@ fn trailer_values(envelope: &serde_json::Value, key: &str) -> Vec<String> {
 /// `activate_card`, which hardcodes `cycle_id: C-001` into the card body it
 /// writes; a second landing under its own cycle needs the real one.
 fn landed(workspace: &Workspace, cycle: &str, card: &str, file: &str) -> (String, String, String) {
+    let project: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.control.join("project/project.json")).unwrap())
+            .unwrap();
+    assert!(
+        project["mutation_exemption_policy"].is_null(),
+        "anchor fixtures must remain fail-closed instead of installing an exemption policy"
+    );
+
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -98,13 +106,21 @@ fn landed(workspace: &Workspace, cycle: &str, card: &str, file: &str) -> (String
     ]);
 
     workspace.review(&["begin", "--card-id", card]);
+    let mutation_receipt = workspace.create_fixture_mutation_receipt(
+        card,
+        "reviewer-session",
+        "reviewer-principal",
+        "reviewer-session",
+    );
     let verdict = workspace.root.join(format!("{card}-verdict.yaml"));
     fs::write(
         &verdict,
-        "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+        format!(
+            "reviewer_actor_id: reviewer-session\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: reviewer-session\n  principal_id: reviewer-principal\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: added the fixture mutation marker\n    failing_test: fixture oracle rejects the marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{mutation_receipt}]\n"
+        ),
     )
     .unwrap();
-    workspace.review(&[
+    let review = workspace.review_json(&[
         "record",
         "--card-id",
         card,
@@ -113,6 +129,15 @@ fn landed(workspace: &Workspace, cycle: &str, card: &str, file: &str) -> (String
         "--actor",
         "reviewer-session",
     ]);
+    assert_eq!(
+        review["data"]["review"]["mutation_receipt_ids"],
+        serde_json::json!([mutation_receipt]),
+        "the anchor setup must carry executable mutation evidence explicitly"
+    );
+    assert!(
+        review["data"]["review"]["mutation_exemption"].is_null(),
+        "the anchor setup must not depend on an exemption"
+    );
 
     let id =
         workspace.integration_json(&["prepare", "--cycle-id", cycle, "--actor-id", "coordinator"])
@@ -284,8 +309,6 @@ fn appending_to_the_control_record_never_reports_a_discrepancy() {
     // landing — proving the check tolerates ordinary continued work, not
     // just more landings.
     workspace.register_gate("gate.extra", &["true"]);
-    workspace.activate_card("F-002", &["src/F-002/**"]);
-    workspace.approve_card("F-002", "src/F-002/a.rs");
     workspace.configure_convergence_policy(5, 5);
 
     // And a second landing too: growth by landing again must be exactly as

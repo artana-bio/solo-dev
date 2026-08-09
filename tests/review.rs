@@ -10,6 +10,9 @@ use support::Workspace;
 /// A card handed off and ready for review.
 fn handed_off() -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    // This suite exercises exemption authorization directly. Ordinary shared
+    // workspaces stay fail-closed; the policy is explicit test setup here.
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -19,7 +22,15 @@ fn handed_off() -> (Workspace, String) {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/**"]);
-    workspace.work(&["start", "--card-id", "F-001"]);
+    workspace.work(&[
+        "start",
+        "--card-id",
+        "F-001",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
 
     let path = workspace.worktrees.join("F-001");
     fs::create_dir_all(path.join("src")).unwrap();
@@ -51,6 +62,16 @@ fn handed_off() -> (Workspace, String) {
 /// Writes a verdict file and returns its path.
 fn verdict(workspace: &Workspace, body: &str) -> String {
     let path = workspace.root.join("verdict.yaml");
+    // This helper is intentionally limited to the fixture's explicitly
+    // installed, registered exemption. Raw production-path tests bypass it
+    // when exercising missing or unauthorized evidence.
+    let body = if body.contains("decision: approved") && !body.contains("mutation_exemption:") {
+        format!(
+            "{body}mutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
+        )
+    } else {
+        body.to_owned()
+    };
     fs::write(&path, body).unwrap();
     path.display().to_string()
 }
@@ -58,7 +79,7 @@ fn verdict(workspace: &Workspace, body: &str) -> String {
 /// A clean approval by a distinct reviewer.
 fn approval(reviewer: &str) -> String {
     format!(
-        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n"
+        "reviewer_actor_id: {reviewer}\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n"
     )
 }
 
@@ -123,6 +144,39 @@ fn self_review_is_refused() {
         String::from_utf8_lossy(&output.stdout).contains("procedural"),
         "the message must not overclaim what this check proves"
     );
+}
+
+#[test]
+fn different_actor_in_the_implementer_session_is_refused() {
+    let (workspace, _) = handed_off();
+    let body = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: agent\n  session_id: implementer-session\n  principal_id: other-principal\ndecision: changes_requested\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: same session must be refused\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: non-approval fixture\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, body),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
+fn different_session_with_the_implementer_principal_is_refused() {
+    let (workspace, _) = handed_off();
+    let body = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: agent\n  session_id: different-review-session\n  principal_id: Implementer-Principal\ndecision: changes_requested\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: same principal must be refused even when sessions differ\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: non-approval fixture\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, body),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
 }
 
 #[test]
@@ -318,6 +372,10 @@ fn a_declared_exemption_is_recorded_and_visible() {
     assert_eq!(
         evidence["reason"], "fixture verdict for unrelated review behavior; no mutation performed",
         "the exemption's own reason must be visible in the recorded review, not merely a boolean"
+    );
+    assert_eq!(
+        envelope["data"]["review"]["mutation_exemption_binding"]["code"], "fixture-no-mutation",
+        "the approval must pin the resolved exemption policy facts"
     );
 
     // And still visible on a later read, not only in the write's own reply.
@@ -1028,6 +1086,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     // the treatment a low-risk one did: the policy was documented, modelled,
     // and never enforced.
     let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -1064,6 +1123,18 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     ]);
     workspace.review(&["begin", "--card-id", "F-001"]);
 
+    let legacy_human = "reviewer_actor_id: reviewer-session-a\nhuman_reviewer: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: legacy self-certification\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let legacy_output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, legacy_human),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&legacy_output), "CH-POLICY-RISK-REVIEW");
+
     let output = workspace.review_raw(&[
         "record",
         "--card-id",
@@ -1088,7 +1159,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     // Declaring it is the way through. Like every other identity in this
     // harness it is a claim, not a proof — D-013 — so this must be recorded on
     // the review rather than checked.
-    let human = "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\nhuman_reviewer: true\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let human = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation-1\n  attestor_actor_id: independent-attestor\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: I independently attest this is a human review\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture review has no executable mutation\n  approved_by: independent-attestor\n";
     let envelope = workspace.review_json(&[
         "record",
         "--card-id",
@@ -1100,8 +1171,8 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(
-        envelope["data"]["review"]["human_reviewer"], true,
-        "the claim must be on the record, so an auditor can see who made it"
+        envelope["data"]["review"]["reviewer_kind"], "human",
+        "the typed claim must be on the record, so an auditor can see who made it"
     );
 }
 
@@ -1121,4 +1192,171 @@ fn a_low_risk_card_needs_no_human_declaration() {
     ]);
     assert_eq!(envelope["data"]["state"], "approved");
     assert_eq!(envelope["data"]["review"]["human_reviewer"], false);
+}
+
+#[test]
+fn an_arbitrary_mutation_exemption_is_refused_by_the_production_path() {
+    for (code, approved_by) in [
+        ("made-up-bypass", "unrelated-string"),
+        ("fixture-no-mutation", "unrelated-string"),
+        ("fixture-no-mutation", "reviewer-session-a"),
+    ] {
+        let (workspace, _) = handed_off();
+        let path = workspace.root.join("arbitrary-exemption.yaml");
+        fs::write(
+            &path,
+            format!(
+                "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: review-session\n  principal_id: reviewer-principal\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: prose only\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: {code}\n  reason: made-up reason\n  approved_by: {approved_by}\n"
+            ),
+        )
+        .unwrap();
+        let output = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path.display().to_string(),
+            "--actor",
+            "reviewer-session-a",
+        ]);
+        assert!(
+            !output.status.success(),
+            "arbitrary exemption must be refused"
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+    }
+}
+
+#[test]
+fn every_new_low_risk_approval_needs_typed_mutation_evidence() {
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("unbound-approval.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: prose only\nresidual_risks: []\nreview_conduct: separate_process\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-INCOMPLETE-REVIEW");
+}
+
+#[test]
+fn human_approval_rejects_blank_attestor_identity() {
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("blank-attestor.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: attestation-blank\n  attestor_actor_id: ' '\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: independent attestation\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: fixture\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-attestor\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-RISK-REVIEW");
+}
+
+#[test]
+fn human_attestation_requires_a_distinct_principal_and_session_boundary() {
+    let cases = [
+        (
+            "same-reviewer-principal",
+            "reviewer-principal",
+            "attestor-session",
+        ),
+        (
+            "same-reviewer-session",
+            "attestor-principal",
+            "review-session",
+        ),
+        (
+            "same-implementer-principal",
+            "implementer-principal",
+            "attestor-session",
+        ),
+        (
+            "same-implementer-session",
+            "attestor-principal",
+            "implementer-session",
+        ),
+        ("blank-provenance", " ", " "),
+    ];
+    for (label, principal, session) in cases {
+        let (workspace, _) = handed_off();
+        let path = workspace.root.join(format!("{label}.yaml"));
+        fs::write(
+            &path,
+            format!(
+                "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: {label}\n  attestor_actor_id: different-attestor\n  attestor_principal_id: '{principal}'\n  attestor_session_id: '{session}'\n  statement: independent\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: fixture\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-approver\n"
+            ),
+        )
+        .unwrap();
+        let output = workspace.review_raw(&[
+            "record",
+            "--card-id",
+            "F-001",
+            "--verdict",
+            &path.display().to_string(),
+            "--actor",
+            "reviewer-session-a",
+        ]);
+        assert!(
+            !output.status.success(),
+            "{label} unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(&output), "CH-POLICY-RISK-REVIEW", "{label}");
+    }
+
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("missing-attestor-provenance.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: missing-provenance\n  attestor_actor_id: independent-attestor\n  statement: independent\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: fixture\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-approver\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(error_code(&output), "CH-POLICY-RISK-REVIEW");
+
+    let (workspace, _) = handed_off();
+    let path = workspace.root.join("valid-distinct-attestation.yaml");
+    fs::write(
+        &path,
+        "reviewer_actor_id: reviewer-session-a\nreviewer_kind: human\nreviewer_provenance:\n  provider: fixture\n  model: human\n  session_id: review-session\n  principal_id: reviewer-principal\nhuman_attestation:\n  evidence_id: distinct-attestation\n  attestor_actor_id: independent-attestor\n  attestor_principal_id: attestor-principal\n  attestor_session_id: attestor-session\n  statement: independent\n  independently_created: true\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: fixture\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture\n  reason: no mutation\n  approved_by: independent-approver\n",
+    )
+    .unwrap();
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &path.display().to_string(),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert!(
+        output.status.success(),
+        "valid distinct attestation refused: {output:?}"
+    );
 }

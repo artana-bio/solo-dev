@@ -25,10 +25,14 @@ use crate::{
         digest::CANONICAL_ALGORITHM,
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
+        mutation::{
+            MutationExemption, MutationExemptionBinding, MutationReceipt, MutationReceiptBinding,
+        },
         review::{
-            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, MutationAuthorship,
-            MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct, ReviewRecord,
-            check_independence, check_review_conduct,
+            Decision, Disposition, Finding, FindingSeverity, GateAdequacy, HumanAttestation,
+            MutationAuthorship, MutationEvidence, REVIEW_DIR, REVIEW_SCHEMA, ReviewConduct,
+            ReviewRecord, ReviewerKind, ReviewerProvenance, check_independence,
+            check_review_conduct, validate_human_attestation_boundary,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -81,6 +85,12 @@ pub struct CommonArgs {
     /// Identifies the acting party. Declared, not proven; see D-013.
     #[arg(long, default_value = "operator")]
     pub actor: String,
+    /// Declared reviewer principal; not host-attested.
+    #[arg(long)]
+    pub actor_principal_id: Option<String>,
+    /// Declared reviewer session; not host-attested.
+    #[arg(long)]
+    pub actor_session_id: Option<String>,
 }
 
 /// Arguments accepted by `review begin`.
@@ -145,6 +155,18 @@ pub struct ExampleArgs {}
 pub struct Verdict {
     /// Who reviewed.
     pub reviewer_actor_id: String,
+    /// Typed reviewer identity. Omission is accepted only for legacy verdicts.
+    #[serde(default)]
+    pub reviewer_kind: Option<ReviewerKind>,
+    #[serde(default)]
+    pub reviewer_provenance: Option<ReviewerProvenance>,
+    #[serde(default)]
+    pub human_attestation: Option<HumanAttestation>,
+    /// IDs of executable mutation receipts stored in control state.
+    #[serde(default)]
+    pub mutation_receipt_ids: Vec<String>,
+    #[serde(default)]
+    pub mutation_exemption: Option<MutationExemption>,
     /// The conclusion.
     pub decision: Decision,
     /// Why the work is being returned.
@@ -344,6 +366,7 @@ pub fn current_approval(
         let standings =
             dependency_standings(control, scope, depends_on, &review.dependency_bindings)?;
         if review.is_current_for(candidate_sha, card_digest, &standings) {
+            validate_approved_review_evidence(control, &review)?;
             return Ok(Some(review));
         }
     }
@@ -367,7 +390,11 @@ pub fn standing_approval(
     control: &ControlRepository,
     card_id: &CardId,
 ) -> Result<Option<ReviewRecord>, HarnessError> {
-    Ok(ReviewRecord::standing_approval(&reviews_for(control, card_id)?).cloned())
+    let approval = ReviewRecord::standing_approval(&reviews_for(control, card_id)?).cloned();
+    if let Some(review) = &approval {
+        validate_approved_review_evidence(control, review)?;
+    }
+    Ok(approval)
 }
 
 /// Where each declared dependency stands against one record's bindings.
@@ -414,13 +441,40 @@ pub fn dependency_standings(
     Ok(standings)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let card_id: CardId = args.card_id.parse()?;
+
+    let validate_identity = |handoff: &crate::domain::handoff::HandoffRecord| {
+        check_independence(&args.common.actor, &handoff.actor_id)?;
+        let reviewer_provenance = (args.common.actor_principal_id.is_some()
+            || args.common.actor_session_id.is_some())
+        .then(|| ReviewerProvenance {
+            provider: None,
+            model: None,
+            session_id: args.common.actor_session_id.clone(),
+            principal_id: args.common.actor_principal_id.clone(),
+        });
+        refuse_shared_reviewer_boundary(
+            &args.common.actor,
+            reviewer_provenance.as_ref(),
+            &handoff.actor_id,
+            handoff.actor_principal_id.as_deref(),
+            handoff.actor_session_id.as_deref(),
+        )
+    };
 
     if args.dry_run {
         let control = ControlRepository::open(&args.common.control)?;
         let config = control.project()?;
         let (record, state) = load_card(&control, &card_id)?;
+        let cycle = crate::commands::cycle::load_cycle(&control, &record.cycle_id)?;
+        crate::commands::cycle::require_active_plan(&control, &cycle)?;
+        let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no handoff to review"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+        validate_identity(&handoff)?;
         // The dry run must ask this too: a preview that skips a check the
         // real command enforces is worse than no preview, per
         // `preview_record`'s "Tier 3 defect 24" note.
@@ -433,6 +487,15 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         ));
     }
 
+    {
+        let control = ControlRepository::open(&args.common.control)?;
+        let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no handoff to review"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+        validate_identity(&handoff)?;
+    }
+
     with_transaction(
         &args.common.control,
         "review.begin",
@@ -441,16 +504,18 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            let cycle = crate::commands::cycle::load_cycle(control, &record.cycle_id)?;
+            crate::commands::cycle::require_active_plan(control, &cycle)?;
             // 72-2: the first check that can refuse, before anything is
             // written — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
-            state.state.check_transition(CardState::ReviewPending)?;
-
             let handoff =
                 latest_handoff(control, &card_id)?.ok_or_else(|| HarnessError::Control {
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
+            steps.recheck(validate_identity(&handoff))?;
+            state.state.check_transition(CardState::ReviewPending)?;
             if handoff.status == HandoffStatus::Revoked {
                 return Err(HarnessError::Control {
                     reason: format!("handoff {} was revoked", handoff.handoff_id),
@@ -572,6 +637,27 @@ fn read_verdict(path: &PathBuf) -> Result<Verdict, HarnessError> {
 fn example_verdict() -> Verdict {
     Verdict {
         reviewer_actor_id: "reviewer-example".to_owned(),
+        reviewer_kind: Some(ReviewerKind::Human),
+        reviewer_provenance: Some(ReviewerProvenance {
+            provider: Some("local".to_owned()),
+            model: None,
+            session_id: Some("review-example-session".to_owned()),
+            principal_id: Some("human-reviewer".to_owned()),
+        }),
+        human_attestation: Some(HumanAttestation {
+            evidence_id: "AT-EXAMPLE-001".to_owned(),
+            attestor_actor_id: "attestor-example".to_owned(),
+            attestor_principal_id: Some("human-attestor".to_owned()),
+            attestor_session_id: Some("attestor-session".to_owned()),
+            statement: "I independently attest that a human reviewed this candidate".to_owned(),
+            independently_created: true,
+        }),
+        mutation_receipt_ids: vec![],
+        mutation_exemption: Some(MutationExemption {
+            code: "example_fixture".to_owned(),
+            reason: "the generated example has no executable candidate to mutate".to_owned(),
+            approved_by: "example-generator".to_owned(),
+        }),
         decision: Decision::Approved,
         reason_category: None,
         findings: vec![Finding {
@@ -841,10 +927,70 @@ fn require_review_return_reason(
 /// and `check_supersedes`, called from `run_record` beside `validate` and
 /// mirrored here not at all) is a wider change than this targeted fix, left
 /// for a card that owns that decision.
+fn build_review_record(
+    record: &crate::domain::card::CardRecord,
+    state: &crate::commands::card::CardStateRecord,
+    handoff: &crate::domain::handoff::HandoffRecord,
+    verdict: &Verdict,
+    review_id: ReviewId,
+    previous: Option<&ReviewRecord>,
+    clock: &dyn Clock,
+) -> Result<ReviewRecord, HarnessError> {
+    Ok(ReviewRecord {
+        schema: REVIEW_SCHEMA.to_owned(),
+        review_id,
+        card_id: record.card_id.clone(),
+        card_revision: state.current_revision,
+        card_digest: state.current_digest.clone(),
+        cycle_id: record.cycle_id.clone(),
+        baseline_sha: handoff.baseline_sha.clone(),
+        candidate_sha: handoff.candidate_sha.clone(),
+        dependency_bindings: handoff.dependency_bindings.clone(),
+        handoff_id: handoff.handoff_id.clone(),
+        handoff_digest: handoff.digest()?,
+        reviewer_actor_id: verdict.reviewer_actor_id.clone(),
+        reviewer_kind: verdict.reviewer_kind,
+        reviewer_provenance: verdict.reviewer_provenance.clone(),
+        human_attestation: verdict.human_attestation.clone(),
+        mutation_receipt_ids: verdict.mutation_receipt_ids.clone(),
+        mutation_receipt_bindings: vec![],
+        mutation_exemption: verdict.mutation_exemption.clone(),
+        mutation_exemption_binding: None,
+        feature_actor_id: handoff.actor_id.clone(),
+        decision: verdict.decision,
+        findings: verdict.findings.clone(),
+        gate_adequacy: verdict.gate_adequacy.clone(),
+        residual_risks: verdict.residual_risks.clone(),
+        human_reviewer: verdict.human_reviewer,
+        review_conduct: verdict.review_conduct,
+        supersedes: previous.map(|review| review.review_id.clone()),
+        reviewed_at: clock.now(),
+        canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
+    })
+}
+
+fn validate_review_candidate(
+    control: &ControlRepository,
+    record: &crate::domain::card::CardRecord,
+    verdict: &Verdict,
+    review: &mut ReviewRecord,
+    previous: Option<&ReviewRecord>,
+) -> Result<(), HarnessError> {
+    review.validate()?;
+    check_review_conduct(&record.review_policy, review.review_conduct)?;
+    review.check_risk_policy(record.risk)?;
+    if let Some(superseded) = previous {
+        review.check_supersedes(superseded)?;
+    }
+    require_typed_reviewer_contract(record, verdict)?;
+    validate_mutation_receipts(control, review)
+}
+
 fn preview_record(
     args: &RecordArgs,
     card_id: &CardId,
     verdict: &Verdict,
+    clock: &dyn Clock,
 ) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
@@ -863,8 +1009,37 @@ fn preview_record(
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
-    check_review_conduct(&record.review_policy, verdict.review_conduct)?;
-    verdict.gate_adequacy.validate_mutation_evidence()?;
+    refuse_shared_reviewer_boundary(
+        &verdict.reviewer_actor_id,
+        verdict.reviewer_provenance.as_ref(),
+        &handoff.actor_id,
+        handoff.actor_principal_id.as_deref(),
+        handoff.actor_session_id.as_deref(),
+    )?;
+    if verdict.reviewer_kind == Some(ReviewerKind::Human) {
+        validate_human_attestation_boundary(
+            &verdict.reviewer_actor_id,
+            verdict.reviewer_provenance.as_ref(),
+            verdict.human_attestation.as_ref(),
+            &handoff.actor_id,
+            handoff.actor_principal_id.as_deref(),
+            handoff.actor_session_id.as_deref(),
+        )?;
+    }
+    let next_state = state_for(verdict.decision);
+    state.state.check_transition(next_state)?;
+    let previous = reviews_for(&control, card_id)?.into_iter().next_back();
+    let review_id = next_review_id(&control)?;
+    let mut review = build_review_record(
+        &record,
+        &state,
+        &handoff,
+        verdict,
+        review_id,
+        previous.as_ref(),
+        clock,
+    )?;
+    validate_review_candidate(&control, &record, verdict, &mut review, previous.as_ref())?;
     Ok(CommandOutcome::new(
         "review.record",
         format!(
@@ -877,6 +1052,100 @@ fn preview_record(
             "decision": verdict.decision.name(),
         }),
     ))
+}
+
+fn require_typed_reviewer_contract(
+    record: &crate::domain::card::CardRecord,
+    verdict: &Verdict,
+) -> Result<(), HarnessError> {
+    if verdict.human_reviewer && verdict.reviewer_kind != Some(ReviewerKind::Human) {
+        return Err(HarnessError::Control {
+            reason: "legacy human_reviewer is migration input only; declare typed human identity and attestation".to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        });
+    }
+    if record.risk.requires_human_review() && verdict.reviewer_kind != Some(ReviewerKind::Human) {
+        return Err(HarnessError::Control {
+            reason: "high-risk approvals require a declared reviewer_kind: human and independent attestation; legacy human_reviewer is not sufficient"
+                .to_owned(),
+            code: ErrorCode::PolicyRiskReview,
+        });
+    }
+    if verdict.decision == Decision::Approved {
+        let Some(kind) = verdict.reviewer_kind else {
+            return Err(HarnessError::Control {
+                reason: "every new approval requires a declared typed reviewer_kind and nonblank reviewer provenance including session_id".to_owned(),
+                code: if record.risk.requires_human_review() {
+                    ErrorCode::PolicyRiskReview
+                } else {
+                    ErrorCode::PolicyIncompleteReview
+                },
+            });
+        };
+        let Some(provenance) = verdict.reviewer_provenance.as_ref() else {
+            return Err(HarnessError::Control {
+                reason:
+                    "every new approval requires typed reviewer provenance including session_id"
+                        .to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        };
+        if provenance
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            || provenance
+                .principal_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(HarnessError::Control {
+                reason:
+                    "approved reviewer provenance requires nonblank principal_id and session_id"
+                        .to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        }
+        if kind == ReviewerKind::Agent && verdict.human_attestation.is_some() {
+            return Err(HarnessError::Control {
+                reason: "an agent approval cannot carry human-attestation evidence".to_owned(),
+                code: ErrorCode::PolicyRiskReview,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn refuse_shared_reviewer_boundary(
+    reviewer_actor_id: &str,
+    provenance: Option<&ReviewerProvenance>,
+    feature_actor_id: &str,
+    feature_principal_id: Option<&str>,
+    feature_session_id: Option<&str>,
+) -> Result<(), HarnessError> {
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    let reviewer = actors::ActorIdentity {
+        actor_kind: "reviewer",
+        actor_id: reviewer_actor_id,
+        principal_id: provenance.principal_id.as_deref(),
+        session_id: provenance.session_id.as_deref(),
+    };
+    let feature = actors::ActorIdentity {
+        actor_kind: "implementer",
+        actor_id: feature_actor_id,
+        principal_id: feature_principal_id.or(Some(feature_actor_id)),
+        session_id: feature_session_id,
+    };
+    if reviewer.same_boundary(&feature) {
+        return Err(HarnessError::Control {
+            reason: "reviewer and implementer share the declared principal/session boundary"
+                .to_owned(),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    Ok(())
 }
 
 /// The card state a decision moves the card to.
@@ -1048,7 +1317,7 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
     require_actor_agreement(&args.common.actor, &verdict)?;
 
     if args.dry_run {
-        return preview_record(args, &card_id, &verdict);
+        return preview_record(args, &card_id, &verdict, clock);
     }
 
     with_transaction(
@@ -1106,46 +1375,39 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 HandoffScope::Bindings
             };
             require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;
+            refuse_shared_reviewer_boundary(
+                &verdict.reviewer_actor_id,
+                verdict.reviewer_provenance.as_ref(),
+                &handoff.actor_id,
+                handoff.actor_principal_id.as_deref(),
+                handoff.actor_session_id.as_deref(),
+            )?;
+            if verdict.reviewer_kind == Some(ReviewerKind::Human) {
+                validate_human_attestation_boundary(
+                    &verdict.reviewer_actor_id,
+                    verdict.reviewer_provenance.as_ref(),
+                    verdict.human_attestation.as_ref(),
+                    &handoff.actor_id,
+                    handoff.actor_principal_id.as_deref(),
+                    handoff.actor_session_id.as_deref(),
+                )?;
+            }
 
             let next_state = state_for(verdict.decision);
             state.state.check_transition(next_state)?;
 
             let previous = reviews_for(control, &card_id)?.into_iter().next_back();
             let review_id = next_review_id(control)?;
-            let review = ReviewRecord {
-                schema: REVIEW_SCHEMA.to_owned(),
-                review_id: review_id.clone(),
-                card_id: card_id.clone(),
-                card_revision: state.current_revision,
-                card_digest: state.current_digest.clone(),
-                cycle_id: record.cycle_id.clone(),
-                baseline_sha: handoff.baseline_sha.clone(),
-                candidate_sha: handoff.candidate_sha.clone(),
-                dependency_bindings: handoff.dependency_bindings.clone(),
-                handoff_id: handoff.handoff_id.clone(),
-                handoff_digest: handoff.digest()?,
-                reviewer_actor_id: verdict.reviewer_actor_id.clone(),
-                feature_actor_id: handoff.actor_id.clone(),
-                decision: verdict.decision,
-                findings: verdict.findings.clone(),
-                gate_adequacy: verdict.gate_adequacy.clone(),
-                residual_risks: verdict.residual_risks.clone(),
-                human_reviewer: verdict.human_reviewer,
-                review_conduct: verdict.review_conduct,
-                supersedes: previous.as_ref().map(|review| review.review_id.clone()),
-                reviewed_at: clock.now(),
-                canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
-            };
-            review.validate()?;
-            // #28: kept separate from `validate()` rather than folded into
-            // it — see `check_review_conduct`'s doc for why — but must still
-            // run in the real transaction exactly as `preview_record` runs it
-            // on the dry-run path, so the two cannot disagree.
-            check_review_conduct(&record.review_policy, review.review_conduct)?;
-            review.check_risk_policy(record.risk)?;
-            if let Some(superseded) = previous.as_ref() {
-                review.check_supersedes(superseded)?;
-            }
+            let mut review = build_review_record(
+                &record,
+                &state,
+                &handoff,
+                &verdict,
+                review_id.clone(),
+                previous.as_ref(),
+                clock,
+            )?;
+            validate_review_candidate(control, &record, &verdict, &mut review, previous.as_ref())?;
             let digest = review.digest()?;
 
             control.write_atomic(
@@ -1233,6 +1495,236 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             ))
         },
     )
+}
+
+/// Revalidates executable mutation evidence for an approved review consumer.
+///
+/// # Errors
+///
+/// Returns a stable policy or stale-evidence error when a receipt is missing,
+/// malformed, replaced, or no longer matches the approval binding.
+pub fn validate_approved_review_evidence(
+    control: &ControlRepository,
+    review: &ReviewRecord,
+) -> Result<(), HarnessError> {
+    if review.decision != Decision::Approved {
+        return Ok(());
+    }
+    let mut checked = review.clone();
+    validate_mutation_receipts(control, &mut checked)?;
+    validate_mutation_exemption(control, &mut checked)?;
+    if checked.mutation_receipt_bindings != review.mutation_receipt_bindings
+        || checked.mutation_exemption_binding != review.mutation_exemption_binding
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "approved review {} has unpinned mutation evidence bindings",
+                review.review_id
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(())
+}
+
+fn validate_mutation_exemption(
+    control: &ControlRepository,
+    review: &mut ReviewRecord,
+) -> Result<(), HarnessError> {
+    let Some(exemption) = review.mutation_exemption.as_ref() else {
+        if review.mutation_exemption_binding.is_some() {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "review {} carries mutation-exemption authorization without an exemption",
+                    review.review_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+        return Ok(());
+    };
+    exemption.validate(&review.reviewer_actor_id)?;
+    if review.decision != Decision::Approved {
+        return Ok(());
+    }
+    let config = control.project()?;
+    let policy = config.mutation_exemption_policy.as_ref().ok_or_else(|| {
+        HarnessError::Control {
+            reason: "approved mutation exemption has no registered project exemption policy; install one explicitly before approving".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        }
+    })?;
+    let rule = policy
+        .rule_for(&exemption.code, &exemption.approved_by)
+        .ok_or_else(|| HarnessError::Control {
+            reason: format!(
+                "mutation exemption code `{}` is not authorized for approver `{}` by the registered project policy",
+                exemption.code, exemption.approved_by
+            ),
+            code: ErrorCode::PolicyIncompleteReview,
+        })?;
+    if review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.principal_id.as_deref())
+        .is_some_and(|principal| actors::same(principal, &rule.approver_principal_id))
+        || review
+            .reviewer_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.session_id.as_deref())
+            .is_some_and(|session| actors::same(session, &rule.approver_session_id))
+    {
+        return Err(HarnessError::Control {
+            reason: "mutation exemption approver must be independent from the reviewer principal and session".to_owned(),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    let binding = MutationExemptionBinding {
+        policy_digest: policy.digest()?,
+        code: rule.code.clone(),
+        approved_by: rule.approved_by.clone(),
+        approver_principal_id: rule.approver_principal_id.clone(),
+        approver_session_id: rule.approver_session_id.clone(),
+    };
+    if let Some(existing) = &review.mutation_exemption_binding {
+        if existing != &binding {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "mutation exemption authorization for review {} is stale or bound to a different project policy",
+                    review.review_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+    } else {
+        review.mutation_exemption_binding = Some(binding);
+    }
+    Ok(())
+}
+
+fn validate_mutation_receipts(
+    control: &ControlRepository,
+    review: &mut ReviewRecord,
+) -> Result<(), HarnessError> {
+    if review.mutation_exemption.is_some() {
+        if !review.mutation_receipt_ids.is_empty() {
+            return Err(HarnessError::Control {
+                reason: "a review cannot combine executable mutation receipts with an exemption"
+                    .to_owned(),
+                code: ErrorCode::PolicyIncompleteReview,
+            });
+        }
+        review.mutation_receipt_bindings.clear();
+        validate_mutation_exemption(control, review)?;
+        return Ok(());
+    }
+    if review.decision == Decision::Approved && review.mutation_receipt_ids.is_empty() {
+        return Err(HarnessError::Control {
+            reason: "every new approved review requires an executable mutation receipt or typed policy-valid exemption".to_owned(),
+            code: ErrorCode::PolicyIncompleteReview,
+        });
+    }
+    let mut actual_bindings = Vec::new();
+    for receipt_id in &review.mutation_receipt_ids {
+        let receipt = load_mutation_receipt(control, receipt_id)?;
+        validate_receipt_binding(review, receipt_id, &receipt)?;
+        let binding = MutationReceiptBinding::from_receipt(&receipt)?;
+        actual_bindings.push(binding);
+    }
+    if review.mutation_receipt_bindings.is_empty() {
+        review.mutation_receipt_bindings = actual_bindings;
+    } else if review.mutation_receipt_bindings != actual_bindings {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt bindings for review {} no longer match persisted receipts",
+                review.review_id
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(())
+}
+
+fn load_mutation_receipt(
+    control: &ControlRepository,
+    receipt_id: &str,
+) -> Result<MutationReceipt, HarnessError> {
+    let relative = MutationReceipt::relative_path(receipt_id)?;
+    let raw = control
+        .read(&relative)
+        .map_err(|source| HarnessError::Control {
+            reason: format!("mutation receipt {receipt_id} is missing or unreadable: {source}"),
+            code: ErrorCode::GateEvidenceStale,
+        })?;
+    let receipt: MutationReceipt =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+            reason: format!("mutation receipt {receipt_id} is malformed: {source}"),
+            code: ErrorCode::GateEvidenceStale,
+        })?;
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn validate_receipt_binding(
+    review: &ReviewRecord,
+    receipt_id: &str,
+    receipt: &MutationReceipt,
+) -> Result<(), HarnessError> {
+    let expected_revision = format!("{}-r{}", review.card_id, review.card_revision);
+    if receipt.card_revision != expected_revision {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to card revision {expected_revision}"
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    if receipt.reviewer_actor_id != review.reviewer_actor_id {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to reviewer actor {}",
+                review.reviewer_actor_id
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if let Some(principal_id) = review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.principal_id.as_deref())
+        && receipt.reviewer_principal_id.as_deref() != Some(principal_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to the reviewer's declared principal"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if let Some(session_id) = review
+        .reviewer_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.session_id.as_deref())
+        && receipt.reviewer_session_id.as_deref() != Some(session_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to the reviewer's declared session"
+            ),
+            code: ErrorCode::PolicySameActor,
+        });
+    }
+    if receipt.candidate_sha != review.candidate_sha
+        || !actors::same(&receipt.reviewer_actor_id, &review.reviewer_actor_id)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "mutation receipt {receipt_id} is not bound to this candidate and reviewer"
+            ),
+            code: ErrorCode::GateEvidenceStale,
+        });
+    }
+    Ok(())
 }
 
 /// Turns a committed review into the command's outcome.

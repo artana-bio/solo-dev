@@ -173,6 +173,10 @@ fn the_emitted_gate_example_is_complete() {
     let reference = GateDefinition {
         schema: GATE_SCHEMA.to_owned(),
         gate_id: "reference".to_owned(),
+        purpose: Some("reference gate".to_owned()),
+        semantics: Some("true exits successfully".to_owned()),
+        migration: None,
+        reuse_justification: None,
         revision: 1,
         argv: vec!["true".to_owned()],
         working_directory: ".".to_owned(),

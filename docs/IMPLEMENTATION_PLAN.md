@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 61 |
-| Plan date | 2026-08-08 |
+| Plan revision | 78 |
+| Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `alvaro/project-snapshot-observability` |
+| Active branch | `alvaro/harness-p0-p1-governance-r12` |
 | Current release stage | Hardened single-repository release |
-| Current implementation status | `WP-550` is `DONE`: the read-only project snapshot, machine-readable JSON projection, terminal watch mode, declared JUnit metrics, documentation, and historical-control compatibility have passed the full quality gate and independent exact-SHA review. |
-| Next executable work package | Publish the completed `WP-550` branch as a draft pull request. Reconcile the stale Harness authority separately before claiming a self-hosted Harness card for later work. |
+| Current implementation status | `WP-550` is `DONE`. Governance extension `WP-600` has completed its bounded P0/P1 repair at `9342e12` and passed fresh independent exact-SHA review; live `main` reconciliation and draft-PR publication are in progress. |
+| Next executable work package | Validate this reconciliation merge, push `alvaro/harness-p0-p1-governance-r12`, and open the approved work as a draft pull request. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -897,7 +897,7 @@ change-harness handoff create
 change-harness handoff inspect
 change-harness handoff revoke
 
-change-harness review begin
+change-harness review begin --actor reviewer --actor-principal-id reviewer --actor-session-id review-session
 change-harness review record
 change-harness review inspect
 
@@ -2864,7 +2864,7 @@ The authority limitation remains: Harness authority
 `5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside WP-550,
 so this package does not move that ref or claim self-hosted authority.
 
-### WP-600 — Workspace manifest
+### WP-600-MR — Workspace manifest
 
 | Field | Value |
 | --- | --- |
@@ -2892,7 +2892,7 @@ Acceptance:
 | Field | Value |
 | --- | --- |
 | Status | `DEFERRED` |
-| Dependencies | `WP-600` |
+| Dependencies | `WP-600-MR` |
 | Target release | Multi-repository release |
 
 Deliverables:
@@ -3298,6 +3298,7 @@ and `WP-510`: check a claim before writing it down.
 | D-093 | A non-approval verdict is recordable after the branch it read has moved; an approval is not | Accepted 2026-08-01 by Alvaro Alvarez | `review record` refused any verdict whose handoff no longer described the branch. That protects approvals — approving code nobody looked at is `SPIKE-001` finding F-1 one stage later — and destroys everything else. A verdict that found problems is a true statement about the candidate it was reached against, and it stays true when the branch moves. Found by making the mistake four times on one card: each time the findings were fixed before the verdict was filed, the branch moved, and the verdict could never be recorded at all. Three of that card's review rounds survive only as prose inside a `handoff revoke --reason`, which is not a record. As shipped the relaxation is wider than the argument that justifies it. `require_current_handoff` answers three questions — revocation, candidate SHA, card binding — and gating the whole call on `Decision::Approved` drops all three for a non-approval, so a `blocked` verdict against a revoked handoff is currently accepted. Only the candidate question was argued for; the other two are deliberate withdrawals rather than the branch moving underneath a reader, and no one decided they should be skipped. Recorded here as it stands rather than as it ought to be. Narrowing it is `F-030`, in flight at the time of writing; this row will need a successor when that lands. Recorded late — `F-028` landed without this row because `docs/IMPLEMENTATION_PLAN.md` sat inside `F-027`'s write scope while both cards were open in one cycle, and claiming it would have been an ownership overlap the harness refuses. `AGENTS.md` requires the register to track behaviour changes; the gap is filed as `artana-bio/solo-dev#15`. |
 | D-094 | Freeze the #43 minimum record-hygiene policy at candidate `3f405ff932e058be487607ff6c2b1322cac546f5` | Accepted — implemented by #50 at `3370b71bd144866c71b5f5dea7f60d624cb2bd48` | The approved policy is implemented: a clean transaction under the built-in hygiene policy is `ALLOW`; a claimed override or acknowledgment is `REFUSE` because no such capability exists; and a mixed transaction containing sensitive and clean intended entries is `REFUSE` as a whole, with the bounded control inventory restored, the journal settled as `FailedClean`, and the same-ID retry succeeding without recovery. No partial commit or refusal event is created, and no Git commit is created for the refused transaction. This closeout records #50's implementation evidence without claiming a runtime policy digest, override mechanism, additional credential classes, output redaction, path handling, or recovery redesign. |
 | D-095 | Signed control commits are not worth building; detection is the right boundary | Accepted | #91 asked whether signing should move a rewritten control record from detected to prevented. Its own question 3 decides it: the harness runs as an agent driving dozens of control commits per card, so signing must be unattended, and an actor who controls the agent can then sign a rewritten history — the boundary collapses to where it already is. Requiring a human touch per control commit would make the harness unusable instead. The codebase has already reached the same conclusion in code: `src/control/repository.rs:358` sets `commit.gpgsign false` on the control repository, with a comment recording verified evidence that a global `commit.gpgsign = true` with an unusable signer makes `project init` fail outright and leaves control history unborn. Implementing #91 would undo a defensive measure added for a demonstrated failure, in exchange for a guarantee question 3 dissolves. What #87-#89 bought instead is narrower and real: a rewrite is detected by `audit anchors` and refuses `integration promote`, because the anchor lives in the authority repository rather than in the record being rewritten — so an attacker must also rewrite a second repository, remotely hosted in real deployments, with its own permissions. That is a raise in cost, not prevention, and #90's residual tier says so plainly. This decision would reopen if the control repository and the agent ever stop sharing an account — a hosted control plane, or a signing service the agent authenticates to but cannot extract a key from. That would be a fresh issue against a different architecture. |
+| D-096 | Pinning a cycle plan freezes membership; every `joint_integration` card is one exact atomic set | Accepted 2026-08-08 | A pinned plan is the authoritative membership-completeness contract, so allowing later activation makes it incomplete while replacement is correctly forbidden. The smallest bounded rule is to refuse membership additions after pinning and require a new cycle for changed membership. Card revisions retain their existing stale-binding behavior and are outside this repair. `joint_integration` has no group identifier, so all cards with that distribution in one plan form the single exact batch: selecting a subset or adding unrelated cards is refused before integration mutation. Test helpers may inspect an existing plan but may not rewrite its bytes or bindings to fabricate a state production cannot create. |
 
 ### 19.5 Multi-repository gate
 
@@ -3306,7 +3307,7 @@ Status: `DEFERRED`.
 All must be true:
 
 - hardened single-repository release accepted;
-- `WP-600` and `WP-610` are `DONE`;
+- `WP-600-MR` and `WP-610` remain `DEFERRED`;
 - exact-SHA manifest demonstrated with at least two repositories;
 - partial landing is detected and recovered;
 - cross-repository test evidence is retained;
@@ -3622,3 +3623,63 @@ When the plan changes:
 2. record the reason in the decision register;
 3. update dependencies, acceptance, status, and release gates together;
 4. do not silently reinterpret an existing work package.
+
+## 26. Governance extension WP-600
+
+| Field | Value |
+| --- | --- |
+| Status | `IN_PROGRESS` |
+| Scope | P0/P1 evidence-governance contract hardening from the experiment review |
+| Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
+| Focused evidence | The bounded repair closes the rejected candidate's fail-open final authorization: installed policy loss now refuses acceptance and promotion without inventing an owner, actor, policy, or digest. Verification and audit resolve proofs only from exact integration members and refuse duplicate proof IDs or ambiguous invariant/oracle bindings. A pinned plan freezes membership, and its complete `joint_integration` set is atomic. Canonical identity equivalence treats either a shared principal or shared session as a separation collision and validates configured identities deterministically. Audit uses the substantive integration digest bound by acceptance, reports unsupported receipt-reuse dimensions as `not_tested`, and accepts a clean production baseline while retaining corruption refusals. Required probe failure returns a nonzero `CH-POLICY-AUDIT-DISCREPANCY` result; network remains honestly `not_tested` and unenforced. Raw regressions cover refusal before mutation and preserve control HEAD, bytes, status, and cleanliness. Shared helpers now create plans through `cycle plan`; they only inspect an existing authoritative plan and refuse attempts to rewrite it. |
+
+Delivered in this slice:
+
+- `ReviewerKind`, reviewer provenance, and independently-created human
+  attestation are additive typed review fields. Legacy `human_reviewer` records
+  remain readable as a migration bridge; new typed human declarations require
+  attestation and reject self-attestation.
+- `MutationReceipt` is a structured executable-evidence contract bound to card
+  revision, candidate SHA, reviewer/session, mutation and patch digests,
+  command/oracle, expected and observed failure, and restoration proof.
+- Proof entries can carry stable IDs and explicit gate/oracle bindings;
+  `validate_strict` refuses unbound entries. Verification invariant records can
+  carry receipt IDs and an explicit claim classification without rewriting old
+  records.
+- `CyclePlan` validates complete-card planning facts, assignments, evidence
+  plans, acceptance coverage, missing/circular dependencies, and parallel scope
+  overlap. Once pinned, it freezes cycle membership; all
+  `joint_integration` cards in that plan must enter one exact batch.
+  Natural-language decomposition remains outside the domain model.
+- `audit report` emits `harness.claim-report/v1` classifications and preserves
+  discrepancies instead of dropping unsupported claims.
+
+Requirement audit: implementation is in progress against the current Terra review; the transactional plan and executable probe/report slices below are focused evidence, not final acceptance. (1) typed reviewer kind, provenance, independent human
+attestation, and compatibility fields are enforced in review recording; every
+new approval requires nonblank typed principal/session provenance plus
+executable mutation evidence or a typed policy-valid exemption; (2) mutation
+receipts are persisted transactionally and bind card revision,
+candidate, reviewer/session, digests, oracle, failure, and restoration, with
+typed exemptions only; (3) invariant checks carry stable proof IDs, receipt
+IDs, exact landing SHA, and derived `machine_checked`/`not_tested` states; (4)
+sealed-cycle preparation is final-authorized by default, with an exact typed
+legacy migration marker as the only compatibility bypass; new initialized
+projects use an explicit final-authorization mode and migration-required
+refusal until a policy is installed; (5) principal and
+session boundaries are used for review and integration separation and review
+begin fails before mutation without a handoff; (6) cycle plans are versioned,
+validated against complete cycle membership, pinned through integration, and
+revalidated at acceptance/promotion; (7)
+`audit probes` now executes disposable production command paths for all six
+named negative probes with exact observed codes; only network remains
+`not_tested` because host enforcement is unavailable, and network output
+distinguishes declared from enforced; (8) `audit report` reads persisted integrations and
+verification receipts, binds claims to exact SHAs and policy digests, and
+preserves missing/contradictory evidence.
+
+Acceptance evidence: focused evidence above is current; the definitive
+`env -u NO_COLOR TERM=xterm cargo test --all --quiet`, `cargo fmt --check`,
+strict clippy, and `git diff --check` gates pass against the final unchanged
+tree. The denied-network probe
+is intentionally classified `not_tested` because the runner does not enforce
+host network isolation; this is an explicit limitation, not a security claim.

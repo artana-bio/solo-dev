@@ -55,7 +55,18 @@ fn completed() -> Workspace {
 /// A completed integration whose immutable records can be queried by an
 /// integration-level compatibility request.
 fn completed_with_id() -> (Workspace, String) {
+    completed_with_id_using_exemption(false)
+}
+
+fn completed_with_exemption_id() -> (Workspace, String) {
+    completed_with_id_using_exemption(true)
+}
+
+fn completed_with_id_using_exemption(exempt: bool) -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    if exempt {
+        workspace.install_fixture_mutation_exemption_policy();
+    }
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -65,7 +76,11 @@ fn completed_with_id() -> (Workspace, String) {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
-    workspace.approve_card("F-001", "src/F-001/a.rs");
+    if exempt {
+        workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
+    } else {
+        workspace.approve_card("F-001", "src/F-001/a.rs");
+    }
     let id = workspace.integration_json(&[
         "prepare",
         "--cycle-id",
@@ -96,6 +111,36 @@ fn completed_with_id() -> (Workspace, String) {
     ]);
     workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
     (workspace, id)
+}
+
+#[test]
+fn clean_promoted_production_evidence_has_no_audit_contradictions() {
+    let (workspace, _) = completed_with_id();
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        report.status.success(),
+        "clean production evidence must not contradict itself: {}",
+        String::from_utf8_lossy(&report.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["data"]["contradiction_count"], 0);
+    assert_eq!(
+        report["data"]["receipt_reuse_evidence"]["classification"],
+        "not_tested"
+    );
+    assert_eq!(
+        report["data"]["receipt_reuse_evidence"]["unsupported_dimensions"],
+        serde_json::json!(["toolchain", "inputs", "fixtures", "cache", "trust_mode"])
+    );
 }
 
 /// Completes only the privacy-safe dimensions that the current runner cannot
@@ -340,6 +385,295 @@ fn integration_status_and_audit_share_the_exact_verified_receipt_decision() {
         stale["data"]["receipt_compatibility"]["disposition"]["reasons"],
         serde_json::json!(["fixtures"])
     );
+}
+
+#[test]
+fn audit_report_surfaces_missing_verification_receipt_and_cannot_claim_machine_checked() {
+    let (workspace, integration_id) = completed_with_id();
+    let verification_path = workspace
+        .control
+        .join(format!("verifications/{integration_id}.json"));
+    let verification: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&verification_path).unwrap()).unwrap();
+    let receipt_id = verification["receipt_ids"][0].as_str().unwrap();
+    fs::remove_file(
+        workspace
+            .control
+            .join(format!("receipts/{receipt_id}.json")),
+    )
+    .unwrap();
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        !report.status.success(),
+        "contradictory report must fail closed"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        report["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY",
+        "report failure envelope: {report}"
+    );
+}
+
+#[test]
+fn audit_report_surfaces_a_review_mutation_receipt_deleted_after_approval() {
+    let (workspace, integration_id) = completed_with_id();
+    let reviews_dir = workspace.control.join("reviews");
+    let review_path = fs::read_dir(&reviews_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name().unwrap().to_string_lossy().contains("RV-"))
+        .expect("approved review record");
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_ids"] = serde_json::json!(["MR-AUDIT-DELETED"]);
+    review["mutation_exemption"] = serde_json::Value::Null;
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    git(&workspace.control, &["add", "-A"]);
+    git(
+        &workspace.control,
+        &["commit", "-q", "-m", "delete review mutation evidence"],
+    );
+
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        !report.status.success(),
+        "audit must fail on lost review evidence"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY");
+    let details = &envelope["error"]["details"];
+    assert!(
+        details["discrepancies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["claim"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mutation")),
+        "review mutation evidence discrepancy must be explicit: {details}"
+    );
+    assert_eq!(details["cycle_id"], "C-001");
+    let _ = integration_id;
+}
+
+#[test]
+fn audit_report_surfaces_a_review_exemption_policy_discrepancy() {
+    let (workspace, _) = completed_with_exemption_id();
+    let project_path = workspace.control.join("project/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
+    project["mutation_exemption_policy"] = serde_json::Value::Null;
+    fs::write(&project_path, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    git(&workspace.control, &["add", "-A"]);
+    git(
+        &workspace.control,
+        &["commit", "-q", "-m", "remove exemption policy"],
+    );
+
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        !report.status.success(),
+        "audit must fail on lost exemption policy"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY");
+    let discrepancies = &envelope["error"]["details"]["discrepancies"];
+    assert!(
+        discrepancies
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["claim"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mutation")),
+        "audit must identify exemption evidence: {discrepancies}"
+    );
+}
+
+fn report_error_details(workspace: &Workspace) -> serde_json::Value {
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(!report.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        report["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY",
+        "corruption report envelope: {report}"
+    );
+    report["error"]["details"].clone()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn audit_report_corruption_matrix_fails_closed_with_exact_findings() {
+    for corruption in [
+        "foreign_receipt",
+        "failed_receipt",
+        "wrong_landing_sha",
+        "wrong_landing_tree",
+        "proof_id_mismatch",
+        "oracle_mismatch",
+        "policy_digest_drift",
+    ] {
+        let (workspace, integration_id) = completed_with_id();
+        let verification_path = workspace
+            .control
+            .join(format!("verifications/{integration_id}.json"));
+        let mut verification: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&verification_path).unwrap()).unwrap();
+        let receipt_id = verification["receipt_ids"][0].as_str().unwrap().to_owned();
+        verification["invariants"] = serde_json::json!([{
+            "proof_entry_id": "proof-behavior",
+            "invariant": "it works",
+            "machine_checked": true,
+            "observed_receipt_ids": [receipt_id]
+        }]);
+        let card_path = workspace.control.join("cards/F-001/r1.json");
+        let mut card: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&card_path).unwrap()).unwrap();
+        card["proof_map"] = serde_json::json!({
+            "schema": "harness.proof-map/v1",
+            "entries": [{
+                "id": "proof-behavior",
+                "invariant": "it works",
+                "precondition": "fixture",
+                "assertion": "gate passes",
+                "mutation": "gate fails",
+                "gate_oracle": "gate.unit"
+            }],
+            "claim_boundary": "fixture"
+        });
+        fs::write(&card_path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+        match corruption {
+            "foreign_receipt" | "failed_receipt" | "wrong_landing_sha" => {
+                let path = workspace
+                    .control
+                    .join(format!("receipts/{receipt_id}.json"));
+                let mut receipt: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                match corruption {
+                    "foreign_receipt" => receipt["integration_id"] = serde_json::json!("INT-999"),
+                    "failed_receipt" => receipt["passed"] = serde_json::json!(false),
+                    _ => receipt["evaluated_sha"] = serde_json::json!("stale-sha"),
+                }
+                fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+            }
+            "wrong_landing_tree" => verification["landing_tree"] = serde_json::json!("wrong-tree"),
+            "proof_id_mismatch" => {
+                verification["invariants"][0]["proof_entry_id"] =
+                    serde_json::json!("missing-proof");
+            }
+            "oracle_mismatch" => {
+                let path = workspace.control.join("cards/F-001/r1.json");
+                let mut card: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                card["proof_map"]["entries"][0]["gate_oracle"] = serde_json::json!("gate.missing");
+                fs::write(path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+            }
+            "policy_digest_drift" => {
+                let path = fs::read_dir(workspace.control.join("acceptances"))
+                    .unwrap()
+                    .find_map(Result::ok)
+                    .unwrap()
+                    .path();
+                let mut acceptance: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                acceptance["final_authorization_policy_digest"] =
+                    serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+                fs::write(path, serde_json::to_vec_pretty(&acceptance).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        fs::write(
+            &verification_path,
+            serde_json::to_vec_pretty(&verification).unwrap(),
+        )
+        .unwrap();
+        let details = report_error_details(&workspace);
+        assert_eq!(
+            details["all_claims_supported"], false,
+            "{corruption}: {details}"
+        );
+        assert!(details["contradiction_count"].as_u64().unwrap() > 0);
+        assert!(
+            details["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|claim| claim["classification"] != "machine_checked")
+        );
+        let expected_classification = match corruption {
+            "foreign_receipt"
+            | "failed_receipt"
+            | "wrong_landing_sha"
+            | "wrong_landing_tree"
+            | "policy_digest_drift"
+            | "oracle_mismatch"
+            | "proof_id_mismatch" => "failed",
+            _ => unreachable!(),
+        };
+        assert!(
+            details["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|claim| claim["classification"] == expected_classification),
+            "{corruption}: expected {expected_classification}: {details}"
+        );
+        let subjects: Vec<&str> = details["discrepancies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["subject"].as_str())
+            .collect();
+        let expected_subject = match corruption {
+            "policy_digest_drift" => "acceptance ACC-000001",
+            "wrong_landing_tree" => "verification INT-001",
+            "proof_id_mismatch" => "missing-proof",
+            "oracle_mismatch" => "proof-behavior",
+            _ => &format!("receipt {receipt_id}"),
+        };
+        assert!(
+            subjects.contains(&expected_subject),
+            "{corruption}: {subjects:?}"
+        );
+    }
 }
 
 #[test]

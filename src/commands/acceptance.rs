@@ -14,8 +14,9 @@ use crate::{
     commands::{
         card::{load_card, store_card_state},
         integration::{
-            load_cycle, load_integration, load_verification, member_implementers,
-            require_cycle_convergence_budget, require_no_pending_exception, status_gate_refusal,
+            integration_proofs, load_cycle, load_integration, load_verification,
+            member_implementers, require_cycle_convergence_budget, require_no_pending_exception,
+            require_plan_binding, status_gate_refusal,
         },
         transaction::with_transaction,
     },
@@ -333,6 +334,8 @@ fn preview_record(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_plan_binding(&control, &record)?;
+    integration_proofs(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — acceptance
     // is the single gate that authorizes moving the protected branch (see
     // this module's own doc comment), so it is squarely on the path this
@@ -340,7 +343,7 @@ fn preview_record(
     // real command would refuse for an escalated cycle. See
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
-    require_reviewed(&record)?;
+    require_reviewed(&control, &record)?;
     require_no_pending_exception(&control, &config, &record)?;
     refuse_existing_acceptance(&control, integration_id)?;
     let authorizer = authorizer(args)?;
@@ -452,7 +455,9 @@ pub(crate) fn validate_final_authorization_for_promotion(
     // has no v2 final-authorization policy. An explicit v2 policy cannot be
     // bypassed by rewriting a final record to look historical.
     if acceptance.schema == ACCEPTANCE_SCHEMA {
-        if config.final_authorization_policy.is_none() {
+        if config.final_authorization_policy.is_none()
+            && config.final_authorization_mode.as_deref() != Some("installed_default")
+        {
             return Ok(());
         }
         return Err(HarnessError::ControlWithRecovery {
@@ -613,6 +618,13 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
         return preview_record(args, &integration_id, decision);
     }
 
+    {
+        let control = ControlRepository::open(&args.control)?;
+        let record = load_integration(&control, &integration_id)?;
+        require_plan_binding(&control, &record)?;
+        integration_proofs(&control, &record)?;
+    }
+
     with_transaction(
         &args.control,
         "acceptance.record",
@@ -621,10 +633,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            steps.recheck(require_plan_binding(control, &record))?;
+            steps.recheck(integration_proofs(control, &record).map(|_| ()))?;
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
-            require_reviewed(&record)?;
+            require_reviewed(control, &record)?;
             require_no_pending_exception(control, &config, &record)?;
             refuse_existing_acceptance(control, &integration_id)?;
 
@@ -704,8 +718,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
 /// status, where `integration verify` would be wrong advice since
 /// verification already happened; that and every other non-`Reviewed`
 /// status keep the plain code default rather than guessing.
-fn require_reviewed(record: &IntegrationRecord) -> Result<(), HarnessError> {
+fn require_reviewed(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
     if record.status == IntegrationStatus::Reviewed {
+        member_implementers(control, record)?;
         return Ok(());
     }
     let reason = format!(

@@ -119,6 +119,13 @@ pub struct OperationRecord {
     /// decision was made on.
     #[serde(default)]
     pub touched_outside_control: bool,
+    /// Whether the command has crossed into any durable mutation phase.
+    ///
+    /// This is distinct from `touched_outside_control`: a transaction may
+    /// have written a lease, event, or control record without touching Git.
+    /// Once true, a later policy error must retain the recovery journal.
+    #[serde(default)]
+    pub mutation_started: bool,
 }
 
 impl OperationRecord {
@@ -194,6 +201,7 @@ impl<'a> Journal<'a> {
             steps: Vec::new(),
             expected_control_head,
             touched_outside_control: false,
+            mutation_started: false,
             started_at: clock.now(),
             finished_at: None,
             failure: None,
@@ -236,6 +244,23 @@ impl<'a> Journal<'a> {
         record.failure = failure;
         record.finished_at = Some(clock.now());
         self.write(record)
+    }
+
+    /// Removes a provisional journal when a pure policy refusal is detected
+    /// after transaction setup but before any governed mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a control-I/O error when the provisional journal cannot be
+    /// removed.
+    pub fn discard(&self, record: &OperationRecord) -> Result<(), HarnessError> {
+        let path = self
+            .control
+            .path(&OperationRecord::relative_path(&record.operation_id));
+        if path.exists() {
+            fs::remove_file(&path).map_err(|source| HarnessError::ControlIo { path, source })?;
+        }
+        Ok(())
     }
 
     /// Writes one record atomically.
@@ -422,6 +447,19 @@ mod tests {
                 .finished_at
                 .is_some()
         );
+    }
+
+    #[test]
+    fn discarding_a_provisional_operation_is_idempotent_and_unresolved_free() {
+        let (_temp, control) = control();
+        let journal = Journal::new(&control);
+        let record = journal.begin("work.start", None, &clock()).unwrap();
+
+        journal.discard(&record).unwrap();
+        journal.discard(&record).unwrap();
+
+        assert!(journal.unresolved().unwrap().is_empty());
+        assert!(journal.read(&record.operation_id).is_err());
     }
 
     #[test]

@@ -18,6 +18,13 @@
 //! `gate_run_without_a_reservation_names_the_command_that_makes_one` drives
 //! that unhelped path instead, through `gate_raw`; a guard next to it fails
 //! if that test is ever deleted or repointed at `gate`.
+//!
+//! Approved verdicts sent through `Workspace::review` receive a real
+//! executable mutation receipt when they do not name evidence themselves.
+//! `tests/review_recording.rs` drives the fail-closed production path through
+//! `review_raw`, including the missing-evidence refusal. Exemption policies
+//! are never installed by shared setup; tests that exercise exemptions must
+//! call `install_fixture_mutation_exemption_policy` explicitly.
 
 #![allow(dead_code)]
 
@@ -28,6 +35,8 @@ use std::{
 };
 
 use tempfile::TempDir;
+
+use change_harness::domain::digest::Digest;
 
 /// A temporary project with every repository role populated.
 pub struct Workspace {
@@ -99,6 +108,118 @@ impl Workspace {
         workspace
     }
 
+    /// Explicitly installs the closed exemption policy used by tests whose
+    /// subject is exemption authorization. Ordinary fixtures remain
+    /// fail-closed and use executable mutation receipts instead.
+    pub fn install_fixture_mutation_exemption_policy(&self) {
+        let policy = self.root.join("mutation-exemption-policy.json");
+        fs::write(
+            &policy,
+            r#"{
+  "version": "harness.mutation-exemption-policy/v1",
+  "rules": [
+    {"code":"fixture-no-mutation","approved_by":"independent-attestor","approver_principal_id":"attestor-principal","approver_session_id":"attestor-session"},
+    {"code":"fixture","approved_by":"independent-attestor","approver_principal_id":"attestor-principal","approver_session_id":"attestor-session"},
+    {"code":"fixture","approved_by":"independent-approver","approver_principal_id":"approver-principal","approver_session_id":"approver-session"},
+    {"code":"reference_fixture","approved_by":"reference","approver_principal_id":"reference-principal","approver_session_id":"reference-session"},
+    {"code":"example_fixture","approved_by":"example-generator","approver_principal_id":"example-principal","approver_session_id":"example-session"}
+  ]
+}"#,
+        )
+        .unwrap();
+        let output = Self::run(&[
+            "project".into(),
+            "set-mutation-exemption-policy".into(),
+            "--control".into(),
+            self.control.display().to_string(),
+            "--policy".into(),
+            policy.display().to_string(),
+        ]);
+        assert!(
+            output.status.success(),
+            "mutation exemption policy install failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Executes a real disposable mutation and returns its persisted receipt
+    /// ID. Callers still have to name the receipt explicitly in the verdict.
+    pub fn create_fixture_mutation_receipt(
+        &self,
+        card_id: &str,
+        reviewer_actor_id: &str,
+        reviewer_principal_id: &str,
+        reviewer_session_id: &str,
+    ) -> String {
+        const ORACLE: &str = "gate.fixture-mutation";
+        if !self.control.join(format!("gates/{ORACLE}.json")).exists() {
+            self.register_gate(
+                ORACLE,
+                &["sh", "-c", "test ! -e .change-harness-mutation-marker"],
+            );
+        }
+
+        let inspection = self.review_json(&["inspect", "--card-id", card_id]);
+        let candidate_sha = inspection["data"]["candidate_sha"]
+            .as_str()
+            .expect("a handed-off candidate")
+            .to_owned();
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(self.control.join(format!("cards/{card_id}/state.json"))).unwrap(),
+        )
+        .unwrap();
+        let revision = state["current_revision"]
+            .as_u64()
+            .expect("a current card revision");
+        let receipt_count = fs::read_dir(self.control.join("mutation-receipts"))
+            .map_or(0, std::iter::Iterator::count);
+        let receipt_id = format!("MR-FIXTURE-{:06}", receipt_count + 1);
+        let output = Self::run(&[
+            "mutation".into(),
+            "create".into(),
+            "--output".into(),
+            "json".into(),
+            "--control".into(),
+            self.control.display().to_string(),
+            "--receipt-id".into(),
+            receipt_id.clone(),
+            "--card-revision".into(),
+            format!("{card_id}-r{revision}"),
+            "--candidate-sha".into(),
+            candidate_sha,
+            "--reviewer-actor-id".into(),
+            reviewer_actor_id.to_owned(),
+            "--reviewer-principal-id".into(),
+            reviewer_principal_id.to_owned(),
+            "--reviewer-session-id".into(),
+            reviewer_session_id.to_owned(),
+            "--mutation-digest".into(),
+            Digest::of_bytes(b"fixture mutation command").to_string(),
+            "--patch-digest".into(),
+            Digest::of_bytes(b"fixture mutation patch").to_string(),
+            format!("--command={}", "sh"),
+            format!("--command={}", "-c"),
+            format!("--command={}", "touch .change-harness-mutation-marker"),
+            "--gate-oracle".into(),
+            ORACLE.into(),
+            "--expected-failure".into(),
+            "fixture oracle rejects the mutation marker".into(),
+            "--observed-result".into(),
+            "fixture mutation executed".into(),
+            "--failed-at-oracle".into(),
+            "--restoration-proof".into(),
+            "disposable worktree restored to the exact candidate".into(),
+        ]);
+        assert!(
+            output.status.success(),
+            "mutation receipt creation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        receipt_id
+    }
+
     /// Registers a gate at revision 1 with the given argv.
     pub fn register_gate(&self, gate_id: &str, argv: &[&str]) {
         self.register_gate_revision(gate_id, 1, argv);
@@ -112,7 +233,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\n"
+            "schema: harness.gate/v1\ngate_id: {gate_id}\nrevision: {revision}\nargv: [{list}]\nworking_directory: \".\"\ntimeout_seconds: 60\nenvironment:\n  allow: [PATH]\n  set: {{}}\nnetwork_policy: denied\nretry_policy:\n  max_attempts: 1\nartifacts: []\nmigration: legacy_v1\n"
         );
         let path = self.root.join(format!("{gate_id}.yaml"));
         fs::write(&path, body).unwrap();
@@ -211,6 +332,11 @@ impl Workspace {
     /// Writes a gate definition file and returns its path.
     pub fn gate_definition(&self, name: &str, body: &str) -> String {
         let path = self.root.join(format!("{name}.yaml"));
+        let body = if body.contains("schema: harness.gate/v1") && !body.contains("migration:") {
+            format!("{body}migration: legacy_v1\n")
+        } else {
+            body.to_owned()
+        };
         fs::write(&path, body).unwrap();
         path.display().to_string()
     }
@@ -311,23 +437,111 @@ impl Workspace {
             .collect()
     }
 
+    /// Reproduces a control repository created before plan-required cycle
+    /// provenance existed. This is deliberately an explicit fixture mutation,
+    /// not a production migration path.
+    pub fn mark_cycle_pre_upgrade(&self, cycle_id: &str) {
+        let cycle_path = self.control.join(format!("cycles/{cycle_id}.json"));
+        let mut cycle: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cycle_path).unwrap()).unwrap();
+        cycle
+            .as_object_mut()
+            .unwrap()
+            .remove("creation_plan_policy");
+        fs::write(
+            &cycle_path,
+            format!("{}\n", serde_json::to_string_pretty(&cycle).unwrap()),
+        )
+        .unwrap();
+        let events_dir = self.control.join("events");
+        for entry in fs::read_dir(events_dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let mut event: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if event["cycle_id"].as_str() == Some(cycle_id)
+                && event["event_type"] == "cycle.created"
+            {
+                event["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("creation_plan_policy");
+                fs::write(
+                    &path,
+                    format!("{}\n", serde_json::to_string_pretty(&event).unwrap()),
+                )
+                .unwrap();
+            }
+        }
+        git(&self.control, &["add", "-A"]);
+        git(
+            &self.control,
+            &["commit", "-q", "-m", "fixture: pre-upgrade cycle"],
+        );
+    }
+
     /// Runs a `work` subcommand in JSON mode without asserting success.
     pub fn work_raw(&self, args: &[&str]) -> Output {
+        let mut normalized = args.to_vec();
+        if matches!(args.first(), Some(&("start" | "resume")))
+            && let Some(card_id) = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+        {
+            let card_path = self.control.join(format!("cards/{card_id}/r1.json"));
+            if card_path.exists() {
+                let card: serde_json::Value =
+                    serde_json::from_slice(&fs::read(card_path).unwrap()).unwrap();
+                let cycle_id = card["cycle_id"].as_str().unwrap();
+                let cycle_path = self.control.join(format!("cycles/{cycle_id}.json"));
+                let cycle: serde_json::Value =
+                    serde_json::from_slice(&fs::read(cycle_path).unwrap()).unwrap();
+                if cycle["plan_id"].is_string() {
+                    self.ensure_default_cycle_plan_for(cycle_id);
+                    if !normalized.contains(&"--actor-principal-id") {
+                        normalized.extend(["--actor-principal-id", "implementer-principal"]);
+                    }
+                    if !normalized.contains(&"--actor-session-id") {
+                        normalized.extend(["--actor-session-id", "implementer-session"]);
+                    }
+                }
+            }
+        }
         let mut full = vec![
             "work".to_owned(),
-            args[0].to_owned(),
+            normalized[0].to_owned(),
             "--output".to_owned(),
             "json".to_owned(),
             "--control".to_owned(),
             self.control.display().to_string(),
         ];
-        full.extend(args[1..].iter().map(|arg| (*arg).to_owned()));
+        full.extend(normalized[1..].iter().map(|arg| (*arg).to_owned()));
         Self::run(&full)
     }
 
     /// Runs a `work` subcommand, asserting success.
     pub fn work(&self, args: &[&str]) -> Output {
-        let output = self.work_raw(args);
+        let mut normalized = args.to_vec();
+        if matches!(args.first(), Some(&("start" | "resume"))) {
+            let card_id = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+                .expect("work fixture must name a card");
+            let card: serde_json::Value = serde_json::from_slice(
+                &fs::read(self.control.join(format!("cards/{card_id}/r1.json"))).unwrap(),
+            )
+            .unwrap();
+            self.ensure_default_cycle_plan_for(card["cycle_id"].as_str().unwrap());
+            if !args.contains(&"--actor-principal-id") {
+                normalized.extend(["--actor-principal-id", "implementer-principal"]);
+            }
+            if !args.contains(&"--actor-session-id") {
+                normalized.extend(["--actor-session-id", "implementer-session"]);
+            }
+        }
+        let output = self.work_raw(&normalized);
         assert!(
             output.status.success(),
             "work {args:?} failed: {}{}",
@@ -393,7 +607,7 @@ impl Workspace {
         let proof_map = if risk == "low" {
             String::new()
         } else {
-            "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n".to_owned()
+            "proof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n      gate_oracle: gate.review\n  claim_boundary: only this fixture\n".to_owned()
         };
         let review_gates = if risk == "low" { "[]" } else { "[gate.review]" };
         let body = format!(
@@ -490,7 +704,49 @@ impl Workspace {
 
     /// Runs a `review` subcommand, asserting success.
     pub fn review(&self, args: &[&str]) -> Output {
-        let output = self.review_raw(args);
+        let mut normalized = args.to_vec();
+        if args.first() == Some(&"begin") && !args.contains(&"--actor") {
+            normalized.extend(["--actor", "reviewer"]);
+        }
+        if let Some(index) = args.iter().position(|arg| *arg == "--verdict")
+            && let Some(path) = args.get(index + 1)
+        {
+            let verdict_path = PathBuf::from(path);
+            if let Ok(mut body) = fs::read_to_string(&verdict_path)
+                && body.contains("decision: approved")
+            {
+                if !body.contains("reviewer_kind:") {
+                    body.push_str(
+                        "reviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: reviewer-session\n  principal_id: reviewer-principal\n",
+                    );
+                }
+                if !body.contains("mutation_receipt_ids:") && !body.contains("mutation_exemption:")
+                {
+                    let card_id = args
+                        .windows(2)
+                        .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+                        .expect("approved review fixture must name a card");
+                    let verdict: serde_yaml_ng::Value =
+                        serde_yaml_ng::from_str(&body).expect("valid fixture verdict");
+                    let reviewer = verdict["reviewer_actor_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer");
+                    let principal = verdict["reviewer_provenance"]["principal_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer principal");
+                    let session = verdict["reviewer_provenance"]["session_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer session");
+                    let receipt =
+                        self.create_fixture_mutation_receipt(card_id, reviewer, principal, session);
+                    body.push_str("mutation_receipt_ids: [");
+                    body.push_str(&receipt);
+                    body.push_str("]\n");
+                }
+                fs::write(&verdict_path, body).unwrap();
+            }
+        }
+        let output = self.review_raw(&normalized);
         assert!(
             output.status.success(),
             "review {args:?} failed: {}{}",
@@ -546,6 +802,15 @@ impl Workspace {
 
     /// Runs an `integration` subcommand and parses its JSON envelope.
     pub fn integration_json(&self, args: &[&str]) -> serde_json::Value {
+        if args.first() == Some(&"prepare") {
+            // Keep legacy fixture setup explicit while preserving raw-command
+            // tests that assert a planless cycle is refused.
+            let cycle_id = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--cycle-id").then_some(pair[1]))
+                .unwrap_or("C-001");
+            self.ensure_default_cycle_plan_for(cycle_id);
+        }
         serde_json::from_slice(&self.integration(args).stdout).expect("the JSON envelope")
     }
 
@@ -735,10 +1000,16 @@ impl Workspace {
             &declaration.display().to_string(),
         ]);
         self.review(&["begin", "--card-id", card_id]);
+        let receipt = self.create_fixture_mutation_receipt(
+            card_id,
+            "reviewer-session",
+            "reviewer-principal",
+            "reviewer-session",
+        );
         let verdict = self.root.join(format!("{card_id}-rework-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+            format!("reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: added the fixture mutation marker\n    failing_test: fixture oracle rejects the marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"),
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
@@ -760,7 +1031,29 @@ impl Workspace {
     /// feature actor — the whole pre-integration path, which every integration
     /// test needs and none of them is testing.
     pub fn approve_card(&self, card_id: &str, file: &str) {
-        self.work(&["start", "--card-id", card_id]);
+        self.approve_card_with_fixture_evidence(card_id, file, false);
+    }
+
+    /// Approves through the explicitly installed exemption policy. Callers
+    /// must install that policy themselves so the authorization is visible in
+    /// the owning test.
+    pub fn approve_card_with_fixture_mutation_exemption(&self, card_id: &str, file: &str) {
+        self.approve_card_with_fixture_evidence(card_id, file, true);
+    }
+
+    fn approve_card_with_fixture_evidence(&self, card_id: &str, file: &str, exempt: bool) {
+        // The fixture may add cards after an earlier plan was pinned. Publish
+        // an explicit revised complete plan before lifecycle work starts.
+        self.ensure_default_cycle_plan_for("C-001");
+        self.work(&[
+            "start",
+            "--card-id",
+            card_id,
+            "--actor-principal-id",
+            "implementer-principal",
+            "--actor-session-id",
+            "implementer-session",
+        ]);
 
         let worktree = self.worktrees.join(card_id);
         let path = worktree.join(file);
@@ -792,10 +1085,25 @@ impl Workspace {
         ]);
 
         self.review(&["begin", "--card-id", card_id]);
+        let evidence = if exempt {
+            "gate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: fixture exemption authorization\n  mutation_evidence:\n    status: exempt\n    reason: this test explicitly exercises exemption-backed approval\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: this test explicitly exercises exemption-backed approval\n  approved_by: independent-attestor\n".to_owned()
+        } else {
+            let receipt = self.create_fixture_mutation_receipt(
+                card_id,
+                "reviewer-session",
+                "reviewer-principal",
+                "reviewer-session",
+            );
+            format!(
+                "gate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: added the fixture mutation marker\n    failing_test: fixture oracle rejects the marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"
+            )
+        };
         let verdict = self.root.join(format!("{card_id}-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\n",
+            format!(
+                "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\n{evidence}"
+            ),
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
@@ -808,6 +1116,235 @@ impl Workspace {
             "--actor",
             "reviewer-session",
         ]);
+        self.ensure_default_cycle_plan_for("C-001");
+    }
+
+    /// Gives legacy lifecycle fixtures an explicit, real plan before they
+    /// enter integration. This is test plumbing, not a production bypass:
+    /// the command under test still refuses a cycle that has no plan.
+    #[allow(clippy::too_many_lines)]
+    fn ensure_default_cycle_plan_for(&self, cycle_id: &str) {
+        let cycle_record: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(self.control.join(format!("cycles/{cycle_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        if cycle_record["plan_migration_provenance"].is_string() {
+            return;
+        }
+        let cycle = self.cycle_json(&["status", "--cycle-id", cycle_id]);
+        let card_ids = cycle["data"]["card_ids"]
+            .as_array()
+            .expect("cycle status exposes card membership");
+        let current_plan_covers_cards = cycle_record["plan_id"]
+            .as_str()
+            .and_then(|plan_id| {
+                let path = self.control.join(format!("plans/{plan_id}.json"));
+                fs::read_to_string(path).ok()
+            })
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .and_then(|plan| plan["cards"].as_array().cloned())
+            .is_some_and(|planned_cards| {
+                let planned_ids = planned_cards
+                    .iter()
+                    .filter_map(|card| card["card_id"].as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let cycle_ids = card_ids
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                planned_ids == cycle_ids
+                    && planned_cards.iter().all(|planned| {
+                        let Some(card_id) = planned["card_id"].as_str() else {
+                            return false;
+                        };
+                        let card_path = self.control.join(format!("cards/{card_id}/r1.json"));
+                        let Ok(raw) = fs::read(card_path) else {
+                            return false;
+                        };
+                        let Ok(card) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                            return false;
+                        };
+                        planned["card_revision"] == card["revision"]
+                    })
+            });
+        if current_plan_covers_cards {
+            return;
+        }
+        assert!(
+            cycle_record["plan_id"].is_null(),
+            "fixture attempted to rewrite an authoritative pinned plan; create all cards and revisions before the first governed plan command"
+        );
+        let plan_id = (1..10_000)
+            .map(|revision| format!("PLAN-TEST-{revision:03}"))
+            .find(|candidate| {
+                !self
+                    .control
+                    .join(format!("plans/{candidate}.json"))
+                    .exists()
+            })
+            .expect("a fixture plan id should be available");
+        let cards = card_ids
+            .iter()
+            .map(|id| {
+                let card_id = id.as_str().unwrap();
+                let card: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(self.control.join(format!("cards/{card_id}/r1.json")))
+                        .unwrap(),
+                )
+                .unwrap();
+                let proof_entries = card["proof_map"]["entries"]
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| vec!["fixture-proof".to_owned()]);
+                serde_json::json!({
+                    "card_id": card_id,
+                    "card_revision": card["revision"],
+                    "scope": card["write_scope"]["include"],
+                    "scope_exclude": card["write_scope"]["exclude"],
+                    "depends_on": card["depends_on"],
+                    "proof_entries": proof_entries,
+                    "mutation_plan": ["fixture mutation"],
+                    "risk": card["risk"],
+                    "reviewer_requirements": ["independent"],
+                    "assignment": "operator",
+                    "assignment_principal_id": "implementer-principal",
+                    "assignment_session_id": "implementer-session",
+                    "distribution": "parallel",
+                    "acceptance_behaviors": card["acceptance"]["behaviors"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = serde_json::json!({
+            "schema": "harness.cycle-plan/v1",
+            "plan_id": &plan_id,
+            "cycle_id": cycle_id,
+            "objective": "fixture distribution",
+            "cards": cards,
+        });
+        let path = self.root.join(format!("{plan_id}.json"));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&plan).unwrap()),
+        )
+        .unwrap();
+        self.cycle(&[
+            "plan",
+            "--plan-id",
+            &plan_id,
+            "--file",
+            &path.display().to_string(),
+        ]);
+        fs::remove_file(path).expect("the disposable plan input should be removable");
+    }
+
+    /// Binds a complete fixture plan with one explicit execution class.
+    pub fn bind_fixture_plan(&self, plan_id: &str, distribution: &str) {
+        self.bind_fixture_plan_with_assignment(plan_id, distribution, "operator");
+    }
+
+    /// Binds a complete fixture plan for a caller-declared implementer.
+    pub fn bind_fixture_plan_with_assignment(
+        &self,
+        plan_id: &str,
+        distribution: &str,
+        assignment: &str,
+    ) {
+        let card_count = self.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["card_ids"]
+            .as_array()
+            .unwrap()
+            .len();
+        let distributions = vec![distribution; card_count];
+        self.bind_fixture_plan_with_distributions(plan_id, &distributions, assignment);
+    }
+
+    /// Binds a complete fixture plan with one execution class per card.
+    pub fn bind_fixture_plan_with_distributions(
+        &self,
+        plan_id: &str,
+        distributions: &[&str],
+        assignment: &str,
+    ) {
+        let cycle_record: serde_json::Value =
+            serde_json::from_slice(&fs::read(self.control.join("cycles/C-001.json")).unwrap())
+                .unwrap();
+        let bound_plan_id = cycle_record["plan_id"]
+            .as_str()
+            .map_or_else(|| plan_id.to_owned(), str::to_owned);
+        let cycle = self.cycle_json(&["status", "--cycle-id", "C-001"]);
+        let card_ids = cycle["data"]["card_ids"].as_array().unwrap();
+        let cards = card_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let card_id = id.as_str().unwrap();
+                let card: serde_json::Value = serde_json::from_slice(
+                    &fs::read(self.control.join(format!("cards/{card_id}/r1.json"))).unwrap(),
+                )
+                .unwrap();
+                let proof_entries = card["proof_map"]["entries"]
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| vec!["fixture-proof".to_owned()]);
+                serde_json::json!({
+                    "card_id": card_id,
+                    "card_revision": card["revision"],
+                    "scope": card["write_scope"]["include"],
+                    "scope_exclude": card["write_scope"]["exclude"],
+                    "depends_on": card["depends_on"],
+                    "proof_entries": proof_entries,
+                    "mutation_plan": ["fixture mutation"],
+                    "risk": card["risk"],
+                    "reviewer_requirements": ["independent"],
+                    "assignment": assignment,
+                    "assignment_principal_id": "implementer-principal",
+                    "assignment_session_id": "implementer-session",
+                    "distribution": distributions
+                        .get(index)
+                        .copied()
+                        .unwrap_or("parallel"),
+                    "acceptance_behaviors": card["acceptance"]["behaviors"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = serde_json::json!({
+            "schema": "harness.cycle-plan/v1",
+            "plan_id": bound_plan_id,
+            "cycle_id": "C-001",
+            "objective": "fixture distribution",
+            "cards": cards,
+        });
+        if cycle_record["plan_id"].is_string() {
+            let stored_plan = self.control.join(format!("plans/{bound_plan_id}.json"));
+            let existing: serde_json::Value =
+                serde_json::from_slice(&fs::read(stored_plan).unwrap()).unwrap();
+            assert_eq!(
+                existing, plan,
+                "fixture attempted to replace an authoritative pinned plan"
+            );
+            return;
+        }
+        let path = self.root.join(format!("{bound_plan_id}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        self.cycle(&[
+            "plan",
+            "--plan-id",
+            &bound_plan_id,
+            "--file",
+            &path.display().to_string(),
+        ]);
+        fs::remove_file(path).unwrap();
     }
 
     /// Revises a card, moving its digest.
@@ -818,7 +1355,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n  claim_boundary: only this fixture\n",
+            "card_id: {card_id}\ncycle_id: C-001\ntitle: Implement {card_id}\ngoal: Deliver {card_id} differently\nnon_goals: []\nrisk: medium\nchange_kind: feature\nbase_sha: {base}\nwrite_scope:\n  include: [{list}]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\nproof_map:\n  schema: harness.proof-map/v1\n  entries:\n    - id: proof-behavior\n      invariant: behavior remains correct\n      precondition: valid fixture\n      assertion: focused test passes\n      mutation: bypass assertion fails\n      gate_oracle: gate.review\n  claim_boundary: only this fixture\n",
             base = self.cycle_baseline(),
         );
         let path = self.root.join(format!("{card_id}-revised.yaml"));

@@ -135,6 +135,10 @@ mod tests {
         let gate = GateDefinition {
             schema: GATE_SCHEMA.to_owned(),
             gate_id: "gate.junit".to_owned(),
+            purpose: Some("JUnit retry test".to_owned()),
+            semantics: Some("a stale report cannot satisfy a later attempt".to_owned()),
+            migration: None,
+            reuse_justification: None,
             revision: 1,
             argv: vec![
                 "sh".to_owned(),
