@@ -14,6 +14,7 @@ pub mod handoff;
 pub mod ids;
 pub mod integration;
 pub mod lease;
+pub mod lesson;
 pub mod mutation;
 pub mod project_snapshot;
 pub mod review;

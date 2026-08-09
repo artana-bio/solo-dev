@@ -9,12 +9,17 @@ use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
     commands::{
+        acceptance::{
+            FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
+            FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+        },
         card::{load_card, require_convergence_budget, store_card_state},
         handoff::{ancestry, latest_handoff},
+        lesson::validate_manifest_registry,
         transaction::with_transaction,
         work::held_lease,
     },
-    config::ConvergencePolicy,
+    config::{ConvergencePolicy, FinalAuthorizationPolicy},
     control::{
         event_store::{EventDraft, EventStore},
         repository::ControlRepository,
@@ -25,6 +30,7 @@ use crate::{
         digest::CANONICAL_ALGORITHM,
         handoff::{DEPENDENCIES_NOT_CHECKED, DependencyBinding, DependencyStanding, HandoffStatus},
         ids::{CardId, ReviewId},
+        lesson::{LessonCheck, LessonCheckStatus, LessonManifest},
         mutation::{
             MutationExemption, MutationExemptionBinding, MutationReceipt, MutationReceiptBinding,
         },
@@ -40,6 +46,7 @@ use crate::{
     policy::{
         actors,
         convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory, Round, Trend},
+        lessons::validate_manifest_for_card,
     },
 };
 
@@ -193,6 +200,9 @@ pub struct Verdict {
     /// What the reviewer found.
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// Disposition for each lesson review check in the packet.
+    #[serde(default)]
+    pub lesson_checks: Vec<LessonCheck>,
     /// Whether the gates observe the acceptance list.
     pub gate_adequacy: GateAdequacy,
     /// Risks accepted if this is an approval.
@@ -480,6 +490,17 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
         // `preview_record`'s "Tier 3 defect 24" note.
         require_convergence_budget(&control, &config, &record)?;
         state.state.check_transition(CardState::ReviewPending)?;
+        let handoff = latest_handoff(&control, &card_id)?.ok_or_else(|| HarnessError::Control {
+            reason: format!("card {card_id} has no handoff to review"),
+            code: ErrorCode::PreconditionNotFound,
+        })?;
+        if handoff.status == HandoffStatus::Revoked {
+            return Err(HarnessError::Control {
+                reason: format!("handoff {} was revoked", handoff.handoff_id),
+                code: ErrorCode::PolicyInvalidTransition,
+            });
+        }
+        validate_current_lesson_manifest(&control, &record, handoff.lesson_manifest.as_ref())?;
         return Ok(CommandOutcome::new(
             "review.begin",
             format!("Dry run: would open review for card {card_id}; nothing was changed"),
@@ -522,6 +543,12 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     code: ErrorCode::PolicyInvalidTransition,
                 });
             }
+            validate_current_lesson_manifest(control, &record, handoff.lesson_manifest.as_ref())?;
+            let lesson_manifest_digest = handoff
+                .lesson_manifest
+                .as_ref()
+                .map(LessonManifest::digest)
+                .transpose()?;
 
             store_card_state(control, &record, &state, CardState::ReviewPending)?;
             events.append(
@@ -546,8 +573,13 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
             Ok(CommandOutcome::new(
                 "review.begin",
                 format!(
-                    "Review open for card {card_id}\ncandidate: {}\nhandoff: {}\nfeature actor: {}\nthe reviewer must be a different actor in a fresh context",
-                    handoff.candidate_sha, handoff.handoff_id, handoff.actor_id
+                    "Review open for card {card_id}\ncandidate: {}\nhandoff: {}\nfeature actor: {}\nlesson manifest: {}\nthe reviewer must be a different actor in a fresh context",
+                    handoff.candidate_sha,
+                    handoff.handoff_id,
+                    handoff.actor_id,
+                    lesson_manifest_digest
+                        .as_ref()
+                        .map_or("none", |digest| digest.as_str())
                 ),
                 serde_json::json!({
                     "card_id": card_id.to_string(),
@@ -555,7 +587,12 @@ fn run_begin(args: &BeginArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harn
                     "packet": {
                         "card": record,
                         "card_digest": state.current_digest.as_str(),
-                        "handoff": handoff,
+                        "handoff": handoff.clone(),
+                        "lessons": handoff.lesson_manifest.clone(),
+                        "lesson_manifest": handoff.lesson_manifest.clone(),
+                        "lesson_manifest_digest": lesson_manifest_digest
+                            .as_ref()
+                            .map(crate::domain::digest::Digest::as_str),
                         "evaluation_criteria": EVALUATION_CRITERIA,
                     },
                 }),
@@ -666,6 +703,7 @@ fn example_verdict() -> Verdict {
             detail: "off-by-one at the upper boundary".to_owned(),
             disposition: Disposition::Resolved,
         }],
+        lesson_checks: vec![],
         gate_adequacy: GateAdequacy {
             gates_observe_acceptance: true,
             unobserved_behaviors: vec![],
@@ -948,6 +986,7 @@ fn build_review_record(
         dependency_bindings: handoff.dependency_bindings.clone(),
         handoff_id: handoff.handoff_id.clone(),
         handoff_digest: handoff.digest()?,
+        lesson_manifest: handoff.lesson_manifest.clone(),
         reviewer_actor_id: verdict.reviewer_actor_id.clone(),
         reviewer_kind: verdict.reviewer_kind,
         reviewer_provenance: verdict.reviewer_provenance.clone(),
@@ -959,6 +998,7 @@ fn build_review_record(
         feature_actor_id: handoff.actor_id.clone(),
         decision: verdict.decision,
         findings: verdict.findings.clone(),
+        lesson_checks: verdict.lesson_checks.clone(),
         gate_adequacy: verdict.gate_adequacy.clone(),
         residual_risks: verdict.residual_risks.clone(),
         human_reviewer: verdict.human_reviewer,
@@ -1008,6 +1048,12 @@ fn preview_record(
         HandoffScope::Bindings
     };
     require_current_handoff(&control, card_id, &handoff, &state.current_digest, scope)?;
+    validate_current_lesson_manifest(&control, &record, handoff.lesson_manifest.as_ref())?;
+    require_lesson_checks(
+        handoff.lesson_manifest.as_ref(),
+        verdict,
+        config.final_authorization_policy.as_ref(),
+    )?;
     check_independence(&verdict.reviewer_actor_id, &handoff.actor_id)?;
     refuse_shared_reviewer_boundary(
         &verdict.reviewer_actor_id,
@@ -1144,6 +1190,132 @@ fn refuse_shared_reviewer_boundary(
                 .to_owned(),
             code: ErrorCode::PolicySameActor,
         });
+    }
+    Ok(())
+}
+
+/// Validates the frozen packet against both the card and the immutable lesson
+/// registry before a review can start or be recorded.
+///
+/// Deliberately does not rebuild the manifest from today's active registry.
+/// The handoff froze policy for this exact card revision; a later activation or
+/// retirement is a current-policy change, not evidence that the earlier packet
+/// was tampered with.
+fn validate_current_lesson_manifest(
+    control: &ControlRepository,
+    card: &crate::domain::card::CardRecord,
+    manifest: Option<&LessonManifest>,
+) -> Result<(), HarnessError> {
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    validate_manifest_registry(control, manifest)?;
+    validate_manifest_for_card(manifest, card)
+}
+
+/// Requires an explicit disposition for every review check a required lesson
+/// contributes to the packet.  Older handoffs have no manifest and therefore
+/// no retroactive lesson obligations; new handoffs always carry one.
+fn require_lesson_checks(
+    manifest: Option<&LessonManifest>,
+    verdict: &Verdict,
+    authorization: Option<&FinalAuthorizationPolicy>,
+) -> Result<(), HarnessError> {
+    let Some(manifest) = manifest else {
+        if !verdict.lesson_checks.is_empty() {
+            return Err(HarnessError::Control {
+                reason: "verdict supplies lesson checks but the handoff has no lesson manifest"
+                    .to_owned(),
+                code: ErrorCode::PolicyLessonManifestStale,
+            });
+        }
+        return Ok(());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for check in &verdict.lesson_checks {
+        check.validate()?;
+        if !seen.insert((check.lesson_id.clone(), check.check_id.clone())) {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "lesson check `{}` for lesson {} is recorded more than once",
+                    check.check_id, check.lesson_id
+                ),
+                code: ErrorCode::PolicyLessonEvidenceMissing,
+            });
+        }
+        let Some(lesson) = manifest
+            .lessons
+            .iter()
+            .find(|lesson| lesson.lesson_id == check.lesson_id)
+        else {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "verdict records lesson check for lesson {} not present in the handoff manifest",
+                    check.lesson_id
+                ),
+                code: ErrorCode::PolicyLessonEvidenceMissing,
+            });
+        };
+        if !lesson
+            .obligations
+            .review_checks
+            .iter()
+            .any(|id| id == &check.check_id)
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "verdict records unknown review check `{}` for lesson {}",
+                    check.check_id, check.lesson_id
+                ),
+                code: ErrorCode::PolicyLessonEvidenceMissing,
+            });
+        }
+    }
+    for lesson in manifest.required() {
+        for check_id in &lesson.obligations.review_checks {
+            let Some(check) = verdict
+                .lesson_checks
+                .iter()
+                .find(|check| check.lesson_id == lesson.lesson_id && check.check_id == *check_id)
+            else {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "required lesson `{}` review check `{check_id}` has no disposition",
+                        lesson.lesson_id
+                    ),
+                    code: ErrorCode::PolicyLessonEvidenceMissing,
+                });
+            };
+            if check.status == LessonCheckStatus::NotSatisfied {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "required lesson `{}` review check `{check_id}` is not satisfied",
+                        lesson.lesson_id
+                    ),
+                    code: ErrorCode::PolicyLessonEvidenceMissing,
+                });
+            }
+            if check.status == LessonCheckStatus::NotApplicable {
+                let policy = authorization.ok_or_else(|| HarnessError::ControlWithRecovery {
+                    reason: format!(
+                        "required lesson `{}` review check `{check_id}` is marked not_applicable, but final authorization is not configured for this project",
+                        lesson.lesson_id
+                    ),
+                    code: ErrorCode::PolicyLessonDisposition,
+                    recovery: FINAL_AUTHORIZATION_POLICY_NOT_CONFIGURED_RECOVERY,
+                })?;
+                if !policy.authorizes(&verdict.reviewer_actor_id) {
+                    return Err(HarnessError::ControlWithRecovery {
+                        reason: format!(
+                            "reviewer {} is not configured to authorize not_applicable for required lesson `{}` review check `{check_id}`",
+                            verdict.reviewer_actor_id, lesson.lesson_id
+                        ),
+                        code: ErrorCode::PolicyLessonDisposition,
+                        recovery: FINAL_AUTHORIZATION_ACTOR_NOT_AUTHORIZED_RECOVERY,
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1340,7 +1512,6 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     reason: format!("card {card_id} has no handoff to review"),
                     code: ErrorCode::PreconditionNotFound,
                 })?;
-
             // Only an approval answers the candidate question. A verdict that
             // found problems is a true statement about the candidate it was
             // reached against, and it stays true when the branch moves;
@@ -1375,6 +1546,12 @@ fn run_record(args: &RecordArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 HandoffScope::Bindings
             };
             require_current_handoff(control, &card_id, &handoff, &state.current_digest, scope)?;
+            validate_current_lesson_manifest(control, &record, handoff.lesson_manifest.as_ref())?;
+            require_lesson_checks(
+                handoff.lesson_manifest.as_ref(),
+                &verdict,
+                config.final_authorization_policy.as_ref(),
+            )?;
             refuse_shared_reviewer_boundary(
                 &verdict.reviewer_actor_id,
                 verdict.reviewer_provenance.as_ref(),
@@ -1867,6 +2044,34 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
 mod tests {
     use super::*;
 
+    fn required_lesson_manifest() -> LessonManifest {
+        LessonManifest {
+            schema: crate::domain::lesson::LESSON_MANIFEST_SCHEMA.to_owned(),
+            card_id: "F-001".parse().unwrap(),
+            card_revision: 1,
+            card_digest: crate::domain::digest::Digest::of_bytes(b"card"),
+            lessons: vec![crate::domain::lesson::ApplicableLesson {
+                lesson_id: "LS-000001".parse().unwrap(),
+                revision: 2,
+                lesson_digest: crate::domain::digest::Digest::of_bytes(b"lesson"),
+                enforcement: crate::domain::lesson::LessonEnforcement::Required,
+                title: "Review the regression".to_owned(),
+                rule: "Disposition the regression check".to_owned(),
+                obligations: crate::domain::lesson::LessonObligations {
+                    review_checks: vec!["regression-covered".to_owned()],
+                    ..crate::domain::lesson::LessonObligations::default()
+                },
+            }],
+        }
+    }
+
+    fn verdict_with_lesson_status(actor: &str, status: &str) -> Verdict {
+        serde_yaml_ng::from_str(&format!(
+            "reviewer_actor_id: {actor}\ndecision: approved\nfindings: []\nlesson_checks:\n  - lesson_id: LS-000001\n    check_id: regression-covered\n    status: {status}\n    evidence: inspected the exact candidate\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: inspected the exact candidate\n  mutation_evidence:\n    status: exempt\n    reason: unit fixture\nresidual_risks: []\nreview_conduct: separate_process\n"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn identifiers_order_by_number_across_a_width_boundary() {
         // Round 4 of F-029's review, reached with the real allocator: as text,
@@ -1915,5 +2120,57 @@ mod tests {
         ];
         sort_oldest_first(&mut names);
         assert_eq!(names, vec!["", "RV-", "RV-000001", "RV-000002"]);
+    }
+
+    #[test]
+    fn a_satisfied_required_lesson_needs_no_exception_authorizer() {
+        require_lesson_checks(
+            Some(&required_lesson_manifest()),
+            &verdict_with_lesson_status("reviewer", "satisfied"),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn not_applicable_without_configured_authority_is_refused() {
+        let error = require_lesson_checks(
+            Some(&required_lesson_manifest()),
+            &verdict_with_lesson_status("reviewer", "not_applicable"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyLessonDisposition);
+        assert!(
+            error
+                .to_string()
+                .contains("final authorization is not configured")
+        );
+    }
+
+    #[test]
+    fn not_applicable_by_an_outsider_is_refused() {
+        let error = require_lesson_checks(
+            Some(&required_lesson_manifest()),
+            &verdict_with_lesson_status("reviewer", "not_applicable"),
+            Some(&FinalAuthorizationPolicy::default()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyLessonDisposition);
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer reviewer is not configured")
+        );
+    }
+
+    #[test]
+    fn configured_authorizer_may_record_not_applicable() {
+        require_lesson_checks(
+            Some(&required_lesson_manifest()),
+            &verdict_with_lesson_status("owner", "not_applicable"),
+            Some(&FinalAuthorizationPolicy::default()),
+        )
+        .unwrap();
     }
 }
