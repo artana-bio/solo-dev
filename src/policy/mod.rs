@@ -8,6 +8,7 @@ pub mod actors;
 pub mod allocation;
 pub mod convergence;
 pub mod credential_shape;
+pub mod lessons;
 pub mod paths;
 pub mod progressive_validation;
 pub mod receipt_compatibility;

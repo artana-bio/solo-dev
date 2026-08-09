@@ -23,6 +23,7 @@ use crate::{
             load_compatibility_request, read_integration_compatibility_request, receipts_for,
             receipts_for_integration_verification,
         },
+        lesson::{validate_frozen_card_manifest, validate_manifest_registry},
         review::{reviews_for, validate_approved_review_evidence},
     },
     control::{event_store::EventStore, repository::ControlRepository},
@@ -41,7 +42,10 @@ use crate::{
         command::{GitScope, run_ok},
         inspect, landing,
     },
-    policy::receipt_compatibility::{IntegrationCompatibilityRequestV1, evaluate},
+    policy::{
+        lessons::validate_manifest_for_card,
+        receipt_compatibility::{IntegrationCompatibilityRequestV1, evaluate},
+    },
     runner::receipt::ProvenanceSubject,
 };
 
@@ -134,6 +138,20 @@ pub(crate) struct CardEvidence {
     pub(crate) reviews: usize,
 }
 
+/// An informational difference between frozen historical policy and the
+/// policy that would apply to a new handoff today.
+///
+/// This is not a discrepancy: changing the active lesson registry must not
+/// rewrite or invalidate evidence that correctly froze an earlier revision.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct PolicyObservation {
+    pub(crate) subject: String,
+    pub(crate) kind: &'static str,
+    pub(crate) frozen_manifest_digest: String,
+    pub(crate) current_manifest_digest: String,
+    pub(crate) detail: String,
+}
+
 /// Everything a cycle-wide evidence cross-check finds.
 #[derive(Clone, Debug)]
 pub(crate) struct CycleEvidence {
@@ -141,6 +159,8 @@ pub(crate) struct CycleEvidence {
     pub(crate) discrepancies: Vec<Discrepancy>,
     /// Per-card evidence tallies, in the cycle's card order.
     pub(crate) cards: Vec<CardEvidence>,
+    /// Historical/current policy differences that do not invalidate evidence.
+    pub(crate) policy_observations: Vec<PolicyObservation>,
 }
 
 /// Recomputes verification claims from the pinned integration, cards, and
@@ -160,6 +180,7 @@ pub(crate) fn cross_check_cycle(
     cycle: &CycleRecord,
 ) -> Result<CycleEvidence, HarnessError> {
     let mut discrepancies = Vec::new();
+    let mut policy_observations = Vec::new();
     if let Some(baseline) = &cycle.baseline_sha
         && !commit_exists(&config.repository, baseline)
     {
@@ -173,7 +194,13 @@ pub(crate) fn cross_check_cycle(
     let mut cards = Vec::new();
     for card_id in &cycle.card_ids {
         let receipts = check_receipts(control, config, card_id, &mut discrepancies)?;
-        let reviews = check_reviews(control, config, card_id, &mut discrepancies)?;
+        let reviews = check_reviews(
+            control,
+            config,
+            card_id,
+            &mut discrepancies,
+            &mut policy_observations,
+        )?;
         cards.push(CardEvidence {
             card_id: card_id.clone(),
             receipts,
@@ -183,6 +210,7 @@ pub(crate) fn cross_check_cycle(
     Ok(CycleEvidence {
         discrepancies,
         cards,
+        policy_observations,
     })
 }
 
@@ -570,6 +598,7 @@ fn check_reviews(
     config: &crate::config::ProjectConfig,
     card_id: &CardId,
     found: &mut Vec<Discrepancy>,
+    policy_observations: &mut Vec<PolicyObservation>,
 ) -> Result<usize, HarnessError> {
     let reviews = reviews_for(control, card_id)?;
     for review in &reviews {
@@ -604,6 +633,58 @@ fn check_reviews(
                                 review.card_revision
                             ),
                         });
+                    }
+                    if let Some(manifest) = review.lesson_manifest.as_ref()
+                        && let Err(error) = validate_manifest_for_card(manifest, &record)
+                    {
+                        found.push(Discrepancy {
+                            subject: format!("review {}", review.review_id),
+                            claim: "lesson manifest bound to the reviewed card".to_owned(),
+                            found: error.to_string(),
+                        });
+                    }
+                    if let Some(manifest) = review.lesson_manifest.as_ref()
+                        && let Err(error) =
+                            validate_frozen_card_manifest(control, &record, manifest)
+                    {
+                        found.push(Discrepancy {
+                            subject: format!("review {}", review.review_id),
+                            claim: "lesson manifest matches activation-time binding".to_owned(),
+                            found: error.to_string(),
+                        });
+                    }
+                    if let Some(manifest) = review.lesson_manifest.as_ref() {
+                        if let Err(error) = validate_manifest_registry(control, manifest) {
+                            found.push(Discrepancy {
+                                subject: format!("review {}", review.review_id),
+                                claim: "lesson manifest entries match immutable lesson records"
+                                    .to_owned(),
+                                found: error.to_string(),
+                            });
+                        }
+                        match crate::commands::lesson::all_lessons(control)
+                            .and_then(|lessons| {
+                                crate::policy::lessons::build_manifest(&record, &lessons)
+                            }) {
+                            Ok(current) if current.lessons != manifest.lessons => {
+                                policy_observations.push(PolicyObservation {
+                                    subject: format!("review {}", review.review_id),
+                                    kind: "lesson_policy_changed_since_review",
+                                    frozen_manifest_digest: manifest.digest()?.to_string(),
+                                    current_manifest_digest: current.digest()?.to_string(),
+                                    detail: "the active lesson set now differs from this frozen review manifest; the historical manifest remains valid against its immutable lesson revisions".to_owned(),
+                                });
+                            }
+                            Err(error) => found.push(Discrepancy {
+                                subject: "current lesson registry".to_owned(),
+                                claim: format!(
+                                    "current lesson policy can be evaluated while auditing review {}",
+                                    review.review_id
+                                ),
+                                found: error.to_string(),
+                            }),
+                            Ok(_) => {}
+                        }
                     }
                 }
                 Err(source) => found.push(Discrepancy {
@@ -677,6 +758,7 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
 
     let evidence = cross_check_cycle(&control, &config, &cycle_id, &cycle)?;
     let mut discrepancies = evidence.discrepancies;
+    let policy_observations = evidence.policy_observations;
     let cards: Vec<serde_json::Value> = evidence
         .cards
         .iter()
@@ -709,10 +791,18 @@ fn run_cycle(args: &CycleArgs) -> Result<CommandOutcome, HarnessError> {
         "receipt_compatibility": compatibility,
         "protected_branch_transitions": transitions,
         "exceptions": exceptions,
+        "policy_observations": policy_observations,
         "discrepancies": discrepancies,
     });
 
-    let text = render(&cycle_id, &cycle, &events, &transitions, &discrepancies);
+    let text = render(
+        &cycle_id,
+        &cycle,
+        &events,
+        &transitions,
+        &policy_observations,
+        &discrepancies,
+    );
     if discrepancies.is_empty() {
         return Ok(CommandOutcome::new("audit.cycle", text, report).with_project(config.project_id));
     }
@@ -1085,6 +1175,7 @@ fn render(
     cycle: &CycleRecord,
     events: &[serde_json::Value],
     transitions: &[serde_json::Value],
+    policy_observations: &[PolicyObservation],
     discrepancies: &[Discrepancy],
 ) -> String {
     let mut text = format!(
@@ -1110,6 +1201,22 @@ fn render(
                     transition["integration_id"].as_str().unwrap_or("unknown"),
                     transition["acceptance_id"].as_str().unwrap_or("unknown"),
                 ),
+            );
+        }
+    }
+
+    if !policy_observations.is_empty() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut text,
+            format_args!(
+                "\n\n{} historical/current policy observation(s):",
+                policy_observations.len()
+            ),
+        );
+        for observation in policy_observations {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("\n  {}\n    {}", observation.subject, observation.detail),
             );
         }
     }

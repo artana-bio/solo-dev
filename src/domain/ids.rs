@@ -122,6 +122,7 @@ prefixed_id!(
     "Identifies one durable reservation for an expensive validation run."
 );
 prefixed_id!(ReviewId, "RV-", 6, "Identifies one review record.");
+prefixed_id!(LessonId, "LS-", 6, "Identifies one governed lesson.");
 prefixed_id!(
     IntegrationId,
     "INT-",
@@ -249,6 +250,10 @@ mod tests {
         assert_eq!(
             "RV-000001".parse::<ReviewId>().unwrap().to_string(),
             "RV-000001"
+        );
+        assert_eq!(
+            "LS-000001".parse::<LessonId>().unwrap().to_string(),
+            "LS-000001"
         );
         assert_eq!(
             "ACC-000001".parse::<AcceptanceId>().unwrap().to_string(),

@@ -101,6 +101,34 @@ has lost the thread recovers from — `card status` and `cycle status` answer
 what this actor currently owns and what is blocking it, so the next step comes
 from read state rather than from whatever survived in a context window.
 
+## Governed lessons
+
+Prior work can now become durable, scoped guidance without becoming an
+unbounded conversation memory. `lesson propose` records a lesson with
+provenance; an operator must explicitly `lesson activate` it. The Harness
+matches active lessons deterministically against card paths, contracts, change
+kind, and risk, then freezes the exact set into `work packet`, `handoff`, and
+`review begin` output with a digest.
+
+Required lessons are executable policy: their feature-gate evidence is required
+at handoff, their review checks must be dispositioned with evidence, and their
+integration gates are rerun on the combined landing commit. Preferred and
+informational lessons stay visible in fresh packets without silently blocking
+unrelated work. A lesson revision never rewrites an earlier handoff, so changing
+the registry cannot silently change what a reviewer already saw.
+
+Review dispositions are explicit: `satisfied`, `not_applicable`, or
+`not_satisfied`, each with evidence. Missing a required disposition—or recording
+`not_satisfied`—refuses the review; an agent cannot turn an omission into a
+silent exception.
+
+```bash
+change-harness lesson example
+change-harness lesson propose --control "$CONTROL" --definition lesson.yaml
+change-harness lesson activate --control "$CONTROL" --lesson-id LS-000001
+change-harness lesson match --control "$CONTROL" --card-id F-001
+```
+
 Agents contributing to Change Harness itself want [`AGENTS.md`](./AGENTS.md)
 instead, which carries the reading contract and engineering rules for building
 the tool rather than driving it.

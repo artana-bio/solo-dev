@@ -13,8 +13,9 @@ use crate::{
         acceptance::AcceptanceCommand, archive::ArchiveCommand, audit::AuditCommand,
         backup::BackupCommand, card::CardCommand, cycle::CycleCommand, demo::DemoArgs,
         disposition::DispositionCommand, doctor::DoctorArgs, gate::GateCommand,
-        handoff::HandoffCommand, integration::IntegrationCommand, mutation::MutationCommand,
-        project::ProjectCommand, review::ReviewCommand, work::WorkCommand,
+        handoff::HandoffCommand, integration::IntegrationCommand, lesson::LessonCommand,
+        mutation::MutationCommand, project::ProjectCommand, review::ReviewCommand,
+        work::WorkCommand,
     },
     error::HarnessError,
 };
@@ -93,6 +94,12 @@ pub enum Command {
     Review {
         #[command(subcommand)]
         command: ReviewCommand,
+    },
+
+    /// Preserve and apply explicit lessons from prior governed work.
+    Lesson {
+        #[command(subcommand)]
+        command: LessonCommand,
     },
 
     /// Record authorized decisions that change what an escalated card may do

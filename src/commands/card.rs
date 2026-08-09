@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::output::CommandOutcome,
     commands::CONTROL_ENV,
-    commands::{gate::require_registered, transaction::with_transaction},
+    commands::{
+        gate::require_registered, lesson::freeze_card_manifest, transaction::with_transaction,
+    },
     config::{ProjectConfig, ValidationPolicy},
     control::{
         event_store::{EventDraft, EventStore},
@@ -1156,6 +1158,10 @@ fn write_revision(
             code: ErrorCode::PolicyInvalidCard,
         });
     }
+    // The selected lesson set is activation evidence, not a live query.
+    // Freeze it before the revision/state bytes are written; the surrounding
+    // activation or revision transaction commits all three records together.
+    freeze_card_manifest(control, record, digest)?;
     control.write_atomic(
         &relative,
         &format!("{}\n", serde_json::to_string_pretty(record)?),

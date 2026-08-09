@@ -5,16 +5,16 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 80 |
+| Plan revision | 84 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `5feedf4e49af570a6d2ae4f039ce43224fdaa650`, plan revision 79 reconciliation |
+| Previous plan commit | `8234ac155a22cafe0b7db6f2559ed6e75821491e`, plan revision 83 activation-binding repair candidate |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | None; no work package is recorded as active after `WP-560` lands |
+| Active branch | `card/F-045` — review-required `WP-800` semantic repair |
 | Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
 | Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; candidate `main`, `origin/main`, and authority `main` are aligned to that exact SHA. The release merge itself was not Harness-governed. |
-| Current implementation status | `WP-550`, `WP-560`, and governance extension `WP-600` are `DONE`; terminal legacy snapshot noise is filtered only in the read model, with historical control records preserved. |
-| Next executable work package | None selected; a future package requires an explicit plan decision. |
+| Current implementation status | `WP-550`, `WP-560`, governance extension `WP-600`, and `WP-800` are `DONE`. |
+| Next executable work package | None authorized; independent review and final integration remain separate lifecycle gates for `F-045`. |
 | Final acceptance owner | Alvaro Alvarez |
 | Final authorization policy | Sealed-cycle authorization by declared actor `alvaro` |
 
@@ -3107,6 +3107,183 @@ Acceptance:
 - an explicit statement that no external-action capability ships with the
   decision itself.
 
+### WP-800 — Governed lessons and applicability
+
+| Field | Value |
+| --- | --- |
+| Status | `DONE` |
+| Dependencies | `WP-210`, `WP-250`, `WP-310`, `WP-320`, `WP-440`, `WP-530`, `WP-560`, `WP-600` |
+| Target release | Hardened single-repository extension |
+| Required reading | `README.md`; `AGENTS.md`; plan Sections 1–7; Sections 10.3, 10.7–10.9; Section 12; Sections 15.1–15.3; Section 16; `WP-560`; `WP-600`; `WP-800`; Sections 20.2, 22, and 24; `docs/ARCHITECTURE.md` |
+
+Purpose:
+
+Turn durable findings and project preferences into versioned, scoped
+obligations that future implementation and review contexts cannot silently
+omit. The package must preserve the exact lesson set as immutable evidence
+through delivery, review, integration, authorization, and audit.
+
+Root cause:
+
+PR #212 implemented governed lessons from the older
+`5f6ac789fc875f86779f21f1b4e4f6485956c948` baseline. Current `main` has since
+landed `WP-600` mutation-exemption governance and `WP-560` terminal snapshot
+noise cleanup. Replaying the old branch as authority would discard current
+governance and read-model behavior; an unbounded conflict repair would make it
+unclear which semantics survived. `WP-800` therefore defines a bounded semantic
+port whose repaired candidate preserves the original PR head
+`efb2adeeed4a5a924348655946519b30993280b3` as an ancestor and retains current
+`main` behavior deliberately.
+
+The original bounded decision authorized the following 30 paths. Independent
+review `RV-000079` found that activation-time freezing cannot be implemented
+atomically without the activation transaction owner. Corrective card `F-045`
+therefore adds only `src/commands/card.rs`, for an exact delivered scope of 31
+paths:
+
+```text
+README.md
+SKILL.md
+docs/IMPLEMENTATION_PLAN.md
+src/cli/mod.rs
+src/commands/acceptance.rs
+src/commands/audit.rs
+src/commands/card.rs
+src/commands/handoff.rs
+src/commands/integration.rs
+src/commands/lesson.rs
+src/commands/mod.rs
+src/commands/project.rs
+src/commands/review.rs
+src/commands/work.rs
+src/control/repository.rs
+src/domain/handoff.rs
+src/domain/ids.rs
+src/domain/integration.rs
+src/domain/lesson.rs
+src/domain/mod.rs
+src/domain/review.rs
+src/error.rs
+src/lib.rs
+src/policy/lessons.rs
+src/policy/mod.rs
+tests/audit.rs
+tests/combined_verification.rs
+tests/lessons.rs
+tests/promotion.rs
+tests/review_example.rs
+tests/support/mod.rs
+```
+
+Non-goals:
+
+- force-pushing, replacing, or rebasing away PR #212's existing head;
+- rewriting or deleting any historical control record;
+- changing `WP-600` mutation-exemption authorization, proof binding, or
+  fail-closed governance;
+- changing `WP-560` terminal-noise filtering or suppressing live non-terminal
+  snapshot warnings;
+- adding cross-project lesson sharing, automatic LLM inference, a hosted
+  service, stronger actor identity, or new sandbox enforcement;
+- modifying any path outside the exact review-authorized 31-path scope;
+- changing Rust, runtime, or test behavior in the plan card that makes this
+  package executable. Those changes begin only under a separately activated
+  `WP-800` implementation card.
+
+Acceptance behavior:
+
+- lesson records are strict, immutable, revisioned, project-scoped, and retain
+  source provenance;
+- card activation freezes one applicable-lesson manifest and digest, and the
+  same exact binding is carried through handoff, review, integration
+  verification, acceptance, promotion, and audit;
+- selector results are deterministic, with explicit precedence across path,
+  contract, change-kind, and risk selectors; card exclusions cannot silently
+  broaden applicability;
+- `required` lessons block when their declared implementation or review
+  evidence is absent; `preferred` lessons require a visible disposition but do
+  not silently become authorization gates; `informational` lessons are carried
+  for context without blocking;
+- `not_applicable` is accepted only as an explicit, authorized disposition
+  bound to the applicable lesson, actor provenance, and exact card/candidate
+  evidence; free-form or unbound exceptions fail closed;
+- missing lesson records, missing manifests, digest mismatch, registry or
+  manifest tampering, ambiguous bindings, and stale evidence refuse the next
+  authorization step and remain visible in audit output;
+- generated implementation and review packets contain the exact relevant
+  lesson manifest and no unrelated lesson obligations;
+- the repaired implementation preserves current `WP-600` mutation-exemption
+  governance and `WP-560` terminal-noise cleanup behavior.
+
+Regression boundaries (required):
+
+- prove deterministic selector precedence and exclusion handling with focused
+  positive, negative, and ordering cases;
+- distinguish required, preferred, informational, and authorized
+  `not_applicable` behavior at their actual authorization oracles;
+- independently mutate or remove the lesson manifest/digest at handoff, review,
+  integration verification, acceptance, promotion, and audit, and confirm each
+  stage fails closed or reports the discrepancy as specified;
+- preserve current `WP-600` typed mutation-exemption authorization, exact proof
+  bindings, and refusal-before-mutation regressions;
+- preserve current `WP-560` terminal-record suppression and live-warning
+  retention regressions;
+- confirm the repaired candidate keeps
+  `efb2adeeed4a5a924348655946519b30993280b3` as an ancestor and changes only the
+  declared 31 paths;
+- run only targeted implementation and independent-review suites on isolated
+  candidates; run the full `cargo test` suite exactly once, against the final
+  integration landing candidate.
+
+Implementation and review commands:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --test lessons
+cargo test --test combined_verification
+cargo test --test audit
+cargo test --test promotion
+cargo test --test review_example
+git diff --check
+git diff --name-only <base-sha>...HEAD
+git merge-base --is-ancestor efb2adeeed4a5a924348655946519b30993280b3 HEAD
+```
+
+Final integration command, reserved for one execution after the exact combined
+landing candidate is built:
+
+```bash
+cargo test
+```
+
+Completion evidence, recorded 2026-08-09 for the bounded implementation
+candidate:
+
+- the candidate is a normal merge of current baseline
+  `dfd9a00bd4931b109b677c019a786e3310de0ad5` and exact PR #212 head
+  `efb2adeeed4a5a924348655946519b30993280b3`; ancestry and the exact 31-path
+  scope are checked before handoff;
+- focused suites pass: `lessons` 10/10, `card_model` 20/20, `card_example` 8/8,
+  `review` 33/33, `combined_verification` 17/17, `audit` 20/20, `promotion`
+  53/53, `review_example` 7/7, and `project_snapshot` 27/27;
+- an independent mutation replacing the review `policy.authorizes` guard with
+  `false` makes the focused unauthorized-`not_applicable` regression fail,
+  proving that the registered lesson gates observe the authorization oracle;
+- the current-main typed mutation-exemption refusals and WP-560 terminal/live
+  snapshot boundaries pass through their owning focused regressions;
+- `cargo fmt --check`, strict all-target/all-feature Clippy, and
+  `git diff --check` pass on the resolved tree;
+- the full `cargo test` suite is intentionally not run here; `gate.test`
+  remains reserved for its one authorized execution on the final integration
+  landing candidate.
+- final-integration receipt `R-000241` failed at landing SHA
+  `06006ece91ec1766f2d4f65e8647d536c4ba3a0c` because `handoff inspect`
+  validated a historical handoff manifest against the newly current card
+  revision instead of the immutable revision the handoff bound. The isolated
+  candidate repairs that read boundary; no final-suite green claim is made
+  until a new integration landing reruns `gate.test` successfully.
+
 ## 18. Dependency and execution order
 
 The required order is:
@@ -3491,6 +3668,7 @@ Tier 1 of the register is closed.
 | Recovery/concurrency | `DONE` | `WP-500`, `tests/recovery.rs` (8 acceptance tests); `WP-510`, `tests/concurrency.rs` (11 acceptance tests) | Preserve |
 | Backup/audit | `DONE` | `WP-520`, `tests/backup.rs` (9 acceptance tests); `WP-530`, `tests/audit.rs` (9 acceptance tests) | Preserve |
 | Operational visibility | `DONE` | `WP-550` and `WP-560`; typed snapshot projection with terminal legacy-cycle and stale terminal-lease noise suppressed | Preserve the typed projection, fail-closed integrity, and redaction boundary |
+| Governed lessons | `DONE` | `WP-800`; bounded semantic port preserving PR #212 ancestry and current governance | Preserve exact manifest binding and fail-closed lifecycle enforcement |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3498,12 +3676,12 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None; `WP-560` is `DONE` in this post-landing ledger |
-| Active card | None represented here; execution records remain in the control repository |
-| Status | `DONE` for `WP-560` |
-| Active blocker | None; no next package is selected |
-| Required reading | None until another package is made executable |
-| Acceptance evidence | Focused 27-test snapshot suite, independent filter-removal mutations, exact-SHA `gate.fmt` and `gate.snapshot` receipts, `work verify`, and the final integration gate for the combined landing candidate |
+| Next executable work package | None authorized |
+| Status | `DONE` |
+| Active implementation | `F-045` contains the review-required bounded candidate; review and integration remain independently governed |
+| Blocker | None in implementation; promotion authority remains behind exact-SHA review, final integration verification, and acceptance |
+| Required reading | `README.md`; `AGENTS.md`; plan Sections 1–7; Sections 10.3, 10.7–10.9; Section 12; Sections 15.1–15.3; Section 16; `WP-560`; `WP-600`; `WP-800`; Sections 20.2, 22, and 24; `docs/ARCHITECTURE.md` |
+| Acceptance boundary | Targeted implementation and review checks only; one full `cargo test` run is reserved for final integration |
 
 Bootstrap recovery record:
 
@@ -3682,6 +3860,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-054 | Stop pinning `workspace_role` in the `doctor` CLI test | Accepted | The same defect as D-052 in a second place: the test asserted the role was "main worktree" or "linked worktree", which fails in a detached worktree — where the harness runs its own integration gates. Fixing D-052 alone was not enough, and the second `SELFHOST-001` attempt failed on this one. Both are now stated as "any non-bare role is admissible", and the suite is verified green from an actual detached worktree rather than by inspection. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
 | D-097 | Preserve bootstrap history and fix its terminal snapshot noise in one bounded follow-up | Accepted 2026-08-09 | Release v0.1.5 restored one aligned candidate/origin/authority baseline but was itself an ordinary Git/GitHub bootstrap, not a governed delivery. Retiring the 27 legacy cycles and installing final authorization for actor `alvaro` made new governed work honest; it did not rewrite old cycle revisions or lease records. `WP-560` therefore corrects only the read-only projection for terminal records and preserves live drift/silence warnings, the stable schema, and all historical evidence. |
+| D-098 | Repair PR #212 as a semantic port that preserves both histories and current governance | Accepted 2026-08-09 | Preserve current `main`'s `WP-600` mutation-exemption governance and `WP-560` terminal-noise cleanup while porting governed lessons. Preserve every historical control record and do not force-push or replace the existing PR history. The repaired candidate must retain exact PR head `efb2adeeed4a5a924348655946519b30993280b3` as an ancestor so the existing PR can fast-forward to the reviewed repair. This card changes only the plan: no Rust, runtime, or test behavior changes until a separate `WP-800` implementation card is activated. |
 
 ## 23. Decisions required later
 

@@ -25,6 +25,7 @@ pub mod doctor;
 pub mod gate;
 pub mod handoff;
 pub mod integration;
+pub mod lesson;
 pub mod mutation;
 pub mod project;
 pub mod project_snapshot;

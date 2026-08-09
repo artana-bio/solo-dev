@@ -131,6 +131,7 @@ fn reference_verdict() -> Verdict {
             detail: "reference finding, for field-shape probing only".to_owned(),
             disposition: Disposition::Resolved,
         }],
+        lesson_checks: vec![],
         gate_adequacy: GateAdequacy {
             gates_observe_acceptance: true,
             unobserved_behaviors: vec![],
