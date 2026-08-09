@@ -16,7 +16,7 @@ use crate::{
         integration::{
             integration_proofs, load_cycle, load_integration, load_verification,
             member_implementers, require_cycle_convergence_budget, require_no_pending_exception,
-            require_plan_binding, status_gate_refusal,
+            require_plan_binding, status_gate_refusal, validate_lesson_verification,
         },
         transaction::with_transaction,
     },
@@ -344,10 +344,16 @@ fn preview_record(
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
     require_reviewed(&control, &record)?;
+    let verification = load_verification(&control, integration_id)?;
     require_no_pending_exception(&control, &config, &record)?;
     refuse_existing_acceptance(&control, integration_id)?;
     let authorizer = authorizer(args)?;
+    // Establish the pinned member reviews and their implementer identities
+    // before lesson revalidation. If a review was deleted or edited, the
+    // existing integrability diagnosis is the actionable refusal; lesson
+    // evidence must not mask that more specific control-integrity failure.
     refuse_author_accepting(&control, &record, authorizer)?;
+    validate_lesson_verification(&control, &record, &verification)?;
     validate_final_authorization(&control, &config, &record, authorizer)?;
 
     Ok(CommandOutcome::new(
@@ -570,6 +576,7 @@ fn build_acceptance(
     let verification = load_verification(control, &record.integration_id)?;
     let authorizer = authorizer(args)?;
     refuse_author_accepting(control, record, authorizer)?;
+    validate_lesson_verification(control, record, &verification)?;
     let final_bindings =
         validate_final_authorization(control, &control.project()?, record, authorizer)?;
 
