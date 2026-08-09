@@ -79,6 +79,7 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
     "plans",
     "events",
     "gates",
+    "lessons",
     "handoffs",
     "reviews",
     "mutation-receipts",

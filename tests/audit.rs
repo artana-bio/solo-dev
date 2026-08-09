@@ -47,6 +47,76 @@ fn audit_json(workspace: &Workspace, cycle: &str) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("the JSON envelope")
 }
 
+fn install_lesson_authorizer(workspace: &Workspace) {
+    let path = workspace.root.join("audit-final-authorization.json");
+    fs::write(
+        &path,
+        r#"{
+  "version": "harness.final-authorization-policy/v1",
+  "authorization_unit": "sealed_cycle",
+  "authorizer_actor_ids": ["owner"]
+}
+"#,
+    )
+    .unwrap();
+    let output = Workspace::run(&[
+        "project".into(),
+        "set-final-authorization-policy".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--policy".into(),
+        path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        output.status.success(),
+        "installing final authorization failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn activate_audit_lesson(workspace: &Workspace) {
+    let definition = workspace.root.join("audit-lesson.yaml");
+    fs::write(
+        &definition,
+        "title: Audit current policy without rewriting history\nrule: Inspect the historical lesson binding\nrationale: Later policy changes are not evidence tampering\nselectors:\n  paths: [src/**]\n  contracts: []\n  change_kinds: []\n  minimum_risk: null\nenforcement: required\nobligations:\n  feature_gates: []\n  integration_gates: []\n  review_checks: [historical-binding]\nprovenance:\n  source_kind: review\n  source_id: RV-000001\n  evidence: Prior audit confused current policy with historical evidence\n",
+    )
+    .unwrap();
+    let proposed = Workspace::run(&[
+        "lesson".into(),
+        "propose".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--definition".into(),
+        definition.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(proposed.status.success());
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let lesson_id = proposed["data"]["lesson"]["lesson_id"].as_str().unwrap();
+    let activated = Workspace::run(&[
+        "lesson".into(),
+        "activate".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--lesson-id".into(),
+        lesson_id.into(),
+        "--actor".into(),
+        "owner".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        activated.status.success(),
+        "activating lesson failed: {}{}",
+        String::from_utf8_lossy(&activated.stdout),
+        String::from_utf8_lossy(&activated.stderr)
+    );
+}
+
 /// A cycle carried all the way to a promoted, archived integration.
 fn completed() -> Workspace {
     completed_with_id().0
@@ -266,6 +336,47 @@ fn a_clean_cycle_reports_no_discrepancies() {
         envelope["data"]["discrepancies"]
     );
     assert!(envelope["data"]["events"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn later_lesson_policy_changes_are_informational_not_historical_tampering() {
+    let workspace = Workspace::initialized();
+    install_lesson_authorizer(&workspace);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Freeze historical lesson evidence",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/F-001/**"]);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+
+    activate_audit_lesson(&workspace);
+
+    let envelope = audit_json(&workspace, "C-001");
+    assert!(
+        envelope["data"]["discrepancies"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a current policy change must not invalidate frozen evidence: {envelope}"
+    );
+    let observations = envelope["data"]["policy_observations"].as_array().unwrap();
+    assert_eq!(
+        observations.len(),
+        1,
+        "the policy drift must remain visible"
+    );
+    assert_eq!(
+        observations[0]["kind"],
+        "lesson_policy_changed_since_review"
+    );
+    assert_ne!(
+        observations[0]["frozen_manifest_digest"], observations[0]["current_manifest_digest"],
+        "the observation must prove it compared two distinct manifests"
+    );
 }
 
 #[test]

@@ -1054,6 +1054,11 @@ impl Workspace {
             "--actor-session-id",
             "implementer-session",
         ]);
+        let lesson_manifest_digest =
+            self.work_json(&["packet", "--card-id", card_id])["data"]["manifest_digest"]
+                .as_str()
+                .expect("work packet carries a lesson manifest digest")
+                .to_owned();
 
         let worktree = self.worktrees.join(card_id);
         let path = worktree.join(file);
@@ -1082,6 +1087,8 @@ impl Workspace {
             card_id,
             "--declaration",
             &declaration.display().to_string(),
+            "--lesson-manifest-digest",
+            &lesson_manifest_digest,
         ]);
 
         self.review(&["begin", "--card-id", card_id]);

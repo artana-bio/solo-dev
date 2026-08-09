@@ -26,7 +26,8 @@ use crate::{
         audit::check_control_anchors,
         card::load_card,
         gate::{load_gate, next_receipt_id, receipts_for, require_before_integration},
-        handoff::latest_handoff,
+        handoff::{handoffs_for, latest_handoff},
+        lesson::validate_frozen_card_manifest,
         review::{
             current_approval, dependency_standings, reviews_for, validate_approved_review_evidence,
         },
@@ -46,8 +47,8 @@ use crate::{
         integration::{
             ClaimClassification, INTEGRATION_DIR, INTEGRATION_SCHEMA, IntegrationMember,
             IntegrationMode, IntegrationRecord, IntegrationStatus, Interaction, InvariantCheck,
-            LEGACY_PLAN_MIGRATION_PROVENANCE, VERIFICATION_SCHEMA, VerificationRecord,
-            interactions, topological_order,
+            LEGACY_PLAN_MIGRATION_PROVENANCE, LessonManifestBinding, VERIFICATION_SCHEMA,
+            VERIFICATION_V2_SCHEMA, VerificationRecord, interactions, topological_order,
         },
         review::ReviewRecord,
     },
@@ -1127,6 +1128,7 @@ fn build_record(
         merged_at: None,
         landing_sha: None,
         landed_at: None,
+        lesson_manifest_digest: None,
         prepared_by: actor_id.to_owned(),
         prepared_at: clock.now(),
         canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
@@ -1608,6 +1610,7 @@ fn report_integration(
             "integration_head": record.integration_head,
             "integration_tree": record.integration_tree,
             "landing_sha": record.landing_sha,
+            "lesson_manifest_digest": record.lesson_manifest_digest,
             "next_permitted_action": next_permitted_action,
             "members": record.members,
         }),
@@ -3383,15 +3386,71 @@ fn run_land(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harne
     )
 }
 
+/// Loads and validates the exact lesson packet pinned by every selected review.
+///
+/// A `None` manifest is retained as an explicit legacy marker. New handoffs
+/// always carry `Some`, even when no lesson matched, so a v2 verification can
+/// distinguish historical absence from a removed modern binding.
+fn frozen_lesson_manifests(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<LessonManifestBinding>, HarnessError> {
+    let mut bindings = Vec::with_capacity(record.members.len());
+    for member in &record.members {
+        let (card, _) = load_card(control, &member.card_id)?;
+        let handoff = handoffs_for(control, &member.card_id)?
+            .into_iter()
+            .find(|handoff| handoff.handoff_id == member.handoff_id)
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "integration {} pins missing handoff {} for card {}",
+                    record.integration_id, member.handoff_id, member.card_id
+                ),
+                code: ErrorCode::PolicyLessonManifestStale,
+            })?;
+        let review = reviews_for(control, &member.card_id)?
+            .into_iter()
+            .find(|review| review.review_id == member.review_id)
+            .ok_or_else(|| HarnessError::Control {
+                reason: format!(
+                    "integration {} pins missing review {} for card {}",
+                    record.integration_id, member.review_id, member.card_id
+                ),
+                code: ErrorCode::PolicyLessonManifestStale,
+            })?;
+        if review.digest()? != member.review_digest
+            || review.handoff_id != handoff.handoff_id
+            || review.handoff_digest != handoff.digest()?
+            || review.lesson_manifest != handoff.lesson_manifest
+        {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "card {} review and handoff no longer agree on their lesson evidence",
+                    member.card_id
+                ),
+                code: ErrorCode::PolicyLessonManifestStale,
+            });
+        }
+        if let Some(bound) = handoff.lesson_manifest.as_ref() {
+            validate_frozen_card_manifest(control, &card, bound)?;
+        }
+        bindings.push(LessonManifestBinding {
+            card_id: member.card_id.clone(),
+            manifest: handoff.lesson_manifest,
+        });
+    }
+    Ok(bindings)
+}
+
 /// The distinct gates a landing must pass, with the cards that require them.
 ///
 /// Every gate any member names — feature, review, and integration alike — is
-/// rerun against the landing commit. A feature gate that passed on an isolated
-/// candidate proves nothing about the combined tree, which is the whole reason
-/// this rerun exists.
+/// rerun against the landing commit. Lesson gates come from the frozen reviewed
+/// packet, never from a newly computed manifest that nobody reviewed.
 fn required_gates(
     control: &ControlRepository,
     record: &IntegrationRecord,
+    lesson_manifests: &[LessonManifestBinding],
 ) -> Result<Vec<String>, HarnessError> {
     let mut gates: Vec<String> = Vec::new();
     for member in &record.members {
@@ -3405,6 +3464,19 @@ fn required_gates(
         {
             if !gates.contains(gate_id) {
                 gates.push(gate_id.clone());
+            }
+        }
+        if let Some(manifest) = lesson_manifests
+            .iter()
+            .find(|binding| binding.card_id == member.card_id)
+            .and_then(|binding| binding.manifest.as_ref())
+        {
+            for lesson in manifest.required() {
+                for gate_id in &lesson.obligations.integration_gates {
+                    if !gates.contains(gate_id) {
+                        gates.push(gate_id.clone());
+                    }
+                }
             }
         }
     }
@@ -3442,6 +3514,7 @@ fn verify_landing(
     config: &crate::config::ProjectConfig,
     record: &IntegrationRecord,
     landing_sha: &str,
+    gates: &[String],
     clock: &dyn Clock,
 ) -> Result<(Vec<Receipt>, bool), HarnessError> {
     let path =
@@ -3451,8 +3524,8 @@ fn verify_landing(
 
     let outcome = (|| -> Result<(Vec<Receipt>, bool), HarnessError> {
         let mut receipts = Vec::new();
-        for gate_id in required_gates(control, record)? {
-            let gate = load_gate(control, &gate_id)?;
+        for gate_id in gates {
+            let gate = load_gate(control, gate_id)?;
             let log_root = control.path(LOG_DIR).join(record.integration_id.as_str());
             // Checked before each gate rather than once after all of them. The
             // worktree is clean by construction before the first, but a gate
@@ -3549,13 +3622,14 @@ fn store_verification(
     control: &ControlRepository,
     record: &IntegrationRecord,
     cycle: &CycleRecord,
-    receipts: &mut [Receipt],
-    worktree_clean_after: bool,
+    run: (&mut [Receipt], bool),
+    lesson_manifests: Vec<LessonManifestBinding>,
     actor_id: &str,
     actor_principal_id: Option<&str>,
     actor_session_id: Option<&str>,
     clock: &dyn Clock,
 ) -> Result<VerificationRecord, HarnessError> {
+    let (receipts, worktree_clean_after) = run;
     let mut receipt_ids = Vec::new();
     let mut failed_gates = Vec::new();
     for receipt in receipts.iter_mut() {
@@ -3607,7 +3681,7 @@ fn store_verification(
         })
         .collect();
     Ok(VerificationRecord {
-        schema: VERIFICATION_SCHEMA.to_owned(),
+        schema: VERIFICATION_V2_SCHEMA.to_owned(),
         integration_id: record.integration_id.clone(),
         cycle_id: record.cycle_id.clone(),
         landing_sha,
@@ -3616,6 +3690,7 @@ fn store_verification(
         failed_gates,
         invariants: invariant_checks,
         interactions: member_interactions(control, record)?,
+        lesson_manifests,
         worktree_clean_after,
         verified_by: actor_id.to_owned(),
         verified_principal_id: actor_principal_id.map(str::to_owned),
@@ -3662,7 +3737,8 @@ fn preview_verify(
             code: ErrorCode::PreconditionNotFound,
         });
     };
-    let gates = required_gates(&control, &record)?;
+    let lesson_manifests = frozen_lesson_manifests(&control, &record)?;
+    let gates = required_gates(&control, &record, &lesson_manifests)?;
 
     Ok(CommandOutcome::new(
         "integration.verify",
@@ -3682,6 +3758,7 @@ fn preview_verify(
     .with_project(config.project_id))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     let integration_id: IntegrationId = args.integration_id.parse()?;
 
@@ -3714,15 +3791,18 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
             };
 
             let cycle = load_cycle(control, &record.cycle_id)?;
+            let lesson_manifests = frozen_lesson_manifests(control, &record)?;
+            record.lesson_manifest_digest = Some(Digest::of_canonical(&lesson_manifests)?);
+            let gates = required_gates(control, &record, &lesson_manifests)?;
             let (mut receipts, worktree_clean_after) =
-                verify_landing(control, &config, &record, &landing_sha, clock)?;
+                verify_landing(control, &config, &record, &landing_sha, &gates, clock)?;
 
             let verification = store_verification(
                 control,
                 &record,
                 &cycle,
-                &mut receipts,
-                worktree_clean_after,
+                (&mut receipts, worktree_clean_after),
+                lesson_manifests,
                 &args.actor_id,
                 args.actor_principal_id.as_deref(),
                 args.actor_session_id.as_deref(),
@@ -3767,7 +3847,11 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
                     .meta("verification_digest", serde_json::json!(digest.as_str()))
                     .meta("passed", serde_json::json!(passed))
                     .meta("receipt_ids", serde_json::json!(receipt_ids))
-                    .meta("failed_gates", serde_json::json!(failed_gates)),
+                    .meta("failed_gates", serde_json::json!(failed_gates))
+                    .meta(
+                        "lesson_manifest_digest",
+                        serde_json::json!(record.lesson_manifest_digest),
+                    ),
                 clock,
             )?;
             control.commit(expected, &format!("integration: verify {integration_id}"))?;
@@ -3845,6 +3929,7 @@ fn report_verification(
             "failed_gates": verification.failed_gates,
             "invariants": verification.invariants,
             "interactions": verification.interactions,
+            "lesson_manifests": verification.lesson_manifests,
             "worktree_clean_after": verification.worktree_clean_after,
             "passed": verification.passed(),
         }),
@@ -3962,6 +4047,77 @@ pub fn load_verification(
         reason: format!("verification for {integration_id} is malformed: {source}"),
         code: ErrorCode::InternalControlCorrupt,
     })
+}
+
+/// Revalidates the governed-lesson evidence carried by a verification.
+///
+/// V1 records deliberately remain readable and promotable when the integration
+/// has no lesson binding. V2 records must match the integration's authoritative
+/// manifest digest and the exact handoff/review packets for every member.
+pub(crate) fn validate_lesson_verification(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+    verification: &VerificationRecord,
+) -> Result<(), HarnessError> {
+    match record.lesson_manifest_digest.as_ref() {
+        None => {
+            if verification.schema == VERIFICATION_SCHEMA
+                && verification.lesson_manifests.is_empty()
+            {
+                let legacy = frozen_lesson_manifests(control, record)?;
+                if legacy.iter().all(|binding| binding.manifest.is_none()) {
+                    return Ok(());
+                }
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {} uses modern handoff lesson packets but its verification was downgraded to v1",
+                        record.integration_id
+                    ),
+                    code: ErrorCode::PolicyLessonManifestStale,
+                });
+            }
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration {} has verification lesson evidence but no authoritative lesson binding",
+                    record.integration_id
+                ),
+                code: ErrorCode::PolicyLessonManifestStale,
+            });
+        }
+        Some(expected) => {
+            if verification.schema != VERIFICATION_V2_SCHEMA {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "integration {} requires v2 lesson-bound verification evidence",
+                        record.integration_id
+                    ),
+                    code: ErrorCode::PolicyLessonManifestStale,
+                });
+            }
+            let actual = Digest::of_canonical(&verification.lesson_manifests)?;
+            if &actual != expected {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "verification lesson evidence digests to {actual}, but integration {} binds {expected}",
+                        record.integration_id
+                    ),
+                    code: ErrorCode::PolicyLessonManifestStale,
+                });
+            }
+        }
+    }
+
+    let current = frozen_lesson_manifests(control, record)?;
+    if current != verification.lesson_manifests {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "verification for integration {} no longer matches its reviewed lesson packets",
+                record.integration_id
+            ),
+            code: ErrorCode::PolicyLessonManifestStale,
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a review that leaves a declared cycle invariant unaddressed.
@@ -4083,6 +4239,7 @@ fn run_integration_review(
             args.reviewer_session_id.as_deref(),
         )?;
         refuse_member_implementer_reviewing(&control, &record, &args.reviewer_actor_id)?;
+        validate_lesson_verification(&control, &record, &verification)?;
         require_invariants_addressed(&verification, &args.invariants_held)?;
         return Ok(CommandOutcome::new(
             "integration.review",
@@ -4122,6 +4279,7 @@ fn run_integration_review(
                 args.reviewer_session_id.as_deref(),
             )?;
             refuse_member_implementer_reviewing(control, &record, &args.reviewer_actor_id)?;
+            validate_lesson_verification(control, &record, &verification)?;
             require_invariants_addressed(&verification, &args.invariants_held)?;
 
             record.status = IntegrationStatus::Reviewed;
@@ -4421,6 +4579,7 @@ fn check_promotion(
     }
     integration_proofs(control, record)?;
     let verification = load_verification(control, &record.integration_id)?;
+    validate_lesson_verification(control, record, &verification)?;
     if verification.landing_sha != landing_sha {
         return Err(HarnessError::Control {
             reason: format!(
