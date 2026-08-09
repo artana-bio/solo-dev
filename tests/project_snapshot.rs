@@ -102,11 +102,22 @@ fn commit_control(workspace: &Workspace) {
             "commit",
             "-q",
             "-m",
-            "test: corrupt receipt fixture",
+            "test: update snapshot fixture",
         ])
         .status()
         .unwrap();
     assert!(commit.success());
+}
+
+fn backdate_held_leases(workspace: &Workspace, lease_ids: &[&str]) {
+    for lease_id in lease_ids {
+        let path = workspace.control.join(format!("leases/{lease_id}.json"));
+        let mut lease: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).expect("lease JSON");
+        lease["granted_at"] = "1970-01-01T00:00:00Z".into();
+        fs::write(&path, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+    }
+    commit_control(workspace);
 }
 
 fn mutate_receipt(workspace: &Workspace, mutate: impl FnOnce(&mut Value)) {
@@ -415,6 +426,143 @@ fn snapshot_reports_structured_gate_metrics_and_active_card_actor() {
     assert_eq!(active[0]["phase"], "approved");
     assert_eq!(active[0]["actor_id"], "operator");
     assert!(active[0]["last_activity_at"].is_string());
+}
+
+#[test]
+fn terminal_cycle_revision_drift_is_suppressed_for_closed_and_abandoned_cycles() {
+    let workspace = Workspace::initialized();
+
+    // No command closes a cycle yet, so use the established fixture seam for
+    // the terminal-success state. Abandonment is exercised through the real
+    // lifecycle command below.
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Closed legacy",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.tamper_cycle_status("C-001", "closed");
+    commit_control(&workspace);
+
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-002",
+        "--objective",
+        "Abandoned legacy",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-002"]);
+    workspace.cycle(&["abandon", "--cycle-id", "C-002", "--reason", "obsolete"]);
+
+    // Both cycles retain their original revision while the current project
+    // document advances. Snapshot must keep the records and counts but omit
+    // only the no-longer-actionable revision warning.
+    workspace.configure_convergence_policy(3, 3);
+    let snapshot = snapshot_json(&workspace)["data"].clone();
+    let diagnostics = snapshot["consistency"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic == "cycle_project_revision_mismatch"),
+        "terminal legacy cycles must not create revision-drift noise: {snapshot}"
+    );
+    assert_eq!(snapshot["cycle_state_counts"]["abandoned"], 1);
+    assert_eq!(
+        fs::read_dir(workspace.control.join("cycles"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        2,
+        "snapshot suppression must not remove historical cycle records"
+    );
+}
+
+#[test]
+fn non_terminal_cycle_revision_drift_remains_visible() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "Live work"]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.configure_convergence_policy(3, 3);
+
+    let snapshot = snapshot_json(&workspace)["data"].clone();
+    assert!(
+        snapshot["consistency"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "cycle_project_revision_mismatch"),
+        "an active cycle with revision drift must remain actionable: {snapshot}"
+    );
+    assert_eq!(snapshot["cycle_state_counts"]["active"], 1);
+}
+
+#[test]
+fn terminal_card_leases_are_suppressed_for_closed_and_abandoned_cards() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Legacy leases",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/abandoned/**"]);
+    workspace.activate_card("F-002", &["src/closed/**"]);
+    let abandoned = workspace.work_json(&["start", "--card-id", "F-001"]);
+    let closed = workspace.work_json(&["start", "--card-id", "F-002"]);
+    let abandoned_lease = abandoned["data"]["lease_id"].as_str().unwrap();
+    let closed_lease = closed["data"]["lease_id"].as_str().unwrap();
+
+    workspace.card(&["abandon", "--card-id", "F-001", "--reason", "obsolete"]);
+    // Archive close normally releases a successful card's lease, so the
+    // established state-tamper seam constructs the legacy closed+held shape.
+    workspace.tamper_card_state("F-002", "closed");
+    backdate_held_leases(&workspace, &[abandoned_lease, closed_lease]);
+
+    let before_head = workspace.control_head();
+    let snapshot = snapshot_json(&workspace)["data"].clone();
+    assert!(
+        snapshot["silent_leases"].as_array().unwrap().is_empty(),
+        "terminal cards must not appear as silent active work: {snapshot}"
+    );
+    assert_eq!(snapshot["card_state_counts"]["abandoned"], 1);
+    assert_eq!(snapshot["card_state_counts"]["closed"], 1);
+    for lease_id in [abandoned_lease, closed_lease] {
+        let lease: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.control.join(format!("leases/{lease_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lease["status"], "held");
+    }
+    assert_eq!(workspace.control_head(), before_head);
+}
+
+#[test]
+fn non_terminal_card_silent_lease_remains_visible() {
+    let workspace = Workspace::initialized();
+    workspace.cycle(&["create", "--cycle-id", "C-001", "--objective", "Live lease"]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/live/**"]);
+    let started = workspace.work_json(&["start", "--card-id", "F-001"]);
+    let lease_id = started["data"]["lease_id"].as_str().unwrap();
+    backdate_held_leases(&workspace, &[lease_id]);
+
+    let snapshot = snapshot_json(&workspace)["data"].clone();
+    let silent = snapshot["silent_leases"].as_array().unwrap();
+    assert_eq!(
+        silent.len(),
+        1,
+        "live silent work must remain visible: {snapshot}"
+    );
+    assert_eq!(silent[0]["lease_id"], lease_id);
+    assert_eq!(silent[0]["card_id"], "F-001");
+    assert_eq!(snapshot["card_state_counts"]["active"], 1);
 }
 
 #[test]
