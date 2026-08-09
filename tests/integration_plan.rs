@@ -168,6 +168,56 @@ fn an_approved_review_with_corrupt_or_rebound_mutation_receipt_is_not_ready() {
     }
 }
 
+#[test]
+fn an_approved_review_with_changed_mutation_receipt_digest_is_not_ready() {
+    let workspace = cycle_with(1);
+    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let candidate = support::capture(&workspace.worktrees.join("F-001"), &["rev-parse", "HEAD"]);
+    let receipt_id = "MR-DIGEST-CHANGED-AFTER-APPROVAL";
+    corrupt_approved_mutation_binding(
+        &workspace,
+        receipt_id,
+        Some(validish_receipt(receipt_id, &candidate)),
+    );
+
+    let reviews = workspace.review_json(&["inspect", "--card-id", "F-001"]);
+    let review_id = reviews["data"]["reviews"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["review_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let review_path = workspace.control.join(format!("reviews/{review_id}.json"));
+    let mut review: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).unwrap()).unwrap();
+    review["mutation_receipt_bindings"] = serde_json::json!([{
+        "receipt_id": receipt_id,
+        "receipt_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "card_revision": "F-001-r1",
+        "candidate_sha": candidate,
+        "reviewer_actor_id": "reviewer-session",
+        "reviewer_principal_id": "reviewer-principal",
+        "reviewer_session_id": "reviewer-session",
+        "gate_oracle": "gate.unit"
+    }]);
+    fs::write(&review_path, serde_json::to_vec_pretty(&review).unwrap()).unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "change mutation receipt digest"],
+    );
+
+    let ready = workspace.integration_raw(&["ready", "--cycle-id", "C-001"]);
+    assert!(
+        !ready.status.success(),
+        "changed receipt digest must block readiness"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-GATE-EVIDENCE-STALE");
+}
+
 /// The card identifiers in an integration's merge order.
 fn merge_order(envelope: &serde_json::Value) -> Vec<String> {
     envelope["data"]["members"]

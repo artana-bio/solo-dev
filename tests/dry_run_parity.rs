@@ -694,7 +694,7 @@ fn review_record_dry_run_matches_record_for_attestation_and_evidence_contracts()
         ("human-no-attestation", "CH-POLICY-RISK-REVIEW"),
         ("same-principal-attestation", "CH-POLICY-RISK-REVIEW"),
         ("invalid-exemption", "CH-POLICY-INCOMPLETE-REVIEW"),
-        ("missing-receipt", "CH-INTERNAL-CONTROL-CORRUPT"),
+        ("missing-receipt", "CH-GATE-EVIDENCE-STALE"),
     ];
     for (case, expected) in cases {
         let workspace = review_contract_fixture();
