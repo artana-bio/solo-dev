@@ -179,6 +179,8 @@ fn schedule_is_fresh_read_only_and_reports_wait_with_independent_work_at_two_cpu
         ("F-004", "src/four/**", "gate.independent"),
     ] {
         workspace.activate_card_with_gates(card, &[scope], &[gate]);
+    }
+    for card in ["F-001", "F-002", "F-003", "F-004"] {
         workspace.work(&["start", "--card-id", card]);
     }
     let profile = profile(&workspace);
@@ -296,6 +298,8 @@ fn occupied_lanes_without_independent_work_recommend_wait_without_mutation() {
         ("F-003", "src/three/**", "gate.wait.three"),
     ] {
         workspace.activate_card_with_gates(card, &[scope], &[gate]);
+    }
+    for card in ["F-001", "F-002", "F-003"] {
         workspace.work(&["start", "--card-id", card]);
     }
     let profile = profile(&workspace);
@@ -368,8 +372,8 @@ fn budget_crossing_emits_one_event_without_changing_capacity_or_policy() {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card_with_gates("F-001", &["src/budget/**"], &["gate.budget"]);
-    workspace.work(&["start", "--card-id", "F-001"]);
     workspace.activate_card_with_gates("F-002", &["src/budget-second/**"], &["gate.budget.second"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
     workspace.work(&["start", "--card-id", "F-002"]);
     let profile = profile(&workspace);
     let reservation = workspace.gate_json(&[

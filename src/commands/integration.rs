@@ -1397,6 +1397,29 @@ fn require_execution_classification(
                 code: ErrorCode::InternalControlCorrupt,
             }
         })?;
+    let planned_joint: std::collections::BTreeSet<_> = plan
+        .cards
+        .iter()
+        .filter(|card| {
+            card.distribution == crate::domain::cycle_plan::Distribution::JointIntegration
+        })
+        .map(|card| card.card_id.as_str())
+        .collect();
+    let selected_ids: std::collections::BTreeSet<_> = selected
+        .iter()
+        .map(|candidate| candidate.record.card_id.as_str())
+        .collect();
+    if !planned_joint.is_disjoint(&selected_ids)
+        && (mode != IntegrationMode::Batch || selected_ids != planned_joint)
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "plan {plan_id} requires joint-integration cards [{}] to be prepared together as one exact batch",
+                planned_joint.iter().copied().collect::<Vec<_>>().join(", ")
+            ),
+            code: ErrorCode::PolicyInvalidCycle,
+        });
+    }
     for candidate in selected {
         let planned = plan
             .cards
@@ -1612,6 +1635,83 @@ pub fn load_integration(
         reason: format!("integration {integration_id} is malformed: {source}"),
         code: ErrorCode::InternalControlCorrupt,
     })
+}
+
+/// One proof entry bound to the exact card revision carried by an integration.
+#[derive(Clone, Debug)]
+pub(crate) struct IntegrationProof {
+    pub id: String,
+    pub invariant: String,
+    pub oracle: String,
+}
+
+/// Loads the exact member revisions and constructs the only proof namespace an
+/// integration may use. IDs and invariant bindings are global within that
+/// namespace, so lookup can never silently select the first conflicting card.
+pub(crate) fn integration_proofs(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<Vec<IntegrationProof>, HarnessError> {
+    let mut proofs: Vec<IntegrationProof> = Vec::new();
+    for member in &record.members {
+        let relative = CardRecord::relative_path(&member.card_id, member.card_revision);
+        let card: CardRecord =
+            serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+                HarnessError::Control {
+                    reason: format!(
+                        "integration member {} revision {} is malformed: {source}",
+                        member.card_id, member.card_revision
+                    ),
+                    code: ErrorCode::InternalControlCorrupt,
+                }
+            })?;
+        if card.digest()? != member.card_digest {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "integration {} member {} no longer matches its pinned card digest",
+                    record.integration_id, member.card_id
+                ),
+                code: ErrorCode::GateEvidenceStale,
+            });
+        }
+        let Some(map) = card.proof_map else {
+            continue;
+        };
+        map.validate_strict()?;
+        for entry in map.entries {
+            let id = entry.id.expect("strict proof validation requires an id");
+            let oracle = entry
+                .gate_oracle
+                .expect("strict proof validation requires an oracle");
+            if proofs.iter().any(|proof| proof.id == id) {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "proof entry id `{id}` is duplicated across members of integration {}",
+                        record.integration_id
+                    ),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
+            }
+            if proofs
+                .iter()
+                .any(|proof| proof.invariant == entry.invariant)
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "invariant `{}` has more than one proof binding in integration {}",
+                        entry.invariant, record.integration_id
+                    ),
+                    code: ErrorCode::PolicyInvalidCard,
+                });
+            }
+            proofs.push(IntegrationProof {
+                id,
+                invariant: entry.invariant,
+                oracle,
+            });
+        }
+    }
+    Ok(proofs)
 }
 
 /// Revalidates the plan pinned by an integration at every authorization
@@ -3135,6 +3235,8 @@ fn preview_land(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_plan_binding(&control, &record)?;
+    integration_proofs(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — see
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
@@ -3462,32 +3564,21 @@ fn store_verification(
     }
 
     let landing_sha = record.landing_sha.clone().unwrap_or_default();
-    let mut proofs = Vec::new();
-    for card_id in &cycle.card_ids {
-        let (card, _) = load_card(control, card_id)?;
-        if let Some(map) = card.proof_map {
-            for entry in map.entries {
-                let (Some(id), Some(oracle)) = (entry.id, entry.gate_oracle) else {
-                    continue;
-                };
-                proofs.push((id, entry.invariant, oracle));
-            }
-        }
-    }
+    let proofs = integration_proofs(control, record)?;
     let invariant_checks = cycle
         .release_invariants
         .iter()
         .map(|invariant| {
             let proof = proofs
                 .iter()
-                .find(|(id, text, _)| id == invariant || text == invariant);
+                .find(|proof| proof.id == *invariant || proof.invariant == *invariant);
             let matching: Vec<String> = proof
-                .map(|(_, _, oracle)| {
+                .map(|proof| {
                     receipts
                         .iter()
                         .filter(|receipt| {
                             receipt.passed
-                                && receipt.gate_id == *oracle
+                                && receipt.gate_id == proof.oracle
                                 && receipt.evaluated_sha == landing_sha
                         })
                         .map(|receipt| receipt.receipt_id.to_string())
@@ -3496,7 +3587,7 @@ fn store_verification(
                 .unwrap_or_default();
             let checked = proof.is_some() && !matching.is_empty();
             InvariantCheck {
-                proof_entry_id: proof.map(|(id, _, _)| id.clone()),
+                proof_entry_id: proof.map(|proof| proof.id.clone()),
                 invariant: invariant.clone(),
                 machine_checked: checked,
                 observed_receipt_ids: matching,
@@ -3527,6 +3618,16 @@ fn store_verification(
     })
 }
 
+/// Requires verification to use the pinned member and proof catalog.
+fn require_verification_evidence_binding(
+    control: &ControlRepository,
+    record: &IntegrationRecord,
+) -> Result<(), HarnessError> {
+    require_plan_binding(control, record)?;
+    integration_proofs(control, record)?;
+    Ok(())
+}
+
 /// Reports what verification would run, running no gate.
 ///
 /// A dry run that started the gates would be a real verification wearing the
@@ -3539,6 +3640,7 @@ fn preview_verify(
     let control = ControlRepository::open(&args.control)?;
     let config = control.project()?;
     let record = load_integration(&control, integration_id)?;
+    require_verification_evidence_binding(&control, &record)?;
     // 73-2: the first check able to refuse, before anything else — see
     // `require_cycle_convergence_budget`.
     require_cycle_convergence_budget(&control, &config, &record.cycle_id)?;
@@ -3588,6 +3690,7 @@ fn run_verify(args: &MergeArgs, clock: &dyn Clock) -> Result<CommandOutcome, Har
             steps.at("control-write")?;
             let config = control.project()?;
             let mut record = load_integration(control, &integration_id)?;
+            require_verification_evidence_binding(control, &record)?;
             // 73-2: the first check able to refuse, before any write — see
             // `require_cycle_convergence_budget`.
             require_cycle_convergence_budget(control, &config, &record.cycle_id)?;
@@ -4309,6 +4412,7 @@ fn check_promotion(
             recovery: FINAL_AUTHORIZATION_STALE_RECOVERY,
         });
     }
+    integration_proofs(control, record)?;
     let verification = load_verification(control, &record.integration_id)?;
     if verification.landing_sha != landing_sha {
         return Err(HarnessError::Control {

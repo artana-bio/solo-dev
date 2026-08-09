@@ -113,6 +113,36 @@ fn completed_with_id_using_exemption(exempt: bool) -> (Workspace, String) {
     (workspace, id)
 }
 
+#[test]
+fn clean_promoted_production_evidence_has_no_audit_contradictions() {
+    let (workspace, _) = completed_with_id();
+    let report = Workspace::run(&[
+        "audit".into(),
+        "report".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--cycle-id".into(),
+        "C-001".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        report.status.success(),
+        "clean production evidence must not contradict itself: {}",
+        String::from_utf8_lossy(&report.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["data"]["contradiction_count"], 0);
+    assert_eq!(
+        report["data"]["receipt_reuse_evidence"]["classification"],
+        "not_tested"
+    );
+    assert_eq!(
+        report["data"]["receipt_reuse_evidence"]["unsupported_dimensions"],
+        serde_json::json!(["toolchain", "inputs", "fixtures", "cache", "trust_mode"])
+    );
+}
+
 /// Completes only the privacy-safe dimensions that the current runner cannot
 /// yet collect. This is deliberately test-fixture data: production receipts
 /// remain incomplete and must produce `rerun_required` until #56's remaining
@@ -614,8 +644,8 @@ fn audit_report_corruption_matrix_fails_closed_with_exact_findings() {
             | "wrong_landing_sha"
             | "wrong_landing_tree"
             | "policy_digest_drift"
-            | "oracle_mismatch" => "failed",
-            "proof_id_mismatch" => "not_tested",
+            | "oracle_mismatch"
+            | "proof_id_mismatch" => "failed",
             _ => unreachable!(),
         };
         assert!(

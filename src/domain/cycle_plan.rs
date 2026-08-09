@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ErrorCode, HarnessError};
+use crate::{
+    error::{ErrorCode, HarnessError},
+    policy::actors,
+};
 
 pub const CYCLE_PLAN_SCHEMA: &str = "harness.cycle-plan/v1";
 pub const CYCLE_PLAN_REVISION: u32 = 1;
@@ -121,6 +124,21 @@ impl CyclePlan {
                     "card {} has incomplete typed assignment provenance",
                     card.card_id
                 )));
+            }
+            for (role, identity) in [
+                ("assignment", card.assignment.as_deref()),
+                (
+                    "assignment principal",
+                    card.assignment_principal_id.as_deref(),
+                ),
+                ("assignment session", card.assignment_session_id.as_deref()),
+            ] {
+                if identity.is_none_or(|id| actors::refuse_unusable(role, id).is_err()) {
+                    return Err(invalid(&format!(
+                        "card {} has an unusable {role} identity",
+                        card.card_id
+                    )));
+                }
             }
             if card.proof_entries.is_empty() || card.mutation_plan.is_empty() {
                 return Err(invalid(&format!(

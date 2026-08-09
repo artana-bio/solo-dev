@@ -292,6 +292,7 @@ fn stateful_dry_runs_do_not_change_state() {
     ]);
     work.cycle(&["activate", "--cycle-id", "C-001"]);
     work.activate_card("F-001", &["src/F-001/**"]);
+    work.activate_card("F-002", &["src/F-002/**"]);
     work.bind_fixture_plan("plan-dry-run", "parallel");
 
     assert_dry_run_unchanged(&work, "work start", || {
@@ -346,7 +347,6 @@ fn stateful_dry_runs_do_not_change_state() {
         ])
     });
     work.work(&["resume", "--card-id", "F-001"]);
-    work.activate_card("F-002", &["src/F-002/**"]);
     assert_dry_run_unchanged(&work, "cycle declare-group", || {
         work.cycle_raw(&[
             "declare-group",

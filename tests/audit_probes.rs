@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, process::Command};
 
 #[test]
 fn executable_assurance_probes_reach_each_target_oracle() {
@@ -80,4 +80,35 @@ fn executable_assurance_probes_reach_each_target_oracle() {
     assert_eq!(network["network_declared"], "denied");
     assert_eq!(network["network_enforced"], false);
     assert!(run_ids.insert(network["run_id"].as_str().unwrap().to_owned()));
+}
+
+#[test]
+fn failed_required_probes_return_a_machine_readable_refusal() {
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .args(["audit", "probes", "--output", "json"])
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-AUDIT-DISCREPANCY");
+    assert_eq!(
+        envelope["error"]["details"]["all_required_probes_passed"],
+        false
+    );
+    assert!(
+        envelope["error"]["details"]["failed_probe_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let network = envelope["error"]["details"]["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|probe| probe["probe"] == "denied_network")
+        .unwrap();
+    assert_eq!(network["classification"], "not_tested");
+    assert_eq!(network["network_enforced"], false);
 }

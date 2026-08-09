@@ -184,6 +184,8 @@ fn two_cpu_heavy_lanes_are_durable_and_release_before_a_third_execution_starts()
         ("F-004", "src/four/**", "gate.ordinary"),
     ] {
         workspace.activate_card_with_gates(card, &[scope], &[gate_id]);
+    }
+    for card in ["F-001", "F-002", "F-003", "F-004"] {
         workspace.work(&["start", "--card-id", card]);
     }
     let profile = profile(&workspace);

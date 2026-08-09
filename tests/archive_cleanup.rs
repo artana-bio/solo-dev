@@ -24,6 +24,9 @@ fn promoted(count: usize) -> (Workspace, String) {
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
 

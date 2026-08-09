@@ -1297,6 +1297,146 @@ fn mode_individual_is_refused_for_a_multi_card_selection() {
 }
 
 #[test]
+fn a_pinned_plan_freezes_cycle_membership_without_control_mutation() {
+    let workspace = cycle_with(1);
+    let baseline = workspace.cycle_json(&["status", "--cycle-id", "C-001"])["data"]["baseline_sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let draft = workspace.root.join("F-002-after-plan.yaml");
+    fs::write(
+        &draft,
+        format!(
+            "card_id: F-002\ncycle_id: C-001\ntitle: Late card\ngoal: Must be refused\nnon_goals: []\nrisk: low\nchange_kind: feature\nbase_sha: {baseline}\nwrite_scope:\n  include: [src/F-002/**]\n  exclude: []\nnamed_gates:\n  feature: [gate.unit]\n  review: []\n  integration: [gate.all]\nacceptance:\n  behaviors: [it works]\n  regressions: []\nreview_policy: independent\nrollback_strategy: revert the commit\n"
+        ),
+    )
+    .unwrap();
+    workspace.card(&["create", "--draft", draft.to_str().unwrap()]);
+    workspace.bind_fixture_plan("PLAN-FROZEN-MEMBERSHIP-001", "parallel");
+
+    let cycle_path = workspace.control.join("cycles/C-001.json");
+    let plan_path = workspace
+        .control
+        .join("plans/PLAN-FROZEN-MEMBERSHIP-001.json");
+    let cycle_before = fs::read(&cycle_path).unwrap();
+    let plan_before = fs::read(&plan_path).unwrap();
+    let head_before = workspace.control_head();
+    let cleanliness_before = support::capture(&workspace.control, &["status", "--porcelain"]);
+
+    let refusal = workspace.card_raw(&["activate", "--card-id", "F-002"]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(fs::read(&cycle_path).unwrap(), cycle_before);
+    assert_eq!(fs::read(&plan_path).unwrap(), plan_before);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        cleanliness_before
+    );
+    assert!(
+        !workspace.control.join("cards/F-002/state.json").exists(),
+        "a refused activation must not create authoritative card state"
+    );
+}
+
+#[test]
+fn joint_integration_requires_the_exact_complete_planned_set_atomically() {
+    let workspace = cycle_with(2);
+    workspace.bind_fixture_plan("PLAN-JOINT-COMPLETE-001", "joint_integration");
+    workspace.work(&[
+        "start-batch",
+        "--card-id",
+        "F-001",
+        "--card-id",
+        "F-002",
+        "--actor-principal-id",
+        "implementer-principal",
+        "--actor-session-id",
+        "implementer-session",
+    ]);
+    for card in ["F-001", "F-002"] {
+        let worktree = workspace.worktrees.join(card);
+        let source = worktree.join(format!("src/{card}/a.rs"));
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, format!("// {card}\n")).unwrap();
+        support::git(&worktree, &["add", "-A"]);
+        support::git(&worktree, &["commit", "-q", "-m", &format!("feat: {card}")]);
+        workspace.gate(&["run", "--card-id", card, "--gate-id", "gate.unit"]);
+        let head = support::capture(&worktree, &["rev-parse", "HEAD"]);
+        let declaration = workspace
+            .root
+            .join(format!("{card}-joint-declaration.yaml"));
+        fs::write(
+            &declaration,
+            format!(
+                "delivered_sha: {head}\nbehavior_delivered: adds {card}\nimplementation_decisions: [minimal]\nassumptions: []\nknown_limitations: []\nresidual_risks: []\nrollback_notes: revert\n"
+            ),
+        )
+        .unwrap();
+        workspace.handoff(&[
+            "create",
+            "--card-id",
+            card,
+            "--declaration",
+            declaration.to_str().unwrap(),
+        ]);
+        workspace.review(&["begin", "--card-id", card]);
+        let receipt = workspace.create_fixture_mutation_receipt(
+            card,
+            "reviewer-session",
+            "reviewer-principal",
+            "reviewer-session",
+        );
+        let verdict = workspace.root.join(format!("{card}-joint-verdict.yaml"));
+        fs::write(
+            &verdict,
+            format!(
+                "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct joint lifecycle proof\n  mutation_evidence:\n    status: demonstrated\n    mutation: added fixture marker\n    failing_test: fixture oracle rejects marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"
+            ),
+        )
+        .unwrap();
+        workspace.review(&[
+            "record",
+            "--card-id",
+            card,
+            "--verdict",
+            verdict.to_str().unwrap(),
+            "--actor",
+            "reviewer-session",
+        ]);
+    }
+    let plan_path = workspace.control.join("plans/PLAN-JOINT-COMPLETE-001.json");
+    let plan_before = fs::read(&plan_path).unwrap();
+    let head_before = workspace.control_head();
+    let cleanliness_before = support::capture(&workspace.control, &["status", "--porcelain"]);
+
+    let refusal = workspace.integration_raw(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--card-id",
+        "F-001",
+        "--mode",
+        "batch",
+        "--actor-id",
+        "coordinator",
+    ]);
+    assert_eq!(refusal.status.code(), Some(5));
+    assert_eq!(error_code(&refusal), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(fs::read(&plan_path).unwrap(), plan_before);
+    assert_eq!(
+        support::capture(&workspace.control, &["status", "--porcelain"]),
+        cleanliness_before
+    );
+    assert_eq!(
+        fs::read_dir(workspace.control.join("integrations")).map_or(0, std::iter::Iterator::count),
+        0,
+        "partial joint preparation must create no integration"
+    );
+}
+
+#[test]
 fn a_dry_run_reports_the_plan_and_changes_nothing() {
     let workspace = cycle_with(1);
     workspace.approve_card("F-001", "src/F-001/a.rs");

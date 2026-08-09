@@ -309,8 +309,6 @@ fn appending_to_the_control_record_never_reports_a_discrepancy() {
     // landing — proving the check tolerates ordinary continued work, not
     // just more landings.
     workspace.register_gate("gate.extra", &["true"]);
-    workspace.activate_card("F-002", &["src/F-002/**"]);
-    workspace.approve_card("F-002", "src/F-002/a.rs");
     workspace.configure_convergence_policy(5, 5);
 
     // And a second landing too: growth by landing again must be exactly as

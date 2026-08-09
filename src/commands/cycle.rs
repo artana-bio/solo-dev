@@ -26,8 +26,11 @@ use crate::{
         command::{GitScope, run_ok},
         inspect,
     },
-    policy::convergence::{
-        CycleConvergence, CycleDimension, NextPermittedAction, assess_cycle, project,
+    policy::{
+        actors,
+        convergence::{
+            CycleConvergence, CycleDimension, NextPermittedAction, assess_cycle, project,
+        },
     },
 };
 
@@ -773,9 +776,17 @@ pub fn require_plan_assignment(
         })?;
     let principal = principal_id.filter(|value| !value.trim().is_empty());
     let session = session_id.filter(|value| !value.trim().is_empty());
-    if planned.assignment.as_deref() != Some(actor_id)
-        || planned.assignment_principal_id.as_deref() != principal
-        || planned.assignment_session_id.as_deref() != session
+    let same_optional = |planned: Option<&str>, declared: Option<&str>| match (planned, declared) {
+        (Some(planned), Some(declared)) => actors::same(planned, declared),
+        (None, None) => true,
+        _ => false,
+    };
+    if !planned
+        .assignment
+        .as_deref()
+        .is_some_and(|planned| actors::same(planned, actor_id))
+        || !same_optional(planned.assignment_principal_id.as_deref(), principal)
+        || !same_optional(planned.assignment_session_id.as_deref(), session)
     {
         return Err(HarnessError::Control {
             reason: format!(

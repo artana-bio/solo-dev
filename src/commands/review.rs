@@ -1567,12 +1567,12 @@ fn validate_mutation_exemption(
         .reviewer_provenance
         .as_ref()
         .and_then(|provenance| provenance.principal_id.as_deref())
-        == Some(rule.approver_principal_id.as_str())
+        .is_some_and(|principal| actors::same(principal, &rule.approver_principal_id))
         || review
             .reviewer_provenance
             .as_ref()
             .and_then(|provenance| provenance.session_id.as_deref())
-            == Some(rule.approver_session_id.as_str())
+            .is_some_and(|session| actors::same(session, &rule.approver_session_id))
     {
         return Err(HarnessError::Control {
             reason: "mutation exemption approver must be independent from the reviewer principal and session".to_owned(),

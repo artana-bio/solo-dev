@@ -1835,6 +1835,9 @@ fn integrable_under_policy(card_limit: u32, integration_limit: u32, count: usize
     for index in 1..=count {
         let card = format!("F-{index:03}");
         workspace.activate_card(&card, &[&format!("src/{card}/**")]);
+    }
+    for index in 1..=count {
+        let card = format!("F-{index:03}");
         workspace.approve_card(&card, &format!("src/{card}/a.rs"));
     }
     workspace
@@ -2354,12 +2357,12 @@ fn an_escalated_card_refuses_review_record() {
 #[test]
 fn an_unrelated_card_in_the_same_cycle_still_delivers_and_is_reviewed() {
     let workspace = opened_with_policy(1, 3);
+    workspace.activate_card("F-002", &["docs/f002/**"]);
     escalate_via_review_returns(&workspace, "F-001");
 
     // A second, unrelated card in the same cycle, scoped away from `src/**`
     // so the two can coexist without an ownership-overlap refusal, must be
     // completely unaffected by F-001's escalation.
-    workspace.activate_card("F-002", &["docs/f002/**"]);
     workspace.approve_card("F-002", "docs/f002/a.md");
 
     assert_eq!(
@@ -2895,12 +2898,12 @@ fn card_status_reports_legacy_unassessed_without_a_policy() {
 #[test]
 fn an_unrelated_card_in_the_same_cycle_still_starts_work() {
     let workspace = opened_with_policy(1, 3);
+    workspace.activate_card("F-002", &["docs/f002/**"]);
     escalate_via_review_returns(&workspace, "F-001");
 
     // A second, unrelated card, scoped away from `src/**` so the two can
     // coexist without an ownership-overlap refusal, must be completely
     // unaffected by F-001's escalation.
-    workspace.activate_card("F-002", &["docs/f002/**"]);
     let output = workspace.work_raw(&[
         "start",
         "--card-id",
@@ -4958,6 +4961,8 @@ mod disposition_rebaseline {
     #[allow(clippy::too_many_lines)]
     fn a_rebaseline_retires_installs_and_repins_so_an_open_cycle_keeps_working() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        let activation = activate_with_scope(&workspace, "F-002", &["tests/promotion.rs"]);
+        assert!(activation.status.success());
         escalate_via_review_returns(&workspace, "F-001");
         let escalating_fact = &attempt_recorded_events(&workspace)[0];
         assert_real_policy_digest(escalating_fact);
@@ -5080,8 +5085,8 @@ mod disposition_rebaseline {
             "C-001 must be re-pinned to the new project revision"
         );
 
-        // The headline claim: the open cycle keeps working. A new card can
-        // be declared in it, and the gate command that actually runs
+        // The headline claim: the open cycle keeps working. A card declared
+        // before the plan was pinned remains usable, and the gate command that actually runs
         // gate.rs:791's `project_revision` comparison does not refuse it
         // with `CH-POLICY-INVALID-CYCLE`.
         // `escalate_via_review_returns` activated F-001 over `src/**`
@@ -5089,13 +5094,6 @@ mod disposition_rebaseline {
         // disjoint path or `card activate` would correctly refuse on an
         // ownership overlap that has nothing to do with what this test
         // checks.
-        let activation = activate_with_scope(&workspace, "F-002", &["tests/promotion.rs"]);
-        assert!(
-            activation.status.success(),
-            "a card must still be declarable in the re-pinned cycle: {}{}",
-            String::from_utf8_lossy(&activation.stdout),
-            String::from_utf8_lossy(&activation.stderr)
-        );
         let preflight = workspace.gate_raw(&["preflight", "--card-id", "F-002"]);
         assert!(
             preflight.status.success(),
@@ -5740,6 +5738,7 @@ mod disposition_abandon {
     // for F-002, a card the abandon never touched.
     fn an_unrelated_card_in_the_same_cycle_still_works_after_an_abandon() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
+        workspace.activate_card("F-002", &["docs/f002/**"]);
         escalate_via_review_returns(&workspace, "F-001");
 
         let abandon = disposition_abandon_raw(
@@ -5768,7 +5767,6 @@ mod disposition_abandon {
         // create`, `review begin`, and `review record` — three separate
         // `require_convergence_budget` call sites — so this proves the
         // budget-gated write path stays open too.
-        workspace.activate_card("F-002", &["docs/f002/**"]);
         let status = workspace.card_raw(&["status", "--card-id", "F-002"]);
         assert!(
             status.status.success(),
@@ -7323,8 +7321,8 @@ mod disposition_split {
     #[test]
     fn an_authorized_split_lets_an_escalated_card_deliver_again() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
         let follow_up_status_before = workspace.card_json(&["status", "--card-id", "F-002"]);
@@ -7440,8 +7438,8 @@ mod disposition_split {
     // would escalate the card again; this asserts it does not.
     fn a_split_grants_no_further_budget() {
         let workspace = opened_with_disposition_policies_and_limits(&["owner"], 1, 3, 3, 3, 3);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let split = disposition_split_raw(
             &workspace,
@@ -7608,8 +7606,8 @@ mod disposition_split {
     #[test]
     fn a_second_split_of_the_same_dimension_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let first = disposition_split_raw(
             &workspace,
@@ -7808,9 +7806,9 @@ mod disposition_split {
     #[test]
     fn a_terminal_follow_up_card_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
-
         workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        escalate_via_review_returns(&workspace, "F-001");
         workspace.card(&[
             "abandon",
             "--card-id",
@@ -7862,8 +7860,8 @@ mod disposition_split {
     #[test]
     fn an_unauthorized_actor_cannot_split() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_split_raw(
@@ -7909,8 +7907,8 @@ mod disposition_split {
         // convergence policy; authorizing the split requires the other
         // one, which simply does not exist here.
         let workspace = opened_with_policy(1, 3);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_split_raw(
@@ -7945,8 +7943,8 @@ mod disposition_split {
     #[test]
     fn a_blank_rationale_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_split_raw(
@@ -7981,8 +7979,8 @@ mod disposition_split {
     #[test]
     fn the_dry_run_makes_every_check_and_writes_nothing() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         // For the success the real command would make.
         let before_head = workspace.control_head();
@@ -8235,8 +8233,8 @@ mod disposition_redesign {
     #[test]
     fn an_authorized_redesign_ends_a_card_and_names_its_replacement() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let card_status = workspace.card_json(&["status", "--card-id", "F-001"]);
         let replacement_status_before = workspace.card_json(&["status", "--card-id", "F-002"]);
@@ -8403,8 +8401,9 @@ mod disposition_redesign {
     // for F-003, a card the redesign never touched.
     fn an_unrelated_card_in_the_same_cycle_still_works_after_a_redesign() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        workspace.activate_card("F-003", &["docs/f003/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let redesign = disposition_redesign_raw(
             &workspace,
@@ -8435,7 +8434,6 @@ mod disposition_redesign {
         // `review record` — three separate `require_convergence_budget`
         // call sites — so this proves the budget-gated write path stays
         // open too.
-        workspace.activate_card("F-003", &["docs/f003/**"]);
         let status = workspace.card_raw(&["status", "--card-id", "F-003"]);
         assert!(
             status.status.success(),
@@ -8458,9 +8456,9 @@ mod disposition_redesign {
     #[test]
     fn a_second_redesign_of_the_same_card_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
         workspace.activate_card("F-003", &["docs/f003/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let first = disposition_redesign_raw(
             &workspace,
@@ -8659,9 +8657,9 @@ mod disposition_redesign {
     #[test]
     fn a_terminal_replacement_card_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
-
         workspace.activate_card("F-002", &["docs/f002/**"]);
+
+        escalate_via_review_returns(&workspace, "F-001");
         workspace.card(&[
             "abandon",
             "--card-id",
@@ -8711,8 +8709,8 @@ mod disposition_redesign {
     #[test]
     fn an_unauthorized_actor_cannot_redesign() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_redesign_raw(
@@ -8756,8 +8754,8 @@ mod disposition_redesign {
         // convergence policy; authorizing the redesign requires the other
         // one, which simply does not exist here.
         let workspace = opened_with_policy(1, 3);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_redesign_raw(
@@ -8790,8 +8788,8 @@ mod disposition_redesign {
     #[test]
     fn a_blank_rationale_refuses() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         let before_head = workspace.control_head();
         let output = disposition_redesign_raw(
@@ -8824,8 +8822,8 @@ mod disposition_redesign {
     #[test]
     fn the_dry_run_makes_every_check_and_writes_nothing() {
         let workspace = opened_with_disposition_policies(1, 3, &["owner"]);
-        escalate_via_review_returns(&workspace, "F-001");
         workspace.activate_card("F-002", &["docs/f002/**"]);
+        escalate_via_review_returns(&workspace, "F-001");
 
         // For the success the real command would make.
         let before_head = workspace.control_head();
@@ -9256,6 +9254,7 @@ mod cycle_convergence_enforcement {
         ]);
         workspace.cycle(&["activate", "--cycle-id", "C-001"]);
         workspace.activate_card("F-001", &["shared.txt"]);
+        workspace.activate_card("F-002", &["src/f002/**"]);
         workspace.approve_card("F-001", "shared.txt");
         fs::write(
             workspace.repository.join("shared.txt"),
@@ -9301,7 +9300,6 @@ mod cycle_convergence_enforcement {
             "--reason",
             "clearing the lease to isolate the cycle-level refusal",
         ]);
-        workspace.activate_card("F-002", &["src/f002/**"]);
         workspace.approve_card("F-002", "src/f002/a.rs");
 
         // The previously-refused path: a fresh `integration prepare` for
@@ -9940,6 +9938,7 @@ mod fail_closed_on_corrupt_projection {
         // it is a clean probe of exactly one thing: whether the corrupted
         // cycle-wide projection alone is what refuses it.
         let workspace = opened_with_policy(3, 3);
+        workspace.activate_card("F-002", &["docs/f002/**"]);
         let head = ready_candidate(&workspace, "F-001", &["gate.unit"]);
         let declaration = declaration_with_gate_failures(
             &workspace,
@@ -9955,7 +9954,6 @@ mod fail_closed_on_corrupt_projection {
             &declaration,
         ]);
 
-        workspace.activate_card("F-002", &["docs/f002/**"]);
         workspace.approve_card("F-002", "docs/f002/a.md");
 
         corrupt_the_recorded_convergence_facts_policy_digest(&workspace);

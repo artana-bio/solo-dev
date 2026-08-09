@@ -76,7 +76,7 @@ impl MutationExemptionPolicy {
                 ErrorCode::ConfigInvalidValue,
             ));
         }
-        let mut authorizations = std::collections::BTreeSet::new();
+        let mut authorizations: Vec<(&str, &str)> = Vec::new();
         for (index, rule) in self.rules.iter().enumerate() {
             for (field, value) in [
                 ("code", &rule.code),
@@ -92,13 +92,31 @@ impl MutationExemptionPolicy {
                     ));
                 }
             }
-            if !authorizations.insert((&rule.code, &rule.approved_by)) {
+            for (field, value) in [
+                ("approved_by", &rule.approved_by),
+                ("approver_principal_id", &rule.approver_principal_id),
+                ("approver_session_id", &rule.approver_session_id),
+            ] {
+                actors::refuse_unusable("mutation exemption policy identity", value).map_err(
+                    |error| {
+                        FieldError::new(
+                            format!("mutation_exemption_policy.rules[{index}].{field}"),
+                            error.to_string(),
+                            ErrorCode::ConfigInvalidValue,
+                        )
+                    },
+                )?;
+            }
+            if authorizations.iter().any(|(code, approved_by)| {
+                *code == rule.code && actors::same(approved_by, &rule.approved_by)
+            }) {
                 return Err(FieldError::new(
                     format!("mutation_exemption_policy.rules[{index}]"),
                     "the code and approved_by pair must be unique",
                     ErrorCode::ConfigInvalidValue,
                 ));
             }
+            authorizations.push((&rule.code, &rule.approved_by));
         }
         Ok(())
     }
@@ -108,7 +126,7 @@ impl MutationExemptionPolicy {
     pub fn rule_for(&self, code: &str, approved_by: &str) -> Option<&MutationExemptionRule> {
         self.rules
             .iter()
-            .find(|rule| rule.code == code && rule.approved_by == approved_by)
+            .find(|rule| rule.code == code && actors::same(&rule.approved_by, approved_by))
     }
 
     /// Returns the canonical policy digest.
@@ -384,7 +402,7 @@ impl FinalAuthorizationPolicy {
     pub fn authorizes(&self, actor_id: &str) -> bool {
         self.authorizer_actor_ids
             .iter()
-            .any(|configured| configured == actor_id)
+            .any(|configured| actors::same(configured, actor_id))
     }
 
     #[must_use]

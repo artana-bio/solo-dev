@@ -388,16 +388,18 @@ fn run_probes() -> Result<CommandOutcome, HarnessError> {
         "all_required_probes_passed": all_required_probes_passed,
         "failed_probe_count": failed,
     });
-    let outcome = CommandOutcome::new(
+    if !all_required_probes_passed {
+        return Err(HarnessError::ControlWithDetails {
+            reason: format!("{failed} required assurance probe(s) did not pass"),
+            code: ErrorCode::PolicyAuditDiscrepancy,
+            details: report,
+        });
+    }
+    Ok(CommandOutcome::new(
         "audit.probes",
         serde_json::to_string_pretty(&report)?,
         report,
-    );
-    Ok(if all_required_probes_passed {
-        outcome
-    } else {
-        outcome.with_warning(format!("{failed} required assurance probe(s) did not pass"))
-    })
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -501,6 +503,11 @@ fn run_report(args: &ReportArgs) -> Result<CommandOutcome, HarnessError> {
                 )
             }),
         "contradiction_count": discrepancies.len(),
+        "receipt_reuse_evidence": {
+            "classification": "not_tested",
+            "reason": "production integration receipts do not collect every fixed reuse dimension",
+            "unsupported_dimensions": ["toolchain", "inputs", "fixtures", "cache", "trust_mode"],
+        },
         "classification_vocabulary": ["mechanically_enforced", "machine_checked", "reviewer_attested", "externally_observed", "not_tested", "failed"],
     });
     let contradiction_count = discrepancies.len();

@@ -56,17 +56,17 @@ impl<'a> ActorIdentity<'a> {
     }
 
     /// Returns whether two declared roles share the same principal/session
-    /// boundary. A session is the narrowest boundary, then principal, then
-    /// the normalized actor declaration.
+    /// boundary. Reuse of either a principal or a session is a collision;
+    /// differing sessions cannot make one principal independent.
     #[must_use]
     pub fn same_boundary(&self, other: &Self) -> bool {
-        if let (Some(left), Some(right)) = (self.session_id, other.session_id) {
-            return left == right;
-        }
-        if let (Some(left), Some(right)) = (self.principal_id, other.principal_id) {
-            return left == right;
-        }
-        same(self.actor_id, other.actor_id)
+        matches!(
+            (self.session_id, other.session_id),
+            (Some(left), Some(right)) if same(left, right)
+        ) || matches!(
+            (self.principal_id, other.principal_id),
+            (Some(left), Some(right)) if same(left, right)
+        ) || same(self.actor_id, other.actor_id)
     }
 }
 

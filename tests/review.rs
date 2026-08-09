@@ -163,6 +163,23 @@ fn different_actor_in_the_implementer_session_is_refused() {
 }
 
 #[test]
+fn different_session_with_the_implementer_principal_is_refused() {
+    let (workspace, _) = handed_off();
+    let body = "reviewer_actor_id: reviewer-session-a\nreviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: agent\n  session_id: different-review-session\n  principal_id: Implementer-Principal\ndecision: changes_requested\nfindings:\n  - severity: high\n    location: src/a.rs\n    detail: same principal must be refused even when sessions differ\n    disposition: open\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: direct check\n  mutation_evidence:\n    status: exempt\n    reason: non-approval fixture\nresidual_risks: []\nreview_conduct: separate_process\n";
+    let output = workspace.review_raw(&[
+        "record",
+        "--card-id",
+        "F-001",
+        "--verdict",
+        &verdict(&workspace, body),
+        "--actor",
+        "reviewer-session-a",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-SAME-ACTOR");
+}
+
+#[test]
 fn self_review_is_refused_through_a_spelling_variant() {
     // The comparison was exact equality, so `Operator` and `operator ` were
     // different people and the check was one keystroke from being bypassed by
