@@ -434,6 +434,12 @@ or other external side effects in a gate: they may be retried or rerun on the
 landing commit. A declared `network_policy` is not proof that network access
 is enforced.
 
+For structured test metrics, a gate may declare `junit_reports: [target/junit.xml]`.
+Each path is relative to `working_directory`; only declared XML files opened
+inside the exact evaluation worktree and changed by that attempt are eligible.
+The runner records bounded counts or a redacted invalid status. It never
+infers counts from stdout/stderr or exposes report contents in snapshots.
+
 ### 2. Create and activate a cycle
 
 ```bash

@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write as _},
+    io::{self, IsTerminal as _, Write as _},
     process::ExitCode,
 };
 
@@ -7,11 +7,13 @@ use clap::Parser;
 
 use change_harness::{
     cli::{
-        Cli,
+        Cli, Command,
         exit::ExitCategory,
         output::{CommandErrorEnvelope, OutputFormat, render_text_error},
+        resolve_output,
     },
     command_path,
+    commands::{project::ProjectCommand, project_snapshot},
     error::{ErrorCode, HarnessError},
     execute, failure_format,
 };
@@ -97,11 +99,78 @@ fn asked_for_json(raw: &[String]) -> bool {
     false
 }
 
+/// Runs the streaming form of `project snapshot`.
+///
+/// Streaming is kept at the process boundary because ordinary commands return
+/// one rendered [`change_harness::Execution`]. The collector and renderer
+/// remain in the command adapter, so every frame follows the same path as a
+/// one-shot snapshot.
+fn run_snapshot_watch(cli: Cli) -> ExitCode {
+    let format = failure_format(&cli);
+    let command = command_path(&cli);
+    let output = cli.output;
+    let Command::Project {
+        command: ProjectCommand::Snapshot(args),
+    } = cli.command
+    else {
+        unreachable!("watch dispatch is only selected for project snapshot");
+    };
+    let resolved = match resolve_output(output, None) {
+        Ok(resolved) => resolved,
+        Err(error) => return report_error(format, command, &error),
+    };
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let mut stdout = io::stdout().lock();
+    match project_snapshot::run_watch(
+        &args,
+        resolved.format,
+        &change_harness::domain::clock::SystemClock,
+        &mut stdout,
+        stdout_is_terminal,
+    ) {
+        Ok(_) => ExitCode::from(ExitCategory::Success),
+        Err(error) => report_error(format, command, &error),
+    }
+}
+
+/// Emits a command error without allowing a closed output stream to become a
+/// panic or a misleading internal-error exit.
+fn report_error(format: OutputFormat, command: &str, error: &HarnessError) -> ExitCode {
+    match format {
+        // The error envelope is a machine-readable result, not a diagnostic,
+        // so it goes to stdout where a JSON consumer reads it.
+        OutputFormat::Json => match CommandErrorEnvelope::new(command, error).render() {
+            Ok(rendered) => {
+                let mut stdout = io::stdout().lock();
+                let _ = writeln!(stdout, "{rendered}");
+            }
+            Err(nested) => {
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "error: {nested}");
+            }
+        },
+        OutputFormat::Text => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "error: {}", render_text_error(error));
+        }
+    }
+    ExitCode::from(error.category())
+}
+
 fn main() -> ExitCode {
     let cli = match parse_or_report() {
         Ok(cli) => cli,
         Err(code) => return code,
     };
+    let is_snapshot_watch = matches!(
+        &cli.command,
+        Command::Project {
+            command: ProjectCommand::Snapshot(args),
+        } if args.watch
+    );
+    if is_snapshot_watch {
+        return run_snapshot_watch(cli);
+    }
     let format = failure_format(&cli);
     let command = command_path(&cli);
 
@@ -134,36 +203,6 @@ fn main() -> ExitCode {
             }
             ExitCode::from(ExitCategory::Success)
         }
-        Err(error) => {
-            // Every path that reaches here returns before committing any
-            // mutation, so `error.category()` below is the whole truth about
-            // what happened. `println!`/`eprintln!` panic on a broken pipe
-            // (exit 101), which would misreport that stable category as a
-            // harness crash to a caller that stopped reading — the same
-            // failure #16 fixed for a successful result (commit 661bc60),
-            // applied here to the error envelope and the text-mode line.
-            // Written through a locked handle with the write result
-            // discarded, so an unread pipe can never change the exit code
-            // chosen below.
-            match format {
-                // The error envelope is a machine-readable result, not a
-                // diagnostic, so it goes to stdout where a JSON consumer reads.
-                OutputFormat::Json => match CommandErrorEnvelope::new(command, &error).render() {
-                    Ok(rendered) => {
-                        let mut stdout = io::stdout().lock();
-                        let _ = writeln!(stdout, "{rendered}");
-                    }
-                    Err(nested) => {
-                        let mut stderr = io::stderr().lock();
-                        let _ = writeln!(stderr, "error: {nested}");
-                    }
-                },
-                OutputFormat::Text => {
-                    let mut stderr = io::stderr().lock();
-                    let _ = writeln!(stderr, "error: {}", render_text_error(&error));
-                }
-            }
-            ExitCode::from(error.category())
-        }
+        Err(error) => report_error(format, command, &error),
     }
 }

@@ -12,5 +12,6 @@ pub mod handoff;
 pub mod ids;
 pub mod integration;
 pub mod lease;
+pub mod project_snapshot;
 pub mod review;
 pub mod validation_reservation;

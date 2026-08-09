@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 58 |
-| Plan date | 2026-08-02 |
+| Plan revision | 61 |
+| Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `card/F-026` |
-| Current release stage | Single-repository MVP |
-| Current implementation status | Every Single-repository MVP package (`WP-000`, `SPIKE-001`, `WP-100`–`WP-130`, `WP-200`–`WP-250`, `WP-300`–`WP-320`, `WP-400`–`WP-460`) plus hardening `WP-500`, `WP-510`, and `WP-520`; 858 tests passing. `SELFHOST-001` completed, and every package since has been built through the harness itself. **Section 19.3 is `BLOCKED`.** An eight-reviewer independent review (Section 19.6) found 24 defects; every one is now fixed with a mutation proof or explicitly, deliberately left open with a named reason, per `docs/DEFECT-REGISTER.md`. Criterion 9 (no critical or high open defect) now reads `MET` — see Section 19.3. What remains open is criterion 2 (an honest, unresolved bound on scenario-coverage soundness, not a pass or a fail) and the acceptance owner's own signature. |
-| Next executable work package | Acceptance owner resolves Section 19.3 criterion 2 (a larger mutation-audit effort, or a named acceptance of residual risk) and signs the release record; then `WP-530` and `WP-540` |
+| Active branch | `alvaro/project-snapshot-observability` |
+| Current release stage | Hardened single-repository release |
+| Current implementation status | `WP-550` is `DONE`: the read-only project snapshot, machine-readable JSON projection, terminal watch mode, declared JUnit metrics, documentation, and historical-control compatibility have passed the full quality gate and independent exact-SHA review. |
+| Next executable work package | Publish the completed `WP-550` branch as a draft pull request. Reconcile the stale Harness authority separately before claiming a self-hosted Harness card for later work. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -599,6 +599,7 @@ environment.set{}
 network_policy
 retry_policy
 artifacts[]
+junit_reports[]       (optional; paths relative to working_directory)
 ```
 
 Rules:
@@ -610,6 +611,11 @@ Rules:
 - MVP network policy is declarative and reported; hard enforcement is deferred
   until a sandbox executor exists.
 - A gate revision changes its digest and invalidates older receipts.
+- `junit_reports[]` is an optional trusted declaration of bounded JUnit XML
+  files produced by the gate. Paths must remain relative to the gate's
+  working directory, and duplicate declarations are refused. An empty field
+  is omitted from canonical serialization so existing gate digests do not
+  change merely because this optional capability exists.
 
 ### 10.6 Receipt
 
@@ -636,6 +642,7 @@ termination
 stdout_digest
 stderr_digest
 artifact_digests{}
+test_results            (optional typed summary: total, passed, failed, errors, skipped, status, error_code)
 log_location
 attempt
 ```
@@ -645,6 +652,18 @@ attempt
 Exactly one subject is always present: `card_id` with `card_digest` for a
 gate run against one card's candidate, or `integration_id` for a combined
 verification run against a landing commit. See D-046.
+
+`test_results` is omitted on legacy receipts and is optional for compatibility;
+new receipts carry `status: not_reported` when their trusted gate declares no
+JUnit report. When reports are declared, the runner records only validated
+counts on the exact receipt. Unsafe, stale, malformed, inconsistent, duplicate,
+oversized, depth-limited, missing, or unreadable declared evidence records
+`status: invalid` with one closed-set `error_code` and zero counts; the failed
+attempt remains auditable. Snapshot aggregation uses validated subject-bound
+receipts and never parses gate output. Legacy receipts omit the optional field,
+and empty gate declarations remain absent from canonical gate bytes and digests.
+The report reader caps each XML payload at 16 MiB and XML nesting at 128
+elements, independently, before parsing counts.
 
 ### 10.7 Handoff
 
@@ -849,6 +868,8 @@ change-harness doctor
 change-harness project init
 change-harness project validate
 change-harness project status
+change-harness project snapshot
+change-harness project snapshot --watch [--interval-ms <100..=3600000>]
 change-harness project recover
 
 change-harness cycle create
@@ -896,6 +917,15 @@ change-harness archive close
 
 Commands are introduced only by their owning work package. Help output MUST
 mark unimplemented commands absent rather than presenting placeholders.
+
+`project snapshot` is read-only and collects one typed projection from one
+captured control commit. The default is one text frame; `--output json` emits
+one `harness.command-result/v1` envelope whose `data.schema` is
+`harness.project-snapshot/v1`. `--watch` is a text-only terminal refresh: it
+recollects the projection at each frame, emits one frame and exits for non-TTY
+output, and uses `--interval-ms` only when the option is present with bounds
+`100..=3600000`. Watch mode has no persistent state or daemon and cannot be
+combined with `--output json`.
 
 ### 12.4 Stable command output envelope
 
@@ -2743,6 +2773,97 @@ Delivered notes:
 
 | D-059 | Require a class on every generated declaration rather than defaulting one | Accepted | A default would have to be either transient — silently forbidding a file somebody committed on purpose — or per-card, silently granting a card ownership of something integration should produce. Both restore the ambiguity the classification exists to remove, and neither failure is visible at the point it is made. Requiring the class costs one line per declaration and makes the ownership decision explicit where it belongs, in the card under review. |
 
+### WP-550 — Project snapshot and operational visibility
+
+| Field | Value |
+| --- | --- |
+| Status | `DONE` |
+| Dependencies | `WP-510`, `WP-530` |
+| Target release | Hardened single-repository release |
+| Owner | Luna High, coordinated by Codex; independent review by Terra High |
+| Started | 2026-08-08 |
+| Branch | `alvaro/project-snapshot-observability` |
+| Worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
+
+Purpose:
+
+Provide one trustworthy, read-only operational projection for people watching
+work in the CLI and applications consuming the same data. This package does
+not add a dashboard server, a second database, or an authorization path.
+
+Deliverables:
+
+- `project snapshot` with text and JSON rendering from one typed read model;
+- stable `harness.project-snapshot/v1` data inside the existing command
+  envelope;
+- one captured control commit for authoritative records, with a clearly
+  separated ephemeral overlay for live locks, journals, and running work;
+- card and cycle state, current actor and phase, wall-clock age, last activity,
+  gate attempts/failures/timeouts/duration, review returns and repair attempts,
+  integration readiness, bottlenecks, and completion-stage counts;
+- optional structured test-case totals from declared JUnit reports, with
+  `not_reported` when structured evidence is absent;
+- `--watch` for terminal refresh without persistent state or a daemon;
+- default redaction that excludes raw logs, free-form progress text,
+  environment values, and filesystem paths from the machine-facing snapshot.
+
+Acceptance:
+
+- one snapshot is internally consistent with its reported `control_head`;
+- the command is read-only: control/candidate/authority refs, indexes,
+  worktrees, and files are unchanged after text, JSON, and watch sampling;
+- text and JSON views are produced from the same typed snapshot;
+- retries, failed tests, timeouts, elapsed wall-clock durations, silent leases,
+  review rework, and integration blockers are represented when evidence exists;
+- test-case counts are never inferred from arbitrary logs and report
+  `not_reported` without a declared structured report;
+- missing, malformed, duplicate, or cross-subject evidence fails closed or is
+  surfaced explicitly rather than silently omitted;
+- snapshot defaults contain no raw gate output, free-form checkpoint text,
+  environment values, or filesystem paths;
+- focused unit and temporary-repository regressions cover the projection, and
+  `cargo fmt --check`, `cargo test`, and strict Clippy pass from a clean branch.
+
+Approved integrated lane SHAs (prior exact-SHA reviews):
+
+- snapshot core: `0d33343841eb8b87db8b7d78bfdeb8b92ef0b548`,
+  `4baf9d71e5919d694e2c034e9c213432812c0205`,
+  `d1d5c35726862080671086414fc437c19d26b6e6`;
+- watch: `38441a1dd727dd5e41ef85dae550b739cdcc3890`;
+- declared JUnit metrics and failed-report receipts:
+  `43ba98d4e88f514918b172c1a75c5088ee08b5ae`,
+  `e545aae0c454ed39a455638b77c16eca0c9e46ee`.
+- documentation contract: integrated commit
+  `ecf72076641160d703f8fd54742a6ce4ff36277d`, independently approved on its
+  source-equivalent exact SHA `4d9e0fe363ef0b874679ed3c13d0bc68fe222f27`;
+- historical handoff compatibility: integrated commit
+  `960d13e8795fe5abc085d37c48966a8ea8ace452`, independently approved on its
+  source-equivalent exact SHA `adf353bdf90d6096e3f613b4932ba627544c8b6f`.
+
+Final acceptance evidence, recorded 2026-08-08 on integrated candidate
+`960d13e8795fe5abc085d37c48966a8ea8ace452`:
+
+- `cargo fmt --check` passed;
+- `cargo clippy --all-targets --all-features -- -D warnings` passed;
+- `cargo test --all` passed, including 685 unit tests, all integration suites,
+  and doc tests;
+- `tests/project_snapshot.rs` passed all 23 snapshot, watch, integrity, legacy
+  digest, revocation-history, and tamper-refusal regressions;
+- `tests/project_snapshot_docs.rs` passed all three documentation-contract
+  regressions;
+- Terra High approved the exact compatibility candidate after independent
+  mutations of branch, candidate SHA, card ID, receipt evidence, and handoff
+  declaration all failed closed;
+- live JSON, text, and non-TTY watch sampling succeeded against control head
+  `755a00372a588b7db0cc8f1a464bcde29b6582bd`; control, candidate, and authority
+  heads and control/candidate worktree states were unchanged.
+
+The authority limitation remains: Harness authority
+`9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main`
+`5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside WP-550,
+so this package does not move that ref or claim self-hosted authority.
+
 ### WP-600 — Workspace manifest
 
 | Field | Value |
@@ -3266,6 +3387,7 @@ Tier 1 of the register is closed.
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
 | Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
+| Operational visibility | `DONE` | `WP-550` tracker entry; integrated full gate and live read-only smoke | Preserve the typed projection and redaction boundary |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3273,15 +3395,15 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None |
-| Active card | `F-026` — first public binary distribution |
-| Status | Implementation complete, independently re-verified outside the sandbox (native release build run and its binary executed; `install.sh` run unmodified against a hand-built fake release, including a deliberate checksum-mismatch and an unsupported-OS case), committed, and handed to gate/handoff/review |
-| Active implementation branch | `card/F-026` |
-| Active implementation worktree | `/Users/alvaro/Documents/Code/change-harness-worktrees/F-026` |
-| Active owner | Codex, landed by the acceptance owner |
-| Active blocker | None. `LICENSE` is now tracked and committed alongside the rest of this card's diff. |
-| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | `cargo fmt --check` passed; all 877 tests passed with the sandbox-only `ps` shim noted above; strict Clippy passed; `cargo build --release` produced a binary reporting `change-harness 0.1.0`; PyYAML parsed the workflow and confirmed the `v*` trigger and four targets; installer tests passed for piped success/overwrite, checksum mismatch, unsupported OS, and unsupported architecture. |
+| Active work package | None; `WP-550` is complete and awaiting draft pull-request publication |
+| Active card | Not allocated: the live authority is behind GitHub `main`; this PR uses ordinary Git commits with exact-SHA independent review and records the governance drift as a blocker to claiming a Harness-governed card. |
+| Status | `DONE` |
+| Active implementation branch | `alvaro/project-snapshot-observability` |
+| Active implementation worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
+| Active owner | None; Luna High implementation and Terra High independent review are complete |
+| Active blocker | None for `WP-550`. Full self-hosting still cannot start honestly because Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`; reconciliation remains separate work. |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
+| Acceptance evidence | Exact lane and review SHAs, full formatting/Clippy/test results, independent mutation evidence, and live read-only control-repository smoke are recorded in the WP-550 entry. |
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and

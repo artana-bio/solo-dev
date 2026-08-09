@@ -41,6 +41,31 @@ Project profiles provide repository locations, protected branches, named gates,
 generated-artifact policies, and optional runtime adapters. The engine contains
 no ARTANA-specific repository names or language commands.
 
+### Read-only observability boundary
+
+Operational visibility is a projection, not another authority path:
+
+```text
+captured control HEAD
+  → validated durable records
+  → typed project snapshot
+  → text CLI or JSON command envelope
+
+candidate/authority heads, lock, journal, and worktree checks
+  → ephemeral observation overlay
+```
+
+The captured `control_head` is authoritative for every durable record in one
+snapshot. The overlay reports what the surrounding repositories and local
+process state look like while the read occurs; it cannot rewrite, supplement,
+or override the captured control records. If the control HEAD moves during
+collection, the snapshot refuses rather than combining two durable revisions.
+
+This boundary deliberately introduces no second database and no daemon. The
+control repository remains the durable store, the candidate and authority
+repositories remain Git sources, and `project snapshot --watch` recollects the
+same read-only projection at the terminal boundary.
+
 ## Trust model
 
 A feature worktree produces an untrusted candidate. Authority belongs to the
