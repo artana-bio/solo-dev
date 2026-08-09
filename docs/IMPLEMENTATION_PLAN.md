@@ -10,7 +10,7 @@
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `d7b657c8c75fa528c2cdfd9e8532f0767bd5f354`, plan revision 78 reconciliation |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `card/F-038` |
+| Active branch | None; no implementation branch is allocated for `WP-560` while it is `READY` |
 | Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
 | Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; candidate `main`, `origin/main`, and authority `main` are aligned to that exact SHA. The release merge itself was not Harness-governed. |
 | Current implementation status | `WP-550` and governance extension `WP-600` are `DONE`. The v0.1.5 bootstrap recovery is complete, and bounded snapshot-noise cleanup `WP-560` is `READY`. |
@@ -3481,15 +3481,15 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None; plan-maintenance card `F-038` records the completed bootstrap and makes `WP-560` `READY` |
-| Active card | `F-038` revision 1, digest `sha256:e715683c5a265e19a686807f768dcb9e21da44b70583c754e424ab3ef51ba035` |
-| Status | `ACTIVE` in cycle `C-028` at baseline `636f48f7ea4bf9bffbdb271b87a19e5841b87a83` |
-| Active implementation branch | `card/F-038` |
-| Active implementation worktree | `/Users/alvaro/Documents/Code/change-harness-worktrees/F-038` |
-| Active owner | `codex-planner` under lease `L-000037` |
+| Active work package | `WP-560` is the next bounded package |
+| Active card | None allocated |
+| Status | `READY` |
+| Active implementation branch | None allocated |
+| Active implementation worktree | None allocated |
+| Active owner | Unassigned |
 | Active blocker | None |
-| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | Focused plan-content assertions, `cargo fmt --check`, exact-SHA gate receipt, and `work verify`; the final evidence is attached to the F-038 handoff rather than predeclared here. |
+| Required reading | The exact `WP-560` tracker entry defines the package reading contract |
+| Acceptance evidence | None yet; evidence is recorded only after `WP-560` starts and satisfies its listed gates |
 
 Bootstrap recovery record:
 
@@ -3509,6 +3509,11 @@ Bootstrap recovery record:
 - The bootstrap release and alignment were operator recovery performed through
   ordinary Git/GitHub release operations; they were **not Harness-governed**.
   `C-028` is the first new governed cycle on the aligned v0.1.5 baseline.
+- Governed plan-maintenance card `F-038` recorded this recovery under `C-028`.
+  Its first exact-SHA handoff `H-000082` was revoked after independent review
+  `RV-000073` requested the durable post-landing status repair. Those records
+  are execution history, not a continuing card, lease, branch, or worktree
+  allocation in this tracker.
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
