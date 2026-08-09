@@ -21,7 +21,7 @@ use crate::{
         repository::ControlRepository,
     },
     domain::{
-        card::CardState,
+        card::{CardRecord, CardState},
         clock::Clock,
         cycle::CycleRecord,
         digest::{CANONICAL_ALGORITHM, Digest},
@@ -1333,8 +1333,9 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         &handoff.dependency_bindings,
     )?;
     let lesson_staleness = if let Some(manifest) = handoff.lesson_manifest.as_ref() {
+        let bound_card = load_handoff_card(&control, &handoff)?;
         validate_manifest_registry(&control, manifest)?;
-        validate_frozen_card_manifest(&control, &record, manifest)?;
+        validate_frozen_card_manifest(&control, &bound_card, manifest)?;
         None
     } else {
         None
@@ -1383,6 +1384,36 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         );
     }
     Ok(outcome)
+}
+
+/// Loads and verifies the immutable card revision this handoff bound.
+fn load_handoff_card(
+    control: &ControlRepository,
+    handoff: &HandoffRecord,
+) -> Result<CardRecord, HarnessError> {
+    let relative = CardRecord::relative_path(&handoff.card_id, handoff.card_revision);
+    let record: CardRecord = serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+        HarnessError::Control {
+            reason: format!(
+                "handoff {} bound card revision is malformed: {source}",
+                handoff.handoff_id
+            ),
+            code: ErrorCode::InternalControlCorrupt,
+        }
+    })?;
+    if record.card_id != handoff.card_id
+        || record.revision != handoff.card_revision
+        || record.digest()? != handoff.card_digest
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "handoff {} card revision binding does not match its immutable card record",
+                handoff.handoff_id
+            ),
+            code: ErrorCode::PolicyLessonManifestStale,
+        });
+    }
+    Ok(record)
 }
 
 fn run_revoke(args: &RevokeArgs, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {

@@ -724,6 +724,15 @@ fn review_refuses_a_handoff_manifest_that_differs_from_the_activation_binding() 
     );
 
     let before = workspace.control_head();
+    let inspection = workspace.handoff_raw(&["inspect", "--card-id", "F-001"]);
+    assert!(!inspection.status.success());
+    let inspection_envelope: Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_eq!(
+        inspection_envelope["error"]["code"],
+        "CH-POLICY-LESSON-MANIFEST-STALE"
+    );
+    assert_eq!(workspace.control_head(), before);
+
     let output = workspace.review_raw(&[
         "begin",
         "--card-id",
@@ -745,6 +754,57 @@ fn review_refuses_a_handoff_manifest_that_differs_from_the_activation_binding() 
         before,
         "review refusal must occur before lifecycle evidence mutation"
     );
+}
+
+#[test]
+fn handoff_inspect_refuses_a_tampered_historical_card_binding() {
+    let workspace = Workspace::initialized();
+    install_lesson_authorizer(&workspace, "owner");
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Keep historical lesson bindings fail closed",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    propose_and_activate(&workspace, lesson_definition(&workspace));
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.unit"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let manifest_digest = packet_digest(&workspace);
+    let declaration = prepare_candidate(&workspace);
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        declaration.to_str().unwrap(),
+        "--lesson-manifest-digest",
+        &manifest_digest,
+    ]);
+    workspace.revise_card("F-001", &["src/**"], "new review criteria");
+
+    let historical_path = workspace.control.join("cards/F-001/r1.json");
+    let mut historical: Value =
+        serde_json::from_slice(&fs::read(&historical_path).unwrap()).unwrap();
+    historical["title"] = serde_json::json!("tampered historical title");
+    fs::write(
+        &historical_path,
+        format!("{}\n", serde_json::to_string_pretty(&historical).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "fixture: tamper historical card"],
+    );
+
+    let before = workspace.control_head();
+    let output = workspace.handoff_raw(&["inspect", "--card-id", "F-001"]);
+    assert!(!output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-LESSON-MANIFEST-STALE");
+    assert_eq!(workspace.control_head(), before);
 }
 
 #[test]

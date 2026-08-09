@@ -5,10 +5,10 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 83 |
+| Plan revision | 84 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `5491226780a5fb8604e3940a6116f2628ec77d47`, plan revision 82 bounded WP-800 implementation candidate |
+| Previous plan commit | `8234ac155a22cafe0b7db6f2559ed6e75821491e`, plan revision 83 activation-binding repair candidate |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `card/F-045` — review-required `WP-800` semantic repair |
 | Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
@@ -3277,6 +3277,12 @@ candidate:
 - the full `cargo test` suite is intentionally not run here; `gate.test`
   remains reserved for its one authorized execution on the final integration
   landing candidate.
+- final-integration receipt `R-000241` failed at landing SHA
+  `06006ece91ec1766f2d4f65e8647d536c4ba3a0c` because `handoff inspect`
+  validated a historical handoff manifest against the newly current card
+  revision instead of the immutable revision the handoff bound. The isolated
+  candidate repairs that read boundary; no final-suite green claim is made
+  until a new integration landing reruns `gate.test` successfully.
 
 ## 18. Dependency and execution order
 
