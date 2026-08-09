@@ -104,7 +104,7 @@ pub(super) fn collect_at_head(
         &reviews,
         &leases,
     );
-    let silent_leases = project_snapshot_metrics::silent_leases(&leases, captured_at);
+    let silent_leases = project_snapshot_metrics::silent_leases(&leases, &card_states, captured_at);
 
     let control_worktree_clean = control.is_clean()?;
     if !control_worktree_clean {
@@ -473,9 +473,10 @@ fn validate_subjects(
     diagnostics: &mut Vec<String>,
 ) -> Result<(), HarnessError> {
     if records.cycles.iter().any(|cycle| {
-        cycle.record.project_revision
-            != Digest::of_canonical(config)
-                .unwrap_or_else(|_| cycle.record.project_revision.clone())
+        !cycle.record.status.is_terminal()
+            && cycle.record.project_revision
+                != Digest::of_canonical(config)
+                    .unwrap_or_else(|_| cycle.record.project_revision.clone())
     }) {
         diagnostics.push("cycle_project_revision_mismatch".to_owned());
     }
