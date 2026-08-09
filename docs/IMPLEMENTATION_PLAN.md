@@ -5,16 +5,18 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 78 |
+| Plan revision | 79 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
+| Previous plan commit | `d7b657c8c75fa528c2cdfd9e8532f0767bd5f354`, plan revision 78 reconciliation |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `alvaro/harness-p0-p1-governance-r12` |
-| Current release stage | Hardened single-repository release |
-| Current implementation status | `WP-550` is `DONE`. Governance extension `WP-600` has completed its bounded P0/P1 repair at `9342e12` and passed fresh independent exact-SHA review; live `main` reconciliation and draft-PR publication are in progress. |
-| Next executable work package | Validate this reconciliation merge, push `alvaro/harness-p0-p1-governance-r12`, and open the approved work as a draft pull request. |
+| Active branch | `card/F-038` |
+| Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
+| Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; candidate `main`, `origin/main`, and authority `main` are aligned to that exact SHA. The release merge itself was not Harness-governed. |
+| Current implementation status | `WP-550` and governance extension `WP-600` are `DONE`. The v0.1.5 bootstrap recovery is complete, and bounded snapshot-noise cleanup `WP-560` is `READY`. |
+| Next executable work package | `WP-560` — suppress terminal legacy-cycle and stale legacy-lease noise in `project snapshot` without rewriting historical control records. |
 | Final acceptance owner | Alvaro Alvarez |
+| Final authorization policy | Sealed-cycle authorization by declared actor `alvaro` |
 
 This file is the authoritative delivery plan and current status ledger for
 Change Harness. `docs/ARCHITECTURE.md` summarizes the design but does not
@@ -2859,10 +2861,93 @@ Final acceptance evidence, recorded 2026-08-08 on integrated candidate
   `755a00372a588b7db0cc8f1a464bcde29b6582bd`; control, candidate, and authority
   heads and control/candidate worktree states were unchanged.
 
-The authority limitation remains: Harness authority
+At WP-550 acceptance, the authority limitation remained: Harness authority
 `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main`
-`5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside WP-550,
+`5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation was outside WP-550,
 so this package does not move that ref or claim self-hosted authority.
+
+### WP-560 — Terminal legacy snapshot-noise cleanup
+
+| Field | Value |
+| --- | --- |
+| Status | `READY` |
+| Dependencies | `WP-550`, `WP-600`, and the completed v0.1.5 bootstrap recovery |
+| Target release | Hardened single-repository maintenance after v0.1.5 |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12.3–12.4, 15.1, and 16; `WP-550`; `WP-560`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
+
+Purpose:
+
+Remove two kinds of terminal legacy noise from the read-only project snapshot
+while preserving live operational warnings and every historical control
+record. This is a projection correction, not a migration or cleanup command.
+
+Root cause:
+
+- snapshot subject validation currently compares every stored cycle's
+  `project_revision` with the current project policy, so expected policy
+  evolution makes terminal legacy cycles add
+  `cycle_project_revision_mismatch` forever;
+- snapshot metrics currently evaluate every stored lease without consulting
+  the card's current state, so legacy leases that remained recorded as held
+  after their cards landed or were abandoned appear as silent active work.
+
+Implementation scope:
+
+- `src/domain/project_snapshot_collect.rs`;
+- `src/domain/project_snapshot_metrics.rs` only if the terminal-card filtering
+  cannot remain at the collector boundary without duplicating policy;
+- `tests/project_snapshot.rs`;
+- `README.md` only if the stable public snapshot contract changes;
+- `docs/IMPLEMENTATION_PLAN.md` for start, evidence, and completion status.
+
+Non-goals:
+
+- rewriting, deleting, or releasing historical cycles, cards, leases, events,
+  receipts, reviews, or integrations;
+- changing lifecycle state machines, `project status`, or work-reclaim
+  behavior;
+- suppressing drift or silent-lease signals for active or otherwise
+  non-terminal work;
+- changing snapshot schema, redaction, watch semantics, authority, or
+  multi-repository behavior unless a demonstrated acceptance failure requires
+  an explicit package revision.
+
+Acceptance:
+
+- a terminal legacy cycle whose stored project revision differs from the
+  current project policy does not add `cycle_project_revision_mismatch`;
+- an active or otherwise non-terminal cycle with the same mismatch still adds
+  the diagnostic;
+- a legacy held lease whose card is `closed` or `abandoned` is absent from
+  `silent_leases`, while an old held lease for active non-terminal work remains
+  visible;
+- cycle/card counts and historical records are unchanged; the snapshot remains
+  read-only and derived from one captured `control_head`;
+- malformed references, record tampering, mixed-head collection, and other
+  WP-550 integrity failures continue to fail closed rather than being
+  reclassified as terminal noise;
+- text, JSON, and watch rendering continue to use the same typed snapshot, and
+  default redaction remains unchanged.
+
+Required regression boundaries:
+
+- cover terminal and non-terminal cycle revision mismatches independently;
+- cover both terminal-card suppression and active-card retention for legacy
+  held leases;
+- keep the existing WP-550 legacy-digest, revocation, receipt-integrity,
+  consistency, read-only, text/JSON, and watch regressions green;
+- prove the focused tests fail when either terminal-state filter is removed,
+  then restore the exact candidate tree before final gates.
+
+Acceptance commands:
+
+```bash
+cargo fmt --check
+cargo test --test project_snapshot
+cargo test --all
+cargo clippy --all-targets --all-features -- -D warnings
+git diff --check
+```
 
 ### WP-600-MR — Workspace manifest
 
@@ -3388,7 +3473,7 @@ Tier 1 of the register is closed.
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
 | Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
-| Operational visibility | `DONE` | `WP-550` tracker entry; integrated full gate and live read-only smoke | Preserve the typed projection and redaction boundary |
+| Operational visibility | `READY` | `WP-550` is `DONE`; live v0.1.5 snapshot exposed only terminal legacy-cycle and lease presentation noise | Execute bounded `WP-560`; preserve the typed projection and redaction boundary |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3396,15 +3481,34 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | None; `WP-550` is complete and awaiting draft pull-request publication |
-| Active card | Not allocated: the live authority is behind GitHub `main`; this PR uses ordinary Git commits with exact-SHA independent review and records the governance drift as a blocker to claiming a Harness-governed card. |
-| Status | `DONE` |
-| Active implementation branch | `alvaro/project-snapshot-observability` |
-| Active implementation worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
-| Active owner | None; Luna High implementation and Terra High independent review are complete |
-| Active blocker | None for `WP-550`. Full self-hosting still cannot start honestly because Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`; reconciliation remains separate work. |
-| Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | Exact lane and review SHAs, full formatting/Clippy/test results, independent mutation evidence, and live read-only control-repository smoke are recorded in the WP-550 entry. |
+| Active work package | None; plan-maintenance card `F-038` records the completed bootstrap and makes `WP-560` `READY` |
+| Active card | `F-038` revision 1, digest `sha256:e715683c5a265e19a686807f768dcb9e21da44b70583c754e424ab3ef51ba035` |
+| Status | `ACTIVE` in cycle `C-028` at baseline `636f48f7ea4bf9bffbdb271b87a19e5841b87a83` |
+| Active implementation branch | `card/F-038` |
+| Active implementation worktree | `/Users/alvaro/Documents/Code/change-harness-worktrees/F-038` |
+| Active owner | `codex-planner` under lease `L-000037` |
+| Active blocker | None |
+| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
+| Acceptance evidence | Focused plan-content assertions, `cargo fmt --check`, exact-SHA gate receipt, and `work verify`; the final evidence is attached to the F-038 handoff rather than predeclared here. |
+
+Bootstrap recovery record:
+
+- GitHub PR #214 merged and tagged release `v0.1.5` at
+  `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`. Candidate `main`,
+  `origin/main`, and authority `main` are aligned to that exact SHA; the frozen
+  installed CLI reports version `0.1.5`.
+- PR #213 merged governance extension `WP-600` at
+  `eeb1e015274b775da2bad13598a1fee0488adf4a`; that merge contains the final
+  bounded repair `9342e1220fe59e86281369e763d8109ad98aa9f2`.
+- Before starting new work, 27 stale legacy cycles (`C-001` through `C-027`)
+  were explicitly abandoned after confirming that 35 historical cards had
+  landed and closed and that `F-034` was already abandoned. No historical
+  record was deleted or rewritten.
+- The final-authorization policy was migrated to sealed-cycle authorization by
+  declared actor `alvaro` before `C-028` was activated.
+- The bootstrap release and alignment were operator recovery performed through
+  ordinary Git/GitHub release operations; they were **not Harness-governed**.
+  `C-028` is the first new governed cycle on the aligned v0.1.5 baseline.
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
@@ -3554,6 +3658,7 @@ commands before commit even though Rust behavior is unchanged.
 | D-053 | Add `integration abandon` | Accepted | Section 11.3 permits `abandoned` from every pre-promoted state and `holds_lease` treats it as terminal, but no command could reach it. An integration that failed verification therefore held its cycle's integration lease permanently, with no way to plan another. This is the third instance of the same pattern — a state the model defines and no command reaches — after `WP-120`'s event store and `WP-200`'s atomic groups. Member cards return to `approved` rather than to work, because their approvals remained valid: the combination failed, not the candidates. |
 | D-054 | Stop pinning `workspace_role` in the `doctor` CLI test | Accepted | The same defect as D-052 in a second place: the test asserted the role was "main worktree" or "linked worktree", which fails in a detached worktree — where the harness runs its own integration gates. Fixing D-052 alone was not enough, and the second `SELFHOST-001` attempt failed on this one. Both are now stated as "any non-bare role is admissible", and the suite is verified green from an actual detached worktree rather than by inspection. |
 | D-029 | Exclude the operation journal from control history | Accepted | A journal entry describes a mutation in flight, so committing it would place non-authoritative state into authoritative history and leave control permanently dirty. Recovery reads the journal from the working tree precisely because a crashed process leaves it there uncommitted. `WP-530` revisits whether the audit report needs operations in history. |
+| D-097 | Preserve bootstrap history and fix its terminal snapshot noise in one bounded follow-up | Accepted 2026-08-09 | Release v0.1.5 restored one aligned candidate/origin/authority baseline but was itself an ordinary Git/GitHub bootstrap, not a governed delivery. Retiring the 27 legacy cycles and installing final authorization for actor `alvaro` made new governed work honest; it did not rewrite old cycle revisions or lease records. `WP-560` therefore corrects only the read-only projection for terminal records and preserves live drift/silence warnings, the stable schema, and all historical evidence. |
 
 ## 23. Decisions required later
 
@@ -3628,10 +3733,22 @@ When the plan changes:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Scope | P0/P1 evidence-governance contract hardening from the experiment review |
 | Required reading | Sections 7, 10, 15, 16, 24; `docs/ARCHITECTURE.md`; `AGENTS.md` |
 | Focused evidence | The bounded repair closes the rejected candidate's fail-open final authorization: installed policy loss now refuses acceptance and promotion without inventing an owner, actor, policy, or digest. Verification and audit resolve proofs only from exact integration members and refuse duplicate proof IDs or ambiguous invariant/oracle bindings. A pinned plan freezes membership, and its complete `joint_integration` set is atomic. Canonical identity equivalence treats either a shared principal or shared session as a separation collision and validates configured identities deterministically. Audit uses the substantive integration digest bound by acceptance, reports unsupported receipt-reuse dimensions as `not_tested`, and accepts a clean production baseline while retaining corruption refusals. Required probe failure returns a nonzero `CH-POLICY-AUDIT-DISCREPANCY` result; network remains honestly `not_tested` and unenforced. Raw regressions cover refusal before mutation and preserve control HEAD, bytes, status, and cleanliness. Shared helpers now create plans through `cycle plan`; they only inspect an existing authoritative plan and refuse attempts to rewrite it. |
+
+Reconciliation closeout:
+
+- PR #213 merged the approved governance lane at
+  `eeb1e015274b775da2bad13598a1fee0488adf4a`;
+- the merge contains final repair
+  `9342e1220fe59e86281369e763d8109ad98aa9f2` (`fix: close WP-600 governance
+  gaps`);
+- release PR #214 then built v0.1.5 on top of that merged result at
+  `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`;
+- this closes governance extension `WP-600` only. The existing,
+  cross-repository `WP-600-MR` and dependent `WP-610` remain `DEFERRED`.
 
 Delivered in this slice:
 
@@ -3654,7 +3771,9 @@ Delivered in this slice:
 - `audit report` emits `harness.claim-report/v1` classifications and preserves
   discrepancies instead of dropping unsupported claims.
 
-Requirement audit: implementation is in progress against the current Terra review; the transactional plan and executable probe/report slices below are focused evidence, not final acceptance. (1) typed reviewer kind, provenance, independent human
+Requirement audit: the merged and independently reviewed implementation closes
+the bounded P0/P1 package. The transactional plan and executable probe/report
+slices below are the preserved acceptance evidence. (1) typed reviewer kind, provenance, independent human
 attestation, and compatibility fields are enforced in review recording; every
 new approval requires nonblank typed principal/session provenance plus
 executable mutation evidence or a typed policy-valid exemption; (2) mutation
