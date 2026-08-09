@@ -5,16 +5,16 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 81 |
+| Plan revision | 84 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `370d60e3f2b558d406bf968ec649968565b1ccfc`, plan revision 80 terminal-noise cleanup |
+| Previous plan commit | `8234ac155a22cafe0b7db6f2559ed6e75821491e`, plan revision 83 activation-binding repair candidate |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | None; `WP-800` is `READY` and has no implementation allocation |
+| Active branch | `card/F-045` — review-required `WP-800` semantic repair |
 | Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
 | Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; candidate `main`, `origin/main`, and authority `main` are aligned to that exact SHA. The release merge itself was not Harness-governed. |
-| Current implementation status | `WP-550`, `WP-560`, and governance extension `WP-600` are `DONE`; `WP-800` is `READY` as a semantic port of PR #212 onto the current baseline. |
-| Next executable work package | `WP-800` — Governed lessons and applicability |
+| Current implementation status | `WP-550`, `WP-560`, governance extension `WP-600`, and `WP-800` are `DONE`. |
+| Next executable work package | None authorized; independent review and final integration remain separate lifecycle gates for `F-045`. |
 | Final acceptance owner | Alvaro Alvarez |
 | Final authorization policy | Sealed-cycle authorization by declared actor `alvaro` |
 
@@ -3111,7 +3111,7 @@ Acceptance:
 
 | Field | Value |
 | --- | --- |
-| Status | `READY` |
+| Status | `DONE` |
 | Dependencies | `WP-210`, `WP-250`, `WP-310`, `WP-320`, `WP-440`, `WP-530`, `WP-560`, `WP-600` |
 | Target release | Hardened single-repository extension |
 | Required reading | `README.md`; `AGENTS.md`; plan Sections 1–7; Sections 10.3, 10.7–10.9; Section 12; Sections 15.1–15.3; Section 16; `WP-560`; `WP-600`; `WP-800`; Sections 20.2, 22, and 24; `docs/ARCHITECTURE.md` |
@@ -3135,7 +3135,11 @@ port whose repaired candidate preserves the original PR head
 `efb2adeeed4a5a924348655946519b30993280b3` as an ancestor and retains current
 `main` behavior deliberately.
 
-Exact write scope (30 paths):
+The original bounded decision authorized the following 30 paths. Independent
+review `RV-000079` found that activation-time freezing cannot be implemented
+atomically without the activation transaction owner. Corrective card `F-045`
+therefore adds only `src/commands/card.rs`, for an exact delivered scope of 31
+paths:
 
 ```text
 README.md
@@ -3144,6 +3148,7 @@ docs/IMPLEMENTATION_PLAN.md
 src/cli/mod.rs
 src/commands/acceptance.rs
 src/commands/audit.rs
+src/commands/card.rs
 src/commands/handoff.rs
 src/commands/integration.rs
 src/commands/lesson.rs
@@ -3180,7 +3185,7 @@ Non-goals:
   snapshot warnings;
 - adding cross-project lesson sharing, automatic LLM inference, a hosted
   service, stronger actor identity, or new sandbox enforcement;
-- modifying any path outside the exact 30-path scope;
+- modifying any path outside the exact review-authorized 31-path scope;
 - changing Rust, runtime, or test behavior in the plan card that makes this
   package executable. Those changes begin only under a separately activated
   `WP-800` implementation card.
@@ -3225,7 +3230,7 @@ Regression boundaries (required):
   retention regressions;
 - confirm the repaired candidate keeps
   `efb2adeeed4a5a924348655946519b30993280b3` as an ancestor and changes only the
-  declared 30 paths;
+  declared 31 paths;
 - run only targeted implementation and independent-review suites on isolated
   candidates; run the full `cargo test` suite exactly once, against the final
   integration landing candidate.
@@ -3251,6 +3256,33 @@ landing candidate is built:
 ```bash
 cargo test
 ```
+
+Completion evidence, recorded 2026-08-09 for the bounded implementation
+candidate:
+
+- the candidate is a normal merge of current baseline
+  `dfd9a00bd4931b109b677c019a786e3310de0ad5` and exact PR #212 head
+  `efb2adeeed4a5a924348655946519b30993280b3`; ancestry and the exact 31-path
+  scope are checked before handoff;
+- focused suites pass: `lessons` 10/10, `card_model` 20/20, `card_example` 8/8,
+  `review` 33/33, `combined_verification` 17/17, `audit` 20/20, `promotion`
+  53/53, `review_example` 7/7, and `project_snapshot` 27/27;
+- an independent mutation replacing the review `policy.authorizes` guard with
+  `false` makes the focused unauthorized-`not_applicable` regression fail,
+  proving that the registered lesson gates observe the authorization oracle;
+- the current-main typed mutation-exemption refusals and WP-560 terminal/live
+  snapshot boundaries pass through their owning focused regressions;
+- `cargo fmt --check`, strict all-target/all-feature Clippy, and
+  `git diff --check` pass on the resolved tree;
+- the full `cargo test` suite is intentionally not run here; `gate.test`
+  remains reserved for its one authorized execution on the final integration
+  landing candidate.
+- final-integration receipt `R-000241` failed at landing SHA
+  `06006ece91ec1766f2d4f65e8647d536c4ba3a0c` because `handoff inspect`
+  validated a historical handoff manifest against the newly current card
+  revision instead of the immutable revision the handoff bound. The isolated
+  candidate repairs that read boundary; no final-suite green claim is made
+  until a new integration landing reruns `gate.test` successfully.
 
 ## 18. Dependency and execution order
 
@@ -3636,7 +3668,7 @@ Tier 1 of the register is closed.
 | Recovery/concurrency | `DONE` | `WP-500`, `tests/recovery.rs` (8 acceptance tests); `WP-510`, `tests/concurrency.rs` (11 acceptance tests) | Preserve |
 | Backup/audit | `DONE` | `WP-520`, `tests/backup.rs` (9 acceptance tests); `WP-530`, `tests/audit.rs` (9 acceptance tests) | Preserve |
 | Operational visibility | `DONE` | `WP-550` and `WP-560`; typed snapshot projection with terminal legacy-cycle and stale terminal-lease noise suppressed | Preserve the typed projection, fail-closed integrity, and redaction boundary |
-| Governed lessons | `READY` | `WP-800`; bounded semantic-port contract for PR #212 | Activate the separately governed implementation card |
+| Governed lessons | `DONE` | `WP-800`; bounded semantic port preserving PR #212 ancestry and current governance | Preserve exact manifest binding and fail-closed lifecycle enforcement |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3644,10 +3676,10 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Next executable work package | `WP-800` — Governed lessons and applicability |
-| Status | `READY` |
-| Active implementation | None; activation and allocation belong to a separate governed implementation card |
-| Blocker | None; the package has bounded scope, dependencies, reading, behavior, regressions, and commands |
+| Next executable work package | None authorized |
+| Status | `DONE` |
+| Active implementation | `F-045` contains the review-required bounded candidate; review and integration remain independently governed |
+| Blocker | None in implementation; promotion authority remains behind exact-SHA review, final integration verification, and acceptance |
 | Required reading | `README.md`; `AGENTS.md`; plan Sections 1–7; Sections 10.3, 10.7–10.9; Section 12; Sections 15.1–15.3; Section 16; `WP-560`; `WP-600`; `WP-800`; Sections 20.2, 22, and 24; `docs/ARCHITECTURE.md` |
 | Acceptance boundary | Targeted implementation and review checks only; one full `cargo test` run is reserved for final integration |
 
