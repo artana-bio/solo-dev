@@ -63,6 +63,8 @@ pub enum ProjectCommand {
     Validate(ValidateArgs),
     /// Report project and control state.
     Status(StatusArgs),
+    /// Report a typed, read-only operational snapshot.
+    Snapshot(SnapshotArgs),
     /// Report interrupted operations and how to resolve them.
     Recover(RecoverArgs),
     /// Install a convergence policy on an already-initialized project.
@@ -101,6 +103,7 @@ impl ProjectCommand {
             Self::Init(..) => "project.init",
             Self::Validate(..) => "project.validate",
             Self::Status(..) => "project.status",
+            Self::Snapshot(..) => "project.snapshot",
             Self::Recover(..) => "project.recover",
             Self::SetConvergencePolicy(..) => "project.set-convergence-policy",
             Self::SetFinalAuthorizationPolicy(..) => "project.set-final-authorization-policy",
@@ -168,6 +171,49 @@ pub struct StatusArgs {
     /// Path to the control repository.
     #[arg(long, env = CONTROL_ENV)]
     pub control: PathBuf,
+}
+
+/// Arguments accepted by `project snapshot`.
+#[derive(Debug, Args)]
+pub struct SnapshotArgs {
+    /// Path to the control repository.
+    #[arg(long, env = CONTROL_ENV)]
+    pub control: PathBuf,
+    /// Refresh the human-readable snapshot while stdout is an interactive
+    /// terminal. Non-TTY output emits exactly one frame and exits.
+    ///
+    /// Watch mode is intentionally text-only: JSON remains one valid result
+    /// envelope per command rather than becoming an undocumented stream.
+    #[arg(long)]
+    pub watch: bool,
+    /// Milliseconds between watch frames (100..=3,600,000; default: 1000).
+    #[arg(long, value_parser = parse_watch_interval)]
+    pub interval_ms: Option<u64>,
+}
+
+/// The default watch interval. One second is slow enough to avoid turning a
+/// read-only diagnostic into a busy loop, while still being useful for a
+/// person watching a short workflow step.
+pub const DEFAULT_WATCH_INTERVAL_MS: u64 = 1_000;
+/// The shortest permitted interval. This keeps accidental `--interval-ms 0`
+/// invocations from becoming an uncontrolled read loop.
+pub const MIN_WATCH_INTERVAL_MS: u64 = 100;
+/// The longest permitted interval. A larger value is better expressed by
+/// running a one-shot snapshot on demand rather than leaving a watch process
+/// around with a surprising cadence.
+pub const MAX_WATCH_INTERVAL_MS: u64 = 3_600_000;
+
+/// Parses and bounds the watch refresh interval.
+fn parse_watch_interval(value: &str) -> Result<u64, String> {
+    let interval = value
+        .parse::<u64>()
+        .map_err(|_| "interval must be an integer number of milliseconds".to_owned())?;
+    if !(MIN_WATCH_INTERVAL_MS..=MAX_WATCH_INTERVAL_MS).contains(&interval) {
+        return Err(format!(
+            "interval must be between {MIN_WATCH_INTERVAL_MS} and {MAX_WATCH_INTERVAL_MS} milliseconds"
+        ));
+    }
+    Ok(interval)
 }
 
 /// Arguments accepted by `project recover`.
@@ -266,6 +312,7 @@ pub fn execute(
         ProjectCommand::Init(args) => run_init(args, clock),
         ProjectCommand::Validate(args) => run_validate(args),
         ProjectCommand::Status(args) => run_status(args, clock),
+        ProjectCommand::Snapshot(args) => crate::commands::project_snapshot::run(args, clock),
         ProjectCommand::Recover(args) => run_recover(args, clock),
         ProjectCommand::SetConvergencePolicy(args) => run_set_convergence_policy(args, clock),
         ProjectCommand::SetFinalAuthorizationPolicy(args) => {
@@ -1721,10 +1768,13 @@ fn refuse_orphaning_facts(
     // `ATTEMPT_RECORDED_EVENT` is gated on `config.convergence_policy` being
     // `Some` (`review.rs`, both sites in `handoff.rs`, `card.rs`, and
     // `integration.rs`), and nothing removes a policy once installed, so a
-    // fact cannot outlive the policy that admitted it. It is kept, and left
-    // untested, as a diagnostic for a hand-edited project document — which
-    // is why its text sends the operator to the control repository rather
-    // than to a command that would only refuse again.
+    // fact cannot outlive the policy that admitted it. It is kept as a
+    // diagnostic for a hand-edited project document — which is why its text
+    // sends the operator to the control repository rather than to a command
+    // that would only refuse again — and it is pinned by
+    // `set_convergence_policy_refuses_when_facts_exist_but_no_policy_is_configured`,
+    // which reaches it by performing that hand edit directly, the way
+    // `tamper_card_state` reaches the other shapes no shipped command builds.
     let (currently, remedy) = existing_digest.map_or_else(
         || {
             (

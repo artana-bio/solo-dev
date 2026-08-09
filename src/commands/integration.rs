@@ -73,6 +73,7 @@ use crate::{
         receipt::{
             LOG_DIR, ProofMapBinding, ProvenanceDimension, ProvenanceSubject,
             RECEIPT_PROVENANCE_SCHEMA, RECEIPT_SCHEMA, Receipt, ReceiptProvenanceV1,
+            TestResultSummary,
         },
         run_attempt,
     },
@@ -3484,6 +3485,12 @@ fn verify_landing(
                 stdout_digest: attempt.stdout_digest.clone(),
                 stderr_digest: attempt.stderr_digest.clone(),
                 artifact_digests: attempt.artifact_digests.clone(),
+                test_results: Some(
+                    attempt
+                        .test_results
+                        .clone()
+                        .unwrap_or_else(TestResultSummary::not_reported),
+                ),
                 log_location: attempt.log_location.clone(),
                 attempt: 1,
                 passed: attempt.passed(),

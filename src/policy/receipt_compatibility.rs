@@ -627,6 +627,7 @@ mod tests {
             stdout_digest: digest("out"),
             stderr_digest: digest("err"),
             artifact_digests: BTreeMap::new(),
+            test_results: None,
             log_location: PathBuf::from("/tmp/log"),
             attempt: 1,
             passed: true,

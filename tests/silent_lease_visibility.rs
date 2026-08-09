@@ -12,11 +12,12 @@
 //! neither of those builds or asserts on, and keeping it separate keeps
 //! each file's fixture story about one kind of recovery-visible fact.
 //!
-//! Post-review repair: nothing in this codebase ever writes
-//! `LeaseStatus::Released` (a separately tracked defect; see the repair's
-//! report), so `is_held()` never excludes a finished card's lease on its
-//! own, and every lease ever granted would read as silent forever past the
-//! threshold. `a_finished_cards_stale_lease_is_never_reported_silent`,
+//! Post-review repair: `is_held()` never excludes a finished card's lease
+//! on its own, so every lease ever granted would read as silent forever
+//! past the threshold. `archive close` now releases a lease it cleans up,
+//! but that only covers cards that reach an integration and land; a card
+//! abandoned on its own terms never gets there, and its lease stays held
+//! for good (#199). `a_finished_cards_stale_lease_is_never_reported_silent`,
 //! below, is the case the four tests above could not reach: all four use a
 //! card that stays `Active` throughout, so none of them exercise the
 //! card-state exclusion `work.rs`'s `card_work_is_over` adds.
@@ -266,13 +267,12 @@ fn project_recover_names_reclaim_as_an_option_not_an_instruction() {
 
 /// Post-review repair's required proof: a lease for a card whose own work
 /// is over (here, abandoned) is never reported silent, no matter how old
-/// `granted_at` is. `work reclaim`'s own doc comment already treats
-/// "landed or abandoned" as the pair that makes a lease a cleanup
-/// candidate rather than something to page anyone about; `card abandon`
-/// moves the card there directly from `active` without touching the
-/// lease at all (`LeaseStatus::Released` is never written by any
-/// production path), which is exactly why `is_held()` alone cannot tell
-/// this case apart from a genuinely stuck one — only card state can.
+/// `granted_at` is. `card abandon` moves the card there directly from
+/// `active` without touching the lease at all, and an abandoned card never
+/// joins an integration, so the one path that does release a lease —
+/// `archive close`, via `release_lease` — never reaches it. Its lease
+/// stays `held` permanently, which is exactly why `is_held()` alone cannot
+/// tell this case apart from a genuinely stuck one; only card state can.
 ///
 /// This is the case §10 mutation 2 could not reach: that test (and every
 /// other test in this file) uses a card left `active` throughout, so none

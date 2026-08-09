@@ -27,6 +27,7 @@ pub mod handoff;
 pub mod integration;
 pub mod mutation;
 pub mod project;
+pub mod project_snapshot;
 pub mod review;
 pub mod transaction;
 pub mod work;
