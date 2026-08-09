@@ -12,12 +12,12 @@ Budget **30–40 minutes** the first time. Ten after that.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/artana-bio/solo-dev/main/install.sh | sh
-change-harness --version        # change-harness 0.1.4
+change-harness --version        # change-harness 0.1.5
 ```
 
 Four platforms: macOS and Linux, Intel and ARM. This exact command was run from a clean machine state to write this guide.
 
-**You need 0.1.4 or later.** `card example` and `handoff example` — the two commands that save you the most guessing — are not in 0.1.3. If `--version` says otherwise, stop.
+**You need 0.1.5 or later.** This guide uses the current governance and observability contracts. If `--version` says otherwise, stop.
 
 **Get real exit codes.** A pipe's `$?` is the pipe's, not the command's — this bit me on my first command:
 
