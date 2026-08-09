@@ -3484,9 +3484,6 @@ Tier 1 of the register is closed.
 | Active work package | `WP-560` is the next bounded package |
 | Active card | None allocated |
 | Status | `READY` |
-| Active implementation branch | None allocated |
-| Active implementation worktree | None allocated |
-| Active owner | Unassigned |
 | Active blocker | None |
 | Required reading | The exact `WP-560` tracker entry defines the package reading contract |
 | Acceptance evidence | None yet; evidence is recorded only after `WP-560` starts and satisfies its listed gates |
