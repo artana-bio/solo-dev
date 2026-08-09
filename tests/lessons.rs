@@ -672,6 +672,82 @@ fn a_later_lesson_activation_does_not_invalidate_a_frozen_handoff_manifest() {
 }
 
 #[test]
+fn review_refuses_a_handoff_manifest_that_differs_from_the_activation_binding() {
+    let workspace = Workspace::initialized();
+    install_lesson_authorizer(&workspace, "owner");
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Reject downstream lesson evidence that differs from activation",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    propose_and_activate(&workspace, lesson_definition(&workspace));
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.unit"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let manifest_digest = packet_digest(&workspace);
+    let declaration = prepare_candidate(&workspace);
+    workspace.handoff(&[
+        "create",
+        "--card-id",
+        "F-001",
+        "--declaration",
+        declaration.to_str().unwrap(),
+        "--lesson-manifest-digest",
+        &manifest_digest,
+    ]);
+
+    let handoff_path = fs::read_dir(workspace.control.join("handoffs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut handoff: Value = serde_json::from_slice(&fs::read(&handoff_path).unwrap()).unwrap();
+    handoff["lesson_manifest"]["lessons"][0]["title"] =
+        serde_json::json!("tampered downstream title");
+    fs::write(
+        &handoff_path,
+        format!("{}\n", serde_json::to_string_pretty(&handoff).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "fixture: mismatch frozen lesson evidence",
+        ],
+    );
+
+    let before = workspace.control_head();
+    let output = workspace.review_raw(&[
+        "begin",
+        "--card-id",
+        "F-001",
+        "--actor",
+        "independent-reviewer",
+    ]);
+    assert!(!output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-POLICY-LESSON-MANIFEST-STALE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("downstream lesson manifest differs")
+    );
+    assert_eq!(
+        workspace.control_head(),
+        before,
+        "review refusal must occur before lifecycle evidence mutation"
+    );
+}
+
+#[test]
 fn preferred_review_checks_require_a_visible_disposition() {
     let workspace = Workspace::initialized();
     let verdict = prepare_lesson_review(&workspace, "preferred", "reviewer");
