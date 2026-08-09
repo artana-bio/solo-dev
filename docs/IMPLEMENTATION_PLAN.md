@@ -5,15 +5,15 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 60 |
+| Plan revision | 61 |
 | Plan date | 2026-08-08 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
 | Active branch | `alvaro/project-snapshot-observability` |
 | Current release stage | Hardened single-repository release |
-| Current implementation status | `WP-550` is `IN_PROGRESS`: one read-only project snapshot will provide the same authoritative operational view to the CLI and external UIs. Implementation is split into bounded commits by Luna High and each exact commit is reviewed independently by Terra High before the next chunk. |
-| Next executable work package | Complete and independently review `WP-550`, then open a draft pull request. |
+| Current implementation status | `WP-550` is `DONE`: the read-only project snapshot, machine-readable JSON projection, terminal watch mode, declared JUnit metrics, documentation, and historical-control compatibility have passed the full quality gate and independent exact-SHA review. |
+| Next executable work package | Publish the completed `WP-550` branch as a draft pull request. Reconcile the stale Harness authority separately before claiming a self-hosted Harness card for later work. |
 | Final acceptance owner | Alvaro Alvarez |
 
 This file is the authoritative delivery plan and current status ledger for
@@ -2777,7 +2777,7 @@ Delivered notes:
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Dependencies | `WP-510`, `WP-530` |
 | Target release | Hardened single-repository release |
 | Owner | Luna High, coordinated by Codex; independent review by Terra High |
@@ -2834,11 +2834,32 @@ Approved integrated lane SHAs (prior exact-SHA reviews):
 - declared JUnit metrics and failed-report receipts:
   `43ba98d4e88f514918b172c1a75c5088ee08b5ae`,
   `e545aae0c454ed39a455638b77c16eca0c9e46ee`.
+- documentation contract: integrated commit
+  `ecf72076641160d703f8fd54742a6ce4ff36277d`, independently approved on its
+  source-equivalent exact SHA `4d9e0fe363ef0b874679ed3c13d0bc68fe222f27`;
+- historical handoff compatibility: integrated commit
+  `960d13e8795fe5abc085d37c48966a8ea8ace452`, independently approved on its
+  source-equivalent exact SHA `adf353bdf90d6096e3f613b4932ba627544c8b6f`.
 
-Remaining final gate: the integrated full suite and final Terra High review of
-the complete exact-SHA chain, including this documentation closeout. WP-550
-remains `IN_PROGRESS` until both are complete; this closeout does not claim
-`DONE`. The authority limitation also remains: Harness authority
+Final acceptance evidence, recorded 2026-08-08 on integrated candidate
+`960d13e8795fe5abc085d37c48966a8ea8ace452`:
+
+- `cargo fmt --check` passed;
+- `cargo clippy --all-targets --all-features -- -D warnings` passed;
+- `cargo test --all` passed, including 685 unit tests, all integration suites,
+  and doc tests;
+- `tests/project_snapshot.rs` passed all 23 snapshot, watch, integrity, legacy
+  digest, revocation-history, and tamper-refusal regressions;
+- `tests/project_snapshot_docs.rs` passed all three documentation-contract
+  regressions;
+- Terra High approved the exact compatibility candidate after independent
+  mutations of branch, candidate SHA, card ID, receipt evidence, and actor
+  declaration all failed closed;
+- live JSON, text, and non-TTY watch sampling succeeded against control head
+  `755a00372a588b7db0cc8f1a464bcde29b6582bd`; control, candidate, and authority
+  heads and control/candidate worktree states were unchanged.
+
+The authority limitation remains: Harness authority
 `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main`
 `5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside WP-550,
 so this package does not move that ref or claim self-hosted authority.
@@ -3366,7 +3387,7 @@ Tier 1 of the register is closed.
 | Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
 | Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
 | Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
-| Operational visibility | `IN_PROGRESS` | `WP-550` tracker entry | Complete Luna/Terra implementation and review chunks |
+| Operational visibility | `DONE` | `WP-550` tracker entry; integrated full gate and live read-only smoke | Preserve the typed projection and redaction boundary |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3374,15 +3395,15 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | `WP-550` — project snapshot and operational visibility |
+| Active work package | None; `WP-550` is complete and awaiting draft pull-request publication |
 | Active card | Not allocated: the live authority is behind GitHub `main`; this PR uses ordinary Git commits with exact-SHA independent review and records the governance drift as a blocker to claiming a Harness-governed card. |
-| Status | `IN_PROGRESS` |
+| Status | `DONE` |
 | Active implementation branch | `alvaro/project-snapshot-observability` |
 | Active implementation worktree | `/Users/alvaro/.codex/worktrees/0184/change-harness` |
-| Active owner | Luna High, coordinated by Codex; independent review by Terra High |
-| Active blocker | Full self-hosting cannot start honestly: Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`. Reconciliation is outside `WP-550`; no authority ref will be moved by this package. |
+| Active owner | None; Luna High implementation and Terra High independent review are complete |
+| Active blocker | None for `WP-550`. Full self-hosting still cannot start honestly because Harness authority `9396678a54a279cc8e131b7388e05090e34742cf` is behind GitHub `main` `5f6ac789fc875f86779f21f1b4e4f6485956c948`; reconciliation remains separate work. |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12, 14.2–14.3, 15.1, and 16; `WP-550`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
-| Acceptance evidence | Prior lane SHAs are recorded in the WP-550 entry. Documentation-contract regressions and this closeout commit remain subject to the integrated full suite and final exact-SHA Terra High review. |
+| Acceptance evidence | Exact lane and review SHAs, full formatting/Clippy/test results, independent mutation evidence, and live read-only control-repository smoke are recorded in the WP-550 entry. |
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
