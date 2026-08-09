@@ -10,7 +10,7 @@
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `2fa19a4081a8accc19c24593b594835c88dfc07f`, promoted plan revision 84 baseline with `WP-800` complete |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | `card/F-046` — provider-neutral coordination architecture authorization |
+| Active branch | No production coordination implementation is active; `SPIKE-002` is the next executable work package. |
 | Current release stage | Hardened single-repository release plus a documentation-only coordination-extension authorization |
 | Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; the bootstrap alignment was not Harness-governed. Governed lessons subsequently promoted through `INT-040`, establishing current candidate and local authority baseline `2fa19a4081a8accc19c24593b594835c88dfc07f`. |
 | Current implementation status | `WP-550`, `WP-560`, governance extension `WP-600`, and `WP-800` are `DONE` on promoted baseline `2fa19a4081a8accc19c24593b594835c88dfc07f`. No production coordinator, provider adapter, remote gateway, or dashboard has started. |
@@ -867,10 +867,10 @@ Required fields on every line:
   },
   "provider_session_id": null,
   "harness_role": "implementer",
-  "card_id": "F-046",
+  "card_id": "F-123",
   "card_revision": 1,
   "card_digest": "sha256:<64-hex>",
-  "lease_id": "L-000045",
+  "lease_id": "L-000123",
   "worktree": "/absolute/allocated/worktree",
   "packet_digest": "sha256:<64-hex>",
   "candidate_sha": null,
@@ -4442,7 +4442,7 @@ Harness lifecycle. Promoted baseline
 | Promoted baseline | `2fa19a4081a8accc19c24593b594835c88dfc07f` (`INT-040`, `F-045`, `WP-800`) |
 | Next executable work package | `SPIKE-002` only |
 | Status | `READY` |
-| Active implementation | None. `F-046` authorizes architecture and sequencing only; no production coordination component exists. |
+| Active implementation | None. This authorization is documentation-only; no production coordination component exists. |
 | Blocker | None for the bounded spike. `WP-900` and every later package remain blocked on the exact dependency chain in Section 18. |
 | Required reading | Coordinator: complete plan, `docs/ARCHITECTURE.md`, `README.md`, `AGENTS.md`, and `SKILL.md`. Spike roles: their delivered `SPIKE-002` packet only under the spike exception. |
 | Acceptance boundary | Installed-provider feasibility and packet sufficiency only; zero production Rust or infrastructure and no external effect. |
