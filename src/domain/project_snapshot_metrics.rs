@@ -273,10 +273,20 @@ pub(super) fn review_metrics(events: &[crate::control::event_store::Event]) -> R
     metrics
 }
 
-pub(super) fn silent_leases(leases: &[LeaseRecord], now: Timestamp) -> Vec<SilentLeaseSnapshot> {
+pub(super) fn silent_leases(
+    leases: &[LeaseRecord],
+    states: &[StoredCardState],
+    now: Timestamp,
+) -> Vec<SilentLeaseSnapshot> {
     leases
         .iter()
         .filter(|lease| lease.is_silent(now))
+        .filter(|lease| {
+            states
+                .iter()
+                .find(|state| state.card_id == lease.card_id)
+                .is_none_or(|state| !state.state.is_terminal())
+        })
         .map(|lease| SilentLeaseSnapshot {
             lease_id: lease.lease_id.to_string(),
             card_id: lease.card_id.to_string(),

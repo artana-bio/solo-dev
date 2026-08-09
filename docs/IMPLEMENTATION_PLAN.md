@@ -5,16 +5,16 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 79 |
+| Plan revision | 80 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `d7b657c8c75fa528c2cdfd9e8532f0767bd5f354`, plan revision 78 reconciliation |
+| Previous plan commit | `5feedf4e49af570a6d2ae4f039ce43224fdaa650`, plan revision 79 reconciliation |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | None; no implementation branch is allocated for `WP-560` while it is `READY` |
+| Active branch | None; no work package is recorded as active after `WP-560` lands |
 | Current release stage | Hardened single-repository release, bootstrap release `v0.1.5` |
 | Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; candidate `main`, `origin/main`, and authority `main` are aligned to that exact SHA. The release merge itself was not Harness-governed. |
-| Current implementation status | `WP-550` and governance extension `WP-600` are `DONE`. The v0.1.5 bootstrap recovery is complete, and bounded snapshot-noise cleanup `WP-560` is `READY`. |
-| Next executable work package | `WP-560` — suppress terminal legacy-cycle and stale legacy-lease noise in `project snapshot` without rewriting historical control records. |
+| Current implementation status | `WP-550`, `WP-560`, and governance extension `WP-600` are `DONE`; terminal legacy snapshot noise is filtered only in the read model, with historical control records preserved. |
+| Next executable work package | None selected; a future package requires an explicit plan decision. |
 | Final acceptance owner | Alvaro Alvarez |
 | Final authorization policy | Sealed-cycle authorization by declared actor `alvaro` |
 
@@ -2870,7 +2870,7 @@ so this package does not move that ref or claim self-hosted authority.
 
 | Field | Value |
 | --- | --- |
-| Status | `READY` |
+| Status | `DONE` |
 | Dependencies | `WP-550`, `WP-600`, and the completed v0.1.5 bootstrap recovery |
 | Target release | Hardened single-repository maintenance after v0.1.5 |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7; Sections 10.6, 12.3–12.4, 15.1, and 16; `WP-550`; `WP-560`; Sections 20.2 and 24; `docs/ARCHITECTURE.md` |
@@ -2948,6 +2948,28 @@ cargo test --all
 cargo clippy --all-targets --all-features -- -D warnings
 git diff --check
 ```
+
+Completion evidence, recorded 2026-08-09 for the post-landing ledger:
+
+- `project_snapshot_collect` suppresses project-revision drift only for
+  `CycleStatus::Closed` and `CycleStatus::Abandoned`; every non-terminal cycle
+  remains eligible for the existing diagnostic;
+- `project_snapshot_metrics` suppresses an otherwise silent held lease only
+  when its validated card state is `CardState::Closed` or
+  `CardState::Abandoned`; missing and non-terminal states remain visible;
+- `tests/project_snapshot.rs` has 27 passing tests, including independent
+  terminal-suppression and live-warning-retention regressions for both
+  mechanisms. Abandoned states use public lifecycle commands; closed states
+  use the established fixture mutation because no shipped command produces a
+  closed cycle or a closed card with a still-held lease;
+- removing either terminal filter independently makes `gate.snapshot` fail at
+  its intended regression oracle, after which the exact candidate tree is
+  restored before final receipts;
+- the implementation stage runs `cargo fmt --check`,
+  `cargo test --test project_snapshot`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and
+  `git diff --check`; the cycle's final integration gate owns the one
+  authorized full `cargo test` run against the combined landing candidate.
 
 ### WP-600-MR — Workspace manifest
 
@@ -3468,7 +3490,7 @@ Tier 1 of the register is closed.
 | Archive/cleanup | `DONE` | `WP-460`; `tests/archive_cleanup.rs` (15 acceptance tests) | Preserve |
 | Recovery/concurrency | `DONE` | `WP-500`, `tests/recovery.rs` (8 acceptance tests); `WP-510`, `tests/concurrency.rs` (11 acceptance tests) | Preserve |
 | Backup/audit | `DONE` | `WP-520`, `tests/backup.rs` (9 acceptance tests); `WP-530`, `tests/audit.rs` (9 acceptance tests) | Preserve |
-| Operational visibility | `READY` | `WP-550` is `DONE`; live v0.1.5 snapshot exposed only terminal legacy-cycle and lease presentation noise | Execute bounded `WP-560`; preserve the typed projection and redaction boundary |
+| Operational visibility | `DONE` | `WP-550` and `WP-560`; typed snapshot projection with terminal legacy-cycle and stale terminal-lease noise suppressed | Preserve the typed projection, fail-closed integrity, and redaction boundary |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -3476,12 +3498,12 @@ Tier 1 of the register is closed.
 
 | Field | Current value |
 | --- | --- |
-| Active work package | `WP-560` is the next bounded package |
-| Active card | None allocated |
-| Status | `READY` |
-| Active blocker | None |
-| Required reading | The exact `WP-560` tracker entry defines the package reading contract |
-| Acceptance evidence | None yet; evidence is recorded only after `WP-560` starts and satisfies its listed gates |
+| Active work package | None; `WP-560` is `DONE` in this post-landing ledger |
+| Active card | None represented here; execution records remain in the control repository |
+| Status | `DONE` for `WP-560` |
+| Active blocker | None; no next package is selected |
+| Required reading | None until another package is made executable |
+| Acceptance evidence | Focused 27-test snapshot suite, independent filter-removal mutations, exact-SHA `gate.fmt` and `gate.snapshot` receipts, `work verify`, and the final integration gate for the combined landing candidate |
 
 Bootstrap recovery record:
 
