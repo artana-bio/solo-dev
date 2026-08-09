@@ -104,6 +104,64 @@ fn workspace_with_oracle(argv: &[&str]) -> Workspace {
 }
 
 #[test]
+fn a_successful_mutation_receipt_is_committed_to_clean_control_history() {
+    let workspace = workspace_with_oracle(&["sh", "-c", "test ! -f MUTATION_MARKER"]);
+    let output = run_mutation(
+        &workspace,
+        "MR-COMMITTED",
+        &["sh", "-c", "touch MUTATION_MARKER"],
+    );
+    assert!(
+        output.status.success(),
+        "mutation receipt creation failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let receipt = "mutation-receipts/MR-COMMITTED.json";
+    assert!(workspace.control.join(receipt).is_file());
+    assert!(
+        workspace
+            .control_tracked_files()
+            .iter()
+            .any(|path| path == receipt),
+        "the authoritative receipt must be present in control Git history"
+    );
+    assert_eq!(
+        support::capture(
+            &workspace.control,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+        "",
+        "a successful mutation command must leave control state identical to control history"
+    );
+}
+
+#[test]
+fn a_mutation_receipt_identifier_cannot_escape_its_control_directory() {
+    let workspace = Workspace::initialized();
+    let project = workspace.control.join("project/project.json");
+    let project_before = std::fs::read(&project).unwrap();
+    let head_before = workspace.control_head();
+
+    let output = run_mutation(&workspace, "../project/project", &["true"]);
+
+    assert!(!output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "CH-USAGE-INVALID-ID");
+    assert_eq!(std::fs::read(project).unwrap(), project_before);
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(
+        support::capture(
+            &workspace.control,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+        "",
+        "identifier refusal must not mutate control state"
+    );
+}
+
+#[test]
 fn failed_mutation_process_cleans_up_and_retains_recovery_evidence() {
     let workspace = workspace_with_oracle(&["sh", "-c", "test ! -f MUTATION_MARKER"]);
     let output = run_mutation(

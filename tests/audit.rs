@@ -55,7 +55,18 @@ fn completed() -> Workspace {
 /// A completed integration whose immutable records can be queried by an
 /// integration-level compatibility request.
 fn completed_with_id() -> (Workspace, String) {
+    completed_with_id_using_exemption(false)
+}
+
+fn completed_with_exemption_id() -> (Workspace, String) {
+    completed_with_id_using_exemption(true)
+}
+
+fn completed_with_id_using_exemption(exempt: bool) -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    if exempt {
+        workspace.install_fixture_mutation_exemption_policy();
+    }
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -65,7 +76,11 @@ fn completed_with_id() -> (Workspace, String) {
     ]);
     workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/F-001/**"]);
-    workspace.approve_card("F-001", "src/F-001/a.rs");
+    if exempt {
+        workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
+    } else {
+        workspace.approve_card("F-001", "src/F-001/a.rs");
+    }
     let id = workspace.integration_json(&[
         "prepare",
         "--cycle-id",
@@ -432,7 +447,7 @@ fn audit_report_surfaces_a_review_mutation_receipt_deleted_after_approval() {
 
 #[test]
 fn audit_report_surfaces_a_review_exemption_policy_discrepancy() {
-    let (workspace, _) = completed_with_id();
+    let (workspace, _) = completed_with_exemption_id();
     let project_path = workspace.control.join("project/project.json");
     let mut project: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();

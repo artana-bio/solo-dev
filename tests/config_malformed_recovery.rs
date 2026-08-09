@@ -306,6 +306,51 @@ fn gate_definition_recovery_is_identical_for_a_syntax_and_a_schema_failure() {
     );
 }
 
+#[test]
+fn mutation_exemption_policy_recovery_distinguishes_read_syntax_and_schema_failures() {
+    let workspace = Workspace::new();
+    let missing_control = workspace.root.join("no-such-control");
+    let missing = workspace.root.join("missing-policy.json");
+    let syntax = workspace.root.join("syntax-policy.json");
+    let schema = workspace.root.join("schema-policy.json");
+    fs::write(&syntax, "{ not json").unwrap();
+    fs::write(
+        &schema,
+        r#"{"version":"harness.mutation-exemption-policy/v1"}"#,
+    )
+    .unwrap();
+
+    let run = |policy: &std::path::Path| {
+        run_text(&[
+            "project",
+            "set-mutation-exemption-policy",
+            "--control",
+            missing_control.to_str().unwrap(),
+            "--policy",
+            policy.to_str().unwrap(),
+        ])
+    };
+    let read_output = run(&missing);
+    let syntax_output = run(&syntax);
+    let schema_output = run(&schema);
+
+    for output in [&read_output, &syntax_output, &schema_output] {
+        assert!(!output.status.success());
+        assert_eq!(code_line(output), "CH-CONFIG-MALFORMED");
+        assert_ne!(recovery_line(output), SHARED_FALLBACK_RECOVERY);
+    }
+    let read_recovery = recovery_line(&read_output);
+    let syntax_recovery = recovery_line(&syntax_output);
+    let schema_recovery = recovery_line(&schema_output);
+    assert!(read_recovery.contains("read failure"), "{read_recovery}");
+    assert!(
+        syntax_recovery.contains("not valid JSON"),
+        "{syntax_recovery}"
+    );
+    assert!(schema_recovery.contains("valid JSON"), "{schema_recovery}");
+    assert!(schema_recovery.contains("README"), "{schema_recovery}");
+}
+
 // ---------------------------------------------------------------------
 // Establish-and-justify choice #2 (#142 §10, §12): `HarnessError::Config`
 // has no per-site recovery mechanism, so `project validate`'s file-read

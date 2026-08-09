@@ -8,6 +8,7 @@ use crate::error::{ErrorCode, HarnessError};
 
 pub const CYCLE_PLAN_SCHEMA: &str = "harness.cycle-plan/v1";
 pub const CYCLE_PLAN_REVISION: u32 = 1;
+const MAX_CYCLE_PLAN_ID_LEN: usize = 64;
 /// Creation-time policy marker written on every new cycle.
 pub const CYCLE_PLAN_POLICY_REQUIRED: &str = "plan_required_v1";
 
@@ -57,6 +58,16 @@ pub struct CyclePlan {
 }
 
 impl CyclePlan {
+    /// Returns the control-repository path for a validated plan identifier.
+    ///
+    /// # Errors
+    ///
+    /// Refuses identifiers that could escape the plans directory or create
+    /// filesystem-dependent record names.
+    pub fn relative_path(plan_id: &str) -> Result<String, HarnessError> {
+        validate_plan_id(plan_id)?;
+        Ok(format!("plans/{plan_id}.json"))
+    }
     /// The stable digest used to bind this plan into lifecycle records.
     ///
     /// # Errors
@@ -72,9 +83,10 @@ impl CyclePlan {
     /// Returns a cycle-policy error for missing assignments/evidence,
     /// duplicate or overlapping cards, or invalid dependency graphs.
     pub fn validate(&self) -> Result<(), HarnessError> {
-        if self.schema != CYCLE_PLAN_SCHEMA || self.plan_id.trim().is_empty() {
+        if self.schema != CYCLE_PLAN_SCHEMA {
             return Err(invalid("plan schema or id is invalid"));
         }
+        validate_plan_id(&self.plan_id)?;
         if self.cards.is_empty() {
             return Err(invalid(
                 "cycle plan must contain the complete initial card set",
@@ -151,6 +163,20 @@ impl CyclePlan {
         }
         Ok(())
     }
+}
+
+fn validate_plan_id(plan_id: &str) -> Result<(), HarnessError> {
+    if plan_id.is_empty()
+        || plan_id.len() > MAX_CYCLE_PLAN_ID_LEN
+        || !plan_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
+        })
+    {
+        return Err(invalid(
+            "plan id may contain at most 64 ASCII letters, digits, `.`, `-`, and `_`",
+        ));
+    }
+    Ok(())
 }
 
 fn has_cycle(cards: &[PlannedCard]) -> bool {

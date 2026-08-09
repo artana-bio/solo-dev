@@ -18,6 +18,13 @@
 //! `gate_run_without_a_reservation_names_the_command_that_makes_one` drives
 //! that unhelped path instead, through `gate_raw`; a guard next to it fails
 //! if that test is ever deleted or repointed at `gate`.
+//!
+//! Approved verdicts sent through `Workspace::review` receive a real
+//! executable mutation receipt when they do not name evidence themselves.
+//! `tests/review_recording.rs` drives the fail-closed production path through
+//! `review_raw`, including the missing-evidence refusal. Exemption policies
+//! are never installed by shared setup; tests that exercise exemptions must
+//! call `install_fixture_mutation_exemption_policy` explicitly.
 
 #![allow(dead_code)]
 
@@ -29,7 +36,7 @@ use std::{
 
 use tempfile::TempDir;
 
-use change_harness::domain::cycle_plan::CyclePlan;
+use change_harness::domain::{cycle_plan::CyclePlan, digest::Digest};
 
 /// A temporary project with every repository role populated.
 pub struct Workspace {
@@ -75,9 +82,39 @@ impl Workspace {
     /// Creates the repositories and runs `project init`.
     pub fn initialized() -> Self {
         let workspace = Self::new();
-        let exemption_policy = workspace.root.join("mutation-exemption-policy.json");
+        let output = Self::run(&[
+            "project".into(),
+            "init".into(),
+            "--project-id".into(),
+            "example".into(),
+            "--repository".into(),
+            workspace.repository.display().to_string(),
+            "--control".into(),
+            workspace.control.display().to_string(),
+            "--authority".into(),
+            workspace.authority.display().to_string(),
+            "--worktree-root".into(),
+            workspace.worktrees.display().to_string(),
+        ]);
+        assert!(
+            output.status.success(),
+            "project init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Cards may only name registered gates, so the fixtures every test uses
+        // must exist before any card is activated.
+        workspace.register_gate("gate.unit", &["true"]);
+        workspace.register_gate("gate.all", &["true"]);
+        workspace
+    }
+
+    /// Explicitly installs the closed exemption policy used by tests whose
+    /// subject is exemption authorization. Ordinary fixtures remain
+    /// fail-closed and use executable mutation receipts instead.
+    pub fn install_fixture_mutation_exemption_policy(&self) {
+        let policy = self.root.join("mutation-exemption-policy.json");
         fs::write(
-            &exemption_policy,
+            &policy,
             r#"{
   "version": "harness.mutation-exemption-policy/v1",
   "rules": [
@@ -92,30 +129,95 @@ impl Workspace {
         .unwrap();
         let output = Self::run(&[
             "project".into(),
-            "init".into(),
-            "--project-id".into(),
-            "example".into(),
-            "--repository".into(),
-            workspace.repository.display().to_string(),
+            "set-mutation-exemption-policy".into(),
             "--control".into(),
-            workspace.control.display().to_string(),
-            "--authority".into(),
-            workspace.authority.display().to_string(),
-            "--worktree-root".into(),
-            workspace.worktrees.display().to_string(),
-            "--mutation-exemption-policy".into(),
-            exemption_policy.display().to_string(),
+            self.control.display().to_string(),
+            "--policy".into(),
+            policy.display().to_string(),
         ]);
         assert!(
             output.status.success(),
-            "project init failed: {}",
+            "mutation exemption policy install failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        // Cards may only name registered gates, so the fixtures every test uses
-        // must exist before any card is activated.
-        workspace.register_gate("gate.unit", &["true"]);
-        workspace.register_gate("gate.all", &["true"]);
-        workspace
+    }
+
+    /// Executes a real disposable mutation and returns its persisted receipt
+    /// ID. Callers still have to name the receipt explicitly in the verdict.
+    pub fn create_fixture_mutation_receipt(
+        &self,
+        card_id: &str,
+        reviewer_actor_id: &str,
+        reviewer_principal_id: &str,
+        reviewer_session_id: &str,
+    ) -> String {
+        const ORACLE: &str = "gate.fixture-mutation";
+        if !self.control.join(format!("gates/{ORACLE}.json")).exists() {
+            self.register_gate(
+                ORACLE,
+                &["sh", "-c", "test ! -e .change-harness-mutation-marker"],
+            );
+        }
+
+        let inspection = self.review_json(&["inspect", "--card-id", card_id]);
+        let candidate_sha = inspection["data"]["candidate_sha"]
+            .as_str()
+            .expect("a handed-off candidate")
+            .to_owned();
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(self.control.join(format!("cards/{card_id}/state.json"))).unwrap(),
+        )
+        .unwrap();
+        let revision = state["current_revision"]
+            .as_u64()
+            .expect("a current card revision");
+        let receipt_count = fs::read_dir(self.control.join("mutation-receipts"))
+            .map_or(0, std::iter::Iterator::count);
+        let receipt_id = format!("MR-FIXTURE-{:06}", receipt_count + 1);
+        let output = Self::run(&[
+            "mutation".into(),
+            "create".into(),
+            "--output".into(),
+            "json".into(),
+            "--control".into(),
+            self.control.display().to_string(),
+            "--receipt-id".into(),
+            receipt_id.clone(),
+            "--card-revision".into(),
+            format!("{card_id}-r{revision}"),
+            "--candidate-sha".into(),
+            candidate_sha,
+            "--reviewer-actor-id".into(),
+            reviewer_actor_id.to_owned(),
+            "--reviewer-principal-id".into(),
+            reviewer_principal_id.to_owned(),
+            "--reviewer-session-id".into(),
+            reviewer_session_id.to_owned(),
+            "--mutation-digest".into(),
+            Digest::of_bytes(b"fixture mutation command").to_string(),
+            "--patch-digest".into(),
+            Digest::of_bytes(b"fixture mutation patch").to_string(),
+            format!("--command={}", "sh"),
+            format!("--command={}", "-c"),
+            format!("--command={}", "touch .change-harness-mutation-marker"),
+            "--gate-oracle".into(),
+            ORACLE.into(),
+            "--expected-failure".into(),
+            "fixture oracle rejects the mutation marker".into(),
+            "--observed-result".into(),
+            "fixture mutation executed".into(),
+            "--failed-at-oracle".into(),
+            "--restoration-proof".into(),
+            "disposable worktree restored to the exact candidate".into(),
+        ]);
+        assert!(
+            output.status.success(),
+            "mutation receipt creation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        receipt_id
     }
 
     /// Registers a gate at revision 1 with the given argv.
@@ -618,6 +720,29 @@ impl Workspace {
                         "reviewer_kind: agent\nreviewer_provenance:\n  provider: fixture\n  model: fixture\n  session_id: reviewer-session\n  principal_id: reviewer-principal\n",
                     );
                 }
+                if !body.contains("mutation_receipt_ids:") && !body.contains("mutation_exemption:")
+                {
+                    let card_id = args
+                        .windows(2)
+                        .find_map(|pair| (pair[0] == "--card-id").then_some(pair[1]))
+                        .expect("approved review fixture must name a card");
+                    let verdict: serde_yaml_ng::Value =
+                        serde_yaml_ng::from_str(&body).expect("valid fixture verdict");
+                    let reviewer = verdict["reviewer_actor_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer");
+                    let principal = verdict["reviewer_provenance"]["principal_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer principal");
+                    let session = verdict["reviewer_provenance"]["session_id"]
+                        .as_str()
+                        .expect("approved fixture reviewer session");
+                    let receipt =
+                        self.create_fixture_mutation_receipt(card_id, reviewer, principal, session);
+                    body.push_str("mutation_receipt_ids: [");
+                    body.push_str(&receipt);
+                    body.push_str("]\n");
+                }
                 fs::write(&verdict_path, body).unwrap();
             }
         }
@@ -875,10 +1000,16 @@ impl Workspace {
             &declaration.display().to_string(),
         ]);
         self.review(&["begin", "--card-id", card_id]);
+        let receipt = self.create_fixture_mutation_receipt(
+            card_id,
+            "reviewer-session",
+            "reviewer-principal",
+            "reviewer-session",
+        );
         let verdict = self.root.join(format!("{card_id}-rework-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
+            format!("reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: added the fixture mutation marker\n    failing_test: fixture oracle rejects the marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"),
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.
@@ -900,6 +1031,17 @@ impl Workspace {
     /// feature actor — the whole pre-integration path, which every integration
     /// test needs and none of them is testing.
     pub fn approve_card(&self, card_id: &str, file: &str) {
+        self.approve_card_with_fixture_evidence(card_id, file, false);
+    }
+
+    /// Approves through the explicitly installed exemption policy. Callers
+    /// must install that policy themselves so the authorization is visible in
+    /// the owning test.
+    pub fn approve_card_with_fixture_mutation_exemption(&self, card_id: &str, file: &str) {
+        self.approve_card_with_fixture_evidence(card_id, file, true);
+    }
+
+    fn approve_card_with_fixture_evidence(&self, card_id: &str, file: &str, exempt: bool) {
         // The fixture may add cards after an earlier plan was pinned. Publish
         // an explicit revised complete plan before lifecycle work starts.
         self.ensure_default_cycle_plan_for("C-001");
@@ -943,10 +1085,25 @@ impl Workspace {
         ]);
 
         self.review(&["begin", "--card-id", card_id]);
+        let evidence = if exempt {
+            "gate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: fixture exemption authorization\n  mutation_evidence:\n    status: exempt\n    reason: this test explicitly exercises exemption-backed approval\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: this test explicitly exercises exemption-backed approval\n  approved_by: independent-attestor\n".to_owned()
+        } else {
+            let receipt = self.create_fixture_mutation_receipt(
+                card_id,
+                "reviewer-session",
+                "reviewer-principal",
+                "reviewer-session",
+            );
+            format!(
+                "gate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: demonstrated\n    mutation: added the fixture mutation marker\n    failing_test: fixture oracle rejects the marker\n    oracle: gate.fixture-mutation\n    authorship: reviewer_devised\nresidual_risks: []\nreview_conduct: separate_process\nmutation_receipt_ids: [{receipt}]\n"
+            )
+        };
         let verdict = self.root.join(format!("{card_id}-verdict.yaml"));
         fs::write(
             &verdict,
-            "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\ngate_adequacy:\n  gates_observe_acceptance: true\n  unobserved_behaviors: []\n  basis: probed each acceptance behavior directly\n  mutation_evidence:\n    status: exempt\n    reason: fixture verdict for unrelated review behavior; no mutation performed\nresidual_risks: []\nreview_conduct: separate_process\nmutation_exemption:\n  code: fixture-no-mutation\n  reason: fixture has no executable mutation\n  approved_by: independent-attestor\n",
+            format!(
+                "reviewer_actor_id: reviewer-session\ndecision: approved\nfindings: []\n{evidence}"
+            ),
         )
         .unwrap();
         // #120: `--actor` must agree with the verdict's `reviewer_actor_id`.

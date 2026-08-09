@@ -10,6 +10,9 @@ use support::Workspace;
 /// A card handed off and ready for review.
 fn handed_off() -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    // This suite exercises exemption authorization directly. Ordinary shared
+    // workspaces stay fail-closed; the policy is explicit test setup here.
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -1066,6 +1069,7 @@ fn approving_a_high_risk_card_requires_a_declared_human_reviewer() {
     // the treatment a low-risk one did: the policy was documented, modelled,
     // and never enforced.
     let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",

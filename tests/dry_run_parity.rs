@@ -62,7 +62,19 @@ fn active_cycle() -> Workspace {
 }
 
 fn review_contract_fixture() -> Workspace {
-    let workspace = active_cycle();
+    let workspace = Workspace::initialized();
+    // This local fixture includes valid and invalid exemption-backed verdicts.
+    // Opt into their closed policy before cycle creation so the cycle freezes
+    // it explicitly; shared setup remains fail-closed.
+    workspace.install_fixture_mutation_exemption_policy();
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
     workspace.activate_card("F-001", &["src/**"]);
     workspace.work(&["start", "--card-id", "F-001"]);
     let worktree = workspace.worktrees.join("F-001");

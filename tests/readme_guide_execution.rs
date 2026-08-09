@@ -175,11 +175,14 @@ fn run_documented_line(
 /// holding an allocated worktree with a real commit and a passed gate (step
 /// 4), and a handoff naming that exact commit (step 5) — the state an
 /// operator who had actually done steps 1-5 would be standing in before
-/// typing step 6's two lines. None of this is parsed *from* README's text;
+/// typing step 6's two lines. The fixture also explicitly installs the policy
+/// README says an exemption-backed approval requires, because `review example`
+/// emits that documented approval form. None of this is parsed *from* README's text;
 /// see `tests/skill_guide_execution.rs`'s identical note on its own
 /// `fixture_ready_for_the_narrow_claim`.
 fn fixture_ready_for_review() -> Workspace {
     let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",

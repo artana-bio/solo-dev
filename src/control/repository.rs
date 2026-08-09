@@ -81,6 +81,7 @@ const CONTROL_TRACKED_PATHS: &[&str] = &[
     "gates",
     "handoffs",
     "reviews",
+    "mutation-receipts",
     "receipts",
     "leases",
     "integrations",

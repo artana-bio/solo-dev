@@ -1389,13 +1389,14 @@ fn require_execution_classification(
     let Some(plan_id) = cycle.plan_id.as_deref() else {
         return Ok(());
     };
-    let plan: crate::domain::cycle_plan::CyclePlan = serde_json::from_str(
-        &control.read(&format!("plans/{plan_id}.json"))?,
-    )
-    .map_err(|source| HarnessError::Control {
-        reason: format!("cycle plan {plan_id} is malformed: {source}"),
-        code: ErrorCode::InternalControlCorrupt,
-    })?;
+    let relative = crate::domain::cycle_plan::CyclePlan::relative_path(plan_id)?;
+    let plan: crate::domain::cycle_plan::CyclePlan =
+        serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+            HarnessError::Control {
+                reason: format!("cycle plan {plan_id} is malformed: {source}"),
+                code: ErrorCode::InternalControlCorrupt,
+            }
+        })?;
     for candidate in selected {
         let planned = plan
             .cards

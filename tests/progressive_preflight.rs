@@ -10,6 +10,16 @@ use support::Workspace;
 
 fn active_cycle() -> Workspace {
     let workspace = Workspace::initialized();
+    create_active_cycle(workspace)
+}
+
+fn active_cycle_with_exemption_policy() -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
+    create_active_cycle(workspace)
+}
+
+fn create_active_cycle(workspace: Workspace) -> Workspace {
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -343,7 +353,9 @@ fn progressive_execution_allows_only_the_next_gate_and_reserves_final_for_integr
 
 #[test]
 fn an_approved_card_cannot_schedule_final_integration_until_handoff_evidence_is_current() {
-    let workspace = active_cycle();
+    // This is the only test in this binary whose verdict carries a typed
+    // exemption, so it opts into the policy before the cycle freezes config.
+    let workspace = active_cycle_with_exemption_policy();
     workspace.register_gate("gate.review", &["true"]);
     activate(
         &workspace,

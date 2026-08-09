@@ -138,7 +138,7 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                 code: ErrorCode::GateEvidenceStale,
                 recovery: "Use the exact committed candidate SHA reviewed by the reviewer.",
             })?;
-            let relative = MutationReceipt::relative_path(&receipt.receipt_id);
+            let relative = MutationReceipt::relative_path(&receipt.receipt_id)?;
             if control.path(&relative).exists() {
                 return Err(HarnessError::Control {
                     reason: format!("mutation receipt {} already exists", receipt.receipt_id),
@@ -355,12 +355,14 @@ fn cleanup_disposable_worktree(
 
 fn inspect(args: &InspectArgs) -> Result<CommandOutcome, HarnessError> {
     let control = ControlRepository::open(&args.control)?;
+    let relative = MutationReceipt::relative_path(&args.receipt_id)?;
     let receipt: MutationReceipt =
-        serde_json::from_str(&control.read(&MutationReceipt::relative_path(&args.receipt_id))?)
-            .map_err(|source| HarnessError::Control {
+        serde_json::from_str(&control.read(&relative)?).map_err(|source| {
+            HarnessError::Control {
                 reason: format!("mutation receipt is malformed: {source}"),
                 code: ErrorCode::InternalControlCorrupt,
-            })?;
+            }
+        })?;
     receipt.validate()?;
     Ok(CommandOutcome::new(
         "mutation.inspect",

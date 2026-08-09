@@ -9,6 +9,7 @@ use crate::{
 
 pub const MUTATION_RECEIPT_SCHEMA: &str = "harness.mutation-receipt/v1";
 pub const MUTATION_RECEIPT_DIR: &str = "mutation-receipts";
+const MAX_MUTATION_RECEIPT_ID_LEN: usize = 64;
 
 /// A policy-valid reason why a material mutation could not be executed.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -124,9 +125,15 @@ impl MutationReceipt {
             code: ErrorCode::PolicyIncompleteReview,
         })
     }
-    #[must_use]
-    pub fn relative_path(receipt_id: &str) -> String {
-        format!("{MUTATION_RECEIPT_DIR}/{receipt_id}.json")
+    /// Returns the control-repository path for a validated receipt identifier.
+    ///
+    /// # Errors
+    ///
+    /// Refuses identifiers that could escape the receipt directory or create
+    /// filesystem-dependent record names.
+    pub fn relative_path(receipt_id: &str) -> Result<String, HarnessError> {
+        validate_receipt_id(receipt_id)?;
+        Ok(format!("{MUTATION_RECEIPT_DIR}/{receipt_id}.json"))
     }
     /// Refuses prose-only or contradictory mutation evidence.
     ///
@@ -135,6 +142,7 @@ impl MutationReceipt {
     /// Returns a policy error when executable bindings, the failing oracle, or
     /// restoration proof is missing.
     pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_receipt_id(&self.receipt_id)?;
         let required = [
             ("schema", self.schema.as_str()),
             ("receipt_id", self.receipt_id.as_str()),
@@ -208,6 +216,31 @@ impl MutationReceipt {
     pub fn is_valid(&self) -> bool {
         self.validate().is_ok()
     }
+}
+
+fn validate_receipt_id(receipt_id: &str) -> Result<(), HarnessError> {
+    if receipt_id.is_empty() {
+        return Err(HarnessError::invalid_id(
+            receipt_id,
+            "mutation receipt identifier is empty",
+        ));
+    }
+    if receipt_id.len() > MAX_MUTATION_RECEIPT_ID_LEN {
+        return Err(HarnessError::invalid_id(
+            receipt_id,
+            format!("mutation receipt identifier exceeds {MAX_MUTATION_RECEIPT_ID_LEN} characters"),
+        ));
+    }
+    if !receipt_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_')
+    {
+        return Err(HarnessError::invalid_id(
+            receipt_id,
+            "mutation receipt identifiers may contain only ASCII letters, digits, `.`, `-`, and `_`",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(field: &str, reason: &str) -> HarnessError {

@@ -17,6 +17,19 @@ use support::Workspace;
 /// A cycle with `count` cards, all activated against the cycle baseline.
 fn cycle_with(count: usize) -> Workspace {
     let workspace = Workspace::initialized();
+    activate_cycle_cards(workspace, count)
+}
+
+/// Same lifecycle fixture with exemption authorization frozen into the cycle
+/// from creation. Tests opt into this explicitly; the shared default remains
+/// fail-closed.
+fn cycle_with_exemption_policy(count: usize) -> Workspace {
+    let workspace = Workspace::initialized();
+    workspace.install_fixture_mutation_exemption_policy();
+    activate_cycle_cards(workspace, count)
+}
+
+fn activate_cycle_cards(workspace: Workspace, count: usize) -> Workspace {
     workspace.cycle(&[
         "create",
         "--cycle-id",
@@ -220,8 +233,8 @@ fn an_approved_review_with_changed_mutation_receipt_digest_is_not_ready() {
 
 #[test]
 fn an_approved_exemption_without_its_project_policy_is_not_ready() {
-    let workspace = cycle_with(1);
-    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
     let project_path = workspace.control.join("project/project.json");
     let mut project: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
@@ -244,8 +257,8 @@ fn an_approved_exemption_without_its_project_policy_is_not_ready() {
 
 #[test]
 fn an_existing_project_must_install_exemption_policy_through_the_typed_command() {
-    let workspace = cycle_with(1);
-    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
     let project_path = workspace.control.join("project/project.json");
     let mut project: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
@@ -285,8 +298,8 @@ fn an_existing_project_must_install_exemption_policy_through_the_typed_command()
 
 #[test]
 fn an_approved_exemption_with_a_replaced_policy_digest_is_not_ready() {
-    let workspace = cycle_with(1);
-    workspace.approve_card("F-001", "src/F-001/a.rs");
+    let workspace = cycle_with_exemption_policy(1);
+    workspace.approve_card_with_fixture_mutation_exemption("F-001", "src/F-001/a.rs");
     let project_path = workspace.control.join("project/project.json");
     let mut project: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&project_path).unwrap()).unwrap();
@@ -2311,6 +2324,40 @@ fn planned_single_card() -> (Workspace, std::path::PathBuf) {
     let workspace = cycle_with(1);
     let plan = simple_plan_file(&workspace, "PLAN-RACE");
     (workspace, plan)
+}
+
+#[test]
+fn cycle_plan_identifier_cannot_escape_its_control_directory() {
+    let workspace = cycle_with(1);
+    let plan = workspace.root.join("escaping-plan.json");
+    fs::write(
+        &plan,
+        r#"{"schema":"harness.cycle-plan/v1","plan_id":"../project/project","cycle_id":"C-001","objective":"slice","cards":[{"card_id":"F-001","card_revision":1,"scope":["src/F-001/**"],"scope_exclude":[],"depends_on":[],"proof_entries":["fixture-proof"],"mutation_plan":["fixture mutation"],"risk":"low","reviewer_requirements":["independent"],"assignment":"operator","assignment_principal_id":"implementer-principal","assignment_session_id":"implementer-session","distribution":"parallel","acceptance_behaviors":["it works"]}]}"#,
+    )
+    .unwrap();
+    let project = workspace.control.join("project/project.json");
+    let project_before = fs::read(&project).unwrap();
+    let head_before = workspace.control_head();
+
+    let output = workspace.cycle_raw(&[
+        "plan",
+        "--plan-id",
+        "../project/project",
+        "--file",
+        &plan.display().to_string(),
+    ]);
+
+    assert_eq!(error_code(&output), "CH-POLICY-INVALID-CYCLE");
+    assert_eq!(fs::read(project).unwrap(), project_before);
+    assert_eq!(workspace.control_head(), head_before);
+    assert_eq!(
+        support::capture(
+            &workspace.control,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+        "",
+        "identifier refusal must not mutate control state"
+    );
 }
 
 #[test]

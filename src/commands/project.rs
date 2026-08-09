@@ -337,21 +337,35 @@ fn read_convergence_policy(path: &PathBuf) -> Result<ConvergencePolicy, HarnessE
 }
 
 fn read_mutation_exemption_policy(path: &PathBuf) -> Result<MutationExemptionPolicy, HarnessError> {
-    let raw = fs::read_to_string(path).map_err(|source| HarnessError::Control {
+    let raw = fs::read_to_string(path).map_err(|source| HarnessError::ControlWithRecovery {
         reason: format!(
             "cannot read mutation exemption policy {}: {source}",
             path.display()
         ),
         code: ErrorCode::ConfigMalformed,
+        recovery: MUTATION_EXEMPTION_POLICY_READ_RECOVERY,
     })?;
-    let policy: MutationExemptionPolicy =
-        serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
+    let policy: MutationExemptionPolicy = serde_json::from_str(&raw).map_err(|source| {
+        let recovery = if source.is_data() {
+            MUTATION_EXEMPTION_POLICY_SCHEMA_RECOVERY
+        } else {
+            MUTATION_EXEMPTION_POLICY_SYNTAX_RECOVERY
+        };
+        HarnessError::ControlWithRecovery {
             reason: format!("mutation exemption policy is malformed: {source}"),
             code: ErrorCode::ConfigMalformed,
-        })?;
+            recovery,
+        }
+    })?;
     policy.validate().map_err(FieldError::into_error)?;
     Ok(policy)
 }
+
+const MUTATION_EXEMPTION_POLICY_READ_RECOVERY: &str = "This is a read failure, not a syntax problem: the mutation-exemption policy file above could not be opened. Confirm the path exists, is spelled correctly, and is readable by this process.";
+
+const MUTATION_EXEMPTION_POLICY_SCHEMA_RECOVERY: &str = "This mutation-exemption policy is valid JSON but does not match the schema; the message above names the missing or invalid field. There is no generated mutation-exemption policy example; compare the document with the versioned `rules` shape in the README.";
+
+const MUTATION_EXEMPTION_POLICY_SYNTAX_RECOVERY: &str = "This mutation-exemption policy is not valid JSON; the message above names the exact line and column to fix.";
 
 /// #142, same shape as [`CONVERGENCE_POLICY_READ_RECOVERY`] above, for the
 /// document B1 (#142 §1) actually hit: `authorization_unit` missing, with

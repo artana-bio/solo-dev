@@ -30,6 +30,9 @@ use support::Workspace;
 /// the example unchanged does not trip the self-review check.
 fn handed_off() -> (Workspace, String) {
     let workspace = Workspace::initialized();
+    // The emitted example intentionally demonstrates a typed exemption, so
+    // this owning fixture installs its closed policy before cycle creation.
+    workspace.install_fixture_mutation_exemption_policy();
     workspace.cycle(&[
         "create",
         "--cycle-id",

@@ -317,7 +317,7 @@ fn run_plan(args: &PlanArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
             } else {
                 steps.recheck(validate_plan_against_control(control, &cycle_id, &plan))?;
             }
-            let relative = format!("plans/{}.json", plan.plan_id);
+            let relative = CyclePlan::relative_path(&plan.plan_id)?;
             let digest = plan.digest()?;
             steps.mutation_started()?;
             control.write_atomic(
@@ -498,7 +498,7 @@ fn validate_plan_against_control(
         }
     }
     if control
-        .path(&format!("plans/{}.json", plan.plan_id))
+        .path(&CyclePlan::relative_path(&plan.plan_id)?)
         .exists()
     {
         return Err(HarnessError::Control {
@@ -662,7 +662,7 @@ pub fn require_active_plan(
             code: ErrorCode::PolicyInvalidCycle,
         });
     };
-    let raw = control.read(&format!("plans/{plan_id}.json"))?;
+    let raw = control.read(&CyclePlan::relative_path(plan_id)?)?;
     let plan: CyclePlan = serde_json::from_str(&raw).map_err(|source| HarnessError::Control {
         reason: format!("active cycle plan {plan_id} is malformed: {source}"),
         code: ErrorCode::PolicyInvalidCycle,
@@ -749,7 +749,7 @@ pub fn require_plan_assignment(
         // A migrated historical cycle has no typed assignment to enforce.
         return Ok(());
     };
-    let plan: CyclePlan = serde_json::from_str(&control.read(&format!("plans/{plan_id}.json"))?)
+    let plan: CyclePlan = serde_json::from_str(&control.read(&CyclePlan::relative_path(plan_id)?)?)
         .map_err(|source| HarnessError::Control {
             reason: format!("cycle plan {plan_id} is malformed: {source}"),
             code: ErrorCode::InternalControlCorrupt,
@@ -870,7 +870,7 @@ pub fn require_work_admission(
         // enforce; their typed compatibility marker is the boundary.
         return Ok(());
     };
-    let plan: CyclePlan = serde_json::from_str(&control.read(&format!("plans/{plan_id}.json"))?)
+    let plan: CyclePlan = serde_json::from_str(&control.read(&CyclePlan::relative_path(plan_id)?)?)
         .map_err(|source| HarnessError::Control {
             reason: format!("cycle plan {plan_id} is malformed: {source}"),
             code: ErrorCode::InternalControlCorrupt,
@@ -937,7 +937,7 @@ pub fn require_joint_work_admission(
     let Some(plan_id) = cycle.plan_id.as_deref() else {
         return Ok(());
     };
-    let plan: CyclePlan = serde_json::from_str(&control.read(&format!("plans/{plan_id}.json"))?)
+    let plan: CyclePlan = serde_json::from_str(&control.read(&CyclePlan::relative_path(plan_id)?)?)
         .map_err(|source| HarnessError::Control {
             reason: format!("cycle plan {plan_id} is malformed: {source}"),
             code: ErrorCode::InternalControlCorrupt,

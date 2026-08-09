@@ -1649,7 +1649,7 @@ fn load_mutation_receipt(
     control: &ControlRepository,
     receipt_id: &str,
 ) -> Result<MutationReceipt, HarnessError> {
-    let relative = MutationReceipt::relative_path(receipt_id);
+    let relative = MutationReceipt::relative_path(receipt_id)?;
     let raw = control
         .read(&relative)
         .map_err(|source| HarnessError::Control {
