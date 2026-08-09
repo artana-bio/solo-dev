@@ -3447,9 +3447,9 @@ Tier 1 of the register is closed.
 | Repository foundation | `DONE` | Commit `4729d18` | Preserve |
 | Walking-skeleton validation | `DONE` | `SPIKE-001` report accepted 2026-07-28, seven passing hypotheses, archive ref `1bb3fc8` | Preserve |
 | Rust toolchain | `DONE` | `rust-toolchain.toml`, Cargo build | Preserve |
-| CLI shell | `DONE` | `--help`, `doctor` | Extend in `WP-100` |
+| CLI shell | `DONE` | v0.1.5 `--help`, `doctor`, and the documented command surface | Preserve |
 | Read-only Git probe | `DONE` | `src/git/`, 21 fixture tests | Preserve |
-| Stable command envelope | `DONE` | `WP-100`, 59 passing tests | Extend as commands are added |
+| Stable command envelope | `DONE` | `WP-100`, 59 passing tests | Preserve |
 | Project configuration | `DONE` | `WP-110`, 28 tests | Preserve |
 | Control repository | `DONE` | `WP-120`, 30 tests | Preserve |
 | Full Git inspection | `DONE` | `WP-130`, 21 fixture tests | Preserve |
@@ -3462,17 +3462,12 @@ Tier 1 of the register is closed.
 | Gate runner and receipts | `DONE` | `WP-310`, 37 tests | Preserve |
 | Handoff | `DONE` | `WP-250`, 24 tests | Preserve |
 | Independent review | `DONE` | `WP-320`, 27 tests | Preserve |
-| Bare authority | `DONE` | Established, health-checked, and covered | `WP-400` |
-
-
-
-
-
-| Integration | `DONE` | Plan through archive and close, all covered | — |
-| Acceptance/promotion | `NOT_STARTED` | None | `WP-450` |
-| Archive/cleanup | `NOT_STARTED` | None | `WP-460` |
-| Recovery/concurrency | `NOT_STARTED` | None | `WP-500`, `WP-510` |
-| Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
+| Bare authority | `DONE` | `WP-400`; `tests/authority.rs` (13 acceptance tests) | Preserve |
+| Integration | `DONE` | `WP-410` through `WP-440`; plan, preflight, merge, landing, combined verification, and integration-review suites | Preserve |
+| Acceptance/promotion | `DONE` | `WP-450`; `tests/promotion.rs` (15 acceptance tests) | Preserve |
+| Archive/cleanup | `DONE` | `WP-460`; `tests/archive_cleanup.rs` (15 acceptance tests) | Preserve |
+| Recovery/concurrency | `DONE` | `WP-500`, `tests/recovery.rs` (8 acceptance tests); `WP-510`, `tests/concurrency.rs` (11 acceptance tests) | Preserve |
+| Backup/audit | `DONE` | `WP-520`, `tests/backup.rs` (9 acceptance tests); `WP-530`, `tests/audit.rs` (9 acceptance tests) | Preserve |
 | Operational visibility | `READY` | `WP-550` is `DONE`; live v0.1.5 snapshot exposed only terminal legacy-cycle and lease presentation noise | Execute bounded `WP-560`; preserve the typed projection and redaction boundary |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
@@ -3511,6 +3506,10 @@ Bootstrap recovery record:
   `RV-000073` requested the durable post-landing status repair. Those records
   are execution history, not a continuing card, lease, branch, or worktree
   allocation in this tracker.
+- Its second exact-SHA handoff `H-000083` was revoked after independent review
+  `RV-000074` found the stale pre-bootstrap statuses and next actions retained
+  in Section 20.1. That review is likewise execution history, not current
+  package state.
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
