@@ -18,6 +18,7 @@ use crate::{
         clock::Timestamp,
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId},
+        lesson::LessonManifest,
     },
     error::{ErrorCode, HarnessError},
     git::diff::ChangedPath,
@@ -322,6 +323,10 @@ pub struct HandoffRecord {
     pub changed_paths: Vec<ChangedPath>,
     /// Gate evidence in force at handoff time.
     pub receipts: Vec<EvidenceEntry>,
+    /// Exact lesson set the implementation packet was required to consume.
+    /// Optional only for handoffs written before governed lessons existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_manifest: Option<LessonManifest>,
     /// True when the worktree was clean.
     pub worktree_clean: bool,
     /// What the actor claims.
@@ -514,6 +519,7 @@ mod tests {
             dependency_bindings: vec![],
             changed_paths: vec![],
             receipts: vec![],
+            lesson_manifest: None,
             worktree_clean: true,
             declaration: declaration(),
             actor_id: "alvaro".to_owned(),

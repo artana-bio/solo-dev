@@ -11,6 +11,71 @@ use std::fs;
 
 use support::Workspace;
 
+fn activate_integration_lesson(workspace: &Workspace) {
+    let policy = workspace.root.join("lesson-authorizers.json");
+    fs::write(
+        &policy,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": "harness.final-authorization-policy/v1",
+            "authorization_unit": "sealed_cycle",
+            "authorizer_actor_ids": ["curator"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let installed = Workspace::run(&[
+        "project".into(),
+        "set-final-authorization-policy".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--policy".into(),
+        policy.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "policy install failed: {}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let definition = workspace.root.join("integration-lesson.yaml");
+    fs::write(
+        &definition,
+        "title: Recheck governed evidence in integration\nrule: Run the combined gate from the frozen packet\nrationale: Candidate-only evidence does not prove the landing tree\nselectors:\n  paths: [src/**]\n  contracts: []\n  change_kinds: []\n  minimum_risk: null\nenforcement: required\nobligations:\n  feature_gates: []\n  integration_gates: [gate.all]\n  review_checks: []\nprovenance:\n  source_kind: review\n  source_id: RV-LESSON\n  evidence: Combined verification previously omitted the required rerun\n",
+    )
+    .unwrap();
+    let proposed = Workspace::run_json(&[
+        "lesson".into(),
+        "propose".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--definition".into(),
+        definition.display().to_string(),
+        "--actor".into(),
+        "curator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    let lesson_id = proposed["data"]["lesson"]["lesson_id"]
+        .as_str()
+        .expect("lesson proposal succeeded")
+        .to_owned();
+    let activated = Workspace::run_json(&[
+        "lesson".into(),
+        "activate".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--lesson-id".into(),
+        lesson_id,
+        "--actor".into(),
+        "curator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(activated["status"], "success");
+}
+
 /// A cycle with `count` approved, merged, landed cards.
 fn landed(count: usize) -> (Workspace, String) {
     landed_with_invariants(count, &[])
@@ -167,6 +232,89 @@ fn every_gate_any_member_names_is_rerun() {
         .map(|receipt| receipt["gate_id"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(gates, ["gate.all", "gate.unit"]);
+}
+
+#[test]
+fn verification_persists_exact_lesson_evidence_and_acceptance_rejects_its_mutation() {
+    let workspace = Workspace::initialized();
+    activate_integration_lesson(&workspace);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Lesson-bound integration",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.approve_card("F-001", "src/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+
+    let verification_path = workspace.control.join(format!("verifications/{id}.json"));
+    let mut verification: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verification_path).unwrap()).unwrap();
+    assert_eq!(
+        verification["schema"],
+        "harness.integration-verification/v2"
+    );
+    assert_eq!(
+        verification["lesson_manifests"].as_array().unwrap().len(),
+        1
+    );
+    let integration: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.control.join(format!("integrations/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        integration["lesson_manifest_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    verification["lesson_manifests"][0]["manifest"]["lessons"][0]["rule"] =
+        serde_json::json!("tampered after verification");
+    fs::write(
+        &verification_path,
+        format!("{}\n", serde_json::to_string_pretty(&verification).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "tamper lesson evidence"],
+    );
+    let before = workspace.control_head();
+    let refused = workspace.acceptance_raw(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    assert_eq!(refused.status.code(), Some(5));
+    assert_eq!(error_code(&refused), "CH-POLICY-LESSON-MANIFEST-STALE");
+    assert_eq!(workspace.control_head(), before);
 }
 
 #[test]

@@ -35,6 +35,7 @@ use crate::{
         digest::{CANONICAL_ALGORITHM, Digest},
         handoff::{DependencyBinding, DependencyStanding, dependency_staleness},
         ids::{CardId, CycleId, ReviewId},
+        lesson::{LessonCheck, LessonManifest},
     },
     error::{ErrorCode, HarnessError},
     policy::actors,
@@ -460,6 +461,9 @@ pub struct ReviewRecord {
     pub handoff_id: String,
     /// Digest of that handoff, so the packet is pinned too.
     pub handoff_digest: Digest,
+    /// Exact lesson set delivered in the review packet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_manifest: Option<LessonManifest>,
     /// Who reviewed. Declared, not proven; see D-013 and R-012.
     pub reviewer_actor_id: String,
     /// Who produced the candidate.
@@ -468,6 +472,9 @@ pub struct ReviewRecord {
     pub decision: Decision,
     /// What the reviewer found.
     pub findings: Vec<Finding>,
+    /// Explicit disposition for every required lesson review check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lesson_checks: Vec<LessonCheck>,
     /// Whether the gates can observe the acceptance list.
     pub gate_adequacy: GateAdequacy,
     /// Risks accepted if this is an approval.
@@ -1009,10 +1016,12 @@ mod tests {
             dependency_bindings: vec![],
             handoff_id: "F-001-r1-aaaaaaaaaaaa".to_owned(),
             handoff_digest: Digest::of_bytes(b"handoff"),
+            lesson_manifest: None,
             reviewer_actor_id: "reviewer-session-a".to_owned(),
             feature_actor_id: "implementer-session-1".to_owned(),
             decision,
             findings,
+            lesson_checks: vec![],
             gate_adequacy: adequacy(),
             residual_risks: vec![],
             human_reviewer: false,

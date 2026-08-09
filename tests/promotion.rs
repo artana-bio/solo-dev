@@ -11,6 +11,67 @@ use std::fs;
 
 use support::Workspace;
 
+fn activate_integration_lesson(workspace: &Workspace) -> String {
+    let policy = workspace.root.join("lesson-authorizers.json");
+    fs::write(
+        &policy,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": "harness.final-authorization-policy/v1",
+            "authorization_unit": "sealed_cycle",
+            "authorizer_actor_ids": ["curator"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let installed = Workspace::run(&[
+        "project".into(),
+        "set-final-authorization-policy".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--policy".into(),
+        policy.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(installed.status.success());
+    let definition = workspace.root.join("promotion-lesson.yaml");
+    fs::write(
+        &definition,
+        "title: Keep promotion bound to governed evidence\nrule: Preserve the exact reviewed lesson packet through promotion\nrationale: Mutable lesson evidence must not authorize a protected-ref update\nselectors:\n  paths: [src/**]\n  contracts: []\n  change_kinds: []\n  minimum_risk: null\nenforcement: required\nobligations:\n  feature_gates: []\n  integration_gates: [gate.all]\n  review_checks: []\nprovenance:\n  source_kind: review\n  source_id: RV-PROMOTION\n  evidence: Promotion previously had no exact lesson binding\n",
+    )
+    .unwrap();
+    let proposed = Workspace::run_json(&[
+        "lesson".into(),
+        "propose".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--definition".into(),
+        definition.display().to_string(),
+        "--actor".into(),
+        "curator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    let lesson_id = proposed["data"]["lesson"]["lesson_id"]
+        .as_str()
+        .expect("lesson proposal succeeded")
+        .to_owned();
+    let activated = Workspace::run_json(&[
+        "lesson".into(),
+        "activate".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--lesson-id".into(),
+        lesson_id.clone(),
+        "--actor".into(),
+        "curator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(activated["status"], "success");
+    lesson_id
+}
+
 /// A cycle carried all the way to a reviewed integration.
 fn reviewed(count: usize) -> (Workspace, String) {
     let workspace = Workspace::initialized();
@@ -63,6 +124,50 @@ fn accepted(count: usize) -> (Workspace, String) {
         "owner",
     ]);
     (workspace, id)
+}
+
+fn accepted_with_lesson() -> (Workspace, String, String) {
+    let workspace = Workspace::initialized();
+    let lesson_id = activate_integration_lesson(&workspace);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "Lesson-bound promotion",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card("F-001", &["src/**"]);
+    workspace.approve_card("F-001", "src/a.rs");
+    let id = workspace.integration_json(&[
+        "prepare",
+        "--cycle-id",
+        "C-001",
+        "--actor-id",
+        "coordinator",
+    ])["data"]["integration_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for step in ["merge", "land"] {
+        workspace.integration(&[step, "--integration-id", &id, "--actor-id", "coordinator"]);
+    }
+    workspace.integration(&["verify", "--integration-id", &id, "--actor-id", "verifier"]);
+    workspace.integration(&[
+        "review",
+        "--integration-id",
+        &id,
+        "--reviewer-actor-id",
+        "reviewer",
+    ]);
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    (workspace, id, lesson_id)
 }
 
 /// A reviewed final integration, eligible for the v2 final authorization path.
@@ -957,6 +1062,128 @@ fn an_exact_accepted_landing_promotes() {
             "landed"
         );
     }
+}
+
+#[test]
+fn retiring_a_bound_lesson_after_acceptance_refuses_promotion() {
+    let (workspace, id, lesson_id) = accepted_with_lesson();
+    let authority_before = workspace.authority_head();
+    let retired = Workspace::run_json(&[
+        "lesson".into(),
+        "retire".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--lesson-id".into(),
+        lesson_id,
+        "--actor".into(),
+        "curator".into(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert_eq!(retired["status"], "success");
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-LESSON-MANIFEST-STALE");
+    assert_eq!(workspace.authority_head(), authority_before);
+}
+
+#[test]
+fn tampering_with_bound_verification_lessons_after_acceptance_refuses_promotion() {
+    let (workspace, id, _) = accepted_with_lesson();
+    let authority_before = workspace.authority_head();
+    let path = workspace.control.join(format!("verifications/{id}.json"));
+    let mut verification: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    verification["lesson_manifests"][0]["manifest"]["lessons"][0]["title"] =
+        serde_json::json!("tampered after acceptance");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&verification).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "tamper verified lesson evidence"],
+    );
+
+    let output =
+        workspace.integration_raw(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(error_code(&output), "CH-POLICY-LESSON-MANIFEST-STALE");
+    assert_eq!(workspace.authority_head(), authority_before);
+}
+
+#[test]
+fn historical_v1_verification_without_lesson_fields_remains_promotable() {
+    let (workspace, id) = reviewed(1);
+    let handoff_path = fs::read_dir(workspace.control.join("handoffs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let review_path = fs::read_dir(workspace.control.join("reviews"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let integration_path = workspace.control.join(format!("integrations/{id}.json"));
+    let verification_path = workspace.control.join(format!("verifications/{id}.json"));
+    let mut handoff: change_harness::domain::handoff::HandoffRecord =
+        serde_json::from_slice(&fs::read(&handoff_path).unwrap()).unwrap();
+    let mut review: change_harness::domain::review::ReviewRecord =
+        serde_json::from_slice(&fs::read(&review_path).unwrap()).unwrap();
+    let mut integration: change_harness::domain::integration::IntegrationRecord =
+        serde_json::from_slice(&fs::read(&integration_path).unwrap()).unwrap();
+    let mut verification: change_harness::domain::integration::VerificationRecord =
+        serde_json::from_slice(&fs::read(&verification_path).unwrap()).unwrap();
+    handoff.lesson_manifest = None;
+    review.lesson_manifest = None;
+    review.lesson_checks.clear();
+    review.handoff_digest = handoff.digest().unwrap();
+    integration.members[0].review_digest = review.digest().unwrap();
+    integration.lesson_manifest_digest = None;
+    verification.schema = change_harness::domain::integration::VERIFICATION_SCHEMA.to_owned();
+    verification.lesson_manifests.clear();
+    fs::write(
+        &handoff_path,
+        format!("{}\n", serde_json::to_string_pretty(&handoff).unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        &review_path,
+        format!("{}\n", serde_json::to_string_pretty(&review).unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        &integration_path,
+        format!("{}\n", serde_json::to_string_pretty(&integration).unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        &verification_path,
+        format!("{}\n", serde_json::to_string_pretty(&verification).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "-q", "-m", "represent historical v1 verification"],
+    );
+
+    workspace.acceptance(&[
+        "record",
+        "--integration-id",
+        &id,
+        "--acceptance-owner",
+        "owner",
+    ]);
+    workspace.integration(&["promote", "--integration-id", &id, "--actor-id", "promoter"]);
+    assert_eq!(workspace.authority_head(), integration.landing_sha.unwrap());
 }
 
 #[test]

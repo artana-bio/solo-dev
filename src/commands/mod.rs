@@ -20,6 +20,7 @@ pub mod doctor;
 pub mod gate;
 pub mod handoff;
 pub mod integration;
+pub mod lesson;
 pub mod project;
 pub mod review;
 pub mod transaction;

@@ -19,6 +19,7 @@ use crate::{
         clock::Timestamp,
         digest::{CANONICAL_ALGORITHM, Digest},
         ids::{CardId, CycleId, IntegrationId, ReviewId},
+        lesson::LessonManifest,
     },
     error::{ErrorCode, HarnessError},
 };
@@ -289,6 +290,11 @@ pub struct IntegrationRecord {
     pub landing_sha: Option<String>,
     /// When the landing commit was built.
     pub landed_at: Option<Timestamp>,
+    /// Digest of the ordered lesson manifests whose obligations were used for
+    /// combined verification. Absent only on integrations verified before
+    /// governed lessons were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_manifest_digest: Option<Digest>,
     /// Who prepared it. Declared, not proven; see D-013.
     pub prepared_by: String,
     /// When it was prepared.
@@ -678,6 +684,9 @@ mod tests {
 
 /// Schema identifier for a combined-verification record.
 pub const VERIFICATION_SCHEMA: &str = "harness.integration-verification/v1";
+/// Verification schema that binds the exact governed-lesson manifests rerun
+/// evidence was selected from.
+pub const VERIFICATION_V2_SCHEMA: &str = "harness.integration-verification/v2";
 
 /// Directory holding verification records, relative to the control repository.
 pub const VERIFICATION_DIR: &str = "verifications";
@@ -715,6 +724,20 @@ pub struct InvariantCheck {
     pub machine_checked: bool,
 }
 
+/// The frozen lesson packet for one integration member.
+///
+/// `manifest: None` is an explicit compatibility marker for a handoff written
+/// before governed lessons existed. New handoffs always carry a manifest,
+/// including an empty one, so absence is never inferred for new evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LessonManifestBinding {
+    /// The member this binding belongs to.
+    pub card_id: CardId,
+    /// The exact frozen manifest, or the explicit legacy marker.
+    pub manifest: Option<LessonManifest>,
+}
+
 /// The result of running every required gate against the landing commit.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -737,6 +760,10 @@ pub struct VerificationRecord {
     pub invariants: Vec<InvariantCheck>,
     /// Member pairs whose contracts interact.
     pub interactions: Vec<Interaction>,
+    /// Exact per-card lesson manifests whose required integration gates were
+    /// selected. Empty only for compatible v1 verification records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lesson_manifests: Vec<LessonManifestBinding>,
     /// True when the worktree was clean after every gate ran.
     pub worktree_clean_after: bool,
     /// Who ran it. Declared, not proven; see D-013.

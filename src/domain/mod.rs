@@ -12,5 +12,6 @@ pub mod handoff;
 pub mod ids;
 pub mod integration;
 pub mod lease;
+pub mod lesson;
 pub mod review;
 pub mod validation_reservation;

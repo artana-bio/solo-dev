@@ -48,6 +48,7 @@ pub fn failure_format(cli: &Cli) -> OutputFormat {
         | Command::Gate { .. }
         | Command::Handoff { .. }
         | Command::Review { .. }
+        | Command::Lesson { .. }
         | Command::Disposition { .. }
         | Command::Integration { .. }
         | Command::Acceptance { .. }
@@ -71,6 +72,7 @@ pub fn command_path(cli: &Cli) -> &'static str {
         Command::Gate { command } => command.path(),
         Command::Handoff { command } => command.path(),
         Command::Review { command } => command.path(),
+        Command::Lesson { command } => command.path(),
         Command::Disposition { command } => command.path(),
         Command::Integration { command } => command.path(),
         Command::Acceptance { command } => command.path(),
@@ -176,6 +178,9 @@ pub fn execute(cli: Cli) -> Result<Execution, HarnessError> {
         }),
         Command::Review { command } => dispatch(cli.output, |clock| {
             commands::review::execute(&command, clock)
+        }),
+        Command::Lesson { command } => dispatch(cli.output, |clock| {
+            commands::lesson::execute(&command, clock)
         }),
         Command::Disposition { command } => dispatch(cli.output, |clock| {
             commands::disposition::execute(&command, clock)

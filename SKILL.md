@@ -240,6 +240,8 @@ as the new task's working directory:
 change-harness card status --card-id F-001
 change-harness work start --card-id F-001 --actor implementer-a
 change-harness work status --card-id F-001
+change-harness work packet --card-id F-001
+change-harness lesson example
 ```
 
 The implementation packet contains only what the task needs to deliver the
@@ -251,6 +253,8 @@ card:
 - lease ID, allocated worktree path, and feature actor ID;
 - repository guidance files the task must read;
 - named gates and any approved focused test commands;
+- the exact governed-lesson manifest, including required, preferred, and
+  informational lessons;
 - the reporting contract below; and
 - explicit confirmation that this packet is the complete assigned context.
 
@@ -275,6 +279,7 @@ Complete assigned context:
 - Activated card: <attach or paste the complete authoritative card>
 - Required repository guidance: <exact file list>
 - Named gates and focused checks: <exact names or commands>
+- Governed lessons: <exact manifest and digest from `work packet`>
 
 Rules:
 1. Work only in the allocated worktree and only within the card's write scope.
@@ -284,6 +289,9 @@ Rules:
 4. Make bounded assumptions only when they stay inside the card; report them.
 5. Add or update focused tests, run an intended-oracle mutation, commit all work,
    run the named gates, verify scope, and create the exact-SHA handoff.
+6. Read every lesson in the packet. For each required lesson, preserve the
+   exact rule and evidence in the review verdict; omission of a required gate
+   or review disposition is a Harness refusal.
 
 Reporting:
 - Progress: current phase, completed evidence, next action, and any risk discovered.
@@ -294,6 +302,14 @@ Reporting:
 
 This packet is the complete assigned context. Do not infer authority from prior chat.
 ```
+
+The packet is the memory boundary. `lesson propose` records a candidate lesson
+with provenance; only `lesson activate` makes it applicable. `work packet`,
+`review begin`, and `handoff inspect` expose the exact manifest and digest. A
+lesson is never applied retroactively to an older handoff, and an agent cannot
+silently ignore a required one: handoff creation requires its feature-gate
+evidence, while review recording requires every named lesson check and its
+evidence.
 
 ### Progress, clarification, and completion
 
@@ -365,6 +381,10 @@ Review requirements:
    the changed mechanism, command, intended oracle, and observed result.
 5. Record `approved`, `changes_requested`, or `blocked` through the Harness.
    Locate every finding and disposition every prior authoritative finding.
+6. Read the packet's governed lessons. Record one structured lesson check for
+   every required review check; each must state `satisfied` or
+   `not_applicable` and include evidence. A missing or `not_satisfied` check
+   refuses the verdict.
 
 Return: decision, findings first, mutation result, gate-adequacy conclusion,
 verdict/review ID, residual risks, and limits of what you verified.

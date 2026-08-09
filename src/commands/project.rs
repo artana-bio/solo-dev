@@ -635,6 +635,7 @@ const CONTROL_OWNED_ENTRIES: &[&str] = &[
     CYCLE_DIR,
     EVENT_DIR,
     GATE_DIR,
+    crate::domain::lesson::LESSON_DIR,
     HANDOFF_DIR,
     REVIEW_DIR,
     RECEIPT_DIR,

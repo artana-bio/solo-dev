@@ -10,6 +10,7 @@ use crate::{
     commands::{
         card::{load_card, require_convergence_budget, store_card_state},
         gate::{load_gate, receipts_for, require_before_handoff},
+        lesson::{all_lessons, validate_manifest_registry},
         review::dependency_standings,
         transaction::with_transaction,
         work::held_lease,
@@ -23,16 +24,18 @@ use crate::{
         card::CardState,
         clock::Clock,
         cycle::CycleRecord,
-        digest::CANONICAL_ALGORITHM,
+        digest::{CANONICAL_ALGORITHM, Digest},
         handoff::{
             ActorDeclaration, DeclaredGateFailure, DependencyBinding, EvidenceEntry, HANDOFF_DIR,
             HANDOFF_SCHEMA, HandoffRecord, HandoffStatus, check_delivered_sha,
         },
         ids::CardId,
+        lesson::LessonManifest,
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, diff::DiffSummary, inspect},
     policy::convergence::{ATTEMPT_RECORDED_EVENT, AttemptKind, ReasonCategory},
+    policy::lessons::build_manifest,
     policy::verification::{CandidateFacts, VerificationReport, verify},
     runner::receipt::evidence_is_acceptable,
 };
@@ -95,6 +98,10 @@ pub struct CreateArgs {
     /// Path to the actor's declaration, in YAML or JSON.
     #[arg(long)]
     pub declaration: PathBuf,
+    /// Exact lesson-manifest digest emitted by `work packet`; required once
+    /// the project has governed lesson history.
+    #[arg(long)]
+    pub lesson_manifest_digest: Option<String>,
     /// Report planned mutations without performing them.
     #[arg(long)]
     pub dry_run: bool,
@@ -794,6 +801,8 @@ fn preview_create(
     let control = ControlRepository::open(&args.common.control)?;
     let config = control.project()?;
     let (record, state) = load_card(&control, card_id)?;
+    let lesson_manifest =
+        bound_packet_manifest(&control, &record, args.lesson_manifest_digest.as_deref())?;
     // 72-2: the first check that can refuse, before anything else — a
     // preview must never promise a handoff the real command would refuse
     // for an escalated card. See `require_convergence_budget`.
@@ -819,13 +828,14 @@ fn preview_create(
     // Preview must validate the same feature-gate evidence the real handoff
     // binds. Otherwise it can report ready immediately before the real command
     // refuses for a missing or stale receipt.
-    let _receipts = collect_evidence(
+    let receipts = collect_evidence(
         &control,
         card_id,
         &state.current_digest,
         &record.named_gates.feature,
         &head,
     )?;
+    require_lesson_evidence(&control, &record, &lesson_manifest, &receipts)?;
 
     // 71-R3: the same two counts `run_create` would actually record — see the
     // matching fields on its own success outcome.
@@ -838,6 +848,7 @@ fn preview_create(
         (0, false)
     };
 
+    let lesson_manifest_digest = lesson_manifest.digest()?;
     Ok(CommandOutcome::new(
         "handoff.create",
         format!(
@@ -850,8 +861,111 @@ fn preview_create(
             "candidate_sha": head,
             "gate_failure_facts": gate_failure_facts,
             "repair_attempt_recorded": repair_attempt_recorded,
+            "lesson_manifest": lesson_manifest,
+            "lesson_manifest_digest": lesson_manifest_digest.as_str(),
         }),
     ))
+}
+
+/// Reconstructs the live manifest and proves it is the exact one emitted to
+/// the implementer by `work packet`.
+///
+/// A live recomputation alone is unsafe: retiring a lesson after packet
+/// generation would make the handoff silently omit an obligation the
+/// implementer received. Once a project has any lesson history, the caller
+/// must therefore return the packet digest and it must match exactly. Projects
+/// created before governed lessons remain compatible while their registry is
+/// empty; supplying a digest there still opts into the exact comparison.
+fn bound_packet_manifest(
+    control: &ControlRepository,
+    card: &crate::domain::card::CardRecord,
+    expected_digest: Option<&str>,
+) -> Result<LessonManifest, HarnessError> {
+    let lessons = all_lessons(control)?;
+    let manifest = build_manifest(card, &lessons)?;
+    let actual_digest = manifest.digest()?;
+
+    let expected_digest = match expected_digest {
+        Some(value) => Some(value.parse::<Digest>()?),
+        None if lessons.is_empty() => None,
+        None => {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "handoff for card {} is missing the lesson manifest digest from `work packet`; the current manifest is {actual_digest}",
+                    card.card_id
+                ),
+                code: ErrorCode::PolicyLessonManifestStale,
+            });
+        }
+    };
+
+    if let Some(expected_digest) = expected_digest
+        && expected_digest != actual_digest
+    {
+        return Err(HarnessError::Control {
+            reason: format!(
+                "handoff for card {} expected lesson manifest {expected_digest}, but the current manifest is {actual_digest}; the implementation packet is stale",
+                card.card_id
+            ),
+            code: ErrorCode::PolicyLessonManifestStale,
+        });
+    }
+
+    Ok(manifest)
+}
+
+/// Enforces the machine-checkable part of every required lesson at handoff.
+///
+/// A lesson cannot silently become a note an agent may skip: required feature
+/// gates must be named by the card, registered in the control repository, and
+/// represented by a passing receipt for the exact candidate. Review checks are
+/// enforced when the independent verdict is recorded.
+fn require_lesson_evidence(
+    control: &ControlRepository,
+    card: &crate::domain::card::CardRecord,
+    manifest: &LessonManifest,
+    receipts: &[EvidenceEntry],
+) -> Result<(), HarnessError> {
+    for lesson in manifest.required() {
+        for gate_id in lesson.obligations.gate_ids() {
+            load_gate(control, &gate_id)?;
+        }
+        for gate_id in &lesson.obligations.feature_gates {
+            if !card
+                .named_gates
+                .feature
+                .iter()
+                .any(|named| named == gate_id)
+            {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "required lesson `{}` requires feature gate `{gate_id}`, but card {} does not name it",
+                        lesson.lesson_id, card.card_id
+                    ),
+                    code: ErrorCode::PolicyLessonEvidenceMissing,
+                });
+            }
+            let Some(receipt) = receipts.iter().find(|receipt| receipt.gate_id == *gate_id) else {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "required lesson `{}` has no evidence for feature gate `{gate_id}`",
+                        lesson.lesson_id
+                    ),
+                    code: ErrorCode::PolicyLessonEvidenceMissing,
+                });
+            };
+            if !receipt.passed {
+                return Err(HarnessError::Control {
+                    reason: format!(
+                        "required lesson `{}` is not satisfied: feature gate `{gate_id}` did not pass",
+                        lesson.lesson_id
+                    ),
+                    code: ErrorCode::PolicyLessonEvidenceMissing,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Gathers the machine-computed half of a handoff from Git objects.
@@ -1016,6 +1130,8 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
             steps.at("control-write")?;
             let config = control.project()?;
             let (record, state) = load_card(control, &card_id)?;
+            let lesson_manifest =
+                bound_packet_manifest(control, &record, args.lesson_manifest_digest.as_deref())?;
             // 72-2: the first check that can refuse, before anything is
             // written — see `require_convergence_budget`.
             require_convergence_budget(control, &config, &record)?;
@@ -1051,6 +1167,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 &record.named_gates.feature,
                 &candidate_sha,
             )?;
+            require_lesson_evidence(control, &record, &lesson_manifest, &receipts)?;
             let dependency_bindings =
                 resolve_dependency_bindings(control, &scope, &record.depends_on, &candidate_sha)?;
 
@@ -1069,6 +1186,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 dependency_bindings,
                 changed_paths: diff.paths,
                 receipts,
+                lesson_manifest: Some(lesson_manifest.clone()),
                 worktree_clean: true,
                 declaration: declaration.clone(),
                 actor_id: args.common.actor.clone(),
@@ -1077,6 +1195,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 canonical_algorithm: CANONICAL_ALGORITHM.to_owned(),
             };
             let digest = handoff.digest()?;
+            let lesson_manifest_digest = lesson_manifest.digest()?;
 
             control.write_atomic(
                 &HandoffRecord::relative_path(&id),
@@ -1100,6 +1219,10 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                     .meta(
                         "delivered_sha",
                         serde_json::json!(declaration.delivered_sha),
+                    )
+                    .meta(
+                        "lesson_manifest_digest",
+                        serde_json::json!(lesson_manifest_digest.as_str()),
                     ),
                 clock,
             )?;
@@ -1182,6 +1305,7 @@ fn run_create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Ha
                 serde_json::json!({
                     "handoff": handoff,
                     "handoff_digest": digest.as_str(),
+                    "lesson_manifest_digest": lesson_manifest_digest.as_str(),
                     "gate_failure_facts": gate_failure_facts,
                     "repair_attempt_recorded": repair_attempt_recorded,
                 }),
@@ -1211,9 +1335,19 @@ fn run_inspect(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         &record.depends_on,
         &handoff.dependency_bindings,
     )?;
-    let staleness = current_candidate
-        .as_ref()
-        .and_then(|sha| handoff.staleness(sha, &state.current_digest, &standings));
+    let lesson_staleness = if let Some(manifest) = handoff.lesson_manifest.as_ref() {
+        validate_manifest_registry(&control, manifest)?;
+        let current = build_manifest(&record, &all_lessons(&control)?)?;
+        (manifest.lessons != current.lessons)
+            .then(|| "the active lesson set changed since this handoff was created".to_owned())
+    } else {
+        None
+    };
+    let staleness = lesson_staleness.or_else(|| {
+        current_candidate
+            .as_ref()
+            .and_then(|sha| handoff.staleness(sha, &state.current_digest, &standings))
+    });
 
     let mut text = format!(
         "Handoff {} for card {card_id}\ncandidate: {}\nbranch: {}\ndigest: {}\ncommits: {}\nchanged paths: {}\nevidence: {}\nstatus: {}",

@@ -14,6 +14,7 @@ use crate::{
     commands::CONTROL_ENV,
     commands::{
         card::{CardStateRecord, load_card, require_convergence_budget, store_card_state},
+        lesson::all_lessons,
         transaction::{Steps, with_transaction},
     },
     control::{event_store::EventDraft, repository::ControlRepository},
@@ -28,6 +29,7 @@ use crate::{
     },
     error::{ErrorCode, HarnessError},
     git::{command::GitScope, diff::diff_commits, inspect, worktree},
+    policy::lessons::build_manifest,
     policy::verification::{CandidateFacts, verify},
 };
 
@@ -36,6 +38,8 @@ use crate::{
 pub enum WorkCommand {
     /// Allocate a branch and worktree for a ready card.
     Start(StartArgs),
+    /// Emit the complete implementation packet, including governed lessons.
+    Packet(CardArgs),
     /// Report a card's allocation.
     Status(CardArgs),
     /// Record a progress note against the current lease.
@@ -60,6 +64,7 @@ impl WorkCommand {
     pub const fn path(&self) -> &'static str {
         match self {
             Self::Start(..) => "work.start",
+            Self::Packet(..) => "work.packet",
             Self::Status(..) => "work.status",
             Self::Checkpoint(..) => "work.checkpoint",
             Self::Resume(..) => "work.resume",
@@ -157,6 +162,7 @@ pub struct BlockArgs {
 pub fn execute(command: &WorkCommand, clock: &dyn Clock) -> Result<CommandOutcome, HarnessError> {
     match command {
         WorkCommand::Start(args) => run_start(args, clock),
+        WorkCommand::Packet(args) => run_packet(args),
         WorkCommand::Status(args) => run_status(args),
         WorkCommand::Checkpoint(args) => run_checkpoint(args, clock),
         WorkCommand::Resume(args) => run_resume(args, clock),
@@ -691,6 +697,55 @@ fn run_status(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+/// Emits a bounded implementation packet that a fresh agent can use without
+/// relying on the implementer's conversation history.
+fn run_packet(args: &CardArgs) -> Result<CommandOutcome, HarnessError> {
+    let card_id: CardId = args.card_id.parse()?;
+    let control = ControlRepository::open(&args.common.control)?;
+    let config = control.project()?;
+    let (card, state, lease) = allocation(&control, &card_id)?;
+    let lessons = all_lessons(&control)?;
+    let manifest = build_manifest(&card, &lessons)?;
+    let manifest_digest = manifest.digest()?;
+    let lesson_records: Vec<_> = lessons
+        .into_iter()
+        .filter(|lesson| {
+            manifest.lessons.iter().any(|entry| {
+                entry.lesson_id == lesson.lesson_id && entry.revision == lesson.revision
+            })
+        })
+        .collect();
+    let required: Vec<_> = manifest.required().cloned().collect();
+    let advisory: Vec<_> = manifest.advisory().cloned().collect();
+    Ok(CommandOutcome::new(
+        "work.packet",
+        format!(
+            "Implementation packet for card {card_id}\ncard digest: {}\nlease: {}\nlesson manifest: {}\nrequired lessons: {}\nadvisory lessons: {}\nThe agent must report each required lesson check and pass the exact digest back with `handoff create --lesson-manifest-digest`",
+            state.current_digest,
+            lease.lease_id,
+            manifest_digest,
+            required.len(),
+            advisory.len()
+        ),
+        serde_json::json!({
+            "packet_schema": "harness.implementation-packet/v1",
+            "card": card,
+            "card_digest": state.current_digest.as_str(),
+            "lease": lease,
+            "manifest": manifest,
+            "manifest_digest": manifest_digest.as_str(),
+            "lessons": lesson_records,
+            "required_lessons": required,
+            "advisory_lessons": advisory,
+            "reporting_contract": {
+                "required": "include exact lesson ids, check ids, status, and evidence in the review verdict",
+                "binding": "pass this exact digest back as `handoff create --lesson-manifest-digest`; do not hand off if the manifest digest or required gate evidence changes",
+                "handoff_argument": ["--lesson-manifest-digest", manifest_digest.as_str()]
+            }
+        }),
+    ).with_project(config.project_id.clone()))
 }
 
 // 72-3: deliberately never gated by `require_convergence_budget`. #72's

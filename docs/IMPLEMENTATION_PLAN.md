@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 58 |
+| Plan revision | 60 |
 | Plan date | 2026-08-02 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `c51f2dc` (`Land INT-001 (1 card, individual)`), the SELFHOST-001 landing commit |
@@ -2879,6 +2879,57 @@ Acceptance:
 - an explicit statement that no external-action capability ships with the
   decision itself.
 
+### WP-800 — Governed lessons and applicability
+
+| Field | Value |
+| --- | --- |
+| Status | `IN_PROGRESS` |
+| Owner | Codex |
+| Dependencies | `WP-210`, `WP-250`, `WP-310`, `WP-320`, `WP-440`, `WP-530` |
+| Target release | Hardened single-repository extension |
+| Required reading | `README.md`; `AGENTS.md`; complete `docs/IMPLEMENTATION_PLAN.md`; `docs/ARCHITECTURE.md` |
+
+Purpose: turn durable findings and test preferences into versioned, project-
+scoped obligations that future cards cannot silently omit.
+
+Deliverables:
+
+- strict, immutable lesson records with source provenance and revisions;
+- deterministic applicability by paths, contracts, change kind, and risk;
+- a frozen applicable-lesson manifest bound to each activated card;
+- generated implementation and review packets containing only relevant lessons;
+- required-gate enforcement through validation, handoff, review, integration,
+  acceptance, promotion, and audit;
+- explicit preferred/informational lessons and authorized exceptions;
+- lesson proposal, activation, inspection, retirement, and coverage commands.
+
+Acceptance:
+
+- an applicable required lesson omitted by an implementer refuses handoff;
+- an unrelated lesson is excluded from the packet and does not block the card;
+- receipts and reviews bind to the exact lesson-set digest;
+- missing review disposition or integration evidence refuses approval;
+- lesson and manifest tampering refuses promotion and appears in audit output;
+- a fresh context can complete the assigned work from the generated packet alone;
+- all enforcement paths have focused regression tests and discriminating
+  mutation checks;
+- no automatic LLM inference or cross-project policy leakage is used by the
+  authorization path.
+
+Implementation evidence (working tree, 2026-08-08): the registry, immutable
+revisions, deterministic matching including card exclusions, exact packet
+manifests, implementation/review packets, and handoff/review/integration/
+acceptance/promotion/audit enforcement are implemented. Packet digests are
+required at handoff; modern verification records persist exact per-card lesson
+bindings; authorization, registry continuity, frozen-history audit semantics,
+and tamper regressions are covered. Focused lesson, handoff, review,
+integration, audit, packet, guide, promotion, and malformed-example
+regressions pass; `cargo test --lib` passes 688 tests; sanitized
+`cargo test --all-targets --all-features` passes; strict all-target Clippy,
+`cargo fmt --check`, and `git diff --check` pass. The status remains
+`IN_PROGRESS` until this worktree is intentionally committed, as required by
+the plan's `DONE` definition.
+
 ## 18. Dependency and execution order
 
 The required order is:
@@ -3268,6 +3319,7 @@ Tier 1 of the register is closed.
 | Backup/audit | `NOT_STARTED` | None | `WP-520`, `WP-530` |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
+| Governed lessons | `IN_PROGRESS` | `WP-800` | Implementation and validation complete in the worktree; commit before marking `DONE` |
 
 ### 20.2 Active work
 

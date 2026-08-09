@@ -207,6 +207,14 @@ pub enum ErrorCode {
     /// A card's registered convergence budget is spent, and no authorized
     /// disposition has released it.
     PolicyConvergenceEscalated,
+    /// A lesson record is malformed or violates the lesson schema.
+    PolicyLessonInvalid,
+    /// A required lesson has no matching gate or review evidence.
+    PolicyLessonEvidenceMissing,
+    /// A packet or record is bound to a lesson manifest that no longer applies.
+    PolicyLessonManifestStale,
+    /// A lesson proposal or retirement lacks an authorized disposition.
+    PolicyLessonDisposition,
     /// A previous mutation did not complete and must be recovered first.
     RecoveryIncomplete,
     /// Control state is internally inconsistent.
@@ -246,7 +254,7 @@ fn classify_io(source: &std::io::Error) -> ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for exhaustive testing and documentation.
-    pub const ALL: [Self; 89] = [
+    pub const ALL: [Self; 93] = [
         Self::UsageInvalidId,
         Self::UsageInvalidDigest,
         Self::UsageInvalidTimestamp,
@@ -329,6 +337,10 @@ impl ErrorCode {
         Self::PolicyStaleHandoff,
         Self::PolicyReviewNotBegun,
         Self::PolicyConvergenceEscalated,
+        Self::PolicyLessonInvalid,
+        Self::PolicyLessonEvidenceMissing,
+        Self::PolicyLessonManifestStale,
+        Self::PolicyLessonDisposition,
         Self::RecoveryIncomplete,
         Self::InternalControlCorrupt,
         Self::ConflictControlHeadMoved,
@@ -411,7 +423,11 @@ impl ErrorCode {
             | Self::PolicyIncompleteReview
             | Self::PolicyStaleHandoff
             | Self::PolicyReviewNotBegun
-            | Self::PolicyConvergenceEscalated => ExitCategory::Policy,
+            | Self::PolicyConvergenceEscalated
+            | Self::PolicyLessonInvalid
+            | Self::PolicyLessonEvidenceMissing
+            | Self::PolicyLessonManifestStale
+            | Self::PolicyLessonDisposition => ExitCategory::Policy,
             Self::GateRunnerError | Self::GateFailed | Self::GateEvidenceStale => {
                 ExitCategory::Gate
             }
@@ -518,6 +534,10 @@ impl ErrorCode {
             Self::PolicyStaleHandoff => "STALE-HANDOFF",
             Self::PolicyReviewNotBegun => "REVIEW-NOT-BEGUN",
             Self::PolicyConvergenceEscalated => "CONVERGENCE-ESCALATED",
+            Self::PolicyLessonInvalid => "LESSON-INVALID",
+            Self::PolicyLessonEvidenceMissing => "LESSON-EVIDENCE-MISSING",
+            Self::PolicyLessonManifestStale => "LESSON-MANIFEST-STALE",
+            Self::PolicyLessonDisposition => "LESSON-DISPOSITION",
             Self::RecoveryIncomplete => "INCOMPLETE-OPERATION",
             Self::InternalControlCorrupt => "CONTROL-CORRUPT",
             Self::ConflictControlHeadMoved => "CONTROL-HEAD-MOVED",
@@ -686,6 +706,7 @@ impl ErrorCode {
         "This card's convergence budget is spent; it requires an authorized disposition before it can be delivered or reviewed again. Run `disposition renew` with `--card-id`, `--dimension`, and `--rationale` to grant the exhausted dimension its configured limit again, or record a different disposition if renewal is not the right response."
     }
 
+    #[allow(clippy::too_many_lines)]
     const fn policy_recovery(self) -> &'static str {
         match self {
             Self::PolicyBackupNotIndependent
@@ -706,6 +727,18 @@ impl ErrorCode {
             }
             Self::PolicyInvalidCard => {
                 "Correct the card as this error states; use `card revise` if the card is already activated."
+            }
+            Self::PolicyLessonInvalid => {
+                "Correct the lesson definition; it must name explicit selectors, provenance, and valid obligations."
+            }
+            Self::PolicyLessonEvidenceMissing => {
+                "Read the generated lesson packet, add the required gate or review disposition, then recreate the handoff."
+            }
+            Self::PolicyLessonManifestStale => {
+                "Regenerate the packet for the current card and active lesson revisions before continuing."
+            }
+            Self::PolicyLessonDisposition => {
+                "Have an authorized operator activate, retire, or supersede the lesson before relying on it."
             }
             Self::PolicyCycleBaselineMismatch => CYCLE_BASELINE_MISMATCH_RECOVERY,
             Self::PolicyOwnershipOverlap => {
