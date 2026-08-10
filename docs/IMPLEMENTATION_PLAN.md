@@ -4470,13 +4470,13 @@ this revision records the completed `SPIKE-002` evidence above that base.
 
 | Field | Current value |
 | --- | --- |
-| Status | `IN_PROGRESS` — final test-only repair after `RV-000095` found the event-ID order guard lacked an owning mutation regression |
+| Status | `DONE` |
 | Owner | `mutation-recovery-implementer` |
 | Branch and worktree | `card/F-053`; `/Users/alvaro/Documents/Code/change-harness-worktrees/F-053` |
 | Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7, 12.1–12.3, 16, `WP-500`, 20.2, and 24–25; `PLAN-C043`; card `F-053` revision 1; `tests/mutation.rs`; `tests/gate_runner.rs`; `src/commands/mutation.rs`; `src/commands/project.rs`; `src/commands/transaction.rs`; `src/commands/gate.rs`; legacy evidence `OP-001486`, `R-000280`, `VR-000048`, and recovery commit `cfdcf061e425d0963faeeaab1d2ff4c63552a66d` |
 | Acceptance commands | `cargo test --test mutation`; `cargo test --test gate_runner`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `env -u NO_COLOR TERM=xterm-256color cargo test` |
-| Evidence | Review `RV-000095` confirmed the cross-second production repair but found that deleting the stable event-ID order comparison left the focused recovery tests green. Replacement evidence will add one semantic event-order swap regression, run only the focused suites, formatting, strict Clippy, frozen feature gates, and a replacement handoff; the full suite remains deferred to mandatory landing `gate.test`. |
+| Evidence | Final test-only repair after `RV-000095`: a focused regression swaps the semantic settled and gate-ran event payloads across their existing paths while keeping each embedded event ID path-correct, proving recovery refuses reversed durable append order. Removing `settled.event_id < gate_ran.event_id` makes that exact test fail because the malformed operation is completed. The valid cross-second path and all prior tamper and provenance cases remain green. Focused checks passed: gate runner 36/36 and mutation 7/7. `cargo fmt --check` and strict all-target/all-feature Clippy passed. No production behavior changed. The full normalized suite was intentionally not rerun because mandatory landing `gate.test` will run it. Exact-SHA feature receipts and the replacement handoff remain authoritative in control state rather than being copied into this mutable tracker. |
 | Sequencing | Maintenance prerequisite only. `WP-900` remains `READY`; the coordination-extension dependency sequence is unchanged. |
 
 Bootstrap recovery record:
