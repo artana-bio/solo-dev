@@ -2001,7 +2001,6 @@ fn committed_gate_events_agree(
             && event.card_revision == Some(reservation.key.card_revision)
             && event.card_digest.as_ref() == Some(&reservation.key.card_digest)
             && event.actor_id == settlement.settled_by_actor_id
-            && event.occurred_at == settlement.settled_at
     };
     let settled = events
         .iter()
@@ -2011,6 +2010,7 @@ fn committed_gate_events_agree(
         return false;
     };
     common_matches(settled)
+        && settled.event_id < gate_ran.event_id
         && settled.head_sha.is_none()
         && settled.metadata.len() == 2
         && settled.metadata.get("reservation_id")

@@ -4,7 +4,7 @@ mod support;
 
 use std::fs;
 
-use change_harness::domain::digest::Digest;
+use change_harness::domain::{clock::Timestamp, digest::Digest};
 use serde_json::Value;
 use support::Workspace;
 
@@ -743,6 +743,60 @@ fn operator_can_settle_the_exact_legacy_committed_gate_failure() {
     assert_eq!(recovered["data"]["state"], "completed");
     let (_, journal) = gate_settlement_operation(&workspace);
     assert_eq!(journal["state"], "completed");
+}
+
+#[test]
+fn legitimate_committed_gate_recovery_survives_a_cross_second_event_boundary() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    let settlement_path =
+        fs::read_dir(workspace.control.join("validation-reservation-settlements"))
+            .unwrap()
+            .next()
+            .expect("the gate settlement")
+            .unwrap()
+            .path();
+    let settlement: Value =
+        serde_json::from_str(&fs::read_to_string(settlement_path).unwrap()).unwrap();
+    let settled_at: Timestamp = serde_json::from_value(settlement["settled_at"].clone()).unwrap();
+    let reservation_id = settlement["reservation_id"].clone();
+    let mut changed = 0;
+    for path in fs::read_dir(workspace.control.join("events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+    {
+        let mut event: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        if event["metadata"]["reservation_id"] != reservation_id {
+            continue;
+        }
+        let offset = match event["event_type"].as_str() {
+            Some("validation.execution_settled") => 1,
+            Some("gate.ran") => 2,
+            _ => continue,
+        };
+        event["occurred_at"] = serde_json::json!(
+            Timestamp::from_unix_seconds(settled_at.unix_seconds() + offset)
+                .unwrap()
+                .to_string()
+        );
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&event).unwrap()),
+        )
+        .unwrap();
+        changed += 1;
+    }
+    assert_eq!(changed, 2, "both governed gate events must be shifted");
+    amend_control_head(&workspace);
+
+    let recovered = recover_committed_gate_raw(&workspace, &operation_id);
+    assert!(
+        recovered.status.success(),
+        "cross-second recovery failed: {}{}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["data"]["state"], "completed");
 }
 
 #[test]
