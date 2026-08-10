@@ -4470,13 +4470,13 @@ this revision records the completed `SPIKE-002` evidence above that base.
 
 | Field | Current value |
 | --- | --- |
-| Status | `IN_PROGRESS` — final repair after `RV-000094` found time-dependent rejection of legitimate committed-gate recovery |
+| Status | `DONE` |
 | Owner | `mutation-recovery-implementer` |
 | Branch and worktree | `card/F-053`; `/Users/alvaro/Documents/Code/change-harness-worktrees/F-053` |
 | Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7, 12.1–12.3, 16, `WP-500`, 20.2, and 24–25; `PLAN-C043`; card `F-053` revision 1; `tests/mutation.rs`; `tests/gate_runner.rs`; `src/commands/mutation.rs`; `src/commands/project.rs`; `src/commands/transaction.rs`; `src/commands/gate.rs`; legacy evidence `OP-001486`, `R-000280`, `VR-000048`, and recovery commit `cfdcf061e425d0963faeeaab1d2ff4c63552a66d` |
 | Acceptance commands | `cargo test --test mutation`; `cargo test --test gate_runner`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `env -u NO_COLOR TERM=xterm-256color cargo test` |
-| Evidence | Review `RV-000094` returned `H-000105` because recovery required event timestamps to equal the settlement timestamp exactly even though the two events are appended with separate clock reads. Replacement evidence will use a deterministic cross-second regression, the focused suites, formatting, strict Clippy, frozen feature gates, and a replacement handoff; the full suite is intentionally deferred to the mandatory landing `gate.test`. |
+| Evidence | Final repair after `RV-000094`: committed-gate recovery no longer requires wall-clock equality between the settlement and its separately appended events. It preserves exact event identity and content checks and now binds stable append order through monotonically allocated event IDs. A deterministic regression moves the settled and gate-ran events one and two seconds beyond the settlement; legitimate recovery succeeds, while all prior tamper cases remain refused. Focused checks passed: gate runner 35/35 and mutation 7/7. `cargo fmt --check` and strict all-target/all-feature Clippy passed. Restoring the accidental timestamp equality made the cross-second regression fail. The full normalized suite was intentionally not rerun here because mandatory landing `gate.test` will run it. Exact-SHA feature receipts and the replacement handoff remain authoritative in control state rather than being copied into this mutable tracker. |
 | Sequencing | Maintenance prerequisite only. `WP-900` remains `READY`; the coordination-extension dependency sequence is unchanged. |
 
 Bootstrap recovery record:
