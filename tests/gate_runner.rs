@@ -800,6 +800,53 @@ fn legitimate_committed_gate_recovery_survives_a_cross_second_event_boundary() {
 }
 
 #[test]
+fn committed_gate_recovery_refuses_reversed_semantic_event_order() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    let governed_events: Vec<_> = fs::read_dir(workspace.control.join("events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter_map(|path| {
+            let event: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            (event["metadata"]["reservation_id"].is_string()
+                && matches!(
+                    event["event_type"].as_str(),
+                    Some("validation.execution_settled" | "gate.ran")
+                ))
+            .then_some((path, event))
+        })
+        .collect();
+    assert_eq!(governed_events.len(), 2);
+    let (settled_path, settled_event) = governed_events
+        .iter()
+        .find(|(_, event)| event["event_type"] == "validation.execution_settled")
+        .unwrap();
+    let (gate_path, gate_event) = governed_events
+        .iter()
+        .find(|(_, event)| event["event_type"] == "gate.ran")
+        .unwrap();
+    let mut earlier_gate = gate_event.clone();
+    earlier_gate["event_id"] = settled_event["event_id"].clone();
+    let mut later_settlement = settled_event.clone();
+    later_settlement["event_id"] = gate_event["event_id"].clone();
+    fs::write(
+        settled_path,
+        format!("{}\n", serde_json::to_string_pretty(&earlier_gate).unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        gate_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&later_settlement).unwrap()
+        ),
+    )
+    .unwrap();
+    amend_control_head(&workspace);
+
+    assert_committed_gate_recovery_refused(&workspace, &operation_id);
+}
+
+#[test]
 fn committed_gate_recovery_refuses_a_mismatched_gate_event() {
     let workspace = Workspace::initialized();
     workspace.register_gate("gate.fails", &["false"]);
