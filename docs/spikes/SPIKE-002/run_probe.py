@@ -46,6 +46,45 @@ PERMISSION_BEHAVIORS = {
         "is not a security boundary."
     ),
 }
+NORMALIZED_EVENT_TYPES = {
+    "codex": {
+        "item.completed": "provider.activity",
+        "item.started": "provider.activity",
+        "thread.started": "session.started",
+        "turn.completed": "turn.completed",
+        "turn.started": "turn.started",
+    },
+    "claude": {
+        "assistant": "provider.event",
+        "rate_limit_event": "provider.event",
+        "result": "turn.completed",
+        "system": "session.started",
+        "user": "provider.event",
+    },
+    "copilot": {
+        "assistant.idle": "provider.event",
+        "assistant.message": "provider.event",
+        "assistant.message_delta": "provider.event",
+        "assistant.message_start": "provider.event",
+        "assistant.reasoning": "provider.event",
+        "assistant.reasoning_delta": "provider.event",
+        "assistant.tool_call_delta": "provider.activity",
+        "assistant.turn_end": "turn.completed",
+        "assistant.turn_start": "turn.started",
+        "mcp.tools.list_changed": "provider.activity",
+        "model.call_start": "provider.activity",
+        "result": "turn.completed",
+        "session.background_tasks_changed": "provider.event",
+        "session.mcp_server_status_changed": "provider.event",
+        "session.skills_loaded": "provider.event",
+        "session.tools_updated": "provider.activity",
+        "session.usage_checkpoint": "provider.event",
+        "tool.execution_complete": "provider.activity",
+        "tool.execution_partial_result": "provider.activity",
+        "tool.execution_start": "provider.activity",
+        "user.message": "provider.event",
+    },
+}
 SESSION_KEYS = {
     "thread_id",
     "threadId",
@@ -247,17 +286,11 @@ def native_type(value: dict[str, object]) -> str:
     return "unknown"
 
 
-def normalized_type(native: str) -> str:
-    lowered = native.lower()
-    if "tool" in lowered or "command" in lowered or "item" in lowered:
-        return "provider.activity"
-    if "start" in lowered or "init" in lowered or "system" in lowered:
-        return "session.started"
-    if "result" in lowered or "complete" in lowered or "finish" in lowered or "end" in lowered:
-        return "turn.completed"
-    if "error" in lowered or "fail" in lowered:
-        return "turn.failed"
-    return "provider.event"
+def normalized_type(provider: str, native: str) -> str:
+    try:
+        return NORMALIZED_EVENT_TYPES[provider][native]
+    except KeyError as exc:
+        raise RuntimeError(f"unknown native event type for {provider}: {native}") from exc
 
 
 def normalize_objects(
@@ -284,7 +317,7 @@ def normalize_objects(
                 "turn": turn,
                 "sequence": start_sequence + offset,
                 "native_event_type": native,
-                "normalized_event_type": normalized_type(native),
+                "normalized_event_type": normalized_type(provider, native),
                 "session_id": observed[0] if observed else None,
                 "cwd_digest": cwd_digest,
                 "exit_code": exit_code if offset == len(objects) - 1 else None,
@@ -294,7 +327,7 @@ def normalize_objects(
     return events, sessions, types
 
 
-def event_mapping_from_events(events: list[dict[str, object]]) -> dict[str, str]:
+def event_mapping_from_events(provider: str, events: list[dict[str, object]]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for event in events:
         native = event.get("native_event_type")
@@ -303,6 +336,8 @@ def event_mapping_from_events(events: list[dict[str, object]]) -> dict[str, str]
             raise RuntimeError("normalized event is missing a native type")
         if not isinstance(normalized, str) or not normalized:
             raise RuntimeError("normalized event is missing a normalized type")
+        if normalized != normalized_type(provider, native):
+            raise RuntimeError(f"native event type was normalized incorrectly: {native}")
         previous = mapping.setdefault(native, normalized)
         if previous != normalized:
             raise RuntimeError(f"native event type mapped inconsistently: {native}")
@@ -315,6 +350,19 @@ def first_session(provider: str, supplied: str | None, observed: list[str]) -> s
     if supplied and supplied in observed:
         return supplied
     return observed[0] if observed else None
+
+
+def has_exact_session_continuity(
+    observed_session: str | None,
+    resume_session: str | None,
+    observed_second: str | None,
+) -> bool:
+    return bool(
+        observed_session
+        and resume_session
+        and observed_second
+        and observed_session == resume_session == observed_second
+    )
 
 
 def empty_results() -> dict[str, object]:
@@ -461,12 +509,7 @@ def probe(provider: str) -> dict[str, object]:
     final_bytes = final_path.read_bytes() if final_path.exists() else b""
     git_status = run_checked(["git", "status", "--porcelain=v1"], cwd).decode("utf-8", errors="replace")
     observed_second = first_session(provider, supplied_session, sessions_two)
-    session_continuity = bool(
-        observed_session
-        and resume_session
-        and observed_session == resume_session
-        and (observed_second in {None, resume_session} or observed_second == resume_session)
-    )
+    session_continuity = has_exact_session_continuity(observed_session, resume_session, observed_second)
     expected_content = final_bytes == EXPECTED_BYTES
     failures: list[str] = []
     if first["timed_out"] or second["timed_out"]:
@@ -524,7 +567,7 @@ def probe(provider: str) -> dict[str, object]:
         "expected_content": expected_content,
         "structured_output": structured_one and structured_two,
         "structured_event_types": sorted(set(types_one + types_two)),
-        "event_mapping": event_mapping_from_events(all_events),
+        "event_mapping": event_mapping_from_events(provider, all_events),
         "unavailable_fields": ["provider-side authoritative worktree identity", "provider-side cryptographic termination receipt"],
         "permission_behavior": PERMISSION_BEHAVIORS[provider],
         "reason": reason,
@@ -562,13 +605,13 @@ def refresh_derived_artifacts() -> None:
             native = event.get("native_event_type")
             if not isinstance(native, str) or not native:
                 raise RuntimeError(f"normalized event is missing a native type for {provider}")
-            event["normalized_event_type"] = normalized_type(native)
+            event["normalized_event_type"] = normalized_type(provider, native)
         event_bytes = b"".join(
             (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
             for event in events
         )
         event_path.write_bytes(event_bytes)
-        mapping = event_mapping_from_events(events)
+        mapping = event_mapping_from_events(provider, events)
         row["event_artifact_sha256"] = sha256_bytes(event_bytes)
         row["structured_event_types"] = sorted(mapping)
         row["event_mapping"] = mapping
@@ -577,11 +620,32 @@ def refresh_derived_artifacts() -> None:
     render_report(results)
 
 
+def run_self_check() -> None:
+    session = "session-evidence"
+    if has_exact_session_continuity(session, session, None):
+        raise RuntimeError("missing turn-two session incorrectly counts as continuous")
+    if has_exact_session_continuity(session, session, "other-session"):
+        raise RuntimeError("different turn-two session incorrectly counts as continuous")
+    if not has_exact_session_continuity(session, session, session):
+        raise RuntimeError("matching session evidence incorrectly fails continuity")
+    try:
+        normalized_type("codex", "unknown.native.event")
+    except RuntimeError:
+        return
+    raise RuntimeError("unknown native event type did not fail closed")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument("--refresh-derived", action="store_true")
+    parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
+    if args.self_check:
+        if args.provider or args.refresh_derived:
+            parser.error("--self-check cannot be combined with another action")
+        run_self_check()
+        return 0
     if args.refresh_derived:
         if args.provider:
             parser.error("--refresh-derived cannot be combined with --provider")

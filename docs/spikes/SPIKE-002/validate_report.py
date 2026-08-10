@@ -88,6 +88,45 @@ PERMISSION_BEHAVIORS = {
         "is not a security boundary."
     ),
 }
+NORMALIZED_EVENT_TYPES = {
+    "codex": {
+        "item.completed": "provider.activity",
+        "item.started": "provider.activity",
+        "thread.started": "session.started",
+        "turn.completed": "turn.completed",
+        "turn.started": "turn.started",
+    },
+    "claude": {
+        "assistant": "provider.event",
+        "rate_limit_event": "provider.event",
+        "result": "turn.completed",
+        "system": "session.started",
+        "user": "provider.event",
+    },
+    "copilot": {
+        "assistant.idle": "provider.event",
+        "assistant.message": "provider.event",
+        "assistant.message_delta": "provider.event",
+        "assistant.message_start": "provider.event",
+        "assistant.reasoning": "provider.event",
+        "assistant.reasoning_delta": "provider.event",
+        "assistant.tool_call_delta": "provider.activity",
+        "assistant.turn_end": "turn.completed",
+        "assistant.turn_start": "turn.started",
+        "mcp.tools.list_changed": "provider.activity",
+        "model.call_start": "provider.activity",
+        "result": "turn.completed",
+        "session.background_tasks_changed": "provider.event",
+        "session.mcp_server_status_changed": "provider.event",
+        "session.skills_loaded": "provider.event",
+        "session.tools_updated": "provider.activity",
+        "session.usage_checkpoint": "provider.event",
+        "tool.execution_complete": "provider.activity",
+        "tool.execution_partial_result": "provider.activity",
+        "tool.execution_start": "provider.activity",
+        "user.message": "provider.event",
+    },
+}
 FORBIDDEN_EXACT_FLAGS = {
     "--allow-all-paths",
     "--allow-all-urls",
@@ -122,17 +161,11 @@ def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def normalized_event_type(native: str) -> str:
-    lowered = native.lower()
-    if "tool" in lowered or "command" in lowered or "item" in lowered:
-        return "provider.activity"
-    if "start" in lowered or "init" in lowered or "system" in lowered:
-        return "session.started"
-    if "result" in lowered or "complete" in lowered or "finish" in lowered or "end" in lowered:
-        return "turn.completed"
-    if "error" in lowered or "fail" in lowered:
-        return "turn.failed"
-    return "provider.event"
+def normalized_event_type(provider: str, native: str) -> str:
+    try:
+        return NORMALIZED_EVENT_TYPES[provider][native]
+    except KeyError as exc:
+        raise ValidationError(f"unknown native event type for {provider}: {native}") from exc
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -164,7 +197,7 @@ def parse_events_bytes(raw: bytes, provider: str) -> list[dict[str, object]]:
         require(isinstance(native, str) and native, f"{provider} JSONL line {number} native type missing")
         require(isinstance(normalized, str) and normalized, f"{provider} JSONL line {number} normalized type missing")
         require(
-            normalized == normalized_event_type(native),
+            normalized == normalized_event_type(provider, native),
             f"{provider} JSONL line {number} normalization mismatch",
         )
         require(isinstance(value["cwd_digest"], str) and value["cwd_digest"], f"{provider} cwd digest missing")
@@ -181,14 +214,14 @@ def parse_events_bytes(raw: bytes, provider: str) -> list[dict[str, object]]:
     return events
 
 
-def derive_event_mapping(events: list[dict[str, object]]) -> dict[str, str]:
+def derive_event_mapping(provider: str, events: list[dict[str, object]]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for event in events:
         native = event["native_event_type"]
         normalized = event["normalized_event_type"]
         require(isinstance(native, str) and native, "event native type missing")
         require(isinstance(normalized, str) and normalized, "event normalized type missing")
-        require(normalized == normalized_event_type(native), "event normalization mismatch")
+        require(normalized == normalized_event_type(provider, native), "event normalization mismatch")
         previous = mapping.setdefault(native, normalized)
         require(previous == normalized, f"native event type maps inconsistently: {native}")
     return dict(sorted(mapping.items()))
@@ -274,7 +307,7 @@ def expected_pass_argvs(provider: str, executable: str, session: str) -> tuple[l
 def validate_event_bindings(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
     for event in events:
         require(event["cwd_digest"] == row["cwd_digest"], f"{provider} event cwd binding mismatch")
-    mapping = derive_event_mapping(events)
+    mapping = derive_event_mapping(provider, events)
     require(row["event_mapping"] == mapping, f"{provider} event mapping does not match normalized JSONL")
     require(
         row["structured_event_types"] == sorted(mapping),
@@ -287,6 +320,34 @@ def require_nonblank_session(value: object, provider: str, field: str) -> str:
     return value
 
 
+def turn_session_ids(provider: str, events: list[dict[str, object]], turn: int) -> set[str]:
+    session_ids: set[str] = set()
+    for event in events:
+        if event["turn"] != turn or event["session_id"] is None:
+            continue
+        session_id = event["session_id"]
+        require(
+            isinstance(session_id, str) and session_id.strip(),
+            f"{provider} turn-{turn} JSONL contains a blank session identifier",
+        )
+        session_ids.add(session_id)
+    return session_ids
+
+
+def validate_native_session_evidence(
+    provider: str,
+    observed: str,
+    resumed: str,
+    events: list[dict[str, object]],
+) -> None:
+    turn_one = turn_session_ids(provider, events, 1)
+    turn_two = turn_session_ids(provider, events, 2)
+    require(observed in turn_one, f"{provider} turn-one JSONL lacks the observed session")
+    require(turn_one == {observed}, f"{provider} turn-one JSONL contains a different session")
+    require(resumed in turn_two, f"{provider} turn-two JSONL lacks the resumed session")
+    require(turn_two == {resumed}, f"{provider} turn-two JSONL contains a different session")
+
+
 def validate_pass_requirements(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
@@ -296,6 +357,7 @@ def validate_pass_requirements(provider: str, row: dict[str, object], events: li
         row["turn_two_observed_session_id"], provider, "turn-two observed session"
     )
     require(observed == resumed == second_observed, f"{provider} PASS session continuity is not exact")
+    validate_native_session_evidence(provider, observed, resumed, events)
     executable = row["executable"]
     require(isinstance(executable, str) and executable, f"{provider} executable missing")
     expected_first, expected_second = expected_pass_argvs(provider, executable, observed)
@@ -441,11 +503,11 @@ def rendered_reason(row: dict[str, object]) -> str:
     return str(row["reason"]).replace("|", "/")
 
 
-def validate_report_agreement(provider: str, row: dict[str, object], report: str) -> None:
+def report_agreement_lines(provider: str, row: dict[str, object]) -> tuple[str, ...]:
     first = row["turn_one"]
     second = row["turn_two"]
     assert isinstance(first, dict) and isinstance(second, dict)
-    expected_lines = (
+    return (
         f"| {provider} | {row['status']} | {row['version']} | {row['session_continuity']} | {row['expected_content']} | {rendered_reason(row)} |",
         f"- Executable: {row['executable']}",
         f"- Version: {row['version']}",
@@ -460,7 +522,10 @@ def validate_report_agreement(provider: str, row: dict[str, object], report: str
         f"- Turn-one argv: {json.dumps(first['argv'], ensure_ascii=False)}",
         f"- Turn-two argv: {json.dumps(second['argv'], ensure_ascii=False)}",
     )
-    for line in expected_lines:
+
+
+def validate_report_agreement(provider: str, row: dict[str, object], report: str) -> None:
+    for line in report_agreement_lines(provider, row):
         require(line in report, f"report does not agree with {provider}: {line.split(':', 1)[0]}")
 
 
@@ -546,6 +611,26 @@ def run_negative_regressions(results: dict[str, object]) -> None:
         "session substitution",
     )
 
+    fabricated_session = "00000000-0000-4000-8000-000000000085"
+    fabricated_evidence = copy.deepcopy(codex_row)
+    fabricated_evidence["observed_session_id"] = fabricated_session
+    fabricated_evidence["resume_session_id"] = fabricated_session
+    fabricated_evidence["turn_two_observed_session_id"] = fabricated_session
+    fabricated_first, fabricated_second = expected_pass_argvs(
+        "codex", str(fabricated_evidence["executable"]), fabricated_session
+    )
+    fabricated_turn_one = fabricated_evidence["turn_one"]
+    fabricated_turn_two = fabricated_evidence["turn_two"]
+    assert isinstance(fabricated_turn_one, dict) and isinstance(fabricated_turn_two, dict)
+    fabricated_turn_one["argv"] = fabricated_first
+    fabricated_turn_two["argv"] = fabricated_second
+    fabricated_report = "\n".join(report_agreement_lines("codex", fabricated_evidence))
+    validate_report_agreement("codex", fabricated_evidence, fabricated_report)
+    expect_failure(
+        lambda: validate_pass_requirements("codex", fabricated_evidence, codex_events),
+        "fabricated results/report session disagrees with JSONL",
+    )
+
     missing_second_session = copy.deepcopy(codex_row)
     missing_second_session["turn_two_observed_session_id"] = ""
     expect_failure(
@@ -569,6 +654,14 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     expect_failure(
         lambda: validate_event_bindings("codex", codex_row, relabelled_event),
         "normalized event relabeling",
+    )
+
+    unknown_native_event = copy.deepcopy(codex_events)
+    unknown_native_event[0]["native_event_type"] = "unknown.native.event"
+    unknown_native_event[0]["normalized_event_type"] = "provider.event"
+    expect_failure(
+        lambda: validate_event_bindings("codex", codex_row, unknown_native_event),
+        "unknown native event type",
     )
 
     bypass_argv = copy.deepcopy(copilot_row)
