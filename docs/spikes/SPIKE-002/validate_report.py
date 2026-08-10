@@ -100,7 +100,8 @@ NORMALIZED_EVENT_TYPES = {
         "assistant": "provider.event",
         "rate_limit_event": "provider.event",
         "result": "turn.completed",
-        "system": "session.started",
+        "system.init": "session.started",
+        "system.thinking_tokens": "provider.event",
         "user": "provider.event",
     },
     "copilot": {
@@ -642,10 +643,12 @@ def events_for(provider: str) -> list[dict[str, object]]:
 def run_negative_regressions(results: dict[str, object]) -> None:
     providers = results["providers"]
     assert isinstance(providers, dict)
+    claude_row = providers["claude"]
     codex_row = providers["codex"]
     copilot_row = providers["copilot"]
-    assert isinstance(codex_row, dict) and isinstance(copilot_row, dict)
+    assert isinstance(claude_row, dict) and isinstance(codex_row, dict) and isinstance(copilot_row, dict)
     codex_raw = (EVENT_DIR / "codex.jsonl").read_bytes()
+    claude_events = events_for("claude")
     codex_events = events_for("codex")
     copilot_events = events_for("copilot")
     report = REPORT_PATH.read_text(encoding="utf-8")
@@ -674,6 +677,21 @@ def run_negative_regressions(results: dict[str, object]) -> None:
             "codex", codex_row, provider_report_section(final_digest_substitution, "codex")
         ),
         "provider rendered final-file digest substitution",
+    )
+
+    claude_mapping = derive_event_mapping("claude", claude_events)
+    require(claude_mapping.get("system.init") == "session.started", "Claude init mapping is missing")
+    require(
+        claude_mapping.get("system.thinking_tokens") == "provider.event",
+        "Claude non-init system mapping is not provider-neutral",
+    )
+    require(
+        all(native == "system.init" or normalized != "session.started" for native, normalized in claude_mapping.items()),
+        "a non-init Claude system subtype maps to session.started",
+    )
+    expect_failure(
+        lambda: normalized_event_type("claude", "system.unknown"),
+        "unknown Claude system subtype",
     )
 
     expect_failure(lambda: parse_events_bytes(codex_raw[:-1] + b"{", "codex"), "corrupt JSONL")

@@ -58,7 +58,8 @@ NORMALIZED_EVENT_TYPES = {
         "assistant": "provider.event",
         "rate_limit_event": "provider.event",
         "result": "turn.completed",
-        "system": "session.started",
+        "system.init": "session.started",
+        "system.thinking_tokens": "provider.event",
         "user": "provider.event",
     },
     "copilot": {
@@ -278,10 +279,18 @@ def recursive_values(value: object, keys: set[str]) -> list[str]:
     return found
 
 
-def native_type(value: dict[str, object]) -> str:
+def claude_system_native_type(subtype: object) -> str:
+    if not isinstance(subtype, str) or not subtype.strip():
+        raise RuntimeError("Claude system event is missing a nonblank subtype")
+    return f"system.{subtype.strip()}"
+
+
+def native_type(provider: str, value: dict[str, object]) -> str:
     for key in TYPE_KEYS:
         item = value.get(key)
         if isinstance(item, str) and item:
+            if provider == "claude" and item == "system":
+                return claude_system_native_type(value.get("subtype"))
             return item
     return "unknown"
 
@@ -306,7 +315,7 @@ def normalize_objects(
     sessions: list[str] = []
     types: list[str] = []
     for offset, value in enumerate(objects):
-        native = native_type(value)
+        native = native_type(provider, value)
         types.append(native)
         observed = recursive_values(value, SESSION_KEYS)
         sessions.extend(observed)
@@ -574,6 +583,49 @@ def probe(provider: str) -> dict[str, object]:
     }
 
 
+def discover_claude_system_types() -> list[str]:
+    """Observe only Claude's top-level system discriminators in scratch storage."""
+    provider = "claude"
+    executable = executable_for(provider)
+    cwd = create_disposable_repository(provider)
+    run_checked(version_argv(provider, executable), cwd)
+    run_checked(help_argv(provider, executable), cwd)
+    supplied_session = str(uuid.uuid4())
+    turn_one_prompt = (SCRATCH_ROOT / "turn-one.input").read_text(encoding="utf-8").strip()
+    turn_two_prompt = (SCRATCH_ROOT / "turn-two.input").read_text(encoding="utf-8").strip()
+    raw_one = SCRATCH_ROOT / f"{provider}-turn-one.raw"
+    raw_two = SCRATCH_ROOT / f"{provider}-turn-two.raw"
+    try:
+        first = process_attempt(provider_argv(provider, executable, turn_one_prompt, supplied_session, 1), cwd, raw_one)
+        objects_one, structured_one = json_objects(first["stdout"])
+        observed_session = first_session(provider, supplied_session, recursive_values(objects_one, SESSION_KEYS))
+        resume_session = observed_session or supplied_session
+        second = process_attempt(provider_argv(provider, executable, turn_two_prompt, resume_session, 2), cwd, raw_two)
+        objects_two, structured_two = json_objects(second["stdout"])
+        observed_second = first_session(provider, supplied_session, recursive_values(objects_two, SESSION_KEYS))
+        if first["exit_code"] != 0 or second["exit_code"] != 0 or first["timed_out"] or second["timed_out"]:
+            raise RuntimeError("Claude structural discovery did not complete both turns")
+        if not structured_one or not structured_two:
+            raise RuntimeError("Claude structural discovery lacked parseable structured output")
+        if not has_exact_session_continuity(observed_session, resume_session, observed_second):
+            raise RuntimeError("Claude structural discovery lacked exact session continuity")
+        composites = {
+            native_type(provider, value)
+            for value in objects_one + objects_two
+            if value.get("type") == "system"
+        }
+        if not composites:
+            raise RuntimeError("Claude structural discovery observed no top-level system events")
+        return sorted(composites)
+    finally:
+        for raw_path in (raw_one, raw_two):
+            if raw_path.exists():
+                raw_path.unlink()
+        for prompt_path in (SCRATCH_ROOT / "turn-one.input", SCRATCH_ROOT / "turn-two.input"):
+            if prompt_path.exists():
+                prompt_path.unlink()
+
+
 def load_normalized_events(path: Path, provider: str) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -628,11 +680,22 @@ def run_self_check() -> None:
         raise RuntimeError("different turn-two session incorrectly counts as continuous")
     if not has_exact_session_continuity(session, session, session):
         raise RuntimeError("matching session evidence incorrectly fails continuity")
-    try:
-        normalized_type("codex", "unknown.native.event")
-    except RuntimeError:
-        return
-    raise RuntimeError("unknown native event type did not fail closed")
+    if native_type("claude", {"type": "system", "subtype": "init"}) != "system.init":
+        raise RuntimeError("Claude init subtype was not preserved")
+    if normalized_type("claude", "system.init") != "session.started":
+        raise RuntimeError("Claude init subtype was not the sole session-start mapping")
+    if normalized_type("claude", "system.thinking_tokens") != "provider.event":
+        raise RuntimeError("Claude non-init system subtype was not provider-neutral")
+    for action, message in (
+        (lambda: native_type("claude", {"type": "system"}), "missing Claude system subtype did not fail closed"),
+        (lambda: normalized_type("claude", "system.unknown"), "unknown Claude system subtype did not fail closed"),
+        (lambda: normalized_type("codex", "unknown.native.event"), "unknown native event type did not fail closed"),
+    ):
+        try:
+            action()
+        except RuntimeError:
+            continue
+        raise RuntimeError(message)
 
 
 def main() -> int:
@@ -640,7 +703,13 @@ def main() -> int:
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument("--refresh-derived", action="store_true")
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--discover-claude-system-types", action="store_true")
     args = parser.parse_args()
+    if args.discover_claude_system_types:
+        if args.provider or args.refresh_derived or args.self_check:
+            parser.error("--discover-claude-system-types cannot be combined with another action")
+        print(json.dumps({"provider": "claude", "system_types": discover_claude_system_types()}, sort_keys=True))
+        return 0
     if args.self_check:
         if args.provider or args.refresh_derived:
             parser.error("--self-check cannot be combined with another action")

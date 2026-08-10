@@ -34,19 +34,19 @@ This report records a bounded two-turn disposable-worktree experiment. It does n
 - Executable: /Users/alvaro/.local/share/claude/versions/2.1.220
 - Version: 2.1.220 (Claude Code)
 - Result: PASS — all required capabilities observed
-- Working-directory token/digest: $PROBE_ROOT/claude / sha256:74fb55ad22f8f9a179213ba67cdda59696bfb58f5d06c08886b02f9c484fe2e4
-- Observed/resumed session: fdf28489-7639-44fa-957b-b4c46c078e50 / fdf28489-7639-44fa-957b-b4c46c078e50
-- Turn-two observed session: fdf28489-7639-44fa-957b-b4c46c078e50
+- Working-directory token/digest: $PROBE_ROOT/claude / sha256:e311b6511f98eb12c0859be39759cf98d7f1ff3d2e572e85d32d8a3b70f74970
+- Observed/resumed session: 7f025a20-7eec-4245-9019-b1ddfde0bb8a / 7f025a20-7eec-4245-9019-b1ddfde0bb8a
+- Turn-two observed session: 7f025a20-7eec-4245-9019-b1ddfde0bb8a
 - Turn exits: 0 / 0
-- Raw stream digests: sha256:365d7b451ba79ac78803de38b70f9a56fc4a03df52e713807c33d8ed51aca931 / sha256:7f97df57361a696505de22d441d6ef8ab12cbf6e4c398cde8891614499e32d71
-- Normalized artifact: docs/spikes/SPIKE-002/events/claude.jsonl (sha256:0bc38c2a7a3809f2586a8256ec90ea22b67bef6ce8984be92749a4e804927cb6)
+- Raw stream digests: sha256:519db349a32e6858ab4c4b022e77c05a8b3a2365780c19a2975e93e93e47b922 / sha256:bfc9864ae422ac6e2b0f71f6ec567fc09b133171c8114c06dba337683a6576e1
+- Normalized artifact: docs/spikes/SPIKE-002/events/claude.jsonl (sha256:bb010632131791bc04b00fc0ab6a385983b51ec41a0ecc17d8981d37bb5ee07b)
 - Final file digest: sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d
 - Permission behavior: Claude used --safe-mode and --permission-mode acceptEdits on both turns; neither turn used a permission-bypass flag.
-- Native event types: assistant, rate_limit_event, result, system, user
-- Exact native-to-normalized mapping: {"assistant": "provider.event", "rate_limit_event": "provider.event", "result": "turn.completed", "system": "session.started", "user": "provider.event"}
+- Native event types: assistant, rate_limit_event, result, system.init, system.thinking_tokens, user
+- Exact native-to-normalized mapping: {"assistant": "provider.event", "rate_limit_event": "provider.event", "result": "turn.completed", "system.init": "session.started", "system.thinking_tokens": "provider.event", "user": "provider.event"}
 - Unavailable/unstable fields: provider-side authoritative worktree identity, provider-side cryptographic termination receipt
-- Turn-one argv: ["/Users/alvaro/.local/share/claude/versions/2.1.220", "--print", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-mode", "acceptEdits", "--session-id", "fdf28489-7639-44fa-957b-b4c46c078e50", "<redacted-prompt>"]
-- Turn-two argv: ["/Users/alvaro/.local/share/claude/versions/2.1.220", "--print", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-mode", "acceptEdits", "--resume", "fdf28489-7639-44fa-957b-b4c46c078e50", "<redacted-prompt>"]
+- Turn-one argv: ["/Users/alvaro/.local/share/claude/versions/2.1.220", "--print", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-mode", "acceptEdits", "--session-id", "7f025a20-7eec-4245-9019-b1ddfde0bb8a", "<redacted-prompt>"]
+- Turn-two argv: ["/Users/alvaro/.local/share/claude/versions/2.1.220", "--print", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-mode", "acceptEdits", "--resume", "7f025a20-7eec-4245-9019-b1ddfde0bb8a", "<redacted-prompt>"]
 
 ### copilot
 

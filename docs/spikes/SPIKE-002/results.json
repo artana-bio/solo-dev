@@ -2,15 +2,16 @@
   "all_pass": true,
   "providers": {
     "claude": {
-      "cwd_digest": "sha256:74fb55ad22f8f9a179213ba67cdda59696bfb58f5d06c08886b02f9c484fe2e4",
+      "cwd_digest": "sha256:e311b6511f98eb12c0859be39759cf98d7f1ff3d2e572e85d32d8a3b70f74970",
       "cwd_token": "$PROBE_ROOT/claude",
       "event_artifact": "docs/spikes/SPIKE-002/events/claude.jsonl",
-      "event_artifact_sha256": "sha256:0bc38c2a7a3809f2586a8256ec90ea22b67bef6ce8984be92749a4e804927cb6",
+      "event_artifact_sha256": "sha256:bb010632131791bc04b00fc0ab6a385983b51ec41a0ecc17d8981d37bb5ee07b",
       "event_mapping": {
         "assistant": "provider.event",
         "rate_limit_event": "provider.event",
         "result": "turn.completed",
-        "system": "session.started",
+        "system.init": "session.started",
+        "system.thinking_tokens": "provider.event",
         "user": "provider.event"
       },
       "executable": "/Users/alvaro/.local/share/claude/versions/2.1.220",
@@ -18,18 +19,19 @@
       "final_file_sha256": "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d",
       "git_status": "?? probe-result.txt\n",
       "help_sha256": "sha256:fcd5b45507c7c602d54d85a300eab288a8a3c6770c6def696ca19a3100725de4",
-      "observed_session_id": "fdf28489-7639-44fa-957b-b4c46c078e50",
+      "observed_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
       "permission_behavior": "Claude used --safe-mode and --permission-mode acceptEdits on both turns; neither turn used a permission-bypass flag.",
       "provider": "claude",
       "reason": "all required capabilities observed",
-      "resume_session_id": "fdf28489-7639-44fa-957b-b4c46c078e50",
+      "resume_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
       "session_continuity": true,
       "status": "PASS",
       "structured_event_types": [
         "assistant",
         "rate_limit_event",
         "result",
-        "system",
+        "system.init",
+        "system.thinking_tokens",
         "user"
       ],
       "structured_output": true,
@@ -44,12 +46,12 @@
           "--permission-mode",
           "acceptEdits",
           "--session-id",
-          "fdf28489-7639-44fa-957b-b4c46c078e50",
+          "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 7573,
+        "elapsed_ms": 7729,
         "exit_code": 0,
-        "raw_sha256": "sha256:365d7b451ba79ac78803de38b70f9a56fc4a03df52e713807c33d8ed51aca931",
+        "raw_sha256": "sha256:519db349a32e6858ab4c4b022e77c05a8b3a2365780c19a2975e93e93e47b922",
         "timed_out": false
       },
       "turn_two": {
@@ -63,15 +65,15 @@
           "--permission-mode",
           "acceptEdits",
           "--resume",
-          "fdf28489-7639-44fa-957b-b4c46c078e50",
+          "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 6593,
+        "elapsed_ms": 6385,
         "exit_code": 0,
-        "raw_sha256": "sha256:7f97df57361a696505de22d441d6ef8ab12cbf6e4c398cde8891614499e32d71",
+        "raw_sha256": "sha256:bfc9864ae422ac6e2b0f71f6ec567fc09b133171c8114c06dba337683a6576e1",
         "timed_out": false
       },
-      "turn_two_observed_session_id": "fdf28489-7639-44fa-957b-b4c46c078e50",
+      "turn_two_observed_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
       "unavailable_fields": [
         "provider-side authoritative worktree identity",
         "provider-side cryptographic termination receipt"
