@@ -503,30 +503,82 @@ def rendered_reason(row: dict[str, object]) -> str:
     return str(row["reason"]).replace("|", "/")
 
 
+def report_summary_rows(report: str) -> dict[str, list[str]]:
+    header = "| Provider | Result | Version | Exact-session resume | Expected file | Reason |"
+    separator = "| --- | --- | --- | --- | --- | --- |"
+    lines = report.splitlines()
+    require(lines.count(header) == 1, "report summary header is missing or duplicated")
+    index = lines.index(header)
+    require(index + 1 < len(lines) and lines[index + 1] == separator, "report summary separator is missing")
+    rows: dict[str, list[str]] = {}
+    for line in lines[index + 2 :]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        require(len(cells) == 6, "report summary row has the wrong column count")
+        provider = cells[0]
+        require(provider in PROVIDERS, f"unexpected provider in report summary: {provider}")
+        require(provider not in rows, f"duplicate provider in report summary: {provider}")
+        rows[provider] = cells
+    require(set(rows) == set(PROVIDERS), "report summary provider matrix is incomplete")
+    return rows
+
+
+def validate_report_summary(provider: str, row: dict[str, object], summary: dict[str, list[str]]) -> None:
+    expected = [
+        provider,
+        str(row["status"]),
+        str(row["version"]),
+        str(row["session_continuity"]),
+        str(row["expected_content"]),
+        rendered_reason(row),
+    ]
+    require(summary.get(provider) == expected, f"report summary does not agree with {provider}")
+
+
+def provider_report_section(report: str, provider: str) -> str:
+    heading = f"### {provider}"
+    lines = report.splitlines()
+    matches = [index for index, line in enumerate(lines) if line == heading]
+    require(len(matches) == 1, f"report has missing or duplicate {provider} evidence section")
+    start = matches[0] + 1
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("### ") or lines[index].startswith("## "):
+            end = index
+            break
+    section = "\n".join(lines[start:end])
+    require(section.strip(), f"report {provider} evidence section is empty")
+    return section
+
+
 def report_agreement_lines(provider: str, row: dict[str, object]) -> tuple[str, ...]:
     first = row["turn_one"]
     second = row["turn_two"]
     assert isinstance(first, dict) and isinstance(second, dict)
     return (
-        f"| {provider} | {row['status']} | {row['version']} | {row['session_continuity']} | {row['expected_content']} | {rendered_reason(row)} |",
         f"- Executable: {row['executable']}",
         f"- Version: {row['version']}",
         f"- Result: {row['status']} — {row['reason']}",
+        f"- Working-directory token/digest: {row['cwd_token']} / {row['cwd_digest']}",
         f"- Observed/resumed session: {row['observed_session_id']} / {row['resume_session_id']}",
         f"- Turn-two observed session: {row['turn_two_observed_session_id']}",
         f"- Turn exits: {first['exit_code']} / {second['exit_code']}",
+        f"- Raw stream digests: {first['raw_sha256']} / {second['raw_sha256']}",
         f"- Normalized artifact: {row['event_artifact']} ({row['event_artifact_sha256']})",
         f"- Final file digest: {row['final_file_sha256']}",
         f"- Permission behavior: {row['permission_behavior']}",
+        f"- Native event types: {', '.join(row['structured_event_types']) or 'none'}",
         f"- Exact native-to-normalized mapping: {json.dumps(row['event_mapping'], ensure_ascii=False, sort_keys=True)}",
+        f"- Unavailable/unstable fields: {', '.join(row['unavailable_fields']) or 'none'}",
         f"- Turn-one argv: {json.dumps(first['argv'], ensure_ascii=False)}",
         f"- Turn-two argv: {json.dumps(second['argv'], ensure_ascii=False)}",
     )
 
 
-def validate_report_agreement(provider: str, row: dict[str, object], report: str) -> None:
+def validate_report_agreement(provider: str, row: dict[str, object], section: str) -> None:
     for line in report_agreement_lines(provider, row):
-        require(line in report, f"report does not agree with {provider}: {line.split(':', 1)[0]}")
+        require(line in section, f"report does not agree with {provider}: {line.split(':', 1)[0]}")
 
 
 def package_block(text: str, package: str) -> str:
@@ -565,8 +617,10 @@ def validate_baseline(report_path: Path) -> dict[str, object]:
     all_pass = all(rows[name]["status"] == "PASS" for name in PROVIDERS)
     require(results.get("all_pass") is all_pass, "all_pass does not match provider rows")
     report = report_path.read_text(encoding="utf-8")
+    summary = report_summary_rows(report)
     for provider in PROVIDERS:
-        validate_report_agreement(provider, rows[provider], report)
+        validate_report_summary(provider, rows[provider], summary)
+        validate_report_agreement(provider, rows[provider], provider_report_section(report, provider))
     require("does not claim a production adapter or coordinator" in report, "report claim boundary missing")
     scan_candidate(results, report_path)
     validate_plan(results)
@@ -594,6 +648,33 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     codex_raw = (EVENT_DIR / "codex.jsonl").read_bytes()
     codex_events = events_for("codex")
     copilot_events = events_for("copilot")
+    report = REPORT_PATH.read_text(encoding="utf-8")
+    codex_turn_one = codex_row["turn_one"]
+    codex_turn_two = codex_row["turn_two"]
+    assert isinstance(codex_turn_one, dict) and isinstance(codex_turn_two, dict)
+
+    raw_line = f"- Raw stream digests: {codex_turn_one['raw_sha256']} / {codex_turn_two['raw_sha256']}"
+    altered_raw_line = "- Raw stream digests: sha256:" + "0" * 64 + " / sha256:" + "1" * 64
+    raw_digest_substitution = report.replace(raw_line, altered_raw_line, 1)
+    require(raw_digest_substitution != report, "raw digest report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(raw_digest_substitution, "codex")
+        ),
+        "provider raw-stream digest substitution",
+    )
+
+    final_line = f"- Final file digest: {codex_row['final_file_sha256']}"
+    altered_final_line = "- Final file digest: sha256:" + "2" * 64
+    final_digest_substitution = report.replace(final_line, altered_final_line, 1)
+    require(final_digest_substitution != report, "final digest report mutation setup failed")
+    require(final_line in final_digest_substitution, "shared final digest report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(final_digest_substitution, "codex")
+        ),
+        "provider rendered final-file digest substitution",
+    )
 
     expect_failure(lambda: parse_events_bytes(codex_raw[:-1] + b"{", "codex"), "corrupt JSONL")
 
