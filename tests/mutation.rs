@@ -2,7 +2,10 @@
 
 mod support;
 
-use std::process::{Command, Output};
+use std::{
+    fs,
+    process::{Command, Output},
+};
 
 use change_harness::domain::digest::Digest;
 use serde_json::Value;
@@ -249,6 +252,64 @@ fn operator_can_settle_a_legacy_clean_mutation_failure() {
     );
     let worktrees = support::capture(&workspace.repository, &["worktree", "list", "--porcelain"]);
     assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+}
+
+#[test]
+fn legacy_mutation_settlement_requires_durable_restoration_proof() {
+    let workspace = workspace_with_oracle(&["true"]);
+    let args = mutation_args(
+        &workspace,
+        "MR-MISSING-RESTORATION-PROOF",
+        &["sh", "-c", "printf changed > README.md"],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("CHANGE_HARNESS_FAIL_AT", "mutation-worktree-restored")
+        .args(&args)
+        .output()
+        .expect("the CLI should start");
+    assert!(!output.status.success());
+
+    let status = Workspace::run_json(&[
+        "project".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    let operation_id = status["data"]["unresolved_operations"][0]["operation_id"]
+        .as_str()
+        .unwrap();
+    let journal_path = workspace
+        .control
+        .join(format!("journal/{operation_id}.json"));
+    let mut journal: Value =
+        serde_json::from_str(&fs::read_to_string(&journal_path).unwrap()).unwrap();
+    journal["steps"] = serde_json::json!(["mutation-worktree-added"]);
+    fs::write(
+        &journal_path,
+        format!("{}\n", serde_json::to_string_pretty(&journal).unwrap()),
+    )
+    .unwrap();
+
+    let refused = Workspace::run(&[
+        "project".to_owned(),
+        "recover".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--settle-clean-mutation".to_owned(),
+        operation_id.to_owned(),
+        "--actor-id".to_owned(),
+        "operator".to_owned(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    assert!(!refused.status.success());
+    let error: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "CH-RECOVERY-INCOMPLETE-OPERATION");
+    let preserved: Value =
+        serde_json::from_str(&fs::read_to_string(&journal_path).unwrap()).unwrap();
+    assert_eq!(preserved["state"], "failed_partial");
 }
 
 #[allow(dead_code)]

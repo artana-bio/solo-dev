@@ -1403,7 +1403,7 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
             && record
                 .steps
                 .iter()
-                .any(|step| step == "mutation-worktree-added")
+                .any(|step| step == "mutation-worktree-restored")
             && !failure.contains("disposable mutation cleanup failed")
             && record.expected_control_head == current_head
             && control.is_clean()?;
