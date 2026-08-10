@@ -17,9 +17,21 @@ EVENT_SCHEMA = "harness.provider-feasibility-event/v1"
 PROVIDERS = ("codex", "claude", "copilot")
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
+REPORT_PATH = SCRIPT_DIR.parent / "SPIKE-002-REPORT.md"
 RESULTS_PATH = SCRIPT_DIR / "results.json"
 EVENT_DIR = SCRIPT_DIR / "events"
 PLAN_PATH = REPO_ROOT / "docs" / "IMPLEMENTATION_PLAN.md"
+EXPECTED_FINAL_FILE_SHA256 = "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d"
+EXPECTED_ARTIFACT_RELATIVE_PATHS = frozenset(
+    {
+        "run_probe.py",
+        "validate_report.py",
+        "results.json",
+        "events/codex.jsonl",
+        "events/claude.jsonl",
+        "events/copilot.jsonl",
+    }
+)
 EVENT_KEYS = {
     "schema",
     "provider",
@@ -60,6 +72,41 @@ ROW_KEYS = {
     "reason",
 }
 TURN_KEYS = {"argv", "exit_code", "timed_out", "elapsed_ms", "raw_sha256"}
+PERMISSION_BEHAVIORS = {
+    "codex": (
+        "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, "
+        "and neither turn used a sandbox-bypass or approval-bypass flag."
+    ),
+    "claude": (
+        "Claude used --safe-mode and --permission-mode acceptEdits on both turns; "
+        "neither turn used a permission-bypass flag."
+    ),
+    "copilot": (
+        "Copilot used --allow-all-tools, which the installed CLI required for noninteractive mode: "
+        "all tools were auto-approved. --allow-all-paths, --allow-all-urls, --allow-all, and --yolo "
+        "were absent, so path and URL verification were not disabled. The local same-user process "
+        "is not a security boundary."
+    ),
+}
+FORBIDDEN_EXACT_FLAGS = {
+    "--allow-all-paths",
+    "--allow-all-urls",
+    "--allow-all",
+    "--yolo",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-skip-permissions",
+    "--no-sandbox",
+}
+FORBIDDEN_VALUE_FLAGS = {
+    "--allow-all-paths",
+    "--allow-all-urls",
+    "--allow-all",
+    "--yolo",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-skip-permissions",
+    "--sandbox",
+    "--permission-mode",
+}
 
 
 class ValidationError(RuntimeError):
@@ -73,6 +120,19 @@ def require(condition: bool, message: str) -> None:
 
 def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def normalized_event_type(native: str) -> str:
+    lowered = native.lower()
+    if "tool" in lowered or "command" in lowered or "item" in lowered:
+        return "provider.activity"
+    if "start" in lowered or "init" in lowered or "system" in lowered:
+        return "session.started"
+    if "result" in lowered or "complete" in lowered or "finish" in lowered or "end" in lowered:
+        return "turn.completed"
+    if "error" in lowered or "fail" in lowered:
+        return "turn.failed"
+    return "provider.event"
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -99,20 +159,163 @@ def parse_events_bytes(raw: bytes, provider: str) -> list[dict[str, object]]:
         require(value["provider"] == provider, f"{provider} JSONL line {number} provider mismatch")
         require(value["turn"] in (1, 2), f"{provider} JSONL line {number} invalid turn")
         require(value["sequence"] == number, f"{provider} JSONL sequence is not monotonic")
+        native = value["native_event_type"]
+        normalized = value["normalized_event_type"]
+        require(isinstance(native, str) and native, f"{provider} JSONL line {number} native type missing")
+        require(isinstance(normalized, str) and normalized, f"{provider} JSONL line {number} normalized type missing")
+        require(
+            normalized == normalized_event_type(native),
+            f"{provider} JSONL line {number} normalization mismatch",
+        )
         require(isinstance(value["cwd_digest"], str) and value["cwd_digest"], f"{provider} cwd digest missing")
+        require(
+            value["session_id"] is None or isinstance(value["session_id"], str),
+            f"{provider} JSONL line {number} session identifier invalid",
+        )
+        require(
+            value["exit_code"] is None or isinstance(value["exit_code"], int),
+            f"{provider} JSONL line {number} exit code invalid",
+        )
+        require(isinstance(value["timed_out"], bool), f"{provider} JSONL line {number} timeout invalid")
         events.append(value)
     return events
+
+
+def derive_event_mapping(events: list[dict[str, object]]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for event in events:
+        native = event["native_event_type"]
+        normalized = event["normalized_event_type"]
+        require(isinstance(native, str) and native, "event native type missing")
+        require(isinstance(normalized, str) and normalized, "event normalized type missing")
+        require(normalized == normalized_event_type(native), "event normalization mismatch")
+        previous = mapping.setdefault(native, normalized)
+        require(previous == normalized, f"native event type maps inconsistently: {native}")
+    return dict(sorted(mapping.items()))
+
+
+def assert_no_forbidden_flags(argv: list[str], provider: str, label: str) -> None:
+    for index, argument in enumerate(argv):
+        lowered = argument.lower()
+        require(argument not in FORBIDDEN_EXACT_FLAGS, f"{provider} {label} used forbidden flag {argument}")
+        for flag in FORBIDDEN_VALUE_FLAGS - {"--sandbox", "--permission-mode"}:
+            require(
+                not lowered.startswith(flag + "="),
+                f"{provider} {label} used forbidden flag {argument}",
+            )
+        if argument == "--allow-all-tools":
+            require(provider == "copilot", f"{provider} {label} used Copilot-only auto-approval")
+        if argument == "--sandbox" and index + 1 < len(argv):
+            require(
+                argv[index + 1].lower() not in {"danger-full-access", "dangerfullaccess"},
+                f"{provider} {label} used unrestricted sandbox mode",
+            )
+        require(
+            not lowered.startswith("--sandbox=danger-full-access"),
+            f"{provider} {label} used unrestricted sandbox mode",
+        )
+        if argument == "--permission-mode" and index + 1 < len(argv):
+            require(
+                argv[index + 1].lower() not in {"bypasspermissions", "bypass-permissions", "bypass"},
+                f"{provider} {label} used a permission bypass mode",
+            )
+        require(
+            not lowered.startswith("--permission-mode=bypass"),
+            f"{provider} {label} used a permission bypass mode",
+        )
 
 
 def validate_turn(turn: object, provider: str, label: str) -> dict[str, object]:
     require(isinstance(turn, dict), f"{provider} {label} must be an object")
     require(set(turn) == TURN_KEYS, f"{provider} {label} fields mismatch")
-    require(isinstance(turn["argv"], list) and turn["argv"], f"{provider} {label} argv missing")
-    require("<redacted-prompt>" in turn["argv"], f"{provider} {label} prompt was not redacted")
+    argv = turn["argv"]
+    require(isinstance(argv, list) and argv, f"{provider} {label} argv missing")
+    require(all(isinstance(value, str) and value for value in argv), f"{provider} {label} argv is invalid")
+    require(argv.count("<redacted-prompt>") == 1, f"{provider} {label} prompt was not redacted")
+    require(argv[-1] == "<redacted-prompt>", f"{provider} {label} prompt is not terminal")
     require(isinstance(turn["elapsed_ms"], int) and turn["elapsed_ms"] >= 0, f"{provider} {label} elapsed invalid")
     require(isinstance(turn["timed_out"], bool), f"{provider} {label} timeout invalid")
-    require(isinstance(turn["raw_sha256"], str) and turn["raw_sha256"].startswith("sha256:"), f"{provider} {label} raw digest missing")
+    require(
+        isinstance(turn["raw_sha256"], str) and turn["raw_sha256"].startswith("sha256:"),
+        f"{provider} {label} raw digest missing",
+    )
+    assert_no_forbidden_flags(argv, provider, label)
     return turn
+
+
+def expected_pass_argvs(provider: str, executable: str, session: str) -> tuple[list[str], list[str]]:
+    prompt = "<redacted-prompt>"
+    if provider == "codex":
+        return (
+            [executable, "exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", prompt],
+            [executable, "exec", "resume", session, "--json", prompt],
+        )
+    if provider == "claude":
+        common = [
+            executable,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--safe-mode",
+            "--permission-mode",
+            "acceptEdits",
+        ]
+        return (common + ["--session-id", session, prompt], common + ["--resume", session, prompt])
+    if provider == "copilot":
+        common = [executable, "--output-format", "json", "--allow-all-tools"]
+        return (
+            common + ["--session-id", session, "--prompt", prompt],
+            common + [f"--resume={session}", "--prompt", prompt],
+        )
+    raise ValidationError(f"unknown provider: {provider}")
+
+
+def validate_event_bindings(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
+    for event in events:
+        require(event["cwd_digest"] == row["cwd_digest"], f"{provider} event cwd binding mismatch")
+    mapping = derive_event_mapping(events)
+    require(row["event_mapping"] == mapping, f"{provider} event mapping does not match normalized JSONL")
+    require(
+        row["structured_event_types"] == sorted(mapping),
+        f"{provider} event types do not match normalized JSONL",
+    )
+
+
+def require_nonblank_session(value: object, provider: str, field: str) -> str:
+    require(isinstance(value, str) and value.strip(), f"{provider} PASS lacks {field}")
+    return value
+
+
+def validate_pass_requirements(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
+    first = validate_turn(row["turn_one"], provider, "turn_one")
+    second = validate_turn(row["turn_two"], provider, "turn_two")
+    observed = require_nonblank_session(row["observed_session_id"], provider, "observed session")
+    resumed = require_nonblank_session(row["resume_session_id"], provider, "resumed session")
+    second_observed = require_nonblank_session(
+        row["turn_two_observed_session_id"], provider, "turn-two observed session"
+    )
+    require(observed == resumed == second_observed, f"{provider} PASS session continuity is not exact")
+    executable = row["executable"]
+    require(isinstance(executable, str) and executable, f"{provider} executable missing")
+    expected_first, expected_second = expected_pass_argvs(provider, executable, observed)
+    require(first["argv"] == expected_first, f"{provider} PASS turn-one argv does not match required shape")
+    require(second["argv"] == expected_second, f"{provider} PASS turn-two argv does not match required shape")
+    require(first["argv"][0] == executable and second["argv"][0] == executable, f"{provider} argv executable mismatch")
+    require(first["exit_code"] == 0 and second["exit_code"] == 0, f"{provider} PASS has nonzero exit")
+    require(not first["timed_out"] and not second["timed_out"], f"{provider} PASS timed out")
+    require(row["structured_output"] is True and bool(events), f"{provider} PASS lacks structured events")
+    require(row["session_continuity"] is True, f"{provider} PASS continuity is false")
+    require(row["expected_content"] is True, f"{provider} PASS final content mismatch")
+    require(
+        row["final_file_sha256"] == EXPECTED_FINAL_FILE_SHA256,
+        f"{provider} PASS final file digest does not match expected bytes",
+    )
+    require(
+        row["permission_behavior"] == PERMISSION_BEHAVIORS[provider],
+        f"{provider} permission statement does not match exact argv",
+    )
+    validate_event_bindings(provider, row, events)
 
 
 def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -120,8 +323,24 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     require(set(row) == ROW_KEYS, f"{provider} row has unknown/missing fields")
     require(row["provider"] == provider, f"{provider} row identity mismatch")
     require(row["status"] in ("PASS", "FAIL"), f"{provider} result must be PASS or FAIL")
-    for field in ("executable", "version", "cwd_token", "cwd_digest", "event_artifact", "reason"):
+    for field in (
+        "executable",
+        "version",
+        "version_sha256",
+        "help_sha256",
+        "cwd_token",
+        "cwd_digest",
+        "event_artifact",
+        "event_artifact_sha256",
+        "final_file_sha256",
+        "permission_behavior",
+        "reason",
+    ):
         require(isinstance(row[field], str) and row[field].strip(), f"{provider} {field} missing")
+    require(str(row["version_sha256"]).startswith("sha256:"), f"{provider} version digest missing")
+    require(str(row["help_sha256"]).startswith("sha256:"), f"{provider} help digest missing")
+    require(str(row["event_artifact_sha256"]).startswith("sha256:"), f"{provider} event digest missing")
+    require(str(row["final_file_sha256"]).startswith("sha256:"), f"{provider} final digest missing")
     require(row["cwd_token"] == f"$PROBE_ROOT/{provider}", f"{provider} cwd token mismatch")
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
@@ -130,54 +349,119 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     raw = event_path.read_bytes()
     require(sha256_bytes(raw) == row["event_artifact_sha256"], f"{provider} event digest mismatch")
     events = parse_events_bytes(raw, provider)
-    for event in events:
-        require(event["cwd_digest"] == row["cwd_digest"], f"{provider} event cwd binding mismatch")
+    require(isinstance(row["structured_event_types"], list), f"{provider} event types missing")
+    require(all(isinstance(value, str) and value for value in row["structured_event_types"]), f"{provider} event types invalid")
+    require(isinstance(row["event_mapping"], dict), f"{provider} event mapping missing")
+    require(isinstance(row["unavailable_fields"], list), f"{provider} unavailable fields missing")
+    if events:
+        validate_event_bindings(provider, row, events)
     if row["status"] == "PASS":
-        require(first["exit_code"] == 0 and second["exit_code"] == 0, f"{provider} PASS has nonzero exit")
-        require(not first["timed_out"] and not second["timed_out"], f"{provider} PASS timed out")
-        require(row["structured_output"] is True and bool(events), f"{provider} PASS lacks structured events")
-        observed = row["observed_session_id"]
-        resumed = row["resume_session_id"]
-        require(isinstance(observed, str) and observed.strip(), f"{provider} PASS lacks observed session")
-        require(observed == resumed, f"{provider} PASS resumed a different session")
-        second_observed = row["turn_two_observed_session_id"]
-        require(second_observed in (None, resumed), f"{provider} turn-two session mismatch")
-        require(row["session_continuity"] is True, f"{provider} PASS continuity is false")
-        require(row["expected_content"] is True, f"{provider} PASS final content mismatch")
+        validate_pass_requirements(provider, row, events)
     else:
         require(str(row["reason"]).strip() not in ("FAIL", "unknown"), f"{provider} FAIL reason is not specific")
-    require(isinstance(row["structured_event_types"], list), f"{provider} event types missing")
-    require(isinstance(row["event_mapping"], dict) and row["event_mapping"], f"{provider} event mapping missing")
-    require(isinstance(row["unavailable_fields"], list), f"{provider} unavailable fields missing")
+        require(not row["expected_content"] or row["final_file_sha256"] == EXPECTED_FINAL_FILE_SHA256, f"{provider} FAIL content claim is unbound")
+        require(first["argv"][0] == row["executable"], f"{provider} FAIL turn-one executable mismatch")
+        require(second["argv"][0] == row["executable"], f"{provider} FAIL turn-two executable mismatch")
     return row, events
 
 
-def scan_candidate(results: dict[str, object], report_path: Path) -> None:
+def validate_candidate_file_set(root: Path = SCRIPT_DIR) -> None:
+    actual = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    require(
+        actual == EXPECTED_ARTIFACT_RELATIVE_PATHS,
+        "unexpected or missing SPIKE-002 artifact files: " + ", ".join(sorted(actual ^ EXPECTED_ARTIFACT_RELATIVE_PATHS)),
+    )
+
+
+def validate_executable_exemption(executable: str) -> None:
+    require(executable.startswith("/"), "recorded executable must be an absolute path")
+    require(not executable.endswith("/"), "recorded executable must not be a path prefix")
+    require(len(Path(executable).name) > 1, "recorded executable name is too short")
+
+
+def scan_text(
+    path: Path,
+    text: str,
+    executable_values: list[str],
+    payload_artifact: bool,
+) -> None:
+    scrubbed = text
+    for executable in executable_values:
+        validate_executable_exemption(executable)
+        require(
+            executable + "/" not in text,
+            f"recorded executable is used as a raw path prefix in {path.name}",
+        )
+        scrubbed = scrubbed.replace(executable, "<allowed-executable>")
     secret_sentinel = "SPIKE_" + "SECRET_" + "SENTINEL"
     reasoning_sentinel = "SPIKE_" + "REASONING_" + "SENTINEL"
     home_prefix = "/" + "Users" + "/"
+    raw_scratch_prefixes = (
+        "/" + "tmp" + "/",
+        "/" + "private" + "/" + "tmp" + "/",
+        "/" + "var" + "/" + "folders" + "/",
+    )
     token_pattern = re.compile(r"(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})")
-    executable_values: list[str] = []
+    require(secret_sentinel not in scrubbed, f"forbidden secret sentinel in {path.name}")
+    require(reasoning_sentinel not in scrubbed, f"forbidden reasoning sentinel in {path.name}")
+    require(home_prefix not in scrubbed, f"unrestricted home path in {path.name}")
+    for prefix in raw_scratch_prefixes:
+        require(prefix not in scrubbed, f"raw scratch path in {path.name}")
+    require(not token_pattern.search(scrubbed), f"token-like value in {path.name}")
+    if payload_artifact:
+        lowered = scrubbed.lower()
+        require('"stdout"' not in lowered and '"stderr"' not in lowered, f"raw stream field in {path.name}")
+        require(
+            '"reasoning"' not in lowered and '"message"' not in lowered and '"content"' not in lowered,
+            f"free-form payload field in {path.name}",
+        )
+
+
+def scan_candidate(results: dict[str, object], report_path: Path) -> None:
+    validate_candidate_file_set()
     providers = results.get("providers")
-    if isinstance(providers, dict):
-        for row in providers.values():
-            if isinstance(row, dict) and isinstance(row.get("executable"), str):
-                executable_values.append(row["executable"])
-    paths = [report_path, RESULTS_PATH, Path(__file__), SCRIPT_DIR / "run_probe.py"]
-    paths.extend(sorted(EVENT_DIR.glob("*.jsonl")))
+    require(isinstance(providers, dict), "providers must be an object")
+    executable_values: list[str] = []
+    for provider in PROVIDERS:
+        row = providers.get(provider)
+        require(isinstance(row, dict) and isinstance(row.get("executable"), str), f"{provider} executable missing")
+        executable_values.append(row["executable"])
+    paths = [report_path] + [SCRIPT_DIR / relative for relative in sorted(EXPECTED_ARTIFACT_RELATIVE_PATHS)]
     for path in paths:
-        text = path.read_text(encoding="utf-8")
-        scrubbed = text
-        for executable in executable_values:
-            scrubbed = scrubbed.replace(executable, "<allowed-executable>")
-        require(secret_sentinel not in scrubbed, f"forbidden secret sentinel in {path.name}")
-        require(reasoning_sentinel not in scrubbed, f"forbidden reasoning sentinel in {path.name}")
-        require(home_prefix not in scrubbed, f"unrestricted home path in {path.name}")
-        require(not token_pattern.search(scrubbed), f"token-like value in {path.name}")
-        if path in (report_path, RESULTS_PATH) or path.suffix == ".jsonl":
-            lowered = scrubbed.lower()
-            require('"stdout"' not in lowered and '"stderr"' not in lowered, f"raw stream field in {path.name}")
-            require('"reasoning"' not in lowered and '"message"' not in lowered and '"content"' not in lowered, f"free-form payload field in {path.name}")
+        require(path.is_file(), f"expected artifact is missing: {path.name}")
+        payload_artifact = path == report_path or path.name == "results.json" or path.suffix == ".jsonl"
+        scan_text(path, path.read_text(encoding="utf-8"), executable_values, payload_artifact)
+
+
+def rendered_reason(row: dict[str, object]) -> str:
+    return str(row["reason"]).replace("|", "/")
+
+
+def validate_report_agreement(provider: str, row: dict[str, object], report: str) -> None:
+    first = row["turn_one"]
+    second = row["turn_two"]
+    assert isinstance(first, dict) and isinstance(second, dict)
+    expected_lines = (
+        f"| {provider} | {row['status']} | {row['version']} | {row['session_continuity']} | {row['expected_content']} | {rendered_reason(row)} |",
+        f"- Executable: {row['executable']}",
+        f"- Version: {row['version']}",
+        f"- Result: {row['status']} — {row['reason']}",
+        f"- Observed/resumed session: {row['observed_session_id']} / {row['resume_session_id']}",
+        f"- Turn-two observed session: {row['turn_two_observed_session_id']}",
+        f"- Turn exits: {first['exit_code']} / {second['exit_code']}",
+        f"- Normalized artifact: {row['event_artifact']} ({row['event_artifact_sha256']})",
+        f"- Final file digest: {row['final_file_sha256']}",
+        f"- Permission behavior: {row['permission_behavior']}",
+        f"- Exact native-to-normalized mapping: {json.dumps(row['event_mapping'], ensure_ascii=False, sort_keys=True)}",
+        f"- Turn-one argv: {json.dumps(first['argv'], ensure_ascii=False)}",
+        f"- Turn-two argv: {json.dumps(second['argv'], ensure_ascii=False)}",
+    )
+    for line in expected_lines:
+        require(line in report, f"report does not agree with {provider}: {line.split(':', 1)[0]}")
 
 
 def package_block(text: str, package: str) -> str:
@@ -217,9 +501,7 @@ def validate_baseline(report_path: Path) -> dict[str, object]:
     require(results.get("all_pass") is all_pass, "all_pass does not match provider rows")
     report = report_path.read_text(encoding="utf-8")
     for provider in PROVIDERS:
-        expected = f"| {provider} | {rows[provider]['status']} |"
-        require(expected in report, f"report matrix does not match {provider} result")
-        require(str(rows[provider]["event_artifact_sha256"]) in report, f"report omits {provider} artifact digest")
+        validate_report_agreement(provider, rows[provider], report)
     require("does not claim a production adapter or coordinator" in report, "report claim boundary missing")
     scan_candidate(results, report_path)
     validate_plan(results)
@@ -234,36 +516,102 @@ def expect_failure(action, label: str) -> None:
     raise ValidationError(f"negative regression survived: {label}")
 
 
+def events_for(provider: str) -> list[dict[str, object]]:
+    return parse_events_bytes((EVENT_DIR / f"{provider}.jsonl").read_bytes(), provider)
+
+
 def run_negative_regressions(results: dict[str, object]) -> None:
-    provider = PROVIDERS[0]
-    raw = (EVENT_DIR / f"{provider}.jsonl").read_bytes()
-    expect_failure(lambda: parse_events_bytes(raw[:-1] + b"{", provider), "corrupt JSONL")
-    synthetic = {
-        "observed_session_id": "session-a",
-        "resume_session_id": "session-b",
-        "status": "PASS",
-    }
+    providers = results["providers"]
+    assert isinstance(providers, dict)
+    codex_row = providers["codex"]
+    copilot_row = providers["copilot"]
+    assert isinstance(codex_row, dict) and isinstance(copilot_row, dict)
+    codex_raw = (EVENT_DIR / "codex.jsonl").read_bytes()
+    codex_events = events_for("codex")
+    copilot_events = events_for("copilot")
+
+    expect_failure(lambda: parse_events_bytes(codex_raw[:-1] + b"{", "codex"), "corrupt JSONL")
+
+    changed_digest = copy.deepcopy(codex_row)
+    changed_digest["final_file_sha256"] = "sha256:" + "0" * 64
     expect_failure(
-        lambda: require(synthetic["observed_session_id"] == synthetic["resume_session_id"], "session mismatch"),
+        lambda: validate_pass_requirements("codex", changed_digest, codex_events),
+        "changed final digest",
+    )
+
+    substituted_session = copy.deepcopy(codex_row)
+    substituted_session["resume_session_id"] = "session-b"
+    expect_failure(
+        lambda: validate_pass_requirements("codex", substituted_session, codex_events),
         "session substitution",
     )
-    events = parse_events_bytes(raw, provider)
-    if not events:
-        events = [{"cwd_digest": results["providers"][provider]["cwd_digest"]}]
-    mutated = copy.deepcopy(events)
-    mutated[0]["cwd_digest"] = "sha256:" + "0" * 64
-    expected_cwd = results["providers"][provider]["cwd_digest"]
+
+    missing_second_session = copy.deepcopy(codex_row)
+    missing_second_session["turn_two_observed_session_id"] = ""
     expect_failure(
-        lambda: [require(event["cwd_digest"] == expected_cwd, "cwd mismatch") for event in mutated],
-        "wrong worktree",
+        lambda: validate_pass_requirements("codex", missing_second_session, codex_events),
+        "missing turn-two observed session",
+    )
+
+    wrong_cwd = copy.deepcopy(codex_events)
+    wrong_cwd[0]["cwd_digest"] = "sha256:" + "0" * 64
+    expect_failure(lambda: validate_event_bindings("codex", codex_row, wrong_cwd), "wrong worktree")
+
+    stale_mapping = copy.deepcopy(codex_row)
+    stale_mapping["event_mapping"] = {}
+    expect_failure(
+        lambda: validate_pass_requirements("codex", stale_mapping, codex_events),
+        "event mapping mismatch",
+    )
+
+    relabelled_event = copy.deepcopy(codex_events)
+    relabelled_event[0]["normalized_event_type"] = "turn.failed"
+    expect_failure(
+        lambda: validate_event_bindings("codex", codex_row, relabelled_event),
+        "normalized event relabeling",
+    )
+
+    bypass_argv = copy.deepcopy(copilot_row)
+    bypass_first = bypass_argv["turn_one"]
+    assert isinstance(bypass_first, dict)
+    bypass_values = bypass_first["argv"]
+    assert isinstance(bypass_values, list)
+    bypass_values.insert(-1, "--allow-all-paths")
+    expect_failure(
+        lambda: validate_pass_requirements("copilot", bypass_argv, copilot_events),
+        "Copilot path bypass flag",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="spike002-negative-") as directory:
+        candidate_root = Path(directory)
+        for relative in EXPECTED_ARTIFACT_RELATIVE_PATHS:
+            artifact = candidate_root / relative
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("placeholder\n", encoding="utf-8")
+        (candidate_root / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+        expect_failure(lambda: validate_candidate_file_set(candidate_root), "unexpected candidate artifact")
+
+    synthetic_path = Path("synthetic.txt")
+    raw_scratch = "/" + "private" + "/" + "tmp" + "/" + "probe"
+    expect_failure(
+        lambda: scan_text(synthetic_path, raw_scratch, [], True),
+        "raw scratch path",
     )
     secret_sentinel = "SPIKE_" + "SECRET_" + "SENTINEL"
     reasoning_sentinel = "SPIKE_" + "REASONING_" + "SENTINEL"
-    with tempfile.TemporaryDirectory(prefix="spike002-negative-") as directory:
-        marker = Path(directory) / "marker.txt"
-        for label, sentinel in (("secret sentinel", secret_sentinel), ("reasoning sentinel", reasoning_sentinel)):
-            marker.write_text(sentinel, encoding="utf-8")
-            expect_failure(lambda value=sentinel: require(value not in marker.read_text(encoding="utf-8"), label), label)
+    expect_failure(
+        lambda: scan_text(synthetic_path, secret_sentinel, [], True),
+        "secret sentinel",
+    )
+    expect_failure(
+        lambda: scan_text(synthetic_path, reasoning_sentinel, [], True),
+        "reasoning sentinel",
+    )
+
+    expect_failure(
+        lambda: validate_report_agreement("codex", codex_row, ""),
+        "report/result agreement",
+    )
 
 
 def main() -> int:
@@ -271,7 +619,7 @@ def main() -> int:
         print("usage: validate_report.py docs/spikes/SPIKE-002-REPORT.md", file=sys.stderr)
         return 2
     report_path = (REPO_ROOT / sys.argv[1]).resolve() if not Path(sys.argv[1]).is_absolute() else Path(sys.argv[1]).resolve()
-    require(report_path == (REPO_ROOT / "docs" / "spikes" / "SPIKE-002-REPORT.md").resolve(), "unexpected report path")
+    require(report_path == REPORT_PATH.resolve(), "unexpected report path")
     try:
         results = validate_baseline(report_path)
         run_negative_regressions(results)

@@ -30,6 +30,22 @@ SCRATCH_ROOT = Path(
     )
 )
 EXPECTED_BYTES = b"turn-one\nORBIT-2719\n"
+PERMISSION_BEHAVIORS = {
+    "codex": (
+        "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, "
+        "and neither turn used a sandbox-bypass or approval-bypass flag."
+    ),
+    "claude": (
+        "Claude used --safe-mode and --permission-mode acceptEdits on both turns; "
+        "neither turn used a permission-bypass flag."
+    ),
+    "copilot": (
+        "Copilot used --allow-all-tools, which the installed CLI required for noninteractive mode: "
+        "all tools were auto-approved. --allow-all-paths, --allow-all-urls, --allow-all, and --yolo "
+        "were absent, so path and URL verification were not disabled. The local same-user process "
+        "is not a security boundary."
+    ),
+}
 SESSION_KEYS = {
     "thread_id",
     "threadId",
@@ -233,10 +249,10 @@ def native_type(value: dict[str, object]) -> str:
 
 def normalized_type(native: str) -> str:
     lowered = native.lower()
-    if "start" in lowered or "init" in lowered or "system" in lowered:
-        return "session.started"
     if "tool" in lowered or "command" in lowered or "item" in lowered:
         return "provider.activity"
+    if "start" in lowered or "init" in lowered or "system" in lowered:
+        return "session.started"
     if "result" in lowered or "complete" in lowered or "finish" in lowered or "end" in lowered:
         return "turn.completed"
     if "error" in lowered or "fail" in lowered:
@@ -276,6 +292,21 @@ def normalize_objects(
             }
         )
     return events, sessions, types
+
+
+def event_mapping_from_events(events: list[dict[str, object]]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for event in events:
+        native = event.get("native_event_type")
+        normalized = event.get("normalized_event_type")
+        if not isinstance(native, str) or not native:
+            raise RuntimeError("normalized event is missing a native type")
+        if not isinstance(normalized, str) or not normalized:
+            raise RuntimeError("normalized event is missing a normalized type")
+        previous = mapping.setdefault(native, normalized)
+        if previous != normalized:
+            raise RuntimeError(f"native event type mapped inconsistently: {native}")
+    return dict(sorted(mapping.items()))
 
 
 def first_session(provider: str, supplied: str | None, observed: list[str]) -> str | None:
@@ -341,12 +372,14 @@ def render_report(results: dict[str, object]) -> None:
                 f"- Result: {row['status']} — {row['reason']}",
                 f"- Working-directory token/digest: {row['cwd_token']} / {row['cwd_digest']}",
                 f"- Observed/resumed session: {row['observed_session_id']} / {row['resume_session_id']}",
+                f"- Turn-two observed session: {row['turn_two_observed_session_id']}",
                 f"- Turn exits: {row['turn_one']['exit_code']} / {row['turn_two']['exit_code']}",
                 f"- Raw stream digests: {row['turn_one']['raw_sha256']} / {row['turn_two']['raw_sha256']}",
                 f"- Normalized artifact: {row['event_artifact']} ({row['event_artifact_sha256']})",
                 f"- Final file digest: {row['final_file_sha256']}",
                 f"- Permission behavior: {row['permission_behavior']}",
                 f"- Native event types: {', '.join(row['structured_event_types']) or 'none'}",
+                f"- Exact native-to-normalized mapping: {json.dumps(row['event_mapping'], ensure_ascii=False, sort_keys=True)}",
                 f"- Unavailable/unstable fields: {', '.join(row['unavailable_fields']) or 'none'}",
                 f"- Turn-one argv: {json.dumps(row['turn_one']['argv'], ensure_ascii=False)}",
                 f"- Turn-two argv: {json.dumps(row['turn_two']['argv'], ensure_ascii=False)}",
@@ -491,23 +524,71 @@ def probe(provider: str) -> dict[str, object]:
         "expected_content": expected_content,
         "structured_output": structured_one and structured_two,
         "structured_event_types": sorted(set(types_one + types_two)),
-        "event_mapping": {
-            "session/start": "session.started",
-            "tool/item/activity": "provider.activity",
-            "result/completed": "turn.completed",
-            "error/failed": "turn.failed",
-            "other": "provider.event",
-        },
+        "event_mapping": event_mapping_from_events(all_events),
         "unavailable_fields": ["provider-side authoritative worktree identity", "provider-side cryptographic termination receipt"],
-        "permission_behavior": "noninteractive bounded file-edit permission flags; no URL or unrestricted path permission granted",
+        "permission_behavior": PERMISSION_BEHAVIORS[provider],
         "reason": reason,
     }
 
 
+def load_normalized_events(path: Path, provider: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            raise RuntimeError(f"blank normalized event line {number} for {provider}")
+        value = json.loads(line)
+        if not isinstance(value, dict) or value.get("provider") != provider:
+            raise RuntimeError(f"invalid normalized event line {number} for {provider}")
+        events.append(value)
+    return events
+
+
+def refresh_derived_artifacts() -> None:
+    """Rebuild only derived metadata after a normalization-rule correction."""
+    results = load_results()
+    providers = results.get("providers")
+    if not isinstance(providers, dict) or set(providers) != set(PROVIDERS):
+        raise RuntimeError("cannot refresh an incomplete provider matrix")
+    for provider in PROVIDERS:
+        row = providers.get(provider)
+        if not isinstance(row, dict):
+            raise RuntimeError(f"missing provider row: {provider}")
+        expected_artifact = f"docs/spikes/SPIKE-002/events/{provider}.jsonl"
+        if row.get("event_artifact") != expected_artifact:
+            raise RuntimeError(f"unexpected event artifact for {provider}")
+        event_path = EVENT_DIR / f"{provider}.jsonl"
+        events = load_normalized_events(event_path, provider)
+        for event in events:
+            native = event.get("native_event_type")
+            if not isinstance(native, str) or not native:
+                raise RuntimeError(f"normalized event is missing a native type for {provider}")
+            event["normalized_event_type"] = normalized_type(native)
+        event_bytes = b"".join(
+            (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            for event in events
+        )
+        event_path.write_bytes(event_bytes)
+        mapping = event_mapping_from_events(events)
+        row["event_artifact_sha256"] = sha256_bytes(event_bytes)
+        row["structured_event_types"] = sorted(mapping)
+        row["event_mapping"] = mapping
+        row["permission_behavior"] = PERMISSION_BEHAVIORS[provider]
+    write_json(RESULTS_PATH, results)
+    render_report(results)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", required=True, choices=PROVIDERS)
+    parser.add_argument("--provider", choices=PROVIDERS)
+    parser.add_argument("--refresh-derived", action="store_true")
     args = parser.parse_args()
+    if args.refresh_derived:
+        if args.provider:
+            parser.error("--refresh-derived cannot be combined with --provider")
+        refresh_derived_artifacts()
+        return 0
+    if not args.provider:
+        parser.error("--provider is required unless --refresh-derived is used")
     # Codex is the required first provider. Starting it always discards any
     # prior or partially trusted matrix before the sequential probe begins.
     results = empty_results() if args.provider == PROVIDERS[0] else load_results()
