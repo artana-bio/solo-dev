@@ -1737,28 +1737,13 @@ fn committed_gate_run_is_settleable(
         return Ok(false);
     };
 
-    let reservation: ValidationReservationRecord = match serde_json::from_str(
-        &control.read(&ValidationReservationRecord::relative_path(&reservation_id))?,
-    ) {
-        Ok(record) => record,
-        Err(_) => return Ok(false),
-    };
-    if reservation.schema != VALIDATION_RESERVATION_SCHEMA
-        || reservation.key.schema != VALIDATION_RESERVATION_KEY_SCHEMA
-        || reservation.reservation_id != reservation_id
-        || reservation.key_digest != reservation.key.digest()?
-    {
+    let Some(reservation) = read_committed_gate_reservation(control, &reservation_id)? else {
         return Ok(false);
-    }
+    };
     let Some(permit) = read_committed_gate_permit(control, expected_head, &reservation_id)? else {
         return Ok(false);
     };
-    if permit.schema != VALIDATION_EXECUTION_PERMIT_SCHEMA
-        || permit.reservation_id != reservation_id
-        || permit.reservation_key_digest != reservation.key_digest
-        || permit.holder_actor_id != reservation.holder_actor_id
-        || permit.cpu_lane_id.is_some()
-    {
+    if !committed_gate_permit_matches_reservation(&permit, &reservation) {
         return Ok(false);
     }
 
@@ -1792,16 +1777,7 @@ fn committed_gate_run_is_settleable(
             Ok(record) => record,
             Err(_) => return Ok(false),
         };
-    if receipt.schema != RECEIPT_SCHEMA
-        || receipt.schema != reservation.key.check.receipt_schema
-        || receipt.receipt_id != receipt_id
-        || receipt.integration_id.is_some()
-        || receipt.worktree_clean != Some(true)
-        || receipt.attempt == 0
-        || receipt
-            .test_results
-            .as_ref()
-            .is_some_and(|results| results.validate().is_err())
+    if !committed_gate_receipt_is_structurally_valid(&receipt, &reservation, &receipt_id)
         || !committed_gate_receipt_matches_reservation(&receipt, &reservation)
         || receipt.digest()? != *receipt_digest
         || receipt.finished_at != settlement.settled_at
@@ -1830,6 +1806,51 @@ fn committed_gate_run_is_settleable(
                 .exists()
             && no_live_cpu_lane_for(control, &reservation)?,
     )
+}
+
+fn read_committed_gate_reservation(
+    control: &ControlRepository,
+    reservation_id: &ValidationReservationId,
+) -> Result<Option<ValidationReservationRecord>, HarnessError> {
+    let path = ValidationReservationRecord::relative_path(reservation_id);
+    let Ok(reservation) =
+        serde_json::from_str::<ValidationReservationRecord>(&control.read(&path)?)
+    else {
+        return Ok(None);
+    };
+    Ok((reservation.schema == VALIDATION_RESERVATION_SCHEMA
+        && reservation.key.schema == VALIDATION_RESERVATION_KEY_SCHEMA
+        && reservation.reservation_id == *reservation_id
+        && reservation.key_digest == reservation.key.digest()?)
+    .then_some(reservation))
+}
+
+fn committed_gate_permit_matches_reservation(
+    permit: &ValidationExecutionPermitRecord,
+    reservation: &ValidationReservationRecord,
+) -> bool {
+    permit.schema == VALIDATION_EXECUTION_PERMIT_SCHEMA
+        && permit.reservation_id == reservation.reservation_id
+        && permit.reservation_key_digest == reservation.key_digest
+        && permit.holder_actor_id == reservation.holder_actor_id
+        && permit.cpu_lane_id.is_none()
+}
+
+fn committed_gate_receipt_is_structurally_valid(
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+    receipt_id: &crate::domain::ids::ReceiptId,
+) -> bool {
+    receipt.schema == RECEIPT_SCHEMA
+        && receipt.schema == reservation.key.check.receipt_schema
+        && receipt.receipt_id == *receipt_id
+        && receipt.integration_id.is_none()
+        && receipt.worktree_clean == Some(true)
+        && receipt.attempt > 0
+        && receipt
+            .test_results
+            .as_ref()
+            .is_none_or(|results| results.validate().is_ok())
 }
 
 fn read_committed_gate_permit(
