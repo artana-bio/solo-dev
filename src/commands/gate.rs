@@ -2985,7 +2985,8 @@ fn settle_governed_gate_execution(
     outcome: &AttemptOutcome,
     clock: &dyn Clock,
 ) -> Result<CommandOutcome, HarnessError> {
-    with_transaction(
+    let mut failed_receipt = None;
+    let transaction = with_transaction(
         &args.common.control,
         "gate.run.settle",
         clock,
@@ -3213,9 +3214,25 @@ fn settle_governed_gate_execution(
                     execution.reservation.reservation_id
                 ),
             )?;
-            report_run(&receipt, &execution.config.project_id)
+            if receipt.passed {
+                report_run(&receipt, &execution.config.project_id)
+            } else {
+                failed_receipt = Some(receipt.clone());
+                Ok(CommandOutcome::new(
+                    "gate.run.settle",
+                    "recorded failed governed gate execution",
+                    serde_json::to_value(&receipt)?,
+                )
+                .with_project(execution.config.project_id.clone()))
+            }
         },
-    )
+    )?;
+
+    if let Some(receipt) = failed_receipt {
+        report_run(&receipt, &execution.config.project_id)
+    } else {
+        Ok(transaction)
+    }
 }
 
 fn settle_governed_gate_execution_with_retry(
