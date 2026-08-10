@@ -72,6 +72,14 @@ ROW_KEYS = {
     "reason",
 }
 TURN_KEYS = {"argv", "exit_code", "timed_out", "elapsed_ms", "raw_sha256"}
+CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+ROW_CUSTODY_DIGEST_FIELDS = (
+    "version_sha256",
+    "help_sha256",
+    "cwd_digest",
+    "event_artifact_sha256",
+    "final_file_sha256",
+)
 PERMISSION_BEHAVIORS = {
     "codex": (
         "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, "
@@ -162,6 +170,14 @@ def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def require_canonical_sha256(value: object, label: str) -> str:
+    require(
+        isinstance(value, str) and CANONICAL_SHA256.fullmatch(value) is not None,
+        f"{label} must be a canonical sha256 digest",
+    )
+    return value
+
+
 def normalized_event_type(provider: str, native: str) -> str:
     try:
         return NORMALIZED_EVENT_TYPES[provider][native]
@@ -201,7 +217,7 @@ def parse_events_bytes(raw: bytes, provider: str) -> list[dict[str, object]]:
             normalized == normalized_event_type(provider, native),
             f"{provider} JSONL line {number} normalization mismatch",
         )
-        require(isinstance(value["cwd_digest"], str) and value["cwd_digest"], f"{provider} cwd digest missing")
+        require_canonical_sha256(value["cwd_digest"], f"{provider} JSONL line {number} cwd digest")
         require(
             value["session_id"] is None or isinstance(value["session_id"], str),
             f"{provider} JSONL line {number} session identifier invalid",
@@ -269,12 +285,18 @@ def validate_turn(turn: object, provider: str, label: str) -> dict[str, object]:
     require(argv[-1] == "<redacted-prompt>", f"{provider} {label} prompt is not terminal")
     require(isinstance(turn["elapsed_ms"], int) and turn["elapsed_ms"] >= 0, f"{provider} {label} elapsed invalid")
     require(isinstance(turn["timed_out"], bool), f"{provider} {label} timeout invalid")
-    require(
-        isinstance(turn["raw_sha256"], str) and turn["raw_sha256"].startswith("sha256:"),
-        f"{provider} {label} raw digest missing",
-    )
+    require_canonical_sha256(turn["raw_sha256"], f"{provider} {label} raw digest")
     assert_no_forbidden_flags(argv, provider, label)
     return turn
+
+
+def validate_custody_digests(provider: str, row: dict[str, object]) -> None:
+    for field in ROW_CUSTODY_DIGEST_FIELDS:
+        require_canonical_sha256(row.get(field), f"{provider} {field}")
+    for turn_label in ("turn_one", "turn_two"):
+        turn = row.get(turn_label)
+        require(isinstance(turn, dict), f"{provider} {turn_label} must be an object")
+        require_canonical_sha256(turn.get("raw_sha256"), f"{provider} {turn_label} raw digest")
 
 
 def expected_pass_argvs(provider: str, executable: str, session: str) -> tuple[list[str], list[str]]:
@@ -306,8 +328,12 @@ def expected_pass_argvs(provider: str, executable: str, session: str) -> tuple[l
 
 
 def validate_event_bindings(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
-    for event in events:
-        require(event["cwd_digest"] == row["cwd_digest"], f"{provider} event cwd binding mismatch")
+    row_cwd_digest = require_canonical_sha256(row.get("cwd_digest"), f"{provider} cwd_digest")
+    for number, event in enumerate(events, start=1):
+        event_cwd_digest = require_canonical_sha256(
+            event.get("cwd_digest"), f"{provider} JSONL line {number} cwd digest"
+        )
+        require(event_cwd_digest == row_cwd_digest, f"{provider} event cwd binding mismatch")
     mapping = derive_event_mapping(provider, events)
     require(row["event_mapping"] == mapping, f"{provider} event mapping does not match normalized JSONL")
     require(
@@ -352,6 +378,7 @@ def validate_native_session_evidence(
 def validate_pass_requirements(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
+    validate_custody_digests(provider, row)
     observed = require_nonblank_session(row["observed_session_id"], provider, "observed session")
     resumed = require_nonblank_session(row["resume_session_id"], provider, "resumed session")
     second_observed = require_nonblank_session(
@@ -370,10 +397,8 @@ def validate_pass_requirements(provider: str, row: dict[str, object], events: li
     require(row["structured_output"] is True and bool(events), f"{provider} PASS lacks structured events")
     require(row["session_continuity"] is True, f"{provider} PASS continuity is false")
     require(row["expected_content"] is True, f"{provider} PASS final content mismatch")
-    require(
-        row["final_file_sha256"] == EXPECTED_FINAL_FILE_SHA256,
-        f"{provider} PASS final file digest does not match expected bytes",
-    )
+    expected_final_digest = require_canonical_sha256(EXPECTED_FINAL_FILE_SHA256, "expected final file digest")
+    require(row["final_file_sha256"] == expected_final_digest, f"{provider} PASS final file digest does not match expected bytes")
     require(
         row["permission_behavior"] == PERMISSION_BEHAVIORS[provider],
         f"{provider} permission statement does not match exact argv",
@@ -400,10 +425,7 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
         "reason",
     ):
         require(isinstance(row[field], str) and row[field].strip(), f"{provider} {field} missing")
-    require(str(row["version_sha256"]).startswith("sha256:"), f"{provider} version digest missing")
-    require(str(row["help_sha256"]).startswith("sha256:"), f"{provider} help digest missing")
-    require(str(row["event_artifact_sha256"]).startswith("sha256:"), f"{provider} event digest missing")
-    require(str(row["final_file_sha256"]).startswith("sha256:"), f"{provider} final digest missing")
+    validate_custody_digests(provider, row)
     require(row["cwd_token"] == f"$PROBE_ROOT/{provider}", f"{provider} cwd token mismatch")
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
@@ -512,16 +534,22 @@ def report_summary_rows(report: str) -> dict[str, list[str]]:
     index = lines.index(header)
     require(index + 1 < len(lines) and lines[index + 1] == separator, "report summary separator is missing")
     rows: dict[str, list[str]] = {}
-    for line in lines[index + 2 :]:
-        if not line.startswith("|"):
-            break
+    end = index + 2
+    while end < len(lines) and lines[end].startswith("|"):
+        line = lines[end]
+        require(line.endswith("|"), "report summary row has malformed delimiters")
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
         require(len(cells) == 6, "report summary row has the wrong column count")
         provider = cells[0]
         require(provider in PROVIDERS, f"unexpected provider in report summary: {provider}")
         require(provider not in rows, f"duplicate provider in report summary: {provider}")
         rows[provider] = cells
+        end += 1
     require(set(rows) == set(PROVIDERS), "report summary provider matrix is incomplete")
+    require(
+        not any(line.lstrip().startswith("|") for line in lines[end:]),
+        "report has a summary row or table outside the closed summary",
+    )
     return rows
 
 
@@ -553,33 +581,59 @@ def provider_report_section(report: str, provider: str) -> str:
     return section
 
 
-def report_agreement_lines(provider: str, row: dict[str, object]) -> tuple[str, ...]:
+def report_agreement_fields(provider: str, row: dict[str, object]) -> dict[str, str]:
     first = row["turn_one"]
     second = row["turn_two"]
     assert isinstance(first, dict) and isinstance(second, dict)
-    return (
-        f"- Executable: {row['executable']}",
-        f"- Version: {row['version']}",
-        f"- Result: {row['status']} — {row['reason']}",
-        f"- Working-directory token/digest: {row['cwd_token']} / {row['cwd_digest']}",
-        f"- Observed/resumed session: {row['observed_session_id']} / {row['resume_session_id']}",
-        f"- Turn-two observed session: {row['turn_two_observed_session_id']}",
-        f"- Turn exits: {first['exit_code']} / {second['exit_code']}",
-        f"- Raw stream digests: {first['raw_sha256']} / {second['raw_sha256']}",
-        f"- Normalized artifact: {row['event_artifact']} ({row['event_artifact_sha256']})",
-        f"- Final file digest: {row['final_file_sha256']}",
-        f"- Permission behavior: {row['permission_behavior']}",
-        f"- Native event types: {', '.join(row['structured_event_types']) or 'none'}",
-        f"- Exact native-to-normalized mapping: {json.dumps(row['event_mapping'], ensure_ascii=False, sort_keys=True)}",
-        f"- Unavailable/unstable fields: {', '.join(row['unavailable_fields']) or 'none'}",
-        f"- Turn-one argv: {json.dumps(first['argv'], ensure_ascii=False)}",
-        f"- Turn-two argv: {json.dumps(second['argv'], ensure_ascii=False)}",
-    )
+    return {
+        "Executable": str(row["executable"]),
+        "Version": str(row["version"]),
+        "Result": f"{row['status']} — {row['reason']}",
+        "Working-directory token/digest": f"{row['cwd_token']} / {row['cwd_digest']}",
+        "Observed/resumed session": f"{row['observed_session_id']} / {row['resume_session_id']}",
+        "Turn-two observed session": str(row["turn_two_observed_session_id"]),
+        "Turn exits": f"{first['exit_code']} / {second['exit_code']}",
+        "Raw stream digests": f"{first['raw_sha256']} / {second['raw_sha256']}",
+        "Normalized artifact": f"{row['event_artifact']} ({row['event_artifact_sha256']})",
+        "Final file digest": str(row["final_file_sha256"]),
+        "Permission behavior": str(row["permission_behavior"]),
+        "Native event types": ", ".join(row["structured_event_types"]) or "none",
+        "Exact native-to-normalized mapping": json.dumps(row["event_mapping"], ensure_ascii=False, sort_keys=True),
+        "Unavailable/unstable fields": ", ".join(row["unavailable_fields"]) or "none",
+        "Turn-one argv": json.dumps(first["argv"], ensure_ascii=False),
+        "Turn-two argv": json.dumps(second["argv"], ensure_ascii=False),
+    }
+
+
+def report_agreement_lines(provider: str, row: dict[str, object]) -> tuple[str, ...]:
+    return tuple(f"- {label}: {value}" for label, value in report_agreement_fields(provider, row).items())
+
+
+def parse_provider_evidence_section(
+    provider: str,
+    section: str,
+    expected_labels: set[str],
+) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for number, line in enumerate(section.splitlines(), start=1):
+        if line == "":
+            continue
+        require(line.startswith("- "), f"report {provider} evidence line {number} is malformed")
+        label, delimiter, value = line[2:].partition(": ")
+        require(delimiter == ": " and label and value, f"report {provider} evidence line {number} is malformed")
+        require(label in expected_labels, f"report {provider} has an unexpected evidence label: {label}")
+        require(label not in fields, f"report {provider} has a duplicate evidence label: {label}")
+        fields[label] = value
+    require(set(fields) == expected_labels, f"report {provider} evidence labels are missing or incomplete")
+    return fields
 
 
 def validate_report_agreement(provider: str, row: dict[str, object], section: str) -> None:
-    for line in report_agreement_lines(provider, row):
-        require(line in section, f"report does not agree with {provider}: {line.split(':', 1)[0]}")
+    validate_custody_digests(provider, row)
+    expected = report_agreement_fields(provider, row)
+    parsed = parse_provider_evidence_section(provider, section, set(expected))
+    for label, value in expected.items():
+        require(parsed[label] == value, f"report does not agree with {provider}: {label}")
 
 
 def package_block(text: str, package: str) -> str:
@@ -655,6 +709,7 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     codex_turn_one = codex_row["turn_one"]
     codex_turn_two = codex_row["turn_two"]
     assert isinstance(codex_turn_one, dict) and isinstance(codex_turn_two, dict)
+    codex_section = provider_report_section(report, "codex")
 
     raw_line = f"- Raw stream digests: {codex_turn_one['raw_sha256']} / {codex_turn_two['raw_sha256']}"
     altered_raw_line = "- Raw stream digests: sha256:" + "0" * 64 + " / sha256:" + "1" * 64
@@ -677,6 +732,71 @@ def run_negative_regressions(results: dict[str, object]) -> None:
             "codex", codex_row, provider_report_section(final_digest_substitution, "codex")
         ),
         "provider rendered final-file digest substitution",
+    )
+
+    contradictory_duplicate = report.replace(
+        codex_section, f"{codex_section}\n{altered_final_line}", 1
+    )
+    require(contradictory_duplicate != report, "contradictory duplicate report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(contradictory_duplicate, "codex")
+        ),
+        "contradictory duplicate provider digest line",
+    )
+
+    identical_duplicate = report.replace(codex_section, f"{codex_section}\n{final_line}", 1)
+    require(identical_duplicate != report, "identical duplicate report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(identical_duplicate, "codex")
+        ),
+        "identical duplicate provider evidence label",
+    )
+
+    unexpected_evidence = report.replace(codex_section, f"{codex_section}\n- Extra custody field: absent", 1)
+    require(unexpected_evidence != report, "unexpected evidence report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(unexpected_evidence, "codex")
+        ),
+        "unexpected provider evidence label",
+    )
+
+    malformed_evidence = report.replace(codex_section, f"{codex_section}\n- Final file digest", 1)
+    require(malformed_evidence != report, "malformed evidence report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement(
+            "codex", codex_row, provider_report_section(malformed_evidence, "codex")
+        ),
+        "malformed provider evidence line",
+    )
+
+    missing_final = report.replace(codex_section, codex_section.replace(final_line, "", 1), 1)
+    require(missing_final != report, "missing evidence report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_agreement("codex", codex_row, provider_report_section(missing_final, "codex")),
+        "missing provider evidence label",
+    )
+
+    summary_rows = report_summary_rows(report)
+    codex_summary_line = "| " + " | ".join(summary_rows["codex"]) + " |"
+    duplicate_summary = report.replace(codex_summary_line, f"{codex_summary_line}\n{codex_summary_line}", 1)
+    require(duplicate_summary != report, "duplicate summary report mutation setup failed")
+    expect_failure(lambda: report_summary_rows(duplicate_summary), "duplicate provider summary row")
+
+    mutually_malformed_raw = copy.deepcopy(codex_row)
+    malformed_turn_one = mutually_malformed_raw["turn_one"]
+    assert isinstance(malformed_turn_one, dict)
+    malformed_turn_one["raw_sha256"] = "sha256:not-a-digest"
+    malformed_raw_report = "\n".join(report_agreement_lines("codex", mutually_malformed_raw))
+    expect_failure(
+        lambda: validate_report_agreement("codex", mutually_malformed_raw, malformed_raw_report),
+        "mutually consistent malformed raw digest in results and report",
+    )
+    expect_failure(
+        lambda: validate_pass_requirements("codex", mutually_malformed_raw, codex_events),
+        "malformed raw digest in results",
     )
 
     claude_mapping = derive_event_mapping("claude", claude_events)
@@ -740,6 +860,10 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     wrong_cwd = copy.deepcopy(codex_events)
     wrong_cwd[0]["cwd_digest"] = "sha256:" + "0" * 64
     expect_failure(lambda: validate_event_bindings("codex", codex_row, wrong_cwd), "wrong worktree")
+
+    malformed_cwd = copy.deepcopy(codex_events)
+    malformed_cwd[0]["cwd_digest"] = "sha256:not-a-digest"
+    expect_failure(lambda: validate_event_bindings("codex", codex_row, malformed_cwd), "malformed JSONL cwd digest")
 
     stale_mapping = copy.deepcopy(codex_row)
     stale_mapping["event_mapping"] = {}
