@@ -80,6 +80,11 @@ ROW_CUSTODY_DIGEST_FIELDS = (
     "event_artifact_sha256",
     "final_file_sha256",
 )
+EXPECTED_PASS_UNAVAILABLE_FIELDS = (
+    "provider-side authoritative worktree identity",
+    "provider-side cryptographic termination receipt",
+)
+EXPECTED_PASS_GIT_STATUS = "?? probe-result.txt\n"
 PERMISSION_BEHAVIORS = {
     "codex": (
         "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, "
@@ -375,6 +380,17 @@ def validate_native_session_evidence(
     require(turn_two == {resumed}, f"{provider} turn-two JSONL contains a different session")
 
 
+def validate_pass_observation_boundary(provider: str, row: dict[str, object]) -> None:
+    require(
+        row["unavailable_fields"] == list(EXPECTED_PASS_UNAVAILABLE_FIELDS),
+        f"{provider} PASS unavailable/unstable capability boundary is not exact",
+    )
+    require(
+        row["git_status"] == EXPECTED_PASS_GIT_STATUS,
+        f"{provider} PASS git status does not show only the generated probe result",
+    )
+
+
 def validate_pass_requirements(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
@@ -397,6 +413,7 @@ def validate_pass_requirements(provider: str, row: dict[str, object], events: li
     require(row["structured_output"] is True and bool(events), f"{provider} PASS lacks structured events")
     require(row["session_continuity"] is True, f"{provider} PASS continuity is false")
     require(row["expected_content"] is True, f"{provider} PASS final content mismatch")
+    validate_pass_observation_boundary(provider, row)
     expected_final_digest = require_canonical_sha256(EXPECTED_FINAL_FILE_SHA256, "expected final file digest")
     require(row["final_file_sha256"] == expected_final_digest, f"{provider} PASS final file digest does not match expected bytes")
     require(
@@ -438,6 +455,7 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     require(all(isinstance(value, str) and value for value in row["structured_event_types"]), f"{provider} event types invalid")
     require(isinstance(row["event_mapping"], dict), f"{provider} event mapping missing")
     require(isinstance(row["unavailable_fields"], list), f"{provider} unavailable fields missing")
+    require(isinstance(row["git_status"], str), f"{provider} git status invalid")
     if events:
         validate_event_bindings(provider, row, events)
     if row["status"] == "PASS":
@@ -798,6 +816,36 @@ def run_negative_regressions(results: dict[str, object]) -> None:
         lambda: validate_pass_requirements("codex", mutually_malformed_raw, codex_events),
         "malformed raw digest in results",
     )
+
+    def expect_unavailable_boundary_failure(label: str, unavailable_fields: list[str]) -> None:
+        mutated = copy.deepcopy(claude_row)
+        mutated["unavailable_fields"] = unavailable_fields
+        matching_report = "\n".join(report_agreement_lines("claude", mutated))
+        validate_report_agreement("claude", mutated, matching_report)
+        expect_failure(lambda: validate_pass_requirements("claude", mutated, claude_events), label)
+
+    expected_unavailable_fields = list(EXPECTED_PASS_UNAVAILABLE_FIELDS)
+    expect_unavailable_boundary_failure("empty unavailable fields with matching report", [])
+    expect_unavailable_boundary_failure("one unavailable field missing", expected_unavailable_fields[:1])
+    expect_unavailable_boundary_failure(
+        "extra unavailable field",
+        expected_unavailable_fields + ["provider-side additional unavailable capability"],
+    )
+    expect_unavailable_boundary_failure(
+        "duplicate unavailable field",
+        [expected_unavailable_fields[0], expected_unavailable_fields[0], expected_unavailable_fields[1]],
+    )
+    expect_unavailable_boundary_failure("reordered unavailable fields", list(reversed(expected_unavailable_fields)))
+
+    def expect_git_status_failure(label: str, git_status: str) -> None:
+        mutated = copy.deepcopy(codex_row)
+        mutated["git_status"] = git_status
+        expect_failure(lambda: validate_pass_requirements("codex", mutated, codex_events), label)
+
+    expect_git_status_failure("git status has an extra file", EXPECTED_PASS_GIT_STATUS + "?? extra.txt\n")
+    expect_git_status_failure("git status is missing the probe result", "")
+    expect_git_status_failure("git status has staged code", "A  run_probe.py\n?? probe-result.txt\n")
+    expect_git_status_failure("git status has modified code", " M run_probe.py\n?? probe-result.txt\n")
 
     claude_mapping = derive_event_mapping("claude", claude_events)
     require(claude_mapping.get("system.init") == "session.started", "Claude init mapping is missing")
