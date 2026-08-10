@@ -131,9 +131,51 @@ fn amend_control_head(workspace: &Workspace) {
     );
 }
 
+fn amend_failed_receipt(
+    workspace: &Workspace,
+    mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
+) {
+    let receipt_path = fs::read_dir(workspace.control.join("receipts"))
+        .unwrap()
+        .next()
+        .expect("the failed receipt")
+        .unwrap()
+        .path();
+    let mut receipt: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    mutate(receipt.as_object_mut().expect("an object receipt"));
+    let receipt_digest = Digest::of_canonical(&receipt).unwrap();
+    fs::write(
+        receipt_path,
+        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+    )
+    .unwrap();
+    let settlement_path =
+        fs::read_dir(workspace.control.join("validation-reservation-settlements"))
+            .unwrap()
+            .next()
+            .expect("the gate settlement")
+            .unwrap()
+            .path();
+    let mut settlement: Value =
+        serde_json::from_str(&fs::read_to_string(&settlement_path).unwrap()).unwrap();
+    settlement["outcome"]["receipt_digest"] = serde_json::json!(receipt_digest.to_string());
+    fs::write(
+        settlement_path,
+        format!("{}\n", serde_json::to_string_pretty(&settlement).unwrap()),
+    )
+    .unwrap();
+    amend_control_head(workspace);
+}
+
 fn assert_committed_gate_recovery_refused(workspace: &Workspace, operation_id: &str) {
     let refused = recover_committed_gate_raw(workspace, operation_id);
-    assert!(!refused.status.success());
+    assert!(
+        !refused.status.success(),
+        "malformed evidence was accepted: {}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
     assert_eq!(error_code(&refused), "CH-RECOVERY-INCOMPLETE-OPERATION");
     let (_, journal) = gate_settlement_operation(workspace);
     assert_eq!(
@@ -827,37 +869,23 @@ fn committed_gate_recovery_refuses_an_event_id_that_disagrees_with_its_path() {
 #[test]
 fn committed_gate_recovery_refuses_an_unsupported_receipt_schema_with_a_valid_digest() {
     let (workspace, operation_id) = legacy_committed_gate_failure();
-    let receipt_path = fs::read_dir(workspace.control.join("receipts"))
-        .unwrap()
-        .next()
-        .expect("the failed receipt")
-        .unwrap()
-        .path();
-    let mut receipt: Value =
-        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
-    receipt["schema"] = serde_json::json!("harness.receipt/unsupported");
-    let receipt_digest = Digest::of_canonical(&receipt).unwrap();
-    fs::write(
-        receipt_path,
-        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
-    )
-    .unwrap();
-    let settlement_path =
-        fs::read_dir(workspace.control.join("validation-reservation-settlements"))
-            .unwrap()
-            .next()
-            .expect("the gate settlement")
-            .unwrap()
-            .path();
-    let mut settlement: Value =
-        serde_json::from_str(&fs::read_to_string(&settlement_path).unwrap()).unwrap();
-    settlement["outcome"]["receipt_digest"] = serde_json::json!(receipt_digest.to_string());
-    fs::write(
-        settlement_path,
-        format!("{}\n", serde_json::to_string_pretty(&settlement).unwrap()),
-    )
-    .unwrap();
-    amend_control_head(&workspace);
+    amend_failed_receipt(&workspace, |receipt| {
+        receipt.insert(
+            "schema".to_owned(),
+            serde_json::json!("harness.receipt/unsupported"),
+        );
+    });
+
+    assert_committed_gate_recovery_refused(&workspace, &operation_id);
+}
+
+#[test]
+fn committed_gate_recovery_refuses_a_contradictory_policy_freshness_dependency() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    amend_failed_receipt(&workspace, |receipt| {
+        receipt["provenance"]["freshness_dependencies"]["policy"] =
+            serde_json::json!(Digest::of_bytes(b"contradictory policy").to_string());
+    });
 
     assert_committed_gate_recovery_refused(&workspace, &operation_id);
 }

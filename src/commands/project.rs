@@ -1871,12 +1871,17 @@ fn committed_gate_receipt_matches_reservation(
     receipt: &Receipt,
     reservation: &ValidationReservationRecord,
 ) -> bool {
-    let Some(provenance) = receipt.provenance.as_ref() else {
-        return false;
+    let provenance = if let Ok(provenance) = receipt.reuse_material() {
+        provenance
+    } else {
+        let Some(provenance) = receipt.provenance.as_ref() else {
+            return false;
+        };
+        if provenance.validate().is_err() {
+            return false;
+        }
+        provenance
     };
-    if provenance.validate().is_err() {
-        return false;
-    }
     let subject_matches = matches!(
         &provenance.subject,
         ProvenanceSubject::Card {
@@ -1916,6 +1921,7 @@ fn committed_gate_receipt_matches_reservation(
         && receipt.gate_digest == reservation.key.check.gate_digest
         && provenance.gate_definition_digest == reservation.key.check.gate_digest
         && provenance.policy_digest == reservation.key.policy_digest
+        && provenance.freshness_dependencies.get("policy") == Some(&provenance.policy_digest)
         && subject_matches
         && proof_map_matches
         && binding_matches
