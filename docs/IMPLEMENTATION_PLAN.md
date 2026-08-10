@@ -1522,7 +1522,7 @@ why it is outside the package gate.
 
 | Field | Value |
 | --- | --- |
-| Status | `DONE` |
+| Status | `IN_PROGRESS` — repair after independent review `RV-000092` requested stronger historical-evidence binding and a durable `failed_clean` mutation journal record |
 | Commit | `4729d18` |
 | Dependencies | None |
 | Owner | Codex |
@@ -4476,7 +4476,7 @@ this revision records the completed `SPIKE-002` evidence above that base.
 | Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7, 12.1–12.3, 16, `WP-500`, 20.2, and 24–25; `PLAN-C043`; card `F-053` revision 1; `tests/mutation.rs`; `tests/gate_runner.rs`; `src/commands/mutation.rs`; `src/commands/project.rs`; `src/commands/transaction.rs`; `src/commands/gate.rs`; legacy evidence `OP-001486`, `R-000280`, `VR-000048`, and recovery commit `cfdcf061e425d0963faeeaab1d2ff4c63552a66d` |
 | Acceptance commands | `cargo test --test mutation`; `cargo test --test gate_runner`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `env -u NO_COLOR TERM=xterm-256color cargo test` |
-| Evidence | Cleaned mutation failures now settle `failed_clean` only after verified disposable-worktree restoration; legacy mutation recovery requires the durable restoration step; failed governed gates complete their journal transaction before reporting `CH-GATE-FAILED`; committed-gate recovery binds the direct five-path commit, reservation, settlement, failed receipt and provenance, both events, actor, permit/lane absence, and clean control state. Focused checks passed: mutation 7/7 and gate runner 30/30. `cargo fmt --check`, strict all-target/all-feature Clippy, and the normalized complete `cargo test` suite passed. Four declared negative mutations each made its owning regression fail before exact restoration. Exact-SHA feature receipts remain authoritative in control state rather than being copied into this mutable tracker. |
+| Evidence | Review `RV-000092` returned the prior candidate: committed-gate recovery did not yet bind the deleted permit holder, event IDs to their committed paths, or the supported receipt schema, and cleaned mutation failures were discarded instead of durably recorded as `failed_clean`. Replacement evidence will be recorded only after the focused regressions, declared mutations, full validation, frozen gates, and exact-SHA handoff complete. |
 | Sequencing | Maintenance prerequisite only. `WP-900` remains `READY`; the coordination-extension dependency sequence is unchanged. |
 
 Bootstrap recovery record:
