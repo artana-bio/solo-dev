@@ -23,8 +23,8 @@ use crate::{
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
-        event_store::{EVENT_DIR, EventDraft, EventStore},
-        journal::{JOURNAL_DIR, Journal, OperationState},
+        event_store::{EVENT_DIR, EVENT_SCHEMA, Event, EventDraft, EventStore},
+        journal::{JOURNAL_DIR, Journal, OperationRecord, OperationState},
         lock::{LOCK_FILE, LockDiagnosis, ProjectLock},
         repository::{ControlRepository, PROJECT_FILE, write_project},
     },
@@ -37,10 +37,17 @@ use crate::{
         digest::Digest,
         gate::GATE_DIR,
         handoff::HANDOFF_DIR,
-        ids::ProjectId,
+        ids::{ProjectId, ValidationReservationId},
         integration::{INTEGRATION_DIR, VERIFICATION_DIR},
         lease::{LEASE_DIR, LeaseRecord},
         review::REVIEW_DIR,
+        validation_reservation::{
+            CPU_HEAVY_LANE_DIR, CpuHeavyLaneRecord, VALIDATION_EXECUTION_PERMIT_SCHEMA,
+            VALIDATION_RESERVATION_KEY_SCHEMA, VALIDATION_RESERVATION_SCHEMA,
+            VALIDATION_RESERVATION_SETTLEMENT_SCHEMA, ValidationExecutionPermitRecord,
+            ValidationReservationOutcome, ValidationReservationRecord,
+            ValidationReservationSettlementRecord,
+        },
     },
     error::{ErrorCode, HarnessError},
     git::{
@@ -48,10 +55,13 @@ use crate::{
             initialize as initialize_authority, inspect_authority, stage_objects, unstage_objects,
         },
         command::{GitScope, run, run_ok},
+        diff::{ChangeKind, diff_commits},
         inspect,
     },
     policy::convergence::ATTEMPT_RECORDED_EVENT,
-    runner::receipt::{LOG_DIR, RECEIPT_DIR},
+    runner::receipt::{
+        LOG_DIR, ProofMapBinding, ProvenanceSubject, RECEIPT_DIR, RECEIPT_SCHEMA, Receipt,
+    },
 };
 
 /// Subcommands under `project`.
@@ -229,6 +239,15 @@ pub struct RecoverArgs {
     /// command change state underneath them.
     #[arg(long)]
     pub resume: bool,
+    /// Settle one failed mutation probe after its disposable worktree was
+    /// restored and no control commit was written.
+    #[arg(long, conflicts_with_all = ["resume", "settle_committed_gate_run"])]
+    pub settle_clean_mutation: Option<String>,
+    /// Settle one failed gate-run transaction after its receipt and
+    /// reservation settlement were committed and no outside state was
+    /// touched.
+    #[arg(long, conflicts_with_all = ["resume", "settle_clean_mutation"])]
+    pub settle_committed_gate_run: Option<String>,
     /// Who is resuming.
     #[arg(long, default_value = "operator")]
     pub actor_id: String,
@@ -1359,6 +1378,115 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     let journal = Journal::new(&control);
     let unresolved = journal.unresolved()?;
 
+    if let Some(operation_id) = &args.settle_clean_mutation {
+        let _lock = ProjectLock::acquire(control.root(), "project.recover", clock)?;
+        if args.actor_id.trim().is_empty() {
+            return Err(HarnessError::Control {
+                reason: "recovery actor must be nonblank".to_owned(),
+                code: ErrorCode::UsageInvalidArguments,
+            });
+        }
+        let mut matches = unresolved
+            .into_iter()
+            .filter(|record| record.operation_id.as_str() == operation_id);
+        let mut record = matches.next().ok_or_else(|| HarnessError::Control {
+            reason: format!("unresolved operation {operation_id} was not found"),
+            code: ErrorCode::RecoveryIncomplete,
+        })?;
+        if matches.next().is_some() {
+            return Err(HarnessError::Control {
+                reason: format!("operation identifier {operation_id} is ambiguous"),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        let failure = record.failure.clone().unwrap_or_default();
+        let current_head = control.head()?;
+        let cleanup_was_reported = record.command == "mutation.create"
+            && record.state == OperationState::FailedPartial
+            && record
+                .steps
+                .iter()
+                .any(|step| step == "mutation-worktree-restored")
+            && !failure.contains("disposable mutation cleanup failed")
+            && record.expected_control_head == current_head
+            && control.is_clean()?;
+        if !cleanup_was_reported {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "operation {operation_id} is not a clean, settled mutation failure; inspect it and preserve the recovery record"
+                ),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        let settled_failure = format!(
+            "{failure}; settled as failed_clean by {} after verified disposable-worktree cleanup",
+            args.actor_id
+        );
+        journal.finish(
+            &mut record,
+            OperationState::FailedClean,
+            Some(settled_failure),
+            clock,
+        )?;
+        return Ok(CommandOutcome::new(
+            "project.recover",
+            format!("Settled clean mutation failure {operation_id}"),
+            serde_json::json!({
+                "project_id": config.project_id,
+                "settled": true,
+                "operation_id": operation_id,
+                "state": "failed_clean",
+                "actor_id": args.actor_id,
+            }),
+        )
+        .with_project(config.project_id));
+    }
+
+    if let Some(operation_id) = &args.settle_committed_gate_run {
+        let _lock = ProjectLock::acquire(control.root(), "project.recover", clock)?;
+        if args.actor_id.trim().is_empty() {
+            return Err(HarnessError::Control {
+                reason: "recovery actor must be nonblank".to_owned(),
+                code: ErrorCode::UsageInvalidArguments,
+            });
+        }
+        let mut matches = unresolved
+            .into_iter()
+            .filter(|record| record.operation_id.as_str() == operation_id);
+        let mut record = matches.next().ok_or_else(|| HarnessError::Control {
+            reason: format!("unresolved operation {operation_id} was not found"),
+            code: ErrorCode::RecoveryIncomplete,
+        })?;
+        if matches.next().is_some() {
+            return Err(HarnessError::Control {
+                reason: format!("operation identifier {operation_id} is ambiguous"),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        let settlement_was_committed = committed_gate_run_is_settleable(&control, &record)?;
+        if !settlement_was_committed {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "operation {operation_id} is not a clean gate run with a committed settlement; inspect it and preserve the recovery record"
+                ),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        journal.finish(&mut record, OperationState::Completed, None, clock)?;
+        return Ok(CommandOutcome::new(
+            "project.recover",
+            format!("Settled committed gate-run failure {operation_id}"),
+            serde_json::json!({
+                "project_id": config.project_id,
+                "settled": true,
+                "operation_id": operation_id,
+                "state": "completed",
+                "actor_id": args.actor_id,
+            }),
+        )
+        .with_project(config.project_id));
+    }
+
     if args.resume {
         // Cleared before the journal is consulted, because a process killed
         // outright leaves a lock and no unresolved entry at all — so gating
@@ -1556,6 +1684,393 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
         }),
     )
     .with_project(config.project_id.clone()))
+}
+
+fn committed_gate_run_has_settleable_shape(
+    record: &OperationRecord,
+    current_head: Option<&String>,
+    control_clean: bool,
+) -> bool {
+    record.command == "gate.run.settle"
+        && record.state == OperationState::FailedPartial
+        && record.steps == ["governed-execution-settlement-write"]
+        && !record.touched_outside_control
+        && !record.mutation_started
+        && record
+            .failure
+            .as_deref()
+            .is_some_and(|failure| !failure.trim().is_empty())
+        && record.expected_control_head.is_some()
+        && record.expected_control_head.as_ref() != current_head
+        && control_clean
+}
+
+fn committed_gate_run_is_settleable(
+    control: &ControlRepository,
+    record: &OperationRecord,
+) -> Result<bool, HarnessError> {
+    let current_head = control.head()?;
+    if !committed_gate_run_has_settleable_shape(record, current_head.as_ref(), control.is_clean()?)
+    {
+        return Ok(false);
+    }
+    let current_head = current_head.expect("shape requires a current control head");
+    let expected_head = record
+        .expected_control_head
+        .as_ref()
+        .expect("shape requires an expected control head");
+    let commit = run(
+        &control.scope(),
+        ["show", "-s", "--format=%P%x00%s", current_head.as_str()],
+    )?
+    .require_success()?;
+    let Some((parents, subject)) = commit.trimmed_stdout().split_once('\0') else {
+        return Ok(false);
+    };
+    if parents != expected_head {
+        return Ok(false);
+    }
+    let Some(raw_reservation_id) = subject.strip_prefix("gate: settle governed execution ") else {
+        return Ok(false);
+    };
+    let Ok(reservation_id) = raw_reservation_id.parse::<ValidationReservationId>() else {
+        return Ok(false);
+    };
+
+    let Some(reservation) = read_committed_gate_reservation(control, &reservation_id)? else {
+        return Ok(false);
+    };
+    let Some(permit) = read_committed_gate_permit(control, expected_head, &reservation_id)? else {
+        return Ok(false);
+    };
+    if !committed_gate_permit_matches_reservation(&permit, &reservation) {
+        return Ok(false);
+    }
+
+    let settlement: ValidationReservationSettlementRecord =
+        match serde_json::from_str(&control.read(
+            &ValidationReservationSettlementRecord::relative_path(&reservation_id),
+        )?) {
+            Ok(record) => record,
+            Err(_) => return Ok(false),
+        };
+    if settlement.schema != VALIDATION_RESERVATION_SETTLEMENT_SCHEMA
+        || settlement.reservation_id != reservation_id
+        || settlement.reservation_key_digest != reservation.key_digest
+        || settlement.holder_actor_id != reservation.holder_actor_id
+        || settlement.settled_by_actor_id != reservation.holder_actor_id
+    {
+        return Ok(false);
+    }
+    let ValidationReservationOutcome::ReceiptRecorded {
+        receipt_id,
+        receipt_digest,
+    } = &settlement.outcome
+    else {
+        return Ok(false);
+    };
+    let Ok(receipt_id) = receipt_id.parse() else {
+        return Ok(false);
+    };
+    let receipt: Receipt =
+        match serde_json::from_str(&control.read(&Receipt::relative_path(&receipt_id))?) {
+            Ok(record) => record,
+            Err(_) => return Ok(false),
+        };
+    if !committed_gate_receipt_is_structurally_valid(&receipt, &reservation, &receipt_id)
+        || !committed_gate_receipt_matches_reservation(&receipt, &reservation)
+        || receipt.digest()? != *receipt_digest
+        || receipt.finished_at != settlement.settled_at
+    {
+        return Ok(false);
+    }
+    let Some(event_paths) = committed_gate_diff_event_paths(
+        control,
+        expected_head,
+        &current_head,
+        &reservation_id,
+        &receipt_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(committed_events) = read_committed_gate_events(control, event_paths)? else {
+        return Ok(false);
+    };
+    Ok(
+        committed_gate_events_agree(&committed_events, &receipt, &reservation, &settlement)
+            && !control
+                .path(&ValidationExecutionPermitRecord::relative_path(
+                    &reservation_id,
+                ))
+                .exists()
+            && no_live_cpu_lane_for(control, &reservation)?,
+    )
+}
+
+fn read_committed_gate_reservation(
+    control: &ControlRepository,
+    reservation_id: &ValidationReservationId,
+) -> Result<Option<ValidationReservationRecord>, HarnessError> {
+    let path = ValidationReservationRecord::relative_path(reservation_id);
+    let Ok(reservation) =
+        serde_json::from_str::<ValidationReservationRecord>(&control.read(&path)?)
+    else {
+        return Ok(None);
+    };
+    Ok((reservation.schema == VALIDATION_RESERVATION_SCHEMA
+        && reservation.key.schema == VALIDATION_RESERVATION_KEY_SCHEMA
+        && reservation.reservation_id == *reservation_id
+        && reservation.key_digest == reservation.key.digest()?)
+    .then_some(reservation))
+}
+
+fn committed_gate_permit_matches_reservation(
+    permit: &ValidationExecutionPermitRecord,
+    reservation: &ValidationReservationRecord,
+) -> bool {
+    permit.schema == VALIDATION_EXECUTION_PERMIT_SCHEMA
+        && permit.reservation_id == reservation.reservation_id
+        && permit.reservation_key_digest == reservation.key_digest
+        && permit.holder_actor_id == reservation.holder_actor_id
+        && permit.cpu_lane_id.is_none()
+}
+
+fn committed_gate_receipt_is_structurally_valid(
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+    receipt_id: &crate::domain::ids::ReceiptId,
+) -> bool {
+    receipt.schema == RECEIPT_SCHEMA
+        && receipt.schema == reservation.key.check.receipt_schema
+        && receipt.receipt_id == *receipt_id
+        && receipt.integration_id.is_none()
+        && receipt.worktree_clean == Some(true)
+        && receipt.attempt > 0
+        && receipt
+            .test_results
+            .as_ref()
+            .is_none_or(|results| results.validate().is_ok())
+}
+
+fn read_committed_gate_permit(
+    control: &ControlRepository,
+    expected_head: &str,
+    reservation_id: &ValidationReservationId,
+) -> Result<Option<ValidationExecutionPermitRecord>, HarnessError> {
+    let path = ValidationExecutionPermitRecord::relative_path(reservation_id);
+    let object = format!("{expected_head}:{path}");
+    let output = run(&control.scope(), ["show", object.as_str()])?;
+    if !output.success() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&output.stdout).ok())
+}
+
+fn committed_gate_receipt_matches_reservation(
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+) -> bool {
+    let provenance = if let Ok(provenance) = receipt.reuse_material() {
+        provenance
+    } else {
+        let Some(provenance) = receipt.provenance.as_ref() else {
+            return false;
+        };
+        if provenance.validate().is_err() {
+            return false;
+        }
+        provenance
+    };
+    let subject_matches = matches!(
+        &provenance.subject,
+        ProvenanceSubject::Card {
+            candidate_sha,
+            base_sha,
+            cycle_id,
+            card_id,
+            card_revision,
+            card_digest,
+            lease_id,
+        } if candidate_sha == &reservation.key.candidate_sha
+            && base_sha == &reservation.key.base_sha
+            && cycle_id == &reservation.key.cycle_id
+            && card_id == &reservation.key.card_id
+            && *card_revision == reservation.key.card_revision
+            && card_digest == &reservation.key.card_digest
+            && lease_id == &reservation.key.lease_id
+    );
+    let proof_map_matches = match (&provenance.proof_map, &reservation.key.proof_map_digest) {
+        (ProofMapBinding::Bound(actual), Some(expected)) => actual == expected,
+        (ProofMapBinding::NotApplicable, None) => true,
+        _ => false,
+    };
+    let binding_matches = provenance
+        .validation_reservation
+        .as_ref()
+        .is_some_and(|binding| {
+            binding.reservation_id == reservation.reservation_id
+                && binding.key_digest == reservation.key_digest
+        });
+    !receipt.passed
+        && receipt.card_id.as_ref() == Some(&reservation.key.card_id)
+        && receipt.card_digest.as_ref() == Some(&reservation.key.card_digest)
+        && receipt.cycle_id == reservation.key.cycle_id
+        && receipt.evaluated_sha == reservation.key.candidate_sha
+        && receipt.gate_id == reservation.key.check.gate_id
+        && receipt.gate_digest == reservation.key.check.gate_digest
+        && provenance.gate_definition_digest == reservation.key.check.gate_digest
+        && provenance.policy_digest == reservation.key.policy_digest
+        && provenance.freshness_dependencies.get("policy") == Some(&provenance.policy_digest)
+        && subject_matches
+        && proof_map_matches
+        && binding_matches
+}
+
+fn read_committed_gate_events(
+    control: &ControlRepository,
+    event_paths: Vec<String>,
+) -> Result<Option<Vec<Event>>, HarnessError> {
+    let mut events = Vec::with_capacity(event_paths.len());
+    for path in event_paths {
+        let Ok(event) = serde_json::from_str::<Event>(&control.read(&path)?) else {
+            return Ok(None);
+        };
+        if Event::relative_path(&event.event_id) != path {
+            return Ok(None);
+        }
+        events.push(event);
+    }
+    Ok(Some(events))
+}
+
+fn committed_gate_diff_event_paths(
+    control: &ControlRepository,
+    expected_head: &str,
+    current_head: &str,
+    reservation_id: &ValidationReservationId,
+    receipt_id: &crate::domain::ids::ReceiptId,
+) -> Result<Option<Vec<String>>, HarnessError> {
+    let diff = diff_commits(&control.scope(), expected_head, current_head)?;
+    if diff.paths.len() != 5 {
+        return Ok(None);
+    }
+    let expected_receipt = Receipt::relative_path(receipt_id);
+    let expected_settlement = ValidationReservationSettlementRecord::relative_path(reservation_id);
+    let expected_permit = ValidationExecutionPermitRecord::relative_path(reservation_id);
+    let mut saw_receipt = false;
+    let mut saw_settlement = false;
+    let mut saw_permit_release = false;
+    let mut event_paths = Vec::new();
+    for change in diff.paths {
+        match (change.kind, change.path.as_str()) {
+            (ChangeKind::Added, path) if path == expected_receipt => saw_receipt = true,
+            (ChangeKind::Added, path) if path == expected_settlement => saw_settlement = true,
+            (ChangeKind::Deleted, path) if path == expected_permit => saw_permit_release = true,
+            (ChangeKind::Added, path)
+                if path.starts_with(&format!("{EVENT_DIR}/"))
+                    && Path::new(path)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json")) =>
+            {
+                event_paths.push(path.to_owned());
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(
+        (saw_receipt && saw_settlement && saw_permit_release && event_paths.len() == 2)
+            .then_some(event_paths),
+    )
+}
+
+fn committed_gate_events_agree(
+    events: &[Event],
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+    settlement: &ValidationReservationSettlementRecord,
+) -> bool {
+    if events.len() != 2 {
+        return false;
+    }
+    let common_matches = |event: &Event| {
+        event.schema == EVENT_SCHEMA
+            && event.project_id == receipt.project_id
+            && event.cycle_id.as_ref() == Some(&reservation.key.cycle_id)
+            && event.card_id.as_ref() == Some(&reservation.key.card_id)
+            && event.card_revision == Some(reservation.key.card_revision)
+            && event.card_digest.as_ref() == Some(&reservation.key.card_digest)
+            && event.actor_id == settlement.settled_by_actor_id
+    };
+    let settled = events
+        .iter()
+        .find(|event| event.event_type == "validation.execution_settled");
+    let gate_ran = events.iter().find(|event| event.event_type == "gate.ran");
+    let (Some(settled), Some(gate_ran)) = (settled, gate_ran) else {
+        return false;
+    };
+    common_matches(settled)
+        && settled.event_id < gate_ran.event_id
+        && settled.head_sha.is_none()
+        && settled.metadata.len() == 2
+        && settled.metadata.get("reservation_id")
+            == Some(&serde_json::json!(reservation.reservation_id.to_string()))
+        && settled.metadata.get("receipt_id")
+            == Some(&serde_json::json!(receipt.receipt_id.to_string()))
+        && common_matches(gate_ran)
+        && gate_ran.head_sha.as_ref() == Some(&receipt.evaluated_sha)
+        && gate_ran.metadata.len() == 8
+        && gate_ran.metadata.get("reservation_id")
+            == Some(&serde_json::json!(reservation.reservation_id.to_string()))
+        && gate_ran.metadata.get("reservation_key_digest")
+            == Some(&serde_json::json!(reservation.key_digest.as_str()))
+        && gate_ran.metadata.get("receipt_id")
+            == Some(&serde_json::json!(receipt.receipt_id.to_string()))
+        && gate_ran.metadata.get("gate_id") == Some(&serde_json::json!(receipt.gate_id))
+        && gate_ran.metadata.get("gate_digest")
+            == Some(&serde_json::json!(receipt.gate_digest.as_str()))
+        && gate_ran.metadata.get("attempt") == Some(&serde_json::json!(receipt.attempt))
+        && gate_ran.metadata.get("termination")
+            == Some(&serde_json::json!(receipt.termination.name()))
+        && gate_ran.metadata.get("passed") == Some(&serde_json::json!(receipt.passed))
+}
+
+fn no_live_cpu_lane_for(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+) -> Result<bool, HarnessError> {
+    let directory = control.path(CPU_HEAVY_LANE_DIR);
+    if !directory.exists() {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(&directory).map_err(|source| HarnessError::ControlIo {
+        path: directory.clone(),
+        source,
+    })? {
+        let path = entry
+            .map_err(|source| HarnessError::ControlIo {
+                path: directory.clone(),
+                source,
+            })?
+            .path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(lane) = serde_json::from_str::<CpuHeavyLaneRecord>(
+            &fs::read_to_string(&path).map_err(|source| HarnessError::ControlIo {
+                path: path.clone(),
+                source,
+            })?,
+        ) else {
+            return Ok(false);
+        };
+        if lane.reservation_id == reservation.reservation_id
+            || lane.reservation_key_digest == reservation.key_digest
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The digest a project's currently configured convergence policy is frozen
@@ -2323,4 +2838,65 @@ fn establish_authority(config: &ProjectConfig) -> Result<(), HarnessError> {
     )?;
     unstage_objects(&config.authority_repository, &incoming);
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn committed_gate_record() -> OperationRecord {
+        serde_json::from_value(serde_json::json!({
+            "schema": "harness.operation/v1",
+            "operation_id": "OP-000001",
+            "command": "gate.run.settle",
+            "state": "failed_partial",
+            "steps": ["governed-execution-settlement-write"],
+            "expected_control_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "started_at": "2026-08-10T00:00:00Z",
+            "finished_at": "2026-08-10T00:00:01Z",
+            "failure": "gate did not pass",
+            "touched_outside_control": false,
+            "mutation_started": false
+        }))
+        .expect("valid operation record")
+    }
+
+    #[test]
+    fn committed_gate_recovery_requires_the_exact_clean_durable_shape() {
+        let record = committed_gate_record();
+        let moved_head = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned());
+        assert!(committed_gate_run_has_settleable_shape(
+            &record,
+            moved_head.as_ref(),
+            true
+        ));
+
+        let unchanged_head = record.expected_control_head.clone();
+        assert!(!committed_gate_run_has_settleable_shape(
+            &record,
+            unchanged_head.as_ref(),
+            true
+        ));
+        assert!(!committed_gate_run_has_settleable_shape(
+            &record,
+            moved_head.as_ref(),
+            false
+        ));
+
+        let mut outside = record.clone();
+        outside.touched_outside_control = true;
+        assert!(!committed_gate_run_has_settleable_shape(
+            &outside,
+            moved_head.as_ref(),
+            true
+        ));
+
+        let mut wrong_step = record;
+        wrong_step.steps = vec!["control-write".to_owned()];
+        assert!(!committed_gate_run_has_settleable_shape(
+            &wrong_step,
+            moved_head.as_ref(),
+            true
+        ));
+    }
 }
