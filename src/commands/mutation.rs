@@ -254,7 +254,7 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                 }
                 (Err(error), Ok(_)) => {
                     steps.outside_control_restored("mutation-worktree-restored")?;
-                    return Err(HarnessError::no_persist(error));
+                    return Err(error);
                 }
                 (attempt, Err(cleanup_error)) => {
                     let retained = scratch.keep();

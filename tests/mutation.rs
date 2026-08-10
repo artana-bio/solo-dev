@@ -91,6 +91,22 @@ fn assert_failed_clean_cleanup(workspace: &Workspace, output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let error: Value = serde_json::from_slice(&output.stdout).expect("a JSON error envelope");
+    let expected_failure = error["error"]["message"]
+        .as_str()
+        .expect("the original classified failure message");
+    let mutation_operations: Vec<Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter_map(|path| {
+            let record: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            (record["command"] == "mutation.create").then_some(record)
+        })
+        .collect();
+    assert_eq!(mutation_operations.len(), 1);
+    assert_eq!(mutation_operations[0]["state"], "failed_clean");
+    assert_eq!(mutation_operations[0]["failure"], expected_failure);
+
     let worktrees = support::capture(&workspace.repository, &["worktree", "list", "--porcelain"]);
     assert_eq!(
         worktrees.matches("worktree ").count(),

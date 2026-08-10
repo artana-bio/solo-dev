@@ -42,10 +42,11 @@ use crate::{
         lease::{LEASE_DIR, LeaseRecord},
         review::REVIEW_DIR,
         validation_reservation::{
-            CPU_HEAVY_LANE_DIR, CpuHeavyLaneRecord, VALIDATION_RESERVATION_KEY_SCHEMA,
-            VALIDATION_RESERVATION_SCHEMA, VALIDATION_RESERVATION_SETTLEMENT_SCHEMA,
-            ValidationExecutionPermitRecord, ValidationReservationOutcome,
-            ValidationReservationRecord, ValidationReservationSettlementRecord,
+            CPU_HEAVY_LANE_DIR, CpuHeavyLaneRecord, VALIDATION_EXECUTION_PERMIT_SCHEMA,
+            VALIDATION_RESERVATION_KEY_SCHEMA, VALIDATION_RESERVATION_SCHEMA,
+            VALIDATION_RESERVATION_SETTLEMENT_SCHEMA, ValidationExecutionPermitRecord,
+            ValidationReservationOutcome, ValidationReservationRecord,
+            ValidationReservationSettlementRecord,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -58,7 +59,9 @@ use crate::{
         inspect,
     },
     policy::convergence::ATTEMPT_RECORDED_EVENT,
-    runner::receipt::{LOG_DIR, ProofMapBinding, ProvenanceSubject, RECEIPT_DIR, Receipt},
+    runner::receipt::{
+        LOG_DIR, ProofMapBinding, ProvenanceSubject, RECEIPT_DIR, RECEIPT_SCHEMA, Receipt,
+    },
 };
 
 /// Subcommands under `project`.
@@ -1747,6 +1750,17 @@ fn committed_gate_run_is_settleable(
     {
         return Ok(false);
     }
+    let Some(permit) = read_committed_gate_permit(control, expected_head, &reservation_id)? else {
+        return Ok(false);
+    };
+    if permit.schema != VALIDATION_EXECUTION_PERMIT_SCHEMA
+        || permit.reservation_id != reservation_id
+        || permit.reservation_key_digest != reservation.key_digest
+        || permit.holder_actor_id != reservation.holder_actor_id
+        || permit.cpu_lane_id.is_some()
+    {
+        return Ok(false);
+    }
 
     let settlement: ValidationReservationSettlementRecord =
         match serde_json::from_str(&control.read(
@@ -1778,7 +1792,16 @@ fn committed_gate_run_is_settleable(
             Ok(record) => record,
             Err(_) => return Ok(false),
         };
-    if receipt.receipt_id != receipt_id
+    if receipt.schema != RECEIPT_SCHEMA
+        || receipt.schema != reservation.key.check.receipt_schema
+        || receipt.receipt_id != receipt_id
+        || receipt.integration_id.is_some()
+        || receipt.worktree_clean != Some(true)
+        || receipt.attempt == 0
+        || receipt
+            .test_results
+            .as_ref()
+            .is_some_and(|results| results.validate().is_err())
         || !committed_gate_receipt_matches_reservation(&receipt, &reservation)
         || receipt.digest()? != *receipt_digest
         || receipt.finished_at != settlement.settled_at
@@ -1807,6 +1830,20 @@ fn committed_gate_run_is_settleable(
                 .exists()
             && no_live_cpu_lane_for(control, &reservation)?,
     )
+}
+
+fn read_committed_gate_permit(
+    control: &ControlRepository,
+    expected_head: &str,
+    reservation_id: &ValidationReservationId,
+) -> Result<Option<ValidationExecutionPermitRecord>, HarnessError> {
+    let path = ValidationExecutionPermitRecord::relative_path(reservation_id);
+    let object = format!("{expected_head}:{path}");
+    let output = run(&control.scope(), ["show", object.as_str()])?;
+    if !output.success() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&output.stdout).ok())
 }
 
 fn committed_gate_receipt_matches_reservation(
@@ -1872,6 +1909,9 @@ fn read_committed_gate_events(
         let Ok(event) = serde_json::from_str::<Event>(&control.read(&path)?) else {
             return Ok(None);
         };
+        if Event::relative_path(&event.event_id) != path {
+            return Ok(None);
+        }
         events.push(event);
     }
     Ok(Some(events))

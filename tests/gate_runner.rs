@@ -104,6 +104,44 @@ fn recover_committed_gate_raw(workspace: &Workspace, operation_id: &str) -> std:
     ])
 }
 
+fn legacy_committed_gate_failure() -> (Workspace, String) {
+    let workspace = Workspace::initialized();
+    workspace.register_gate("gate.fails", &["false"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+    let failed = reserved_run_raw(&workspace, "F-001", "gate.fails");
+    assert_eq!(failed.status.code(), Some(7));
+    let operation_id = make_gate_settlement_legacy_failed_partial(&workspace);
+    (workspace, operation_id)
+}
+
+fn amend_control_head(workspace: &Workspace) {
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "--amend", "--no-edit", "-q"],
+    );
+}
+
+fn assert_committed_gate_recovery_refused(workspace: &Workspace, operation_id: &str) {
+    let refused = recover_committed_gate_raw(workspace, operation_id);
+    assert!(!refused.status.success());
+    assert_eq!(error_code(&refused), "CH-RECOVERY-INCOMPLETE-OPERATION");
+    let (_, journal) = gate_settlement_operation(workspace);
+    assert_eq!(
+        journal["state"], "failed_partial",
+        "malformed historical evidence must remain unresolved"
+    );
+}
+
 fn junit_gate_definition(gate_id: &str, script: &str, reports: &str, max_attempts: u32) -> String {
     let argv = serde_json::to_string(&["sh", "-c", script]).unwrap();
     format!(
@@ -713,6 +751,115 @@ fn committed_gate_recovery_refuses_a_mismatched_gate_event() {
         journal["state"], "failed_partial",
         "a mismatched event must preserve recovery evidence"
     );
+}
+
+#[test]
+fn committed_gate_recovery_refuses_a_mismatched_deleted_permit_holder() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    let settlement_tree = support::capture(&workspace.control, &["show", "-s", "--format=%T"]);
+    let settlement_subject = support::capture(&workspace.control, &["show", "-s", "--format=%s"]);
+    support::git(&workspace.control, &["reset", "--hard", "HEAD^"]);
+    let permit_path = fs::read_dir(workspace.control.join("validation-execution-permits"))
+        .unwrap()
+        .next()
+        .expect("the historical execution permit")
+        .unwrap()
+        .path();
+    let mut permit: Value =
+        serde_json::from_str(&fs::read_to_string(&permit_path).unwrap()).unwrap();
+    permit["holder_actor_id"] = serde_json::json!("different-holder");
+    fs::write(
+        permit_path,
+        format!("{}\n", serde_json::to_string_pretty(&permit).unwrap()),
+    )
+    .unwrap();
+    amend_control_head(&workspace);
+    let rewritten_parent = workspace.control_head();
+    let rewritten_settlement = support::capture(
+        &workspace.control,
+        &[
+            "commit-tree",
+            &settlement_tree,
+            "-p",
+            &rewritten_parent,
+            "-m",
+            &settlement_subject,
+        ],
+    );
+    support::git(
+        &workspace.control,
+        &["reset", "--hard", &rewritten_settlement],
+    );
+    let (journal_path, mut journal) = gate_settlement_operation(&workspace);
+    journal["expected_control_head"] = serde_json::json!(rewritten_parent);
+    fs::write(
+        journal_path,
+        format!("{}\n", serde_json::to_string_pretty(&journal).unwrap()),
+    )
+    .unwrap();
+
+    assert_committed_gate_recovery_refused(&workspace, &operation_id);
+}
+
+#[test]
+fn committed_gate_recovery_refuses_an_event_id_that_disagrees_with_its_path() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    let event_path = fs::read_dir(workspace.control.join("events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let event: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            event["event_type"] == "gate.ran" && event["metadata"]["reservation_id"].is_string()
+        })
+        .expect("the governed gate event");
+    let mut event: Value = serde_json::from_str(&fs::read_to_string(&event_path).unwrap()).unwrap();
+    event["event_id"] = serde_json::json!("E-999999");
+    fs::write(
+        event_path,
+        format!("{}\n", serde_json::to_string_pretty(&event).unwrap()),
+    )
+    .unwrap();
+    amend_control_head(&workspace);
+
+    assert_committed_gate_recovery_refused(&workspace, &operation_id);
+}
+
+#[test]
+fn committed_gate_recovery_refuses_an_unsupported_receipt_schema_with_a_valid_digest() {
+    let (workspace, operation_id) = legacy_committed_gate_failure();
+    let receipt_path = fs::read_dir(workspace.control.join("receipts"))
+        .unwrap()
+        .next()
+        .expect("the failed receipt")
+        .unwrap()
+        .path();
+    let mut receipt: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    receipt["schema"] = serde_json::json!("harness.receipt/unsupported");
+    let receipt_digest = Digest::of_canonical(&receipt).unwrap();
+    fs::write(
+        receipt_path,
+        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+    )
+    .unwrap();
+    let settlement_path =
+        fs::read_dir(workspace.control.join("validation-reservation-settlements"))
+            .unwrap()
+            .next()
+            .expect("the gate settlement")
+            .unwrap()
+            .path();
+    let mut settlement: Value =
+        serde_json::from_str(&fs::read_to_string(&settlement_path).unwrap()).unwrap();
+    settlement["outcome"]["receipt_digest"] = serde_json::json!(receipt_digest.to_string());
+    fs::write(
+        settlement_path,
+        format!("{}\n", serde_json::to_string_pretty(&settlement).unwrap()),
+    )
+    .unwrap();
+    amend_control_head(&workspace);
+
+    assert_committed_gate_recovery_refused(&workspace, &operation_id);
 }
 
 #[test]
