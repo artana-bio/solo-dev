@@ -66,6 +66,44 @@ fn receipts(workspace: &Workspace) -> Vec<Value> {
         .collect()
 }
 
+fn gate_settlement_operation(workspace: &Workspace) -> (std::path::PathBuf, Value) {
+    fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find_map(|path| {
+            let record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            (record["command"] == "gate.run.settle").then_some((path, record))
+        })
+        .expect("a gate settlement journal")
+}
+
+fn make_gate_settlement_legacy_failed_partial(workspace: &Workspace) -> String {
+    let (path, mut record) = gate_settlement_operation(workspace);
+    record["state"] = serde_json::json!("failed_partial");
+    record["failure"] = serde_json::json!("legacy gate failure reported after commit");
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&record).unwrap()),
+    )
+    .unwrap();
+    record["operation_id"].as_str().unwrap().to_owned()
+}
+
+fn recover_committed_gate_raw(workspace: &Workspace, operation_id: &str) -> std::process::Output {
+    Workspace::run(&[
+        "project".into(),
+        "recover".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--settle-committed-gate-run".into(),
+        operation_id.to_owned(),
+        "--actor-id".into(),
+        "operator".into(),
+        "--output".into(),
+        "json".into(),
+    ])
+}
+
 fn junit_gate_definition(gate_id: &str, script: &str, reports: &str, max_attempts: u32) -> String {
     let argv = serde_json::to_string(&["sh", "-c", script]).unwrap();
     format!(
@@ -540,6 +578,39 @@ fn a_settled_failed_reservation_cannot_silently_rerun_the_same_gate() {
     let first = reserved_run_raw(&workspace, "F-001", "gate.fails");
     assert_eq!(first.status.code(), Some(7));
 
+    let project_status = Workspace::run(&[
+        "project".into(),
+        "status".into(),
+        "--control".into(),
+        workspace.control.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ]);
+    assert!(
+        project_status.status.success(),
+        "project status failed: {}{}",
+        String::from_utf8_lossy(&project_status.stdout),
+        String::from_utf8_lossy(&project_status.stderr)
+    );
+    let project_status: Value = serde_json::from_slice(&project_status.stdout).unwrap();
+    assert_eq!(
+        project_status["data"]["unresolved_operations"],
+        serde_json::json!([]),
+        "a durably settled failed gate is not an unresolved operation"
+    );
+
+    let settlement_operations: Vec<Value> = fs::read_dir(workspace.control.join("journal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+        .filter(|record: &Value| record["command"] == "gate.run.settle")
+        .collect();
+    assert_eq!(settlement_operations.len(), 1);
+    assert_eq!(
+        settlement_operations[0]["state"], "completed",
+        "the settlement transaction must complete before gate failure is reported"
+    );
+
     let reservation = workspace.gate_json(&[
         "reserve",
         "--card-id",
@@ -559,6 +630,89 @@ fn a_settled_failed_reservation_cannot_silently_rerun_the_same_gate() {
         .map(|receipt| receipt["attempt"].as_u64().unwrap())
         .collect();
     assert_eq!(attempts, vec![1]);
+}
+
+#[test]
+fn operator_can_settle_the_exact_legacy_committed_gate_failure() {
+    let workspace = Workspace::initialized();
+    workspace.register_gate("gate.fails", &["false"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let failed = reserved_run_raw(&workspace, "F-001", "gate.fails");
+    assert_eq!(failed.status.code(), Some(7));
+    let operation_id = make_gate_settlement_legacy_failed_partial(&workspace);
+
+    let recovered = recover_committed_gate_raw(&workspace, &operation_id);
+    assert!(
+        recovered.status.success(),
+        "recovery failed: {}{}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["data"]["operation_id"], operation_id);
+    assert_eq!(recovered["data"]["state"], "completed");
+    let (_, journal) = gate_settlement_operation(&workspace);
+    assert_eq!(journal["state"], "completed");
+}
+
+#[test]
+fn committed_gate_recovery_refuses_a_mismatched_gate_event() {
+    let workspace = Workspace::initialized();
+    workspace.register_gate("gate.fails", &["false"]);
+    workspace.cycle(&[
+        "create",
+        "--cycle-id",
+        "C-001",
+        "--objective",
+        "First slice",
+    ]);
+    workspace.cycle(&["activate", "--cycle-id", "C-001"]);
+    workspace.activate_card_with_gates("F-001", &["src/**"], &["gate.fails"]);
+    workspace.work(&["start", "--card-id", "F-001"]);
+
+    let failed = reserved_run_raw(&workspace, "F-001", "gate.fails");
+    assert_eq!(failed.status.code(), Some(7));
+    let operation_id = make_gate_settlement_legacy_failed_partial(&workspace);
+    let gate_event_path = fs::read_dir(workspace.control.join("events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let event: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            event["event_type"] == "gate.ran" && event["metadata"]["reservation_id"].is_string()
+        })
+        .expect("the governed gate event");
+    let mut event: Value =
+        serde_json::from_str(&fs::read_to_string(&gate_event_path).unwrap()).unwrap();
+    event["metadata"]["receipt_id"] = serde_json::json!("R-999999");
+    fs::write(
+        &gate_event_path,
+        format!("{}\n", serde_json::to_string_pretty(&event).unwrap()),
+    )
+    .unwrap();
+    support::git(&workspace.control, &["add", "-A"]);
+    support::git(
+        &workspace.control,
+        &["commit", "--amend", "--no-edit", "-q"],
+    );
+
+    let refused = recover_committed_gate_raw(&workspace, &operation_id);
+    assert!(!refused.status.success());
+    assert_eq!(error_code(&refused), "CH-RECOVERY-INCOMPLETE-OPERATION");
+    let (_, journal) = gate_settlement_operation(&workspace);
+    assert_eq!(
+        journal["state"], "failed_partial",
+        "a mismatched event must preserve recovery evidence"
+    );
 }
 
 #[test]

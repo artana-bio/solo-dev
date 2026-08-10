@@ -23,7 +23,7 @@ use crate::{
         validate::{Mode, validate, validate_in_mode},
     },
     control::{
-        event_store::{EVENT_DIR, EventDraft, EventStore},
+        event_store::{EVENT_DIR, EVENT_SCHEMA, Event, EventDraft, EventStore},
         journal::{JOURNAL_DIR, Journal, OperationRecord, OperationState},
         lock::{LOCK_FILE, LockDiagnosis, ProjectLock},
         repository::{ControlRepository, PROJECT_FILE, write_project},
@@ -42,10 +42,10 @@ use crate::{
         lease::{LEASE_DIR, LeaseRecord},
         review::REVIEW_DIR,
         validation_reservation::{
-            VALIDATION_RESERVATION_KEY_SCHEMA, VALIDATION_RESERVATION_SCHEMA,
-            VALIDATION_RESERVATION_SETTLEMENT_SCHEMA, ValidationExecutionPermitRecord,
-            ValidationReservationOutcome, ValidationReservationRecord,
-            ValidationReservationSettlementRecord,
+            CPU_HEAVY_LANE_DIR, CpuHeavyLaneRecord, VALIDATION_RESERVATION_KEY_SCHEMA,
+            VALIDATION_RESERVATION_SCHEMA, VALIDATION_RESERVATION_SETTLEMENT_SCHEMA,
+            ValidationExecutionPermitRecord, ValidationReservationOutcome,
+            ValidationReservationRecord, ValidationReservationSettlementRecord,
         },
     },
     error::{ErrorCode, HarnessError},
@@ -54,10 +54,11 @@ use crate::{
             initialize as initialize_authority, inspect_authority, stage_objects, unstage_objects,
         },
         command::{GitScope, run, run_ok},
+        diff::{ChangeKind, diff_commits},
         inspect,
     },
     policy::convergence::ATTEMPT_RECORDED_EVENT,
-    runner::receipt::{LOG_DIR, RECEIPT_DIR, Receipt},
+    runner::receipt::{LOG_DIR, ProofMapBinding, ProvenanceSubject, RECEIPT_DIR, Receipt},
 };
 
 /// Subcommands under `project`.
@@ -1758,6 +1759,7 @@ fn committed_gate_run_is_settleable(
         || settlement.reservation_id != reservation_id
         || settlement.reservation_key_digest != reservation.key_digest
         || settlement.holder_actor_id != reservation.holder_actor_id
+        || settlement.settled_by_actor_id != reservation.holder_actor_id
     {
         return Ok(false);
     }
@@ -1776,29 +1778,232 @@ fn committed_gate_run_is_settleable(
             Ok(record) => record,
             Err(_) => return Ok(false),
         };
-    let Some(binding) = receipt
-        .provenance
-        .as_ref()
-        .and_then(|provenance| provenance.validation_reservation.as_ref())
+    if receipt.receipt_id != receipt_id
+        || !committed_gate_receipt_matches_reservation(&receipt, &reservation)
+        || receipt.digest()? != *receipt_digest
+        || receipt.finished_at != settlement.settled_at
+    {
+        return Ok(false);
+    }
+    let Some(event_paths) = committed_gate_diff_event_paths(
+        control,
+        expected_head,
+        &current_head,
+        &reservation_id,
+        &receipt_id,
+    )?
     else {
         return Ok(false);
     };
-    Ok(receipt.receipt_id == receipt_id
-        && receipt.digest()? == *receipt_digest
-        && !receipt.passed
+    let Some(committed_events) = read_committed_gate_events(control, event_paths)? else {
+        return Ok(false);
+    };
+    Ok(
+        committed_gate_events_agree(&committed_events, &receipt, &reservation, &settlement)
+            && !control
+                .path(&ValidationExecutionPermitRecord::relative_path(
+                    &reservation_id,
+                ))
+                .exists()
+            && no_live_cpu_lane_for(control, &reservation)?,
+    )
+}
+
+fn committed_gate_receipt_matches_reservation(
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+) -> bool {
+    let Some(provenance) = receipt.provenance.as_ref() else {
+        return false;
+    };
+    if provenance.validate().is_err() {
+        return false;
+    }
+    let subject_matches = matches!(
+        &provenance.subject,
+        ProvenanceSubject::Card {
+            candidate_sha,
+            base_sha,
+            cycle_id,
+            card_id,
+            card_revision,
+            card_digest,
+            lease_id,
+        } if candidate_sha == &reservation.key.candidate_sha
+            && base_sha == &reservation.key.base_sha
+            && cycle_id == &reservation.key.cycle_id
+            && card_id == &reservation.key.card_id
+            && *card_revision == reservation.key.card_revision
+            && card_digest == &reservation.key.card_digest
+            && lease_id == &reservation.key.lease_id
+    );
+    let proof_map_matches = match (&provenance.proof_map, &reservation.key.proof_map_digest) {
+        (ProofMapBinding::Bound(actual), Some(expected)) => actual == expected,
+        (ProofMapBinding::NotApplicable, None) => true,
+        _ => false,
+    };
+    let binding_matches = provenance
+        .validation_reservation
+        .as_ref()
+        .is_some_and(|binding| {
+            binding.reservation_id == reservation.reservation_id
+                && binding.key_digest == reservation.key_digest
+        });
+    !receipt.passed
         && receipt.card_id.as_ref() == Some(&reservation.key.card_id)
         && receipt.card_digest.as_ref() == Some(&reservation.key.card_digest)
         && receipt.cycle_id == reservation.key.cycle_id
         && receipt.evaluated_sha == reservation.key.candidate_sha
         && receipt.gate_id == reservation.key.check.gate_id
         && receipt.gate_digest == reservation.key.check.gate_digest
-        && binding.reservation_id == reservation_id
-        && binding.key_digest == reservation.key_digest
-        && !control
-            .path(&ValidationExecutionPermitRecord::relative_path(
-                &reservation_id,
-            ))
-            .exists())
+        && provenance.gate_definition_digest == reservation.key.check.gate_digest
+        && provenance.policy_digest == reservation.key.policy_digest
+        && subject_matches
+        && proof_map_matches
+        && binding_matches
+}
+
+fn read_committed_gate_events(
+    control: &ControlRepository,
+    event_paths: Vec<String>,
+) -> Result<Option<Vec<Event>>, HarnessError> {
+    let mut events = Vec::with_capacity(event_paths.len());
+    for path in event_paths {
+        let Ok(event) = serde_json::from_str::<Event>(&control.read(&path)?) else {
+            return Ok(None);
+        };
+        events.push(event);
+    }
+    Ok(Some(events))
+}
+
+fn committed_gate_diff_event_paths(
+    control: &ControlRepository,
+    expected_head: &str,
+    current_head: &str,
+    reservation_id: &ValidationReservationId,
+    receipt_id: &crate::domain::ids::ReceiptId,
+) -> Result<Option<Vec<String>>, HarnessError> {
+    let diff = diff_commits(&control.scope(), expected_head, current_head)?;
+    if diff.paths.len() != 5 {
+        return Ok(None);
+    }
+    let expected_receipt = Receipt::relative_path(receipt_id);
+    let expected_settlement = ValidationReservationSettlementRecord::relative_path(reservation_id);
+    let expected_permit = ValidationExecutionPermitRecord::relative_path(reservation_id);
+    let mut saw_receipt = false;
+    let mut saw_settlement = false;
+    let mut saw_permit_release = false;
+    let mut event_paths = Vec::new();
+    for change in diff.paths {
+        match (change.kind, change.path.as_str()) {
+            (ChangeKind::Added, path) if path == expected_receipt => saw_receipt = true,
+            (ChangeKind::Added, path) if path == expected_settlement => saw_settlement = true,
+            (ChangeKind::Deleted, path) if path == expected_permit => saw_permit_release = true,
+            (ChangeKind::Added, path)
+                if path.starts_with(&format!("{EVENT_DIR}/"))
+                    && Path::new(path)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json")) =>
+            {
+                event_paths.push(path.to_owned());
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(
+        (saw_receipt && saw_settlement && saw_permit_release && event_paths.len() == 2)
+            .then_some(event_paths),
+    )
+}
+
+fn committed_gate_events_agree(
+    events: &[Event],
+    receipt: &Receipt,
+    reservation: &ValidationReservationRecord,
+    settlement: &ValidationReservationSettlementRecord,
+) -> bool {
+    if events.len() != 2 {
+        return false;
+    }
+    let common_matches = |event: &Event| {
+        event.schema == EVENT_SCHEMA
+            && event.project_id == receipt.project_id
+            && event.cycle_id.as_ref() == Some(&reservation.key.cycle_id)
+            && event.card_id.as_ref() == Some(&reservation.key.card_id)
+            && event.card_revision == Some(reservation.key.card_revision)
+            && event.card_digest.as_ref() == Some(&reservation.key.card_digest)
+            && event.actor_id == settlement.settled_by_actor_id
+            && event.occurred_at == settlement.settled_at
+    };
+    let settled = events
+        .iter()
+        .find(|event| event.event_type == "validation.execution_settled");
+    let gate_ran = events.iter().find(|event| event.event_type == "gate.ran");
+    let (Some(settled), Some(gate_ran)) = (settled, gate_ran) else {
+        return false;
+    };
+    common_matches(settled)
+        && settled.head_sha.is_none()
+        && settled.metadata.len() == 2
+        && settled.metadata.get("reservation_id")
+            == Some(&serde_json::json!(reservation.reservation_id.to_string()))
+        && settled.metadata.get("receipt_id")
+            == Some(&serde_json::json!(receipt.receipt_id.to_string()))
+        && common_matches(gate_ran)
+        && gate_ran.head_sha.as_ref() == Some(&receipt.evaluated_sha)
+        && gate_ran.metadata.len() == 8
+        && gate_ran.metadata.get("reservation_id")
+            == Some(&serde_json::json!(reservation.reservation_id.to_string()))
+        && gate_ran.metadata.get("reservation_key_digest")
+            == Some(&serde_json::json!(reservation.key_digest.as_str()))
+        && gate_ran.metadata.get("receipt_id")
+            == Some(&serde_json::json!(receipt.receipt_id.to_string()))
+        && gate_ran.metadata.get("gate_id") == Some(&serde_json::json!(receipt.gate_id))
+        && gate_ran.metadata.get("gate_digest")
+            == Some(&serde_json::json!(receipt.gate_digest.as_str()))
+        && gate_ran.metadata.get("attempt") == Some(&serde_json::json!(receipt.attempt))
+        && gate_ran.metadata.get("termination")
+            == Some(&serde_json::json!(receipt.termination.name()))
+        && gate_ran.metadata.get("passed") == Some(&serde_json::json!(receipt.passed))
+}
+
+fn no_live_cpu_lane_for(
+    control: &ControlRepository,
+    reservation: &ValidationReservationRecord,
+) -> Result<bool, HarnessError> {
+    let directory = control.path(CPU_HEAVY_LANE_DIR);
+    if !directory.exists() {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(&directory).map_err(|source| HarnessError::ControlIo {
+        path: directory.clone(),
+        source,
+    })? {
+        let path = entry
+            .map_err(|source| HarnessError::ControlIo {
+                path: directory.clone(),
+                source,
+            })?
+            .path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(lane) = serde_json::from_str::<CpuHeavyLaneRecord>(
+            &fs::read_to_string(&path).map_err(|source| HarnessError::ControlIo {
+                path: path.clone(),
+                source,
+            })?,
+        ) else {
+            return Ok(false);
+        };
+        if lane.reservation_id == reservation.reservation_id
+            || lane.reservation_key_digest == reservation.key_digest
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The digest a project's currently configured convergence policy is frozen
