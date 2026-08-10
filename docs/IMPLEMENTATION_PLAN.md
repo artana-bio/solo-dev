@@ -4470,13 +4470,13 @@ this revision records the completed `SPIKE-002` evidence above that base.
 
 | Field | Current value |
 | --- | --- |
-| Status | `IN_PROGRESS` — repair after integration review found an internally contradictory receipt-provenance freshness binding |
+| Status | `DONE` |
 | Owner | `mutation-recovery-implementer` |
 | Branch and worktree | `card/F-053`; `/Users/alvaro/Documents/Code/change-harness-worktrees/F-053` |
 | Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
 | Required reading | `README.md`; `AGENTS.md`; Sections 1–7, 12.1–12.3, 16, `WP-500`, 20.2, and 24–25; `PLAN-C043`; card `F-053` revision 1; `tests/mutation.rs`; `tests/gate_runner.rs`; `src/commands/mutation.rs`; `src/commands/project.rs`; `src/commands/transaction.rs`; `src/commands/gate.rs`; legacy evidence `OP-001486`, `R-000280`, `VR-000048`, and recovery commit `cfdcf061e425d0963faeeaab1d2ff4c63552a66d` |
 | Acceptance commands | `cargo test --test mutation`; `cargo test --test gate_runner`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `env -u NO_COLOR TERM=xterm-256color cargo test` |
-| Evidence | Integration `INT-044` was abandoned and handoff `H-000104` revoked after integration review found that legacy committed-gate recovery accepted a receipt whose provenance `freshness_dependencies.policy` contradicted `policy_digest` when the outer receipt and settlement digests were recomputed. Replacement evidence will be recorded only after the exact regression, declared mutation, full validation, frozen gates, and replacement handoff complete. |
+| Evidence | Integration-review repair after `INT-044`: legacy committed-gate recovery now uses the complete receipt reuse validator when the failed receipt carries complete reusable provenance, preserves the existing basic structural fallback required by legitimate failed receipts, and always binds `freshness_dependencies.policy` to the provenance `policy_digest`. The exact recomputed receipt-and-settlement contradiction is rejected while the legitimate legacy failed-receipt settlement remains accepted. Focused checks passed: mutation 7/7 and gate runner 34/34. `cargo fmt --check`, strict all-target/all-feature Clippy, and the normalized complete `cargo test` suite passed. Removing the policy-freshness equality made the exact regression fail because recovery completed the malformed operation. Exact-SHA feature receipts and the replacement handoff remain authoritative in control state rather than being copied into this mutable tracker. |
 | Sequencing | Maintenance prerequisite only. `WP-900` remains `READY`; the coordination-extension dependency sequence is unchanged. |
 
 Bootstrap recovery record:
