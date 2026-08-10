@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 86 |
+| Plan revision | 87 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
 | Previous plan commit | `f0c705fc94a41a167324eeb0ca7389b45d74107c`, promoted plan revision 85 authorization for `SPIKE-002` |
@@ -4465,6 +4465,19 @@ this revision records the completed `SPIKE-002` evidence above that base.
 | Blocker | None for `WP-900`. Every later package remains blocked on the exact dependency chain in Section 18. |
 | Required reading | `WP-900` implementation role: the exact list in its tracker entry, including the accepted `SPIKE-002` report. |
 | Acceptance boundary | Durable Harness-owned agent-run schema, state validation, persistence, and standalone CLI commands only; no coordinator or provider adapter. |
+
+#### Maintenance prerequisite F-051 — cleaned mutation recovery
+
+| Field | Current value |
+| --- | --- |
+| Status | `IN_PROGRESS` |
+| Owner | `mutation-recovery-implementer` |
+| Branch and worktree | `card/F-051`; `/Users/alvaro/Documents/Code/change-harness-worktrees/F-051` |
+| Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
+| Required reading | `README.md`; `AGENTS.md`; Sections 1–7, 12.1–12.3, 16, `WP-500`, 20.2, and 24–25; `PLAN-C041`; card `F-051` revision 1; `tests/mutation.rs`; `src/commands/mutation.rs`; `src/commands/project.rs`; `src/commands/transaction.rs` |
+| Acceptance commands | `cargo test --test mutation`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `env -u NO_COLOR TERM=xterm-256color cargo test` |
+| Evidence | Pending implementation and exact-SHA gate receipts. |
+| Sequencing | Maintenance prerequisite only. `WP-900` remains `READY`; the coordination-extension dependency sequence is unchanged. |
 
 Bootstrap recovery record:
 
