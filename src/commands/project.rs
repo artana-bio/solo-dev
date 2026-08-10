@@ -229,6 +229,10 @@ pub struct RecoverArgs {
     /// command change state underneath them.
     #[arg(long)]
     pub resume: bool,
+    /// Settle one failed mutation probe after its disposable worktree was
+    /// restored and no control commit was written.
+    #[arg(long, conflicts_with = "resume")]
+    pub settle_clean_mutation: Option<String>,
     /// Who is resuming.
     #[arg(long, default_value = "operator")]
     pub actor_id: String,
@@ -1358,6 +1362,70 @@ fn run_recover(args: &RecoverArgs, clock: &dyn Clock) -> Result<CommandOutcome, 
     let config = control.project()?;
     let journal = Journal::new(&control);
     let unresolved = journal.unresolved()?;
+
+    if let Some(operation_id) = &args.settle_clean_mutation {
+        let _lock = ProjectLock::acquire(control.root(), "project.recover", clock)?;
+        if args.actor_id.trim().is_empty() {
+            return Err(HarnessError::Control {
+                reason: "recovery actor must be nonblank".to_owned(),
+                code: ErrorCode::UsageInvalidArguments,
+            });
+        }
+        let mut matches = unresolved
+            .into_iter()
+            .filter(|record| record.operation_id.as_str() == operation_id);
+        let mut record = matches.next().ok_or_else(|| HarnessError::Control {
+            reason: format!("unresolved operation {operation_id} was not found"),
+            code: ErrorCode::RecoveryIncomplete,
+        })?;
+        if matches.next().is_some() {
+            return Err(HarnessError::Control {
+                reason: format!("operation identifier {operation_id} is ambiguous"),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        let failure = record.failure.clone().unwrap_or_default();
+        let current_head = control.head()?;
+        let cleanup_was_reported = record.command == "mutation.create"
+            && record.state == OperationState::FailedPartial
+            && record
+                .steps
+                .iter()
+                .any(|step| step == "mutation-worktree-added")
+            && !failure.contains("disposable mutation cleanup failed")
+            && record.expected_control_head == current_head
+            && control.is_clean()?;
+        if !cleanup_was_reported {
+            return Err(HarnessError::Control {
+                reason: format!(
+                    "operation {operation_id} is not a clean, settled mutation failure; inspect it and preserve the recovery record"
+                ),
+                code: ErrorCode::RecoveryIncomplete,
+            });
+        }
+        let settled_failure = format!(
+            "{failure}; settled as failed_clean by {} after verified disposable-worktree cleanup",
+            args.actor_id
+        );
+        journal.finish(
+            &mut record,
+            OperationState::FailedClean,
+            Some(settled_failure),
+            clock,
+        )?;
+        return Ok(CommandOutcome::new(
+            "project.recover",
+            format!("Settled clean mutation failure {operation_id}"),
+            serde_json::json!({
+                "project_id": config.project_id,
+                "settled": true,
+                "operation_id": operation_id,
+                "state": "failed_clean",
+                "actor_id": args.actor_id,
+            }),
+        )
+        .with_project(config.project_id));
+    }
 
     if args.resume {
         // Cleared before the journal is consulted, because a process killed

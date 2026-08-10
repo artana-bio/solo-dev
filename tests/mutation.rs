@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::process::Output;
+use std::process::{Command, Output};
 
 use change_harness::domain::digest::Digest;
 use serde_json::Value;
@@ -53,7 +53,7 @@ fn run_mutation(workspace: &Workspace, receipt_id: &str, command: &[&str]) -> Ou
     Workspace::run(&mutation_args(workspace, receipt_id, command))
 }
 
-fn assert_failed_partial_cleanup(workspace: &Workspace, output: &Output) {
+fn assert_failed_clean_cleanup(workspace: &Workspace, output: &Output) {
     assert!(
         !output.status.success(),
         "mutation unexpectedly succeeded: {}{}",
@@ -71,8 +71,7 @@ fn assert_failed_partial_cleanup(workspace: &Workspace, output: &Output) {
     let unresolved = status["data"]["unresolved_operations"]
         .as_array()
         .expect("unresolved operation list");
-    assert_eq!(unresolved.len(), 1, "{status}");
-    assert_eq!(unresolved[0]["command"], "mutation.create");
+    assert!(unresolved.is_empty(), "{status}");
     let recovery = Workspace::run_json(&[
         "project".to_owned(),
         "recover".to_owned(),
@@ -83,7 +82,7 @@ fn assert_failed_partial_cleanup(workspace: &Workspace, output: &Output) {
     ]);
     assert_eq!(
         recovery["data"]["recovery_required"],
-        true,
+        false,
         "{status}; command output: {}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -169,7 +168,7 @@ fn failed_mutation_process_cleans_up_and_retains_recovery_evidence() {
         "MR-FAILED-COMMAND",
         &["sh", "-c", "touch MUTATION_MARKER; exit 7"],
     );
-    assert_failed_partial_cleanup(&workspace, &output);
+    assert_failed_clean_cleanup(&workspace, &output);
 }
 
 #[test]
@@ -180,14 +179,76 @@ fn passing_oracle_after_a_real_mutation_cleans_up_and_retains_recovery_evidence(
         "MR-ORACLE-PASSED",
         &["sh", "-c", "printf changed > README.md"],
     );
-    assert_failed_partial_cleanup(&workspace, &output);
+    assert_failed_clean_cleanup(&workspace, &output);
 }
 
 #[test]
 fn no_tracked_patch_cleans_up_and_retains_recovery_evidence() {
     let workspace = workspace_with_oracle(&["sh", "-c", "test ! -f .git/mutation-marker"]);
     let output = run_mutation(&workspace, "MR-NO-PATCH", &["true"]);
-    assert_failed_partial_cleanup(&workspace, &output);
+    assert_failed_clean_cleanup(&workspace, &output);
+}
+
+#[test]
+fn operator_can_settle_a_legacy_clean_mutation_failure() {
+    let workspace = workspace_with_oracle(&["true"]);
+    let args = mutation_args(
+        &workspace,
+        "MR-INTERRUPTED-RESTORATION",
+        &["sh", "-c", "printf changed > README.md"],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_change-harness"))
+        .env("CHANGE_HARNESS_FAIL_AT", "mutation-worktree-restored")
+        .args(&args)
+        .output()
+        .expect("the CLI should start");
+    assert!(!output.status.success());
+
+    let status = Workspace::run_json(&[
+        "project".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    let unresolved = status["data"]["unresolved_operations"]
+        .as_array()
+        .expect("unresolved operation list");
+    assert_eq!(unresolved.len(), 1, "{status}");
+    let operation_id = unresolved[0]["operation_id"]
+        .as_str()
+        .expect("operation identifier");
+
+    let recovered = Workspace::run_json(&[
+        "project".to_owned(),
+        "recover".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--settle-clean-mutation".to_owned(),
+        operation_id.to_owned(),
+        "--actor-id".to_owned(),
+        "operator".to_owned(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    assert_eq!(recovered["data"]["state"], "failed_clean", "{recovered}");
+
+    let final_status = Workspace::run_json(&[
+        "project".to_owned(),
+        "status".to_owned(),
+        "--control".to_owned(),
+        workspace.control.display().to_string(),
+        "--output".to_owned(),
+        "json".to_owned(),
+    ]);
+    assert_eq!(
+        final_status["data"]["unresolved_operations"],
+        serde_json::json!([]),
+        "{final_status}"
+    );
+    let worktrees = support::capture(&workspace.repository, &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
 }
 
 #[allow(dead_code)]
