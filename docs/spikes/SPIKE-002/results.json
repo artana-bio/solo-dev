@@ -2,10 +2,10 @@
   "all_pass": true,
   "providers": {
     "claude": {
-      "cwd_digest": "sha256:e311b6511f98eb12c0859be39759cf98d7f1ff3d2e572e85d32d8a3b70f74970",
+      "cwd_digest": "sha256:4a500fa51eb8ff1a7b29078644bb592662f7dfe4ecdfe4302494dab43a3eb0ba",
       "cwd_token": "$PROBE_ROOT/claude",
       "event_artifact": "docs/spikes/SPIKE-002/events/claude.jsonl",
-      "event_artifact_sha256": "sha256:bb010632131791bc04b00fc0ab6a385983b51ec41a0ecc17d8981d37bb5ee07b",
+      "event_artifact_sha256": "sha256:ff42bef9f786aea267dc0e9fa400bb2a95febf0b19b22ea5050a224a4239e882",
       "event_mapping": {
         "assistant": "provider.event",
         "rate_limit_event": "provider.event",
@@ -19,11 +19,11 @@
       "final_file_sha256": "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d",
       "git_status": "?? probe-result.txt\n",
       "help_sha256": "sha256:fcd5b45507c7c602d54d85a300eab288a8a3c6770c6def696ca19a3100725de4",
-      "observed_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
+      "observed_session_id": "6f95a601-47fd-4125-8926-8b5c89b42510",
       "permission_behavior": "Claude used --safe-mode and --permission-mode acceptEdits on both turns; neither turn used a permission-bypass flag.",
       "provider": "claude",
       "reason": "all required capabilities observed",
-      "resume_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
+      "resume_session_id": "6f95a601-47fd-4125-8926-8b5c89b42510",
       "session_continuity": true,
       "status": "PASS",
       "structured_event_types": [
@@ -35,6 +35,7 @@
         "user"
       ],
       "structured_output": true,
+      "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
       "turn_one": {
         "argv": [
           "/Users/alvaro/.local/share/claude/versions/2.1.220",
@@ -46,14 +47,17 @@
           "--permission-mode",
           "acceptEdits",
           "--session-id",
-          "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
+          "6f95a601-47fd-4125-8926-8b5c89b42510",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 7729,
+        "elapsed_ms": 6189,
         "exit_code": 0,
-        "raw_sha256": "sha256:519db349a32e6858ab4c4b022e77c05a8b3a2365780c19a2975e93e93e47b922",
+        "prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
+        "raw_sha256": "sha256:c97032a6dc1e7588ed3d40f2d44e86c43b636c7de73fadb659d8c7bc121c46de",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
+      "turn_one_prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
       "turn_two": {
         "argv": [
           "/Users/alvaro/.local/share/claude/versions/2.1.220",
@@ -65,15 +69,18 @@
           "--permission-mode",
           "acceptEdits",
           "--resume",
-          "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
+          "6f95a601-47fd-4125-8926-8b5c89b42510",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 6385,
+        "elapsed_ms": 6327,
         "exit_code": 0,
-        "raw_sha256": "sha256:bfc9864ae422ac6e2b0f71f6ec567fc09b133171c8114c06dba337683a6576e1",
+        "prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
+        "raw_sha256": "sha256:a481ee01276403f91f0d12d856c635bd8733103f60c215e85e0399a85aacabd9",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
-      "turn_two_observed_session_id": "7f025a20-7eec-4245-9019-b1ddfde0bb8a",
+      "turn_two_observed_session_id": "6f95a601-47fd-4125-8926-8b5c89b42510",
+      "turn_two_prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
       "unavailable_fields": [
         "provider-side authoritative worktree identity",
         "provider-side cryptographic termination receipt"
@@ -82,10 +89,10 @@
       "version_sha256": "sha256:74fd5c2567221e143c16e917305e16131d853eb58f8c5ca3c2fdad9037ae4956"
     },
     "codex": {
-      "cwd_digest": "sha256:a9b58176ff846cf128ca36855f5217c5fcbb9f78f26a1df18d9604ad6a885a4e",
+      "cwd_digest": "sha256:e5cf14fff7cc10a44a687af11e119258235f0aacaf73ef11f12959b1f312460f",
       "cwd_token": "$PROBE_ROOT/codex",
       "event_artifact": "docs/spikes/SPIKE-002/events/codex.jsonl",
-      "event_artifact_sha256": "sha256:3bd5e0877f2eaf59ef026b8996526527a86ec804a43ae1572817db4e79467472",
+      "event_artifact_sha256": "sha256:a52fb5284eb623915a5a6339c47510549a3f03a6e22918d8aaa384ae652a1c07",
       "event_mapping": {
         "item.completed": "provider.activity",
         "item.started": "provider.activity",
@@ -98,11 +105,11 @@
       "final_file_sha256": "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d",
       "git_status": "?? probe-result.txt\n",
       "help_sha256": "sha256:9f86f0115238ddde2514587e5f95b0ab0aa6b89495e5912878d49ad26038aa19",
-      "observed_session_id": "019fe8dc-e1cf-7e73-a63b-a8558ad3af05",
+      "observed_session_id": "019fe9b6-054b-7d50-b88c-d15fe177ae84",
       "permission_behavior": "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, and neither turn used a sandbox-bypass or approval-bypass flag.",
       "provider": "codex",
       "reason": "all required capabilities observed",
-      "resume_session_id": "019fe8dc-e1cf-7e73-a63b-a8558ad3af05",
+      "resume_session_id": "019fe9b6-054b-7d50-b88c-d15fe177ae84",
       "session_continuity": true,
       "status": "PASS",
       "structured_event_types": [
@@ -113,6 +120,7 @@
         "turn.started"
       ],
       "structured_output": true,
+      "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
       "turn_one": {
         "argv": [
           "/opt/homebrew/Caskroom/codex/0.146.0/codex-aarch64-apple-darwin",
@@ -123,26 +131,32 @@
           "--skip-git-repo-check",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 14463,
+        "elapsed_ms": 37420,
         "exit_code": 0,
-        "raw_sha256": "sha256:caa158e08a33e4ea9058d2170789e67fb9d4e9fce9058970e861ad1ced766266",
+        "prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
+        "raw_sha256": "sha256:99c06091f5b48c90dd5e3172ba7b5ac8d805dfb745c7d669dd220622f91c2278",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
+      "turn_one_prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
       "turn_two": {
         "argv": [
           "/opt/homebrew/Caskroom/codex/0.146.0/codex-aarch64-apple-darwin",
           "exec",
           "resume",
-          "019fe8dc-e1cf-7e73-a63b-a8558ad3af05",
+          "019fe9b6-054b-7d50-b88c-d15fe177ae84",
           "--json",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 20172,
+        "elapsed_ms": 16555,
         "exit_code": 0,
-        "raw_sha256": "sha256:7f00215b9ac9fe6a20bf992e2f39c34e2b67a70bc9541e126242cef2479a06a3",
+        "prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
+        "raw_sha256": "sha256:ba11d2136dc8242278beb024a4105a993f9c10415b6d9b66c5e1df399a00231a",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
-      "turn_two_observed_session_id": "019fe8dc-e1cf-7e73-a63b-a8558ad3af05",
+      "turn_two_observed_session_id": "019fe9b6-054b-7d50-b88c-d15fe177ae84",
+      "turn_two_prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
       "unavailable_fields": [
         "provider-side authoritative worktree identity",
         "provider-side cryptographic termination receipt"
@@ -151,10 +165,10 @@
       "version_sha256": "sha256:446dce03fa8317c76f51ca91da1f075e192a75cf86c889c594034ef9ec2fcc52"
     },
     "copilot": {
-      "cwd_digest": "sha256:8697a4a7b3a03af9827e6365acd123a0bd5a9856ba65a02e31b3087301c6283f",
+      "cwd_digest": "sha256:25ada636910cab4c53416ce99d22b2cafef155a4c27c357f836fa3cd8166c54d",
       "cwd_token": "$PROBE_ROOT/copilot",
       "event_artifact": "docs/spikes/SPIKE-002/events/copilot.jsonl",
-      "event_artifact_sha256": "sha256:69de5a846cce86a17c308b0ffb29629b727d2540bd9b725b6f93771035026ab8",
+      "event_artifact_sha256": "sha256:6c5b86bf1dee8db2b30f2d32b231a34b1e13a9e898dd17a17b41d13180bed66f",
       "event_mapping": {
         "assistant.idle": "provider.event",
         "assistant.message": "provider.event",
@@ -168,13 +182,12 @@
         "mcp.tools.list_changed": "provider.activity",
         "model.call_start": "provider.activity",
         "result": "turn.completed",
-        "session.background_tasks_changed": "provider.event",
+        "session.info": "provider.event",
         "session.mcp_server_status_changed": "provider.event",
         "session.skills_loaded": "provider.event",
         "session.tools_updated": "provider.activity",
         "session.usage_checkpoint": "provider.event",
         "tool.execution_complete": "provider.activity",
-        "tool.execution_partial_result": "provider.activity",
         "tool.execution_start": "provider.activity",
         "user.message": "provider.event"
       },
@@ -183,11 +196,11 @@
       "final_file_sha256": "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d",
       "git_status": "?? probe-result.txt\n",
       "help_sha256": "sha256:0f4344296acf5eecc4661a5f7ed08e3ffb1e68e32069f56cf1af0652c242a17b",
-      "observed_session_id": "c4af64a8-622e-48ad-8d43-41b186343286",
+      "observed_session_id": "d7edd944-6641-46c1-bd17-eb1b4d688dc8",
       "permission_behavior": "Copilot used --allow-all-tools, which the installed CLI required for noninteractive mode: all tools were auto-approved. --allow-all-paths, --allow-all-urls, --allow-all, and --yolo were absent, so path and URL verification were not disabled. The local same-user process is not a security boundary.",
       "provider": "copilot",
       "reason": "all required capabilities observed",
-      "resume_session_id": "c4af64a8-622e-48ad-8d43-41b186343286",
+      "resume_session_id": "d7edd944-6641-46c1-bd17-eb1b4d688dc8",
       "session_continuity": true,
       "status": "PASS",
       "structured_event_types": [
@@ -203,17 +216,17 @@
         "mcp.tools.list_changed",
         "model.call_start",
         "result",
-        "session.background_tasks_changed",
+        "session.info",
         "session.mcp_server_status_changed",
         "session.skills_loaded",
         "session.tools_updated",
         "session.usage_checkpoint",
         "tool.execution_complete",
-        "tool.execution_partial_result",
         "tool.execution_start",
         "user.message"
       ],
       "structured_output": true,
+      "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
       "turn_one": {
         "argv": [
           "/opt/homebrew/Caskroom/copilot-cli/1.0.54/copilot",
@@ -221,31 +234,37 @@
           "json",
           "--allow-all-tools",
           "--session-id",
-          "c4af64a8-622e-48ad-8d43-41b186343286",
+          "d7edd944-6641-46c1-bd17-eb1b4d688dc8",
           "--prompt",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 12531,
+        "elapsed_ms": 9534,
         "exit_code": 0,
-        "raw_sha256": "sha256:b74a72aa6c382f60c983e1bb541f29307501c81a056f7d4f8b6f46922d476b8a",
+        "prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
+        "raw_sha256": "sha256:efe433e4eb811eb4dc140da8ee63bcabcef06d9bfb43b81a388dd7d8a05bef6a",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
+      "turn_one_prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
       "turn_two": {
         "argv": [
           "/opt/homebrew/Caskroom/copilot-cli/1.0.54/copilot",
           "--output-format",
           "json",
           "--allow-all-tools",
-          "--resume=c4af64a8-622e-48ad-8d43-41b186343286",
+          "--resume=d7edd944-6641-46c1-bd17-eb1b4d688dc8",
           "--prompt",
           "<redacted-prompt>"
         ],
-        "elapsed_ms": 8397,
+        "elapsed_ms": 8731,
         "exit_code": 0,
-        "raw_sha256": "sha256:b630b819e0eaadb6ff3510f87fba97f7f19dc778ae72e51b5894c5387cb804dc",
+        "prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
+        "raw_sha256": "sha256:565968646ac7d48d3504dcde86e99f06c203f0b990173d03be7cc0c6411afd30",
+        "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
         "timed_out": false
       },
-      "turn_two_observed_session_id": "c4af64a8-622e-48ad-8d43-41b186343286",
+      "turn_two_observed_session_id": "d7edd944-6641-46c1-bd17-eb1b4d688dc8",
+      "turn_two_prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
       "unavailable_fields": [
         "provider-side authoritative worktree identity",
         "provider-side cryptographic termination receipt"
@@ -254,5 +273,13 @@
       "version_sha256": "sha256:23753e2902794def1bfb02bdadb096397e642d413a14436f371ee83682530cf1"
     }
   },
-  "schema": "harness.provider-feasibility-report/v1"
+  "schema": "harness.provider-feasibility-report/v1",
+  "task_contract": {
+    "expected_final_sha256": "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d",
+    "schema": "harness.provider-feasibility-task/v1",
+    "task_contract_sha256": "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231",
+    "turn_one_prompt_sha256": "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240",
+    "turn_two_prompt_sha256": "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6",
+    "version": 1
+  }
 }

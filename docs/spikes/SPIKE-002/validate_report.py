@@ -22,6 +22,11 @@ RESULTS_PATH = SCRIPT_DIR / "results.json"
 EVENT_DIR = SCRIPT_DIR / "events"
 PLAN_PATH = REPO_ROOT / "docs" / "IMPLEMENTATION_PLAN.md"
 EXPECTED_FINAL_FILE_SHA256 = "sha256:40e9f7eb05f53663dada2f6e9dc91c49c1113e42ed88cdffa81278b3aafa6f9d"
+TASK_CONTRACT_SCHEMA = "harness.provider-feasibility-task/v1"
+TASK_CONTRACT_VERSION = 1
+EXPECTED_TURN_ONE_PROMPT_SHA256 = "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240"
+EXPECTED_TURN_TWO_PROMPT_SHA256 = "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6"
+EXPECTED_TASK_CONTRACT_SHA256 = "sha256:da3d3877763a3471e229ed18ea230fdb7af1b326a1601c25eaea0f7ebb6cd231"
 EXPECTED_ARTIFACT_RELATIVE_PATHS = frozenset(
     {
         "run_probe.py",
@@ -32,6 +37,15 @@ EXPECTED_ARTIFACT_RELATIVE_PATHS = frozenset(
         "events/copilot.jsonl",
     }
 )
+RESULTS_KEYS = {"schema", "task_contract", "providers", "all_pass"}
+TASK_CONTRACT_KEYS = {
+    "schema",
+    "version",
+    "turn_one_prompt_sha256",
+    "turn_two_prompt_sha256",
+    "expected_final_sha256",
+    "task_contract_sha256",
+}
 EVENT_KEYS = {
     "schema",
     "provider",
@@ -41,12 +55,17 @@ EVENT_KEYS = {
     "normalized_event_type",
     "session_id",
     "cwd_digest",
+    "task_contract_sha256",
+    "prompt_sha256",
     "exit_code",
     "timed_out",
 }
 ROW_KEYS = {
     "provider",
     "status",
+    "task_contract_sha256",
+    "turn_one_prompt_sha256",
+    "turn_two_prompt_sha256",
     "executable",
     "version",
     "version_sha256",
@@ -71,7 +90,15 @@ ROW_KEYS = {
     "permission_behavior",
     "reason",
 }
-TURN_KEYS = {"argv", "exit_code", "timed_out", "elapsed_ms", "raw_sha256"}
+TURN_KEYS = {
+    "argv",
+    "task_contract_sha256",
+    "prompt_sha256",
+    "exit_code",
+    "timed_out",
+    "elapsed_ms",
+    "raw_sha256",
+}
 CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ROW_CUSTODY_DIGEST_FIELDS = (
     "version_sha256",
@@ -79,6 +106,9 @@ ROW_CUSTODY_DIGEST_FIELDS = (
     "cwd_digest",
     "event_artifact_sha256",
     "final_file_sha256",
+    "task_contract_sha256",
+    "turn_one_prompt_sha256",
+    "turn_two_prompt_sha256",
 )
 EXPECTED_PASS_UNAVAILABLE_FIELDS = (
     "provider-side authoritative worktree identity",
@@ -131,6 +161,7 @@ NORMALIZED_EVENT_TYPES = {
         "model.call_start": "provider.activity",
         "result": "turn.completed",
         "session.background_tasks_changed": "provider.event",
+        "session.info": "provider.event",
         "session.mcp_server_status_changed": "provider.event",
         "session.skills_loaded": "provider.event",
         "session.tools_updated": "provider.activity",
@@ -173,6 +204,53 @@ def require(condition: bool, message: str) -> None:
 
 def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def task_contract_digest(contract: dict[str, object]) -> str:
+    payload = {key: contract[key] for key in TASK_CONTRACT_KEYS - {"task_contract_sha256"}}
+    return sha256_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def expected_task_contract() -> dict[str, object]:
+    contract: dict[str, object] = {
+        "schema": TASK_CONTRACT_SCHEMA,
+        "version": TASK_CONTRACT_VERSION,
+        "turn_one_prompt_sha256": EXPECTED_TURN_ONE_PROMPT_SHA256,
+        "turn_two_prompt_sha256": EXPECTED_TURN_TWO_PROMPT_SHA256,
+        "expected_final_sha256": EXPECTED_FINAL_FILE_SHA256,
+    }
+    contract["task_contract_sha256"] = task_contract_digest(contract)
+    require(
+        contract["task_contract_sha256"] == EXPECTED_TASK_CONTRACT_SHA256,
+        "fixed task contract digest is inconsistent",
+    )
+    return contract
+
+
+def validate_task_contract(value: object) -> dict[str, object]:
+    require(isinstance(value, dict), "results task contract must be an object")
+    require(set(value) == TASK_CONTRACT_KEYS, "results task contract fields mismatch")
+    require(value["schema"] == TASK_CONTRACT_SCHEMA, "task contract schema mismatch")
+    require(value["version"] == TASK_CONTRACT_VERSION, "task contract version mismatch")
+    for field in (
+        "turn_one_prompt_sha256",
+        "turn_two_prompt_sha256",
+        "expected_final_sha256",
+        "task_contract_sha256",
+    ):
+        require_canonical_sha256(value[field], f"task contract {field}")
+    expected = expected_task_contract()
+    require(value == expected, "task contract does not match the fixed canonical task")
+    require(value["task_contract_sha256"] == task_contract_digest(value), "task contract digest is inconsistent")
+    return value
+
+
+def task_prompt_digest(contract: dict[str, object], turn: int) -> str:
+    if turn == 1:
+        return str(contract["turn_one_prompt_sha256"])
+    if turn == 2:
+        return str(contract["turn_two_prompt_sha256"])
+    raise ValidationError(f"invalid task-contract turn: {turn}")
 
 
 def require_canonical_sha256(value: object, label: str) -> str:
@@ -223,6 +301,10 @@ def parse_events_bytes(raw: bytes, provider: str) -> list[dict[str, object]]:
             f"{provider} JSONL line {number} normalization mismatch",
         )
         require_canonical_sha256(value["cwd_digest"], f"{provider} JSONL line {number} cwd digest")
+        require_canonical_sha256(
+            value["task_contract_sha256"], f"{provider} JSONL line {number} task contract digest"
+        )
+        require_canonical_sha256(value["prompt_sha256"], f"{provider} JSONL line {number} prompt digest")
         require(
             value["session_id"] is None or isinstance(value["session_id"], str),
             f"{provider} JSONL line {number} session identifier invalid",
@@ -290,6 +372,8 @@ def validate_turn(turn: object, provider: str, label: str) -> dict[str, object]:
     require(argv[-1] == "<redacted-prompt>", f"{provider} {label} prompt is not terminal")
     require(isinstance(turn["elapsed_ms"], int) and turn["elapsed_ms"] >= 0, f"{provider} {label} elapsed invalid")
     require(isinstance(turn["timed_out"], bool), f"{provider} {label} timeout invalid")
+    require_canonical_sha256(turn["task_contract_sha256"], f"{provider} {label} task contract digest")
+    require_canonical_sha256(turn["prompt_sha256"], f"{provider} {label} prompt digest")
     require_canonical_sha256(turn["raw_sha256"], f"{provider} {label} raw digest")
     assert_no_forbidden_flags(argv, provider, label)
     return turn
@@ -332,13 +416,59 @@ def expected_pass_argvs(provider: str, executable: str, session: str) -> tuple[l
     raise ValidationError(f"unknown provider: {provider}")
 
 
-def validate_event_bindings(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
+def validate_provider_task_binding(provider: str, row: dict[str, object], contract: dict[str, object]) -> None:
+    expected_contract = require_canonical_sha256(contract["task_contract_sha256"], "task contract digest")
+    require(row["task_contract_sha256"] == expected_contract, f"{provider} row task contract mismatch")
+    for turn, row_field in ((1, "turn_one"), (2, "turn_two")):
+        expected_prompt = task_prompt_digest(contract, turn)
+        require(
+            row[prompt_digest_field(turn)] == expected_prompt,
+            f"{provider} row turn-{turn} prompt digest mismatch",
+        )
+        turn_row = row[row_field]
+        require(isinstance(turn_row, dict), f"{provider} {row_field} must be an object")
+        require(
+            turn_row["task_contract_sha256"] == expected_contract,
+            f"{provider} {row_field} task contract mismatch",
+        )
+        require(
+            turn_row["prompt_sha256"] == expected_prompt,
+            f"{provider} {row_field} prompt digest mismatch",
+        )
+
+
+def prompt_digest_field(turn: int) -> str:
+    if turn == 1:
+        return "turn_one_prompt_sha256"
+    if turn == 2:
+        return "turn_two_prompt_sha256"
+    raise ValidationError(f"invalid probe turn: {turn}")
+
+
+def validate_event_bindings(
+    provider: str,
+    row: dict[str, object],
+    events: list[dict[str, object]],
+    contract: dict[str, object] | None = None,
+) -> None:
+    contract = expected_task_contract() if contract is None else contract
+    validate_provider_task_binding(provider, row, contract)
     row_cwd_digest = require_canonical_sha256(row.get("cwd_digest"), f"{provider} cwd_digest")
     for number, event in enumerate(events, start=1):
         event_cwd_digest = require_canonical_sha256(
             event.get("cwd_digest"), f"{provider} JSONL line {number} cwd digest"
         )
         require(event_cwd_digest == row_cwd_digest, f"{provider} event cwd binding mismatch")
+        require(
+            event.get("task_contract_sha256") == contract["task_contract_sha256"],
+            f"{provider} JSONL line {number} task contract mismatch",
+        )
+        turn = event.get("turn")
+        require(turn in (1, 2), f"{provider} JSONL line {number} invalid task turn")
+        require(
+            event.get("prompt_sha256") == task_prompt_digest(contract, turn),
+            f"{provider} JSONL line {number} prompt digest mismatch",
+        )
     mapping = derive_event_mapping(provider, events)
     require(row["event_mapping"] == mapping, f"{provider} event mapping does not match normalized JSONL")
     require(
@@ -391,10 +521,17 @@ def validate_pass_observation_boundary(provider: str, row: dict[str, object]) ->
     )
 
 
-def validate_pass_requirements(provider: str, row: dict[str, object], events: list[dict[str, object]]) -> None:
+def validate_pass_requirements(
+    provider: str,
+    row: dict[str, object],
+    events: list[dict[str, object]],
+    contract: dict[str, object] | None = None,
+) -> None:
+    contract = expected_task_contract() if contract is None else contract
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
     validate_custody_digests(provider, row)
+    validate_provider_task_binding(provider, row, contract)
     observed = require_nonblank_session(row["observed_session_id"], provider, "observed session")
     resumed = require_nonblank_session(row["resume_session_id"], provider, "resumed session")
     second_observed = require_nonblank_session(
@@ -420,10 +557,14 @@ def validate_pass_requirements(provider: str, row: dict[str, object], events: li
         row["permission_behavior"] == PERMISSION_BEHAVIORS[provider],
         f"{provider} permission statement does not match exact argv",
     )
-    validate_event_bindings(provider, row, events)
+    validate_event_bindings(provider, row, events, contract)
 
 
-def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[dict[str, object]]]:
+def validate_row(
+    provider: str,
+    row: object,
+    contract: dict[str, object],
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     require(isinstance(row, dict), f"{provider} row must be an object")
     require(set(row) == ROW_KEYS, f"{provider} row has unknown/missing fields")
     require(row["provider"] == provider, f"{provider} row identity mismatch")
@@ -431,6 +572,9 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     for field in (
         "executable",
         "version",
+        "task_contract_sha256",
+        "turn_one_prompt_sha256",
+        "turn_two_prompt_sha256",
         "version_sha256",
         "help_sha256",
         "cwd_token",
@@ -443,6 +587,7 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     ):
         require(isinstance(row[field], str) and row[field].strip(), f"{provider} {field} missing")
     validate_custody_digests(provider, row)
+    validate_provider_task_binding(provider, row, contract)
     require(row["cwd_token"] == f"$PROBE_ROOT/{provider}", f"{provider} cwd token mismatch")
     first = validate_turn(row["turn_one"], provider, "turn_one")
     second = validate_turn(row["turn_two"], provider, "turn_two")
@@ -457,9 +602,9 @@ def validate_row(provider: str, row: object) -> tuple[dict[str, object], list[di
     require(isinstance(row["unavailable_fields"], list), f"{provider} unavailable fields missing")
     require(isinstance(row["git_status"], str), f"{provider} git status invalid")
     if events:
-        validate_event_bindings(provider, row, events)
+        validate_event_bindings(provider, row, events, contract)
     if row["status"] == "PASS":
-        validate_pass_requirements(provider, row, events)
+        validate_pass_requirements(provider, row, events, contract)
     else:
         require(str(row["reason"]).strip() not in ("FAIL", "unknown"), f"{provider} FAIL reason is not specific")
         require(not row["expected_content"] or row["final_file_sha256"] == EXPECTED_FINAL_FILE_SHA256, f"{provider} FAIL content claim is unbound")
@@ -599,6 +744,33 @@ def provider_report_section(report: str, provider: str) -> str:
     return section
 
 
+def task_contract_report_section(report: str) -> str:
+    heading = "## Task contract"
+    lines = report.splitlines()
+    matches = [index for index, line in enumerate(lines) if line == heading]
+    require(len(matches) == 1, "report has a missing or duplicate task contract section")
+    start = matches[0] + 1
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## "):
+            end = index
+            break
+    section = "\n".join(lines[start:end])
+    require(section.strip(), "report task contract section is empty")
+    return section
+
+
+def task_contract_report_fields(contract: dict[str, object]) -> dict[str, str]:
+    return {
+        "Schema": str(contract["schema"]),
+        "Version": str(contract["version"]),
+        "Turn-one prompt digest": str(contract["turn_one_prompt_sha256"]),
+        "Turn-two prompt digest": str(contract["turn_two_prompt_sha256"]),
+        "Expected-final digest": str(contract["expected_final_sha256"]),
+        "Task contract digest": str(contract["task_contract_sha256"]),
+    }
+
+
 def report_agreement_fields(provider: str, row: dict[str, object]) -> dict[str, str]:
     first = row["turn_one"]
     second = row["turn_two"]
@@ -607,6 +779,9 @@ def report_agreement_fields(provider: str, row: dict[str, object]) -> dict[str, 
         "Executable": str(row["executable"]),
         "Version": str(row["version"]),
         "Result": f"{row['status']} — {row['reason']}",
+        "Task contract digest": str(row["task_contract_sha256"]),
+        "Turn-one prompt digest": str(row["turn_one_prompt_sha256"]),
+        "Turn-two prompt digest": str(row["turn_two_prompt_sha256"]),
         "Working-directory token/digest": f"{row['cwd_token']} / {row['cwd_digest']}",
         "Observed/resumed session": f"{row['observed_session_id']} / {row['resume_session_id']}",
         "Turn-two observed session": str(row["turn_two_observed_session_id"]),
@@ -646,8 +821,22 @@ def parse_provider_evidence_section(
     return fields
 
 
-def validate_report_agreement(provider: str, row: dict[str, object], section: str) -> None:
+def validate_report_task_contract(report: str, contract: dict[str, object]) -> None:
+    expected = task_contract_report_fields(contract)
+    parsed = parse_provider_evidence_section("task contract", task_contract_report_section(report), set(expected))
+    for label, value in expected.items():
+        require(parsed[label] == value, f"report task contract does not agree: {label}")
+
+
+def validate_report_agreement(
+    provider: str,
+    row: dict[str, object],
+    section: str,
+    contract: dict[str, object] | None = None,
+) -> None:
+    contract = expected_task_contract() if contract is None else contract
     validate_custody_digests(provider, row)
+    validate_provider_task_binding(provider, row, contract)
     expected = report_agreement_fields(provider, row)
     parsed = parse_provider_evidence_section(provider, section, set(expected))
     for label, value in expected.items():
@@ -679,21 +868,24 @@ def validate_plan(results: dict[str, object]) -> None:
 
 def validate_baseline(report_path: Path) -> dict[str, object]:
     results = load_json(RESULTS_PATH)
+    require(set(results) == RESULTS_KEYS, "results fields mismatch")
     require(results.get("schema") == SCHEMA, "results schema mismatch")
+    contract = validate_task_contract(results.get("task_contract"))
     providers = results.get("providers")
     require(isinstance(providers, dict), "providers must be an object")
     require(set(providers) == set(PROVIDERS), "provider matrix must contain exactly codex, claude, copilot")
     rows: dict[str, dict[str, object]] = {}
     for provider in PROVIDERS:
-        row, _events = validate_row(provider, providers[provider])
+        row, _events = validate_row(provider, providers[provider], contract)
         rows[provider] = row
     all_pass = all(rows[name]["status"] == "PASS" for name in PROVIDERS)
     require(results.get("all_pass") is all_pass, "all_pass does not match provider rows")
     report = report_path.read_text(encoding="utf-8")
     summary = report_summary_rows(report)
+    validate_report_task_contract(report, contract)
     for provider in PROVIDERS:
         validate_report_summary(provider, rows[provider], summary)
-        validate_report_agreement(provider, rows[provider], provider_report_section(report, provider))
+        validate_report_agreement(provider, rows[provider], provider_report_section(report, provider), contract)
     require("does not claim a production adapter or coordinator" in report, "report claim boundary missing")
     scan_candidate(results, report_path)
     validate_plan(results)
@@ -728,6 +920,94 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     codex_turn_two = codex_row["turn_two"]
     assert isinstance(codex_turn_one, dict) and isinstance(codex_turn_two, dict)
     codex_section = provider_report_section(report, "codex")
+    contract = validate_task_contract(results["task_contract"])
+
+    missing_task_contract = report.replace("## Task contract", "## Missing task contract", 1)
+    require(missing_task_contract != report, "missing task contract report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_task_contract(missing_task_contract, contract),
+        "missing report task contract",
+    )
+    task_section = task_contract_report_section(report)
+    duplicate_task_contract = report.replace(
+        task_section,
+        f"{task_section}\n\n## Task contract\n\n{task_section}",
+        1,
+    )
+    require(duplicate_task_contract != report, "duplicate task contract report mutation setup failed")
+    expect_failure(
+        lambda: validate_report_task_contract(duplicate_task_contract, contract),
+        "duplicate report task contract",
+    )
+
+    def rebind_provider_task(
+        row: dict[str, object],
+        events: list[dict[str, object]],
+        target_contract: dict[str, object],
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        rebound_row = copy.deepcopy(row)
+        rebound_events = copy.deepcopy(events)
+        rebound_row["task_contract_sha256"] = target_contract["task_contract_sha256"]
+        for turn, row_field in ((1, "turn_one"), (2, "turn_two")):
+            prompt = task_prompt_digest(target_contract, turn)
+            rebound_row[prompt_digest_field(turn)] = prompt
+            turn_row = rebound_row[row_field]
+            assert isinstance(turn_row, dict)
+            turn_row["task_contract_sha256"] = target_contract["task_contract_sha256"]
+            turn_row["prompt_sha256"] = prompt
+        for event in rebound_events:
+            turn = event["turn"]
+            assert isinstance(turn, int)
+            event["task_contract_sha256"] = target_contract["task_contract_sha256"]
+            event["prompt_sha256"] = task_prompt_digest(target_contract, turn)
+        return rebound_row, rebound_events
+
+    substituted_contract_row, _unchanged_events = rebind_provider_task(
+        codex_row,
+        codex_events,
+        {
+            **contract,
+            "task_contract_sha256": "sha256:" + "0" * 64,
+        },
+    )
+    substituted_contract_report = "\n".join(report_agreement_lines("codex", substituted_contract_row))
+    expect_failure(
+        lambda: validate_report_agreement("codex", substituted_contract_row, substituted_contract_report),
+        "provider task digest substitution in results and report",
+    )
+    expect_failure(
+        lambda: validate_event_bindings("codex", substituted_contract_row, codex_events),
+        "provider task digest does not bind unchanged JSONL",
+    )
+
+    foreign_contract = dict(contract)
+    foreign_contract["turn_one_prompt_sha256"] = "sha256:" + "1" * 64
+    foreign_contract["turn_two_prompt_sha256"] = "sha256:" + "2" * 64
+    foreign_contract["task_contract_sha256"] = task_contract_digest(foreign_contract)
+    rebound_row, rebound_events = rebind_provider_task(codex_row, codex_events, foreign_contract)
+    rebound_report = "\n".join(report_agreement_lines("codex", rebound_row))
+
+    def reject_foreign_task_rebinding() -> None:
+        validate_report_agreement("codex", rebound_row, rebound_report, foreign_contract)
+        validate_event_bindings("codex", rebound_row, rebound_events, foreign_contract)
+        validate_pass_requirements("codex", rebound_row, rebound_events, foreign_contract)
+        validate_task_contract(foreign_contract)
+
+    expect_failure(
+        reject_foreign_task_rebinding,
+        "results report and JSONL rebound to a foreign valid task contract",
+    )
+
+    changed_turn_prompt = copy.deepcopy(codex_row)
+    changed_turn_two = changed_turn_prompt["turn_two"]
+    assert isinstance(changed_turn_two, dict)
+    changed_turn_prompt["turn_two_prompt_sha256"] = "sha256:" + "3" * 64
+    changed_turn_two["prompt_sha256"] = "sha256:" + "3" * 64
+    changed_turn_prompt_report = "\n".join(report_agreement_lines("codex", changed_turn_prompt))
+    expect_failure(
+        lambda: validate_report_agreement("codex", changed_turn_prompt, changed_turn_prompt_report),
+        "one turn prompt digest differs",
+    )
 
     raw_line = f"- Raw stream digests: {codex_turn_one['raw_sha256']} / {codex_turn_two['raw_sha256']}"
     altered_raw_line = "- Raw stream digests: sha256:" + "0" * 64 + " / sha256:" + "1" * 64
@@ -860,6 +1140,18 @@ def run_negative_regressions(results: dict[str, object]) -> None:
     expect_failure(
         lambda: normalized_event_type("claude", "system.unknown"),
         "unknown Claude system subtype",
+    )
+    require(
+        normalized_event_type("copilot", "session.info") == "provider.event",
+        "Copilot session.info mapping is missing",
+    )
+    require(
+        normalized_event_type("copilot", "session.info") != "session.started",
+        "Copilot session.info incorrectly maps to session.started",
+    )
+    expect_failure(
+        lambda: normalized_event_type("copilot", "session.unknown"),
+        "unknown Copilot native type",
     )
 
     expect_failure(lambda: parse_events_bytes(codex_raw[:-1] + b"{", "codex"), "corrupt JSONL")

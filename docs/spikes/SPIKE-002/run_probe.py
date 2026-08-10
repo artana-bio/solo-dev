@@ -30,6 +30,14 @@ SCRATCH_ROOT = Path(
     )
 )
 EXPECTED_BYTES = b"turn-one\nORBIT-2719\n"
+TASK_CONTRACT_SCHEMA = "harness.provider-feasibility-task/v1"
+TASK_CONTRACT_VERSION = 1
+CANONICAL_TURN_ONE_PROMPT_SHA256 = "sha256:3bfa17dee1eeba5751c7068cb611c6a4bec8dd82744fbece05d02616d4d94240"
+CANONICAL_TURN_TWO_PROMPT_SHA256 = "sha256:885655f9feb06d83781f204608386db7042cb82dfe0b58a5743dfa1f130155b6"
+EXPECTED_PASS_UNAVAILABLE_FIELDS = (
+    "provider-side authoritative worktree identity",
+    "provider-side cryptographic termination receipt",
+)
 PERMISSION_BEHAVIORS = {
     "codex": (
         "Codex turn one used --sandbox workspace-write; the exact-session resume used --json, "
@@ -76,6 +84,7 @@ NORMALIZED_EVENT_TYPES = {
         "model.call_start": "provider.activity",
         "result": "turn.completed",
         "session.background_tasks_changed": "provider.event",
+        "session.info": "provider.event",
         "session.mcp_server_status_changed": "provider.event",
         "session.skills_loaded": "provider.event",
         "session.tools_updated": "provider.activity",
@@ -103,6 +112,88 @@ def sha256_bytes(value: bytes) -> str:
 
 def sha256_text(value: str) -> str:
     return sha256_bytes(value.encode("utf-8"))
+
+
+def task_contract() -> dict[str, object]:
+    contract: dict[str, object] = {
+        "schema": TASK_CONTRACT_SCHEMA,
+        "version": TASK_CONTRACT_VERSION,
+        "turn_one_prompt_sha256": CANONICAL_TURN_ONE_PROMPT_SHA256,
+        "turn_two_prompt_sha256": CANONICAL_TURN_TWO_PROMPT_SHA256,
+        "expected_final_sha256": sha256_bytes(EXPECTED_BYTES),
+    }
+    contract["task_contract_sha256"] = sha256_bytes(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return contract
+
+
+def prompt_digest_field(turn: int) -> str:
+    if turn == 1:
+        return "turn_one_prompt_sha256"
+    if turn == 2:
+        return "turn_two_prompt_sha256"
+    raise ValueError(f"invalid probe turn: {turn}")
+
+
+def read_verified_prompt(root: Path, turn: int, expected_digest: str) -> tuple[str, str]:
+    prompt_digest_field(turn)
+    path = root / f"turn-{'one' if turn == 1 else 'two'}.input"
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"canonical turn-{turn} prompt input is unavailable") from exc
+    actual_digest = sha256_bytes(raw)
+    if actual_digest != expected_digest:
+        raise RuntimeError(f"canonical turn-{turn} prompt digest mismatch")
+    try:
+        return raw.decode("utf-8"), actual_digest
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"canonical turn-{turn} prompt is not valid UTF-8") from exc
+
+
+def verified_task_inputs(root: Path = SCRATCH_ROOT) -> tuple[dict[str, object], tuple[str, str], tuple[str, str]]:
+    contract = task_contract()
+    one = read_verified_prompt(root, 1, str(contract["turn_one_prompt_sha256"]))
+    two = read_verified_prompt(root, 2, str(contract["turn_two_prompt_sha256"]))
+    return contract, one, two
+
+
+def require_results_task_contract(results: dict[str, object]) -> dict[str, object]:
+    contract = task_contract()
+    if results.get("task_contract") != contract:
+        raise RuntimeError("results task contract does not match the fixed canonical task")
+    return contract
+
+
+def require_provider_task_binding(row: dict[str, object], contract: dict[str, object]) -> None:
+    expected_contract = contract["task_contract_sha256"]
+    if row.get("task_contract_sha256") != expected_contract:
+        raise RuntimeError("provider row task contract does not match results")
+    for turn, row_field in ((1, "turn_one"), (2, "turn_two")):
+        expected_prompt = contract[prompt_digest_field(turn)]
+        if row.get(prompt_digest_field(turn)) != expected_prompt:
+            raise RuntimeError(f"provider row turn-{turn} prompt digest does not match results")
+        turn_row = row.get(row_field)
+        if not isinstance(turn_row, dict):
+            raise RuntimeError(f"provider row {row_field} is missing")
+        if turn_row.get("task_contract_sha256") != expected_contract:
+            raise RuntimeError(f"provider {row_field} task contract does not match results")
+        if turn_row.get("prompt_sha256") != expected_prompt:
+            raise RuntimeError(f"provider {row_field} prompt digest does not match results")
+
+
+def merge_provider_row(results: dict[str, object], provider: str, row: dict[str, object]) -> None:
+    contract = require_results_task_contract(results)
+    require_provider_task_binding(row, contract)
+    providers = results.get("providers")
+    if not isinstance(providers, dict):
+        raise RuntimeError("results provider matrix is not an object")
+    for existing in providers.values():
+        if not isinstance(existing, dict):
+            raise RuntimeError("existing provider row is not an object")
+        require_provider_task_binding(existing, contract)
+    providers[provider] = row
 
 
 def run_checked(argv: list[str], cwd: Path) -> bytes:
@@ -307,6 +398,8 @@ def normalize_objects(
     turn: int,
     objects: list[dict[str, object]],
     cwd_digest: str,
+    task_contract_sha256: str,
+    prompt_sha256: str,
     start_sequence: int,
     exit_code: int | None,
     timed_out: bool,
@@ -329,6 +422,8 @@ def normalize_objects(
                 "normalized_event_type": normalized_type(provider, native),
                 "session_id": observed[0] if observed else None,
                 "cwd_digest": cwd_digest,
+                "task_contract_sha256": task_contract_sha256,
+                "prompt_sha256": prompt_sha256,
                 "exit_code": exit_code if offset == len(objects) - 1 else None,
                 "timed_out": timed_out if offset == len(objects) - 1 else False,
             }
@@ -375,7 +470,7 @@ def has_exact_session_continuity(
 
 
 def empty_results() -> dict[str, object]:
-    return {"schema": SCHEMA, "providers": {}, "all_pass": False}
+    return {"schema": SCHEMA, "task_contract": task_contract(), "providers": {}, "all_pass": False}
 
 
 def load_results() -> dict[str, object]:
@@ -384,6 +479,7 @@ def load_results() -> dict[str, object]:
         if (
             isinstance(value, dict)
             and value.get("schema") == SCHEMA
+            and isinstance(value.get("task_contract"), dict)
             and isinstance(value.get("providers"), dict)
         ):
             return value
@@ -397,7 +493,8 @@ def write_json(path: Path, value: object) -> None:
 
 def render_report(results: dict[str, object]) -> None:
     providers = results.get("providers", {})
-    assert isinstance(providers, dict)
+    contract = results.get("task_contract")
+    assert isinstance(providers, dict) and isinstance(contract, dict)
     lines = [
         "# SPIKE-002 Installed Provider CLI Feasibility Report",
         "",
@@ -415,7 +512,22 @@ def render_report(results: dict[str, object]) -> None:
             f"| {provider} | {row['status']} | {row['version']} | "
             f"{row['session_continuity']} | {row['expected_content']} | {reason} |"
         )
-    lines.extend(["", "## Evidence", ""])
+    lines.extend(
+        [
+            "",
+            "## Task contract",
+            "",
+            f"- Schema: {contract['schema']}",
+            f"- Version: {contract['version']}",
+            f"- Turn-one prompt digest: {contract['turn_one_prompt_sha256']}",
+            f"- Turn-two prompt digest: {contract['turn_two_prompt_sha256']}",
+            f"- Expected-final digest: {contract['expected_final_sha256']}",
+            f"- Task contract digest: {contract['task_contract_sha256']}",
+            "",
+            "## Evidence",
+            "",
+        ]
+    )
     for provider in PROVIDERS:
         row = providers.get(provider)
         if not isinstance(row, dict):
@@ -427,6 +539,9 @@ def render_report(results: dict[str, object]) -> None:
                 f"- Executable: {row['executable']}",
                 f"- Version: {row['version']}",
                 f"- Result: {row['status']} — {row['reason']}",
+                f"- Task contract digest: {row['task_contract_sha256']}",
+                f"- Turn-one prompt digest: {row['turn_one_prompt_sha256']}",
+                f"- Turn-two prompt digest: {row['turn_two_prompt_sha256']}",
                 f"- Working-directory token/digest: {row['cwd_token']} / {row['cwd_digest']}",
                 f"- Observed/resumed session: {row['observed_session_id']} / {row['resume_session_id']}",
                 f"- Turn-two observed session: {row['turn_two_observed_session_id']}",
@@ -465,8 +580,7 @@ def probe(provider: str) -> dict[str, object]:
     version = version_raw.decode("utf-8", errors="replace").strip().splitlines()[0]
     help_raw = run_checked(help_argv(provider, executable), cwd)
     supplied_session = None if provider == "codex" else str(uuid.uuid4())
-    turn_one_prompt = (SCRATCH_ROOT / "turn-one.input").read_text(encoding="utf-8").strip()
-    turn_two_prompt = (SCRATCH_ROOT / "turn-two.input").read_text(encoding="utf-8").strip()
+    contract, (turn_one_prompt, turn_one_prompt_sha256), (turn_two_prompt, turn_two_prompt_sha256) = verified_task_inputs()
     turn_one_argv = provider_argv(provider, executable, turn_one_prompt, supplied_session, 1)
     raw_one = SCRATCH_ROOT / f"{provider}-turn-one.raw"
     first = process_attempt(turn_one_argv, cwd, raw_one)
@@ -476,18 +590,24 @@ def probe(provider: str) -> dict[str, object]:
         1,
         objects_one,
         cwd_digest,
+        str(contract["task_contract_sha256"]),
+        turn_one_prompt_sha256,
         1,
         first["exit_code"],
         bool(first["timed_out"]),
     )
     observed_session = first_session(provider, supplied_session, sessions_one)
     resume_session = observed_session or supplied_session
-    turn_two_argv = provider_argv(provider, executable, turn_two_prompt, resume_session, 2) if resume_session else []
     raw_two = SCRATCH_ROOT / f"{provider}-turn-two.raw"
-    if turn_two_argv:
+    if resume_session:
+        second_contract, _verified_one, (turn_two_prompt, turn_two_prompt_sha256) = verified_task_inputs()
+        if second_contract != contract:
+            raise RuntimeError("task contract changed between provider turns")
+        turn_two_argv = provider_argv(provider, executable, turn_two_prompt, resume_session, 2)
         second = process_attempt(turn_two_argv, cwd, raw_two)
         objects_two, structured_two = json_objects(second["stdout"])
     else:
+        turn_two_argv = []
         second = {
             "exit_code": None,
             "timed_out": False,
@@ -502,6 +622,8 @@ def probe(provider: str) -> dict[str, object]:
         2,
         objects_two,
         cwd_digest,
+        str(contract["task_contract_sha256"]),
+        turn_two_prompt_sha256,
         len(events_one) + 1,
         second["exit_code"],
         bool(second["timed_out"]),
@@ -545,6 +667,9 @@ def probe(provider: str) -> dict[str, object]:
     return {
         "provider": provider,
         "status": status,
+        "task_contract_sha256": contract["task_contract_sha256"],
+        "turn_one_prompt_sha256": turn_one_prompt_sha256,
+        "turn_two_prompt_sha256": turn_two_prompt_sha256,
         "executable": executable,
         "version": version,
         "version_sha256": sha256_bytes(version_raw),
@@ -554,6 +679,8 @@ def probe(provider: str) -> dict[str, object]:
         "git_status": git_status.replace(str(cwd), cwd_token),
         "turn_one": {
             "argv": sanitize_argv(turn_one_argv, turn_one_prompt),
+            "task_contract_sha256": contract["task_contract_sha256"],
+            "prompt_sha256": turn_one_prompt_sha256,
             "exit_code": first["exit_code"],
             "timed_out": first["timed_out"],
             "elapsed_ms": first["elapsed_ms"],
@@ -561,6 +688,8 @@ def probe(provider: str) -> dict[str, object]:
         },
         "turn_two": {
             "argv": sanitize_argv(turn_two_argv, turn_two_prompt),
+            "task_contract_sha256": contract["task_contract_sha256"],
+            "prompt_sha256": turn_two_prompt_sha256,
             "exit_code": second["exit_code"],
             "timed_out": second["timed_out"],
             "elapsed_ms": second["elapsed_ms"],
@@ -577,7 +706,7 @@ def probe(provider: str) -> dict[str, object]:
         "structured_output": structured_one and structured_two,
         "structured_event_types": sorted(set(types_one + types_two)),
         "event_mapping": event_mapping_from_events(provider, all_events),
-        "unavailable_fields": ["provider-side authoritative worktree identity", "provider-side cryptographic termination receipt"],
+        "unavailable_fields": list(EXPECTED_PASS_UNAVAILABLE_FIELDS),
         "permission_behavior": PERMISSION_BEHAVIORS[provider],
         "reason": reason,
     }
@@ -591,8 +720,7 @@ def discover_claude_system_types() -> list[str]:
     run_checked(version_argv(provider, executable), cwd)
     run_checked(help_argv(provider, executable), cwd)
     supplied_session = str(uuid.uuid4())
-    turn_one_prompt = (SCRATCH_ROOT / "turn-one.input").read_text(encoding="utf-8").strip()
-    turn_two_prompt = (SCRATCH_ROOT / "turn-two.input").read_text(encoding="utf-8").strip()
+    contract, (turn_one_prompt, _turn_one_prompt_sha256), (turn_two_prompt, _turn_two_prompt_sha256) = verified_task_inputs()
     raw_one = SCRATCH_ROOT / f"{provider}-turn-one.raw"
     raw_two = SCRATCH_ROOT / f"{provider}-turn-two.raw"
     try:
@@ -600,6 +728,9 @@ def discover_claude_system_types() -> list[str]:
         objects_one, structured_one = json_objects(first["stdout"])
         observed_session = first_session(provider, supplied_session, recursive_values(objects_one, SESSION_KEYS))
         resume_session = observed_session or supplied_session
+        second_contract, _verified_one, (turn_two_prompt, _verified_two) = verified_task_inputs()
+        if second_contract != contract:
+            raise RuntimeError("task contract changed between Claude discovery turns")
         second = process_attempt(provider_argv(provider, executable, turn_two_prompt, resume_session, 2), cwd, raw_two)
         objects_two, structured_two = json_objects(second["stdout"])
         observed_second = first_session(provider, supplied_session, recursive_values(objects_two, SESSION_KEYS))
@@ -641,6 +772,7 @@ def load_normalized_events(path: Path, provider: str) -> list[dict[str, object]]
 def refresh_derived_artifacts() -> None:
     """Rebuild only derived metadata after a normalization-rule correction."""
     results = load_results()
+    contract = require_results_task_contract(results)
     providers = results.get("providers")
     if not isinstance(providers, dict) or set(providers) != set(PROVIDERS):
         raise RuntimeError("cannot refresh an incomplete provider matrix")
@@ -648,12 +780,20 @@ def refresh_derived_artifacts() -> None:
         row = providers.get(provider)
         if not isinstance(row, dict):
             raise RuntimeError(f"missing provider row: {provider}")
+        require_provider_task_binding(row, contract)
         expected_artifact = f"docs/spikes/SPIKE-002/events/{provider}.jsonl"
         if row.get("event_artifact") != expected_artifact:
             raise RuntimeError(f"unexpected event artifact for {provider}")
         event_path = EVENT_DIR / f"{provider}.jsonl"
         events = load_normalized_events(event_path, provider)
         for event in events:
+            turn = event.get("turn")
+            if turn not in (1, 2):
+                raise RuntimeError(f"normalized event has an invalid turn for {provider}")
+            if event.get("task_contract_sha256") != contract["task_contract_sha256"]:
+                raise RuntimeError(f"normalized event task contract does not match results for {provider}")
+            if event.get("prompt_sha256") != contract[prompt_digest_field(turn)]:
+                raise RuntimeError(f"normalized event prompt digest does not match results for {provider}")
             native = event.get("native_event_type")
             if not isinstance(native, str) or not native:
                 raise RuntimeError(f"normalized event is missing a native type for {provider}")
@@ -673,6 +813,13 @@ def refresh_derived_artifacts() -> None:
 
 
 def run_self_check() -> None:
+    def expect_runtime_failure(action, message: str) -> None:
+        try:
+            action()
+        except RuntimeError:
+            return
+        raise RuntimeError(message)
+
     session = "session-evidence"
     if has_exact_session_continuity(session, session, None):
         raise RuntimeError("missing turn-two session incorrectly counts as continuous")
@@ -686,16 +833,59 @@ def run_self_check() -> None:
         raise RuntimeError("Claude init subtype was not the sole session-start mapping")
     if normalized_type("claude", "system.thinking_tokens") != "provider.event":
         raise RuntimeError("Claude non-init system subtype was not provider-neutral")
+    if normalized_type("copilot", "session.info") != "provider.event":
+        raise RuntimeError("Copilot session.info was not provider-neutral")
+    if normalized_type("copilot", "session.info") == "session.started":
+        raise RuntimeError("Copilot session.info incorrectly maps to session.started")
     for action, message in (
         (lambda: native_type("claude", {"type": "system"}), "missing Claude system subtype did not fail closed"),
         (lambda: normalized_type("claude", "system.unknown"), "unknown Claude system subtype did not fail closed"),
+        (lambda: normalized_type("copilot", "session.unknown"), "unknown Copilot native type did not fail closed"),
         (lambda: normalized_type("codex", "unknown.native.event"), "unknown native event type did not fail closed"),
     ):
-        try:
-            action()
-        except RuntimeError:
-            continue
-        raise RuntimeError(message)
+        expect_runtime_failure(action, message)
+
+    with tempfile.TemporaryDirectory(prefix="spike002-taskcheck-") as directory:
+        root = Path(directory)
+        prompt_one = root / "turn-one.input"
+        expected_prompt = sha256_bytes(b"self-check canonical prompt")
+        prompt_one.write_bytes(b"self-check canonical prompt")
+        read_verified_prompt(root, 1, expected_prompt)
+        prompt_one.write_bytes(b"self-check changed prompt")
+        expect_runtime_failure(
+            lambda: read_verified_prompt(root, 1, expected_prompt),
+            "changed prompt bytes did not refuse before provider execution",
+        )
+        expect_runtime_failure(
+            lambda: read_verified_prompt(root, 2, sha256_bytes(b"missing prompt")),
+            "missing prompt did not refuse before provider execution",
+        )
+
+    contract = task_contract()
+
+    def task_bound_row() -> dict[str, object]:
+        return {
+            "task_contract_sha256": contract["task_contract_sha256"],
+            "turn_one_prompt_sha256": contract["turn_one_prompt_sha256"],
+            "turn_two_prompt_sha256": contract["turn_two_prompt_sha256"],
+            "turn_one": {
+                "task_contract_sha256": contract["task_contract_sha256"],
+                "prompt_sha256": contract["turn_one_prompt_sha256"],
+            },
+            "turn_two": {
+                "task_contract_sha256": contract["task_contract_sha256"],
+                "prompt_sha256": contract["turn_two_prompt_sha256"],
+            },
+        }
+
+    matrix = empty_results()
+    merge_provider_row(matrix, "codex", task_bound_row())
+    foreign = task_bound_row()
+    foreign["task_contract_sha256"] = sha256_bytes(b"foreign task contract")
+    expect_runtime_failure(
+        lambda: merge_provider_row(matrix, "claude", foreign),
+        "provider rows with different task contracts merged",
+    )
 
 
 def main() -> int:
@@ -725,19 +915,23 @@ def main() -> int:
     # Codex is the required first provider. Starting it always discards any
     # prior or partially trusted matrix before the sequential probe begins.
     results = empty_results() if args.provider == PROVIDERS[0] else load_results()
-    providers = results.setdefault("providers", {})
+    contract = require_results_task_contract(results)
+    providers = results.get("providers")
     assert isinstance(providers, dict)
     try:
-        providers[args.provider] = probe(args.provider)
+        row = probe(args.provider)
     except Exception as exc:  # fail result, never hide a provider/setup failure
         EVENT_DIR.mkdir(parents=True, exist_ok=True)
         empty_events = EVENT_DIR / f"{args.provider}.jsonl"
         empty_events.write_bytes(b"")
         executable = shutil.which("claude" if args.provider == "claude" else args.provider) or "unavailable"
         cwd_token = f"$PROBE_ROOT/{args.provider}"
-        providers[args.provider] = {
+        row = {
             "provider": args.provider,
             "status": "FAIL",
+            "task_contract_sha256": contract["task_contract_sha256"],
+            "turn_one_prompt_sha256": contract["turn_one_prompt_sha256"],
+            "turn_two_prompt_sha256": contract["turn_two_prompt_sha256"],
             "executable": executable,
             "version": "unavailable",
             "version_sha256": sha256_bytes(b""),
@@ -745,8 +939,24 @@ def main() -> int:
             "cwd_token": cwd_token,
             "cwd_digest": sha256_text(cwd_token),
             "git_status": "unavailable",
-            "turn_one": {"argv": [executable, "<redacted-prompt>"], "exit_code": None, "timed_out": False, "elapsed_ms": 0, "raw_sha256": sha256_bytes(b"")},
-            "turn_two": {"argv": [executable, "<redacted-prompt>"], "exit_code": None, "timed_out": False, "elapsed_ms": 0, "raw_sha256": sha256_bytes(b"")},
+            "turn_one": {
+                "argv": [executable, "<redacted-prompt>"],
+                "task_contract_sha256": contract["task_contract_sha256"],
+                "prompt_sha256": contract["turn_one_prompt_sha256"],
+                "exit_code": None,
+                "timed_out": False,
+                "elapsed_ms": 0,
+                "raw_sha256": sha256_bytes(b""),
+            },
+            "turn_two": {
+                "argv": [executable, "<redacted-prompt>"],
+                "task_contract_sha256": contract["task_contract_sha256"],
+                "prompt_sha256": contract["turn_two_prompt_sha256"],
+                "exit_code": None,
+                "timed_out": False,
+                "elapsed_ms": 0,
+                "raw_sha256": sha256_bytes(b""),
+            },
             "observed_session_id": None,
             "resume_session_id": None,
             "turn_two_observed_session_id": None,
@@ -762,6 +972,7 @@ def main() -> int:
             "permission_behavior": "not observed",
             "reason": f"probe harness failure: {type(exc).__name__}: {exc}",
         }
+    merge_provider_row(results, args.provider, row)
     results["all_pass"] = set(providers) == set(PROVIDERS) and all(
         isinstance(providers[name], dict) and providers[name].get("status") == "PASS"
         for name in PROVIDERS
