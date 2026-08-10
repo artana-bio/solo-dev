@@ -1522,7 +1522,7 @@ why it is outside the package gate.
 
 | Field | Value |
 | --- | --- |
-| Status | `IN_PROGRESS` — repair after independent review `RV-000092` requested stronger historical-evidence binding and a durable `failed_clean` mutation journal record |
+| Status | `DONE` |
 | Commit | `4729d18` |
 | Dependencies | None |
 | Owner | Codex |
@@ -4470,7 +4470,7 @@ this revision records the completed `SPIKE-002` evidence above that base.
 
 | Field | Current value |
 | --- | --- |
-| Status | `DONE` |
+| Status | `IN_PROGRESS` — repair after independent review `RV-000092` requested stronger historical-evidence binding and a durable `failed_clean` mutation journal record |
 | Owner | `mutation-recovery-implementer` |
 | Branch and worktree | `card/F-053`; `/Users/alvaro/Documents/Code/change-harness-worktrees/F-053` |
 | Exact baseline | `6c447cc63bd80181695e2e870ceb0afbdfa86722` |
