@@ -5,16 +5,16 @@
 | Field | Value |
 | --- | --- |
 | Document status | Authoritative implementation plan |
-| Plan revision | 85 |
+| Plan revision | 86 |
 | Plan date | 2026-08-09 |
 | Implementation baseline | `4729d18` (`chore: scaffold generic change harness`) |
-| Previous plan commit | `2fa19a4081a8accc19c24593b594835c88dfc07f`, promoted plan revision 84 baseline with `WP-800` complete |
+| Previous plan commit | `f0c705fc94a41a167324eeb0ca7389b45d74107c`, promoted plan revision 85 authorization for `SPIKE-002` |
 | Repository | `/Users/alvaro/Documents/Code/change-harness` |
-| Active branch | No production coordination implementation is active; `SPIKE-002` is the next executable work package. |
-| Current release stage | Hardened single-repository release plus a documentation-only coordination-extension authorization |
-| Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; the bootstrap alignment was not Harness-governed. Governed lessons subsequently promoted through `INT-040`, establishing current candidate and local authority baseline `2fa19a4081a8accc19c24593b594835c88dfc07f`. |
-| Current implementation status | `WP-550`, `WP-560`, governance extension `WP-600`, and `WP-800` are `DONE` on promoted baseline `2fa19a4081a8accc19c24593b594835c88dfc07f`. No production coordinator, provider adapter, remote gateway, or dashboard has started. |
-| Next executable work package | `SPIKE-002` is the only `READY` package; every production package is dependency-gated. |
+| Active branch | No production coordination implementation is active; `WP-900` is the next executable work package. |
+| Current release stage | Hardened single-repository release plus accepted installed-provider feasibility evidence |
+| Bootstrap release | PR #214 merged and tagged at `636f48f7ea4bf9bffbdb271b87a19e5841b87a83`; the bootstrap alignment was not Harness-governed. Governed lessons subsequently promoted through `INT-041`, establishing the coordination-extension base `f0c705fc94a41a167324eeb0ca7389b45d74107c`. |
+| Current implementation status | `WP-550`, `WP-560`, governance extension `WP-600`, `WP-800`, and feasibility spike `SPIKE-002` are `DONE`. No production coordinator, provider adapter, remote gateway, or dashboard has started. |
+| Next executable work package | `WP-900` is the only `READY` package; every later production package remains dependency-gated. |
 | Final acceptance owner | Alvaro Alvarez |
 | Final authorization policy | Sealed-cycle authorization by declared actor `alvaro` |
 
@@ -3493,14 +3493,16 @@ candidate:
 
 | Field | Value |
 | --- | --- |
-| Status | `READY` |
-| Dependencies | `WP-800` (`DONE`); plan revision 85 must be promoted before execution |
+| Status | `DONE` |
+| Dependencies | `WP-800` (`DONE`) on coordination-extension base `f0c705fc94a41a167324eeb0ca7389b45d74107c` |
 | Target release | Provider-neutral coordination extension |
 | Maximum duration | Eight active engineering hours or one working day, whichever occurs first |
 | Production implementation budget | Zero lines under `src/`, `schemas/`, or build manifests |
 | Required reading — coordinator | Complete implementation plan, `docs/ARCHITECTURE.md`, `README.md`, `AGENTS.md`, and `SKILL.md` |
 | Required reading — probe role | The delivered `SPIKE-002` implementation packet only |
 | Required reading — reviewer | The delivered `SPIKE-002` review packet only |
+| Completion evidence | `docs/spikes/SPIKE-002-REPORT.md`, `docs/spikes/SPIKE-002/results.json`, and normalized metadata-only JSONL under `docs/spikes/SPIKE-002/events/` |
+| Result | Codex CLI 0.146.0, Claude Code 2.1.220, and GitHub Copilot CLI 1.0.78 all passed bounded noninteractive execution, structured output, exact-session resume, expected-file verification, and distinguishable exit-status checks |
 
 Purpose:
 
@@ -3610,11 +3612,24 @@ json --resume=<uuid>`. It runs each command with the disposable
 worktree as its process working directory and records deviations demanded by
 the installed version instead of silently changing the experiment.
 
+Observed disposition:
+
+- all three installed providers passed the same two-turn provider-neutral task
+  with exact-session continuity and expected final bytes;
+- the committed evidence contains normalized metadata and digests only; raw
+  streams and ephemeral prompt inputs were deleted after normalization;
+- corrupt JSONL, substituted session identity, wrong-worktree identity, and
+  credential/reasoning sentinels are rejected by the deterministic validator;
+- provider-native formats remain version-sensitive, and none of the three
+  providers supplies an authoritative Harness worktree identity or a
+  cryptographic termination receipt. `WP-900` and `WP-920` must therefore bind
+  those facts in Harness-owned records and fail closed on format drift.
+
 ### WP-900 — Durable agent-run contract and records
 
 | Field | Value |
 | --- | --- |
-| Status | `NOT_STARTED` |
+| Status | `READY` |
 | Dependencies | `SPIKE-002` (`DONE` with all three provider rows accepted) |
 | Target release | Provider-neutral coordination extension |
 | Required reading | `README.md`; `AGENTS.md`; plan Sections 1–7, 9, 10.1, 10.4, 10.10, 11, 12, 15.1, 16, 20.2, 22, and 24; `SPIKE-002` accepted report; `WP-900`; `docs/ARCHITECTURE.md` headings `Coordinator execution plane` and `Provider adapters` |
@@ -4056,13 +4071,13 @@ WP-440 ────────────────────────�
 ```
 
 The provider-neutral coordination extension is a separate, strictly serial
-sequence from promoted baseline
-`2fa19a4081a8accc19c24593b594835c88dfc07f`:
+sequence from coordination-extension base
+`f0c705fc94a41a167324eeb0ca7389b45d74107c`:
 
 ```text
-SPIKE-002  READY — only next executable item
+SPIKE-002  DONE — all three installed providers passed
     ↓
-WP-900     durable agent-run records and JSONL contract
+WP-900     READY — only next executable item
     ↓
 WP-910     optional local coordinator
     ↓
@@ -4075,10 +4090,11 @@ WP-930     restricted GitHub App/service promotion authority
 WP-940     read-only dashboard projection
 ```
 
-This order is exact. `WP-900`, `WP-910`, `WP-920`, `WP-720`, `WP-930`, and
-`WP-940` are all `NOT_STARTED`; none may begin early on a fixture, partial
-contract, provider-specific shortcut, or dashboard prototype. A failed or
-contaminated `SPIKE-002` result blocks `WP-900` and requires a plan revision.
+This order is exact. `WP-900` is `READY`; `WP-910`, `WP-920`, `WP-720`,
+`WP-930`, and `WP-940` remain `NOT_STARTED`. None may begin early on a fixture,
+partial contract, provider-specific shortcut, or dashboard prototype. The
+accepted `SPIKE-002` report is the observed provider-feasibility input to
+`WP-900`; it is not a production adapter or coordinator.
 
 Permitted parallel work:
 
@@ -4396,8 +4412,9 @@ self-checks; later independent repair evidence does not rewrite that history.
 **The self-hosting suspension is closed.** D-065 suspended Threshold C while
 Tier 1 of the evidence chain was broken. D-067 resumed it after those repairs
 were independently mutation-verified, and current work again uses the complete
-Harness lifecycle. Promoted baseline
-`2fa19a4081a8accc19c24593b594835c88dfc07f` is the current status boundary.
+Harness lifecycle. `INT-041` landing
+`f0c705fc94a41a167324eeb0ca7389b45d74107c` is the coordination-extension base;
+this revision records the completed `SPIKE-002` evidence above that base.
 
 ## 20. Current status tracker
 
@@ -4431,7 +4448,8 @@ Harness lifecycle. Promoted baseline
 | Backup/audit | `DONE` | `WP-520`, `tests/backup.rs` (9 acceptance tests); `WP-530`, `tests/audit.rs` (9 acceptance tests) | Preserve |
 | Operational visibility | `DONE` | `WP-550` and `WP-560`; typed snapshot projection with terminal legacy-cycle and stale terminal-lease noise suppressed | Preserve the typed projection, fail-closed integrity, and redaction boundary |
 | Governed lessons | `DONE` | `WP-800`; bounded semantic port preserving PR #212 ancestry and current governance | Preserve exact manifest binding and fail-closed lifecycle enforcement |
-| Coordination feasibility | `READY` | `SPIKE-002`; documentation-only contract and isolated probe boundary | Execute `SPIKE-002` only; later packages remain dependency-gated |
+| Coordination feasibility | `DONE` | `SPIKE-002` report; all three installed provider rows passed, with metadata-only evidence and negative regressions | Preserve evidence and fail closed on provider-format drift |
+| Durable agent-run contract | `READY` | `WP-900`; unblocked by accepted `SPIKE-002` capability matrix | Implement `WP-900` only; later packages remain dependency-gated |
 | Multi-repository | `DEFERRED` | Architecture only | After hardened release |
 | Runtime isolation | `DEFERRED` | Architecture only | After demonstrated need |
 
@@ -4439,13 +4457,14 @@ Harness lifecycle. Promoted baseline
 
 | Field | Current value |
 | --- | --- |
-| Promoted baseline | `2fa19a4081a8accc19c24593b594835c88dfc07f` (`INT-040`, `F-045`, `WP-800`) |
-| Next executable work package | `SPIKE-002` only |
+| Coordination-extension base | `f0c705fc94a41a167324eeb0ca7389b45d74107c` (`INT-041`, plan revision 85) |
+| Completed item | `SPIKE-002`; all Codex, Claude Code, and GitHub Copilot CLI rows passed |
+| Next executable work package | `WP-900` only |
 | Status | `READY` |
-| Active implementation | None. This authorization is documentation-only; no production coordination component exists. |
-| Blocker | None for the bounded spike. `WP-900` and every later package remain blocked on the exact dependency chain in Section 18. |
-| Required reading | Coordinator: complete plan, `docs/ARCHITECTURE.md`, `README.md`, `AGENTS.md`, and `SKILL.md`. Spike roles: their delivered `SPIKE-002` packet only under the spike exception. |
-| Acceptance boundary | Installed-provider feasibility and packet sufficiency only; zero production Rust or infrastructure and no external effect. |
+| Active implementation | None. The completed spike added no production Rust, coordinator, adapter, infrastructure, or external effect. |
+| Blocker | None for `WP-900`. Every later package remains blocked on the exact dependency chain in Section 18. |
+| Required reading | `WP-900` implementation role: the exact list in its tracker entry, including the accepted `SPIKE-002` report. |
+| Acceptance boundary | Durable Harness-owned agent-run schema, state validation, persistence, and standalone CLI commands only; no coordinator or provider adapter. |
 
 Bootstrap recovery record:
 
@@ -4476,9 +4495,11 @@ Bootstrap recovery record:
   package state.
 - Governed `WP-800` repair card `F-045` was accepted and promoted through
   `INT-040`; landing commit
-  `2fa19a4081a8accc19c24593b594835c88dfc07f` is the current local candidate
-  `main` and bare-authority `main` baseline. The old `card/F-045` active-work
-  statement is therefore closed history, not current state.
+  `2fa19a4081a8accc19c24593b594835c88dfc07f` is preserved history. Plan
+  revision 85 was subsequently promoted through `INT-041` at
+  `f0c705fc94a41a167324eeb0ca7389b45d74107c`, the base for `SPIKE-002`. The old
+  `card/F-045` active-work statement is therefore closed history, not current
+  state.
 
 The spike-derived corrections are assigned to their owning packages and are not
 `WP-100` scope: F-1 to `WP-250`, F-2 to `WP-250`, F-3 to `WP-410`, and F-4 and
@@ -4539,14 +4560,14 @@ and their listed commands.
 | R-011 | Same-disk backup is mistaken for independent backup | Permanent loss | Independent destination validation and restore drill | Backup path shares device | Open |
 | R-012 | Actor string is treated as proven identity | Invalid separation claim | Declare identity limits; stronger boundary optional | Security-sensitive approval needs proof | Open, accepted for local MVP |
 | R-013 | Repository probe discards `rev-parse` failure diagnostics | Git refusal is misreported as non-repository | Preserve exit/stderr and classify repository versus Git error in `WP-130` | Any nonzero repository probe result | Closed 2026-07-28 by `WP-130`, with a named regression test |
-| R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | `SPIKE-001` preceded `WP-100`; `SPIKE-002` now precedes `WP-900` and freezes provider mechanics only from observed CLI evidence | Production coordination code begins before accepted `SPIKE-002` evidence | Actively controlled |
+| R-014 | Detailed specification hardens before real agent use | Expensive schemas encode the wrong ceremony | `SPIKE-001` preceded `WP-100`; accepted `SPIKE-002` now constrains `WP-900` using observed CLI evidence | Production coordination code diverges from accepted `SPIKE-002` evidence | Mitigated by `SPIKE-002`; actively controlled in `WP-900` |
 | R-015 | Full-plan reading consumes feature-agent context | Reduced implementation focus and higher error rate | Role-specific reading contract and explicit per-item reading list | Feature agent is instructed to load the complete plan without a coordination role | Mitigated by plan revision 2 |
 | R-016 | Review reuses implementation context | Nominally independent review repeats the implementer's assumptions | Fresh session, review packet only, different session ID, no branch edits | Reviewer inherits or forks implementation conversation | Mitigated procedurally; not a security boundary |
 | R-017 | Candidate branch is rewritten between actor delivery and handoff creation | A structurally valid handoff describes code the feature actor never delivered, and review evaluates the wrong objects | Record the actor-declared `delivered_sha` and compare it at handoff creation; reject on mismatch | Any handoff whose candidate SHA differs from the declared delivered SHA | Closed 2026-07-28 by `WP-250`, with a named regression test reproducing the spike's amend |
 | R-018 | Evidence records cannot be independently verified by their holder | An auditor can check records against each other but cannot recompute any digest, so internal consistency is mistaken for correctness | Records name their canonicalization algorithm and carry or reference the card; commit digest vectors before activation | Any record whose digest cannot be recomputed from the record plus Git objects | Open; observed in `SPIKE-001` finding F-2 |
 | R-019 | Independent reviewers reach different verdicts on identical code | Approval depends on which reviewer is assigned rather than on the code | Comparability guidance in Section 15.3; required gate-adequacy output | Same construct flagged in one card and not another | Open; observed in `SPIKE-001` finding F-6 |
 | R-020 | Coordinator becomes a shadow authority or second workflow database | CLI refusals and control history can disagree with what the coordinator presents or resumes | Coordinator invokes the standalone CLI for every durable transition; recovery derives from snapshot plus control-backed run records; ephemeral progress is discardable | Any durable coordinator-only state or direct control-repository write | Controlled by D-099; production unimplemented |
-| R-021 | Provider session or structured-output drift binds the wrong run or candidate | A provider result is attributed to the wrong card, worktree, packet, or SHA | `SPIKE-002` capability proof; strict Section 10.10 JSONL; immutable session/card/worktree binding; fail-closed version probe | Missing/ambiguous session ID, malformed stream, or adapter format change | Open; `SPIKE-002` is next |
+| R-021 | Provider session or structured-output drift binds the wrong run or candidate | A provider result is attributed to the wrong card, worktree, packet, or SHA | Accepted `SPIKE-002` capability proof; strict Section 10.10 JSONL; immutable session/card/worktree binding; fail-closed version probe | Missing/ambiguous session ID, malformed stream, or adapter format change | Feasibility demonstrated; production handling remains open for `WP-900` and `WP-920` |
 | R-022 | Provider or coordinator process receives remote promotion credentials | Compromised or mistaken agent bypasses acceptance and moves GitHub protected state | Harness-controlled remote identity held only by `WP-930` gateway; repository rules reject every other identity; process-environment regressions | Credential visible to provider/coordinator or direct protected-ref update succeeds | Controlled by D-099; remote path unimplemented |
 | R-023 | External effect is duplicated or verified from the executor's own claim | Tickets, publications, or promotion repeat or appear complete when remote state differs | `WP-720` prepare-authorize-execute-verify transaction, exact intent digest, idempotency key, independent readback, and ambiguous-state recovery | Retry after response loss or verification without target readback | Open; blocked on `WP-920` |
 | R-024 | Dashboard becomes a mutation surface or alternate truth | UI state can authorize work or conceal disagreement with control records | Consume only typed snapshot plus labeled ephemeral events; snapshot wins; no writer, mutating CLI, credentials, or durable cache | Any dashboard-originated mutation or durable field without `control_head` provenance | Open; blocked on `WP-930` |
@@ -4612,12 +4633,13 @@ and their listed commands.
 | D-097 | Preserve bootstrap history and fix its terminal snapshot noise in one bounded follow-up | Accepted 2026-08-09 | Release v0.1.5 restored one aligned candidate/origin/authority baseline but was itself an ordinary Git/GitHub bootstrap, not a governed delivery. Retiring the 27 legacy cycles and installing final authorization for actor `alvaro` made new governed work honest; it did not rewrite old cycle revisions or lease records. `WP-560` therefore corrects only the read-only projection for terminal records and preserves live drift/silence warnings, the stable schema, and all historical evidence. |
 | D-098 | Repair PR #212 as a semantic port that preserves both histories and current governance | Accepted 2026-08-09 | Preserve current `main`'s `WP-600` mutation-exemption governance and `WP-560` terminal-noise cleanup while porting governed lessons. Preserve every historical control record and do not force-push or replace the existing PR history. The repaired candidate must retain exact PR head `efb2adeeed4a5a924348655946519b30993280b3` as an ancestor so the existing PR can fast-forward to the reviewed repair. This card changes only the plan: no Rust, runtime, or test behavior changes until a separate `WP-800` implementation card is activated. |
 | D-099 | Keep the CLI as the standalone governance kernel and govern every external effect through an explicit prepare-authorize-execute-verify boundary | Accepted 2026-08-09; resolves Q-007 | The optional coordinator may launch providers and project ephemeral progress, but every durable transition remains a CLI transaction in the existing control repository; there is no second workflow database. A versioned JSONL run record binds provider, provider session, Harness role, card, worktree/lease, packet digest, and exact candidate SHA, while `SKILL.md` remains the single portable guide. Gates remain read-only. Any effect outside the machine is first prepared as an immutable exact-input intent, then authorized against its digest, executed through a restricted action identity, and independently verified from observed target state. Local/offline authority keeps the existing bare repository and its same-user, non-security-boundary limitation. Enforced remote GitHub authority is separate: repository rules allow only a Harness-controlled GitHub App or service identity to update the protected branch; the acceptance owner authenticates directly to that gateway and receives an intent-bound, short-lived signed capability that is not routed through providers or the coordinator; the gateway accepts only the exact accepted landing SHA with expected-old binding. Provider CLIs and the coordinator never receive or own that promotion authority. This authorizes the generic `WP-720` transaction and the narrow `WP-930` remote-promotion slice, not general connectors, deployment, or provider-specific workflow policy. |
+| D-100 | Build Harness-owned run records from observed provider capabilities instead of treating provider sessions as authority | Accepted 2026-08-09 from `SPIKE-002` | Installed Codex, Claude Code, and GitHub Copilot CLI versions all demonstrated noninteractive structured output, explicit working-directory execution, exact-session resume, expected-file completion, and process exit status under bounded probe permissions. Their event formats differ and remain version-sensitive; none supplies an authoritative Harness worktree identity or cryptographic completion receipt. `WP-900` therefore owns the durable provider-neutral record and bindings, while `WP-920` owns versioned adapters that fail closed on unsupported format drift. |
 
 ## 23. Decisions required later
 
 Open items are intentionally time-bounded. Resolved Q-007 remains in the table
 for traceability to D-099; it is not an open decision and does not block
-`SPIKE-002`.
+`WP-900`.
 
 | ID | Decision needed | Deadline | Blocking effect |
 | --- | --- | --- | --- |
