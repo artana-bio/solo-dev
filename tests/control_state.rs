@@ -234,6 +234,24 @@ fn incompatible_reinitialization_fails_without_altering_anything() {
         "rebinding is a configuration failure"
     );
 
+    // `ConfigControlIncompatible`'s recovery text used to carry this
+    // guidance for every site sharing the code, including one it was wrong
+    // for (convergence facts bound to a policy digest an install would
+    // orphan, where the answer is `disposition rebaseline`). It moved into
+    // this message, which is the only site the advice is actually true for.
+    // Pinned here because the move is only half done if it left the shared
+    // text without arriving anywhere: a reader deleting the sentence as
+    // redundant would leave this refusal with no remedy at all, and
+    // `the_control_incompatible_recovery_prescribes_no_single_cause` in
+    // `src/error.rs` would stay green while they did it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported = format!("{stdout}{stderr}");
+    assert!(
+        reported.contains("Point at the control repository that matches this configuration"),
+        "the refusal must carry the guidance the shared recovery text no longer does: {reported}"
+    );
+
     assert_eq!(control.head().unwrap(), before_head);
     assert_eq!(control.read(PROJECT_FILE).unwrap(), before_document);
 }

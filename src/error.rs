@@ -627,8 +627,24 @@ impl ErrorCode {
             Self::ConfigUnknownGate => {
                 "Register the gate before naming it in a card, or correct the gate name."
             }
+            // Deliberately points at this error's own message instead of
+            // naming a remedy, for the same reason
+            // `PreconditionMergeRefused` does. The ways control state can
+            // disagree with what a command is installing form an open set —
+            // no control repository at the path, one already bound to a
+            // different configuration, convergence facts recorded under a
+            // policy digest the install would orphan — and each needs a
+            // different thing done about it. The previous text
+            // ("Point at the matching control repository, or initialize a
+            // new project elsewhere") described the first two and so sent
+            // the operator to the wrong place for the third, which is
+            // resolved by `disposition rebaseline` and not by changing which
+            // repository they point at. Every site's own message names what
+            // mismatched and what to do about it; the guidance this text
+            // used to carry for `reinitialize` now lives in that site's
+            // message, which has the context to state it.
             Self::ConfigControlIncompatible => {
-                "Point at the matching control repository, or initialize a new project elsewhere."
+                "Read the mismatch this error reports: it names what the control repository already holds and what this command would install over it."
             }
             Self::ConfigAuthorityIncompatible => {
                 "Point at an empty directory or an existing bare repository; an authority must have no working tree."
@@ -1283,6 +1299,42 @@ mod tests {
              rather than presenting it as the unconditional remedy, and the condition must \
              not have landed in a different clause; clause naming `card revise`: \
              {clause_naming_card_revise:?} (full recovery: {recovery:?})"
+        );
+    }
+
+    #[test]
+    fn the_control_incompatible_recovery_prescribes_no_single_cause() {
+        // `ConfigControlIncompatible` is shared by three sites whose
+        // remedies have nothing in common: `ControlRepository::open` (no
+        // control repository at the path), `project.rs::reinitialize` (one
+        // already bound to a different configuration), and
+        // `project.rs::refuse_orphaning_facts` (convergence facts recorded
+        // under a policy digest the install would orphan). This recovery
+        // used to read "Point at the matching control repository, or
+        // initialize a new project elsewhere." — correct for the first two
+        // and actively misleading for the third, where the resolution is
+        // `disposition rebaseline` and no amount of pointing at a different
+        // repository helps.
+        //
+        // Unlike `PolicyInvalidCard` above, there is no dominant subclass to
+        // name a command for: each of the three wants a different one, or
+        // none. So this recovery defers to the per-site `reason` text, the
+        // way `PreconditionMergeRefused` does for an equally open set. The
+        // two assertions are deliberately opposite in sign — the first
+        // fails if the old cause-specific advice returns, the second fails
+        // if it is replaced by generic filler ("Correct the configuration.")
+        // that resolves nothing while still reading as guidance and still
+        // passing `every_code_offers_recovery_guidance`'s non-empty check.
+        let recovery = ErrorCode::ConfigControlIncompatible.recovery();
+        assert!(
+            !recovery.contains("control repository, or initialize"),
+            "the recovery prescribes one cause's remedy again, which misdirects the sites \
+             it does not fit; got: {recovery}"
+        );
+        assert!(
+            recovery.contains("Read the mismatch this error reports"),
+            "the recovery must send the operator to the message, which is the only place \
+             that knows which of the three mismatches this is; got: {recovery}"
         );
     }
 
