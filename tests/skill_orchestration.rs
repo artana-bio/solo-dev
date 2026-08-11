@@ -8,6 +8,7 @@
 
 const ORCHESTRATION_HEADING: &str = "## Multi-agent orchestration";
 const IMPLEMENTER_PROMPT_HEADING: &str = "### Start an implementer task";
+const BOTTLENECK_HEADING: &str = "### Stop and untangle a bottleneck";
 const REVIEWER_PROMPT_HEADING: &str = "### Start a genuinely fresh reviewer task";
 
 fn skill_md() -> String {
@@ -56,9 +57,14 @@ fn orchestration_defines_card_slicing_and_work_distribution() {
         body,
         &[
             "Convert a user request into cards",
+            "Plan before executing",
+            "complete card set currently known for the\ncycle",
+            "does not let agents create cards opportunistically while coding",
             "one activated card, one lease, one\nallocated worktree, and one feature actor",
             "independently reviewable outcome",
             "ownership, dependency, and\nexclusive-resource boundaries",
+            "use serial execution when a declared dependency or exclusive resource",
+            "use parallel execution only for cards with accepted disjoint ownership",
             "The coordinator owns fan-out and fan-in",
             "Coordinator integrates only exact candidates whose Harness state is approved",
         ],
@@ -90,6 +96,35 @@ fn implementer_prompt_carries_the_complete_assignment_and_reporting_contract() {
             "This packet is the complete assigned context",
         ],
         "implementer prompt",
+    );
+}
+
+#[test]
+fn orchestration_stops_repeated_attempts_and_convenes_a_diagnostic_group() {
+    let guide = skill_md();
+    let body = section(&guide, BOTTLENECK_HEADING, "### ");
+
+    assert_contains_all(
+        body,
+        &[
+            "two materially similar attempts fail",
+            "repeat the same hypothesis without new evidence",
+            "Formal convergence-budget exhaustion also triggers this protocol",
+            "stops changing the candidate",
+            "short bottleneck packet",
+            "fresh diagnostic\ntasks",
+            "greater reasoning capacity or relevant specialist\nexperience",
+            "investigate independently",
+            "not extra implementers",
+            "root-cause assessment",
+            "challenge the current approach",
+            "replace a flawed implementation inside the existing card boundary",
+            "revise or split the card",
+            "redesign the approach behind a replacement card",
+            "records the decision and rationale",
+            "Repeated renewal without a\nnew hypothesis is not recovery",
+        ],
+        "bottleneck escalation procedure",
     );
 }
 

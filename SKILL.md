@@ -224,6 +224,28 @@ The coordinator translates intent into governance before starting agents:
    proposed cycle and cards before activation. Approval of the product request
    is not permission to silently widen its scope.
 
+### Plan before executing
+
+Planning and execution are separate phases. Before starting an implementer
+task, the coordinator proposes the complete card set currently known for the
+cycle; it does not let agents create cards opportunistically while coding.
+Each proposed card must have the fields above and an explicit execution
+relationship: no dependency, depends on another card, or shares an exclusive
+resource. If implementation reveals work outside an activated card, stop at
+the boundary and propose a new card (or a revised card requiring approval)
+before doing that work.
+
+Execute the approved set according to those relationships:
+
+- use serial execution when a declared dependency or exclusive resource
+  requires it;
+- use parallel execution only for cards with accepted disjoint ownership,
+  dependencies, and resources.
+
+An unrelated card need not wait for another card to finish. "Serial" describes
+the order of card execution, not the creation of the plan; "parallel"
+describes independent card tasks, not shared ownership of one card.
+
 One implementation assignment means **one activated card, one lease, one
 allocated worktree, and one feature actor**. An agent may complete several
 cards over time, but each card gets a separate task and handoff. Cards may run
@@ -331,6 +353,44 @@ The coordinator answers in the implementer task, revises the card when its
 immutable contract must change, and never uses an informal message to override
 the activated card. At completion, verify the report from Harness and Git
 state; do not accept "done" in chat as a handoff.
+
+### Stop and untangle a bottleneck
+
+Do not let a card consume repeated attempts without changing what the team
+knows. Pause ordinary implementation when either condition is true:
+
+- two materially similar attempts fail to resolve the same problem; or
+- the next attempt would repeat the same hypothesis without new evidence.
+
+Formal convergence-budget exhaustion also triggers this protocol, but it is a
+backstop, not a reason to wait. The implementer stops changing the candidate,
+records `work block` when no other in-scope work can continue, and returns a
+short bottleneck packet: the exact card and candidate SHA, observed failure,
+attempts already made, gate output and review findings, hypotheses disproved,
+constraints that must remain true, and the smallest unresolved question.
+
+The coordinator creates a temporary **bottleneck group** of fresh diagnostic
+tasks. Use agents with greater reasoning capacity or relevant specialist
+experience when available. Give each task the same authoritative bottleneck
+packet and ask it to investigate independently. These are diagnostic tasks,
+not extra implementers: they do not edit the candidate, share a worktree,
+silently widen the card, or approve the work.
+
+Ask the group to return evidence, a root-cause assessment, and ranked recovery
+options. At least one task must challenge the current approach rather than
+debug it in place. Options may include:
+
+- resume with a new, falsifiable hypothesis and a narrow proof;
+- replace a flawed implementation inside the existing card boundary;
+- revise or split the card when the outcome or proof is too broad;
+- redesign the approach behind a replacement card; or
+- abandon the card when further investment is not justified.
+
+The coordinator synthesizes the reports, records the decision and rationale,
+and obtains any authority required by the card or convergence policy before
+implementation resumes. A stronger agent is not permission to bypass scope,
+ownership, evidence, review, or a Harness refusal. Repeated renewal without a
+new hypothesis is not recovery; choose `split`, `redesign`, or `abandon`.
 
 ### Start a genuinely fresh reviewer task
 
