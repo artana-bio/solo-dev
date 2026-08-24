@@ -252,7 +252,10 @@ fn create(args: &CreateArgs, clock: &dyn Clock) -> Result<CommandOutcome, Harnes
                     receipt.validate()?;
                     receipt
                 }
-                (Err(error), Ok(_)) => return Err(error),
+                (Err(error), Ok(_)) => {
+                    steps.outside_control_restored("mutation-worktree-restored")?;
+                    return Err(error);
+                }
                 (attempt, Err(cleanup_error)) => {
                     let retained = scratch.keep();
                     let original = attempt.err().map_or_else(

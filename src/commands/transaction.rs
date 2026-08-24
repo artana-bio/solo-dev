@@ -106,6 +106,24 @@ impl Steps<'_> {
         self.record.touched_outside_control = true;
         self.journal.step(self.record, step)
     }
+
+    /// Records that a temporary effect outside control was fully restored.
+    ///
+    /// This is intentionally narrow: callers use it only after independently
+    /// verifying cleanup. A failure while recording the restoration leaves the
+    /// operation partial, so recovery never assumes cleanup that was not
+    /// durably journalled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal I/O or injected-interruption error.
+    pub fn outside_control_restored(&mut self, step: &str) -> Result<(), HarnessError> {
+        self.journal.step(self.record, step)?;
+        self.record.touched_outside_control = false;
+        self.record.mutation_started = false;
+        self.mutation_started = false;
+        self.journal.write(self.record)
+    }
 }
 
 /// Decides how a failed operation is recorded.
